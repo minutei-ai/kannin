@@ -441,6 +441,7 @@ async function query(env: Env, input: typeof Query.Type, manifest: typeof Root.T
 export class SearchNamespace extends DurableObject<Env> {
   private readonly semaphore = Semaphore.makeUnsafe(1);
   private namespace: typeof NamespaceName.Type | undefined;
+  private acknowledgedReceipt: typeof Receipt.Type | undefined;
   private current: { manifest: typeof Root.Type; etag: string | null } | undefined;
 
   private get prefix() {
@@ -501,17 +502,38 @@ export class SearchNamespace extends DurableObject<Env> {
   }
 
   private async persistReceipt(receipt: typeof Receipt.Type) {
-    const key = `${this.prefix}/receipts/${await sha256(receipt.requestId)}.json`;
-    const existing = await this.env.STORAGE.get(key);
-    if (existing) {
-      const prior = Schema.decodeSync(Schema.fromJsonString(Receipt))(await existing.text());
-      if (prior.digest !== receipt.digest || prior.sequence !== receipt.sequence)
-        throw new Rejected({ status: 503, message: "Committed receipt conflict" });
+    const acknowledged = this.acknowledgedReceipt;
+    if (
+      acknowledged &&
+      acknowledged.sequence === receipt.sequence &&
+      acknowledged.digest === receipt.digest &&
+      acknowledged.requestId === receipt.requestId
+    )
       return;
+    const key = `${this.prefix}/receipts/${await sha256(receipt.requestId)}.json`;
+    const stored = await this.env.STORAGE.put(
+      key,
+      Schema.encodeSync(Schema.fromJsonString(Receipt))(receipt),
+      {
+        onlyIf: { etagDoesNotMatch: "*" },
+      },
+    );
+    if (!stored) {
+      const existing = await this.env.STORAGE.get(key);
+      if (!existing)
+        throw new Rejected({
+          status: 503,
+          message: "Committed receipt missing after conditional write",
+        });
+      const prior = Schema.decodeSync(Schema.fromJsonString(Receipt))(await existing.text());
+      if (
+        prior.digest !== receipt.digest ||
+        prior.sequence !== receipt.sequence ||
+        prior.requestId !== receipt.requestId
+      )
+        throw new Rejected({ status: 503, message: "Committed receipt conflict" });
     }
-    await this.env.STORAGE.put(key, Schema.encodeSync(Schema.fromJsonString(Receipt))(receipt), {
-      onlyIf: { etagDoesNotMatch: "*" },
-    });
+    this.acknowledgedReceipt = receipt;
   }
 
   private async enqueue(namespace: string, job: typeof VectorMessage.Type) {
@@ -613,13 +635,25 @@ export class SearchNamespace extends DurableObject<Env> {
       totals.body = 0;
       epoch.value = await sha256(`${current.manifest.vectorEpoch}\0reset\0${sequence}`);
     }
+    const writes: Array<() => Promise<R2Object | null>> = [];
+    const logKey = `${this.prefix}/log/${sequence}-${fingerprint}.bin`;
+    const log = {
+      version: 1,
+      sequence,
+      previous: current.manifest.head,
+      digest: fingerprint,
+      vectorEpoch: epoch.value,
+      vectorDeletes,
+      write: input,
+    } as const;
+    const encodedLog = pack(encodeLog(log));
+    writes.push(() => this.env.STORAGE.put(logKey, encodedLog));
     if (input.upserts.length) {
       const built = await Effect.runPromise(
         buildSegment(input.upserts.map((document) => ({ ...document, revision: sequence }))),
       );
       const key = `${this.prefix}/segments/${sequence}-${fingerprint}.rsix`;
-      const stored = await this.env.STORAGE.put(key, built.bytes);
-      if (!stored) throw new Rejected({ status: 503, message: "R2 segment write failed" });
+      writes.push(() => this.env.STORAGE.put(key, built.bytes));
       const headerBytes =
         16 + new DataView(built.bytes.buffer, built.bytes.byteOffset).getUint32(8, true);
       segments.push({
@@ -638,17 +672,9 @@ export class SearchNamespace extends DurableObject<Env> {
       totals.title += built.header.total_title_length;
       totals.body += built.header.total_body_length;
     }
-    const logKey = `${this.prefix}/log/${sequence}-${fingerprint}.bin`;
-    const log = {
-      version: 1,
-      sequence,
-      previous: current.manifest.head,
-      digest: fingerprint,
-      vectorEpoch: epoch.value,
-      vectorDeletes,
-      write: input,
-    } as const;
-    await this.env.STORAGE.put(logKey, pack(encodeLog(log)));
+    const stored = await Promise.all(writes.map((write) => write()));
+    if (stored.some((object) => object === null))
+      throw new Rejected({ status: 503, message: "R2 immutable write failed" });
     const jobs = [...current.manifest.vectorJobs];
     if (vectorDeletes.length || input.upserts.some((document) => document.vector))
       jobs.push({ log: logKey, sequence });
@@ -990,6 +1016,7 @@ export class SearchNamespace extends DurableObject<Env> {
           }
           if (operation === "rebuild") {
             this.current = undefined;
+            this.acknowledgedReceipt = undefined;
             clearImmutableCache(this.env.STORAGE, this.prefix);
             const { manifest } = yield* Effect.tryPromise({
               try: () => this.root(),
@@ -1009,6 +1036,7 @@ export class SearchNamespace extends DurableObject<Env> {
     }).pipe(
       Effect.catch((error) => {
         this.current = undefined;
+        this.acknowledgedReceipt = undefined;
         if (Schema.is(Rejected)(error))
           return Effect.succeed(
             Response.json(Schema.encodeSync(ErrorBody)({ error: error.message }), {

@@ -94,6 +94,21 @@ const report = await (async () => {
   });
   const metadata = Schema.decodeUnknownSync(Metadata)(await metadataResponse.json());
   if (metadata.documents !== size) throw new Error("Raio document count mismatch");
+  const indexing = { polls: 0, ready: false, waitedMs: 0 };
+  const indexingStarted = performance.now();
+  for (const attempt of Array.from({ length: 180 }, (_, index) => index)) {
+    const state = await comparator.metadata();
+    indexing.polls += 1;
+    if (state.index.status === "up-to-date") {
+      indexing.ready = true;
+      break;
+    }
+    console.error(`Comparator indexing status: ${state.index.status}`);
+    if (attempt < 179) await Effect.runPromise(Effect.sleep("2 seconds"));
+  }
+  indexing.waitedMs = performance.now() - indexingStarted;
+  if (!indexing.ready)
+    throw new Error("Comparator did not finish indexing within observation window");
   const reports = [];
   for (const [name, text] of [
     ["rare", "unique42"],
@@ -204,6 +219,7 @@ const report = await (async () => {
       reusedRaioCorpus: Option.isSome(reuse),
     },
     reports,
+    comparatorIndexing: indexing,
     finalMetadata,
     comparatorNamespace: freshNamespace,
   };

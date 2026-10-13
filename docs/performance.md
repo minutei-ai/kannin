@@ -120,3 +120,24 @@ The standard 100,000-document benchmark also passed: strong p50 was 3.46/23.87/2
 Alchemy deployed runtime `c14445d` successfully. Twelve native checks on the existing static 100,000-document corpus covered `all` and phrase, common and selective matches, and empty results in both strong and edge modes. Every id, score, revision, attribute and sequence matched the pre-deploy results; responses remained private/no-store. SciFact's 300 judged queries retained nDCG@10 0.67306, recall@10 0.79567 and MRR@10 0.64181.
 
 These native checks are correctness probes, with one sample per case and no cache reset. Before deployment, the first selective edge query took 12.62 seconds; after deployment it took 422.78 ms. However, the first common edge query rose from 1.88 to 4.83 seconds. Cache state, deployment and infrastructure vary, so these observations do not establish isolated latency gains. Cold directory acquisition remains unresolved.
+
+## Immutable term projections
+
+The query path now caches each immutable segment's selected term metadata independently from its full document directory. The private native `Terms` entrypoint and Cache API return only frequencies and posting-block metadata. The 4 MiB process LRU reuses decoded catalogs across match modes, phrase order and filters; live statistics and returned documents remain query scoped. Physical bucket identity in native props permits cross-version Workers Cache for immutable responses while the public gateway stays uncached. See [Cloudflare's cache-key contract](https://developers.cloudflare.com/workers/cache/cache-keys/) and [configuration](https://developers.cloudflare.com/workers/cache/configuration/).
+
+Two regressions failed before the relevant changes. After explicitly discarding directory memory, a 30-segment conjunctive query changed from 33 range reads to four. An unfiltered equal-score top-k over 16 segments changed from 19 to four. Returned rows and scores stayed identical. Phase order, filters, updates and sequence barriers have separate coverage. A concurrency regression exposed duplicate caches for distinct binding references to the same physical bucket; physical-name identities removed that split, and ten isolated twelve-query repeats each retained the original thirteen range reads.
+
+The final local benchmark uses the same 100,000-document corpus, five warmups and 50 measured requests per case/mode as the preceding run.
+
+| Query     | Before strong p50 / p95 ms | After strong p50 / p95 ms | After edge p50 / p95 ms |
+| --------- | -------------------------- | ------------------------- | ----------------------- |
+| rare      | 3.46 / 4.45                | 4.10 / 8.10               | 2.89 / 4.05             |
+| selective | 23.87 / 30.14              | 16.64 / 26.07             | 14.48 / 21.41           |
+| common    | 25.80 / 32.46              | 19.97 / 54.87             | 18.80 / 27.06           |
+| filtered  | 26.60 / 33.69              | 19.06 / 23.86             | 19.47 / 27.30           |
+
+Selective, common and filtered strong medians fell approximately 30%, 23% and 28%. Rare strong requests and the common strong tail became slower in this run. An earlier projection run measured common strong p95 of 27.99 ms, so host variation still affects the tails. These sequential experiments do not establish a universal latency improvement. Ingestion measured 23.32 seconds, approximately 4,289 documents/s. The term cache charged about 2.1 MiB in the earlier projection run.
+
+Worker SHA-256: `6f0254f21549930e8e728e2b4107e36480a1b6650043f8400eb7bcabdaf203ad`. WASM SHA-256: `a99ca9af338335f621d1b945b3a948afafec250bfddae4d4b18bcfc53bc3b7f7`. The corpus SHA-256 remains `e23ae431deaee2436ee6674a7834e57663739b6c5bd723b7c9137c4ab123dbfb`. Independent SciFact judgments remain nDCG@10 0.67306, recall@10 0.79567 and MRR@10 0.64181. Immutable R2 segment bytes and framing are unchanged.
+
+A fresh native baseline on the preceding deployed runtime completed the concurrency 1 and 4 phases with 64 matched responses each, then returned HTTP 503 during concurrency 16 and aborted. The completed phases recorded p50/p95 83.05/170.99 ms and 84.00/424.26 ms respectively. The interrupted phase is not a completed benchmark; its response body was not recorded, so the underlying failure is unclassified. Cache state is uncontrolled, and no successful scaling or before/after claim is based on that partial run.

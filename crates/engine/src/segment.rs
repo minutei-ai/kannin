@@ -903,6 +903,42 @@ pub mod wasm {
     use std::rc::Rc;
     use wasm_bindgen::prelude::*;
 
+    fn term_bound(meta: &TermMeta, statistics: &Statistics, df: u64, minimum: (u32, u32)) -> f64 {
+        meta.blocks
+            .iter()
+            .map(|block| {
+                bm25(
+                    block.max_title_tf,
+                    block.max_body_tf,
+                    block.min_title_length.max(minimum.0),
+                    block.min_body_length.max(minimum.1),
+                    statistics,
+                    df,
+                )
+            })
+            .fold(0.0, f64::max)
+    }
+
+    #[wasm_bindgen]
+    #[doc = "# Errors\nRejects invalid statistics or term metadata serialization."]
+    pub fn segment_term_bound(statistics: &str, terms: &str) -> Result<f64, JsValue> {
+        let statistics: Statistics = serde_json::from_str(statistics)
+            .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        let terms: BTreeMap<String, TermMeta> =
+            serde_json::from_str(terms).map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        Ok(terms
+            .iter()
+            .map(|(term, meta)| {
+                term_bound(
+                    meta,
+                    &statistics,
+                    statistics.frequencies.get(term).copied().unwrap_or(0),
+                    (0, 0),
+                )
+            })
+            .sum())
+    }
+
     #[wasm_bindgen]
     pub struct Segment {
         built: BuiltSegment,
@@ -1031,19 +1067,7 @@ pub mod wasm {
                 .map(|term| {
                     let df = statistics.frequencies.get(term).copied().unwrap_or(0);
                     self.header.terms.get(term).map_or(0.0, |meta| {
-                        meta.blocks
-                            .iter()
-                            .map(|block| {
-                                bm25(
-                                    block.max_title_tf,
-                                    block.max_body_tf,
-                                    block.min_title_length.max(title_minimum),
-                                    block.min_body_length.max(body_minimum),
-                                    &statistics,
-                                    df,
-                                )
-                            })
-                            .fold(0.0, f64::max)
+                        term_bound(meta, &statistics, df, (title_minimum, body_minimum))
                     })
                 })
                 .sum();

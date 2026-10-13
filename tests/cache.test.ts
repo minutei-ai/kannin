@@ -56,12 +56,18 @@ test("cached old segments cannot resurrect updated or deleted documents", async 
   expect(deleted.rows).toEqual([]);
 });
 
-test("the authenticated gateway never exposes the immutable segment entrypoint", async () => {
-  const response = await fetch(
-    new URL("/range?key=namespaces/cached/root.json", await worker.ready),
-  );
-  expect(response.status).toBe(401);
-  await response.arrayBuffer();
+test("the authenticated gateway never exposes immutable cache entrypoints", async () => {
+  for (const path of ["/range", "/catalog-v1"]) {
+    const url = new URL(path, await worker.ready);
+    const anonymous = await fetch(url);
+    expect(anonymous.status).toBe(401);
+    await anonymous.arrayBuffer();
+    const authenticated = await fetch(url, {
+      headers: { authorization: "Bearer local-test-token" },
+    });
+    expect(authenticated.status).toBe(404);
+    await authenticated.arrayBuffer();
+  }
 });
 
 test("concurrent cold edge queries share immutable range acquisition", async () => {
@@ -181,4 +187,130 @@ test("conjunctive pruning uses live frequencies after deleting the only shared-t
   );
   expect(after.rangeReads - before.rangeReads).toBe(0);
   expect(after.directoryCacheHits - before.directoryCacheHits).toBe(1);
+});
+
+test("immutable query catalogs survive directory eviction without reloading irrelevant headers", async () => {
+  const namespace = "projected-catalog";
+  for (const index of Array.from({ length: 29 }, (_, ordinal) => ordinal))
+    await request(
+      worker,
+      namespace,
+      "write",
+      write([document(`partial-${index}`, "cloudflare storage")]),
+    );
+  await request(worker, namespace, "write", write([document("complete", "cloudflare rust")]));
+  const input = { ...textQuery("cloudflare rust"), match: "all", consistency: "edge-eventual" };
+  const original = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", input)).json(),
+  );
+  expect(original.rows.map((row) => row.id)).toEqual(["complete"]);
+  await request(worker, namespace, "rebuild", {});
+  const before = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  const restored = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", input)).json(),
+  );
+  expect(restored.rows).toEqual(original.rows);
+  const after = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(after.rangeReads - before.rangeReads).toBe(4);
+});
+
+test("cached term bounds prune uncompetitive segments after directory eviction", async () => {
+  const namespace = "projected-bounds";
+  for (const index of Array.from({ length: 16 }, (_, ordinal) => ordinal))
+    await request(
+      worker,
+      namespace,
+      "write",
+      write(
+        Array.from({ length: 16 }, (_, row) =>
+          document(String(index * 16 + row).padStart(5, "0"), "equal terms"),
+        ),
+      ),
+    );
+  const input = { ...textQuery("equal terms", 1), consistency: "edge-eventual" };
+  const original = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", input)).json(),
+  );
+  expect(original.rows.map((row) => row.id)).toEqual(["00000"]);
+  await request(worker, namespace, "rebuild", {});
+  const before = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  const restored = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", input)).json(),
+  );
+  expect(restored.rows).toEqual(original.rows);
+  const after = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(after.rangeReads - before.rangeReads).toBe(4);
+});
+
+test("term projections share immutable metadata while phrase order, filters and revisions remain query scoped", async () => {
+  const namespace = "projection-isolation";
+  await request(
+    worker,
+    namespace,
+    "write",
+    write([
+      document("left", "rust cloudflare", { group: 1 }),
+      document("right", "cloudflare rust", { group: 2 }),
+    ]),
+  );
+  const left = Schema.decodeUnknownSync(QueryResult)(
+    await (
+      await request(worker, namespace, "query", {
+        ...textQuery("rust cloudflare"),
+        match: "phrase",
+        consistency: "edge-eventual",
+      })
+    ).json(),
+  );
+  expect(left.rows.map((row) => row.id)).toEqual(["left"]);
+  const before = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  const right = Schema.decodeUnknownSync(QueryResult)(
+    await (
+      await request(worker, namespace, "query", {
+        ...textQuery("cloudflare rust", 10, [{ field: "group", op: "eq", value: 2 }]),
+        match: "phrase",
+        consistency: "edge-eventual",
+      })
+    ).json(),
+  );
+  expect(right.rows.map((row) => row.id)).toEqual(["right"]);
+  const filtered = Schema.decodeUnknownSync(QueryResult)(
+    await (
+      await request(worker, namespace, "query", {
+        ...textQuery("cloudflare rust", 10, [{ field: "group", op: "eq", value: 1 }]),
+        match: "all",
+        consistency: "edge-eventual",
+      })
+    ).json(),
+  );
+  expect(filtered.rows.map((row) => row.id)).toEqual(["left"]);
+  const after = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(after.termReads - before.termReads).toBe(0);
+  expect(after.termMemoryHits - before.termMemoryHits).toBe(2);
+  expect(after.termCacheBytes).toBeLessThanOrEqual(4 * 1024 * 1024);
+  await request(worker, namespace, "write", write([document("left", "storage", { group: 3 })]));
+  const changed = Schema.decodeUnknownSync(QueryResult)(
+    await (
+      await request(worker, namespace, "query", {
+        ...textQuery("cloudflare rust"),
+        match: "all",
+        consistency: "edge-eventual",
+        minimumSequence: 2,
+      })
+    ).json(),
+  );
+  expect(changed.rows.map((row) => row.id)).toEqual(["right"]);
+  expect(changed.sequence).toBe(2);
 });

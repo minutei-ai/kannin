@@ -4,7 +4,7 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 - BM25F with global live statistics, phrase matching and filters before top-k.
 - Atomic R2 manifest commits, durable idempotency receipts and disposable coordinator memory.
-- Bounded immutable caches, native Worker Cache and Cache API; explicit edge reads with snapshots younger than one second at selection.
+- Bounded immutable range and term-catalog caches, native Worker Cache and Cache API; explicit edge reads with snapshots younger than one second at selection.
 - Vectorize metadata filtering, stale-revision reconciliation and reciprocal rank fusion.
 
 ## Performance
@@ -13,12 +13,14 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Query     |        Strong | Edge eventual |
 | --------- | ------------: | ------------: |
-| Rare      |   3.46 / 4.45 |   2.99 / 6.02 |
-| Selective | 23.87 / 30.14 | 23.12 / 30.51 |
-| Common    | 25.80 / 32.46 | 28.33 / 52.58 |
-| Filtered  | 26.60 / 33.69 | 26.69 / 32.74 |
+| Rare      |   4.10 / 8.10 |   2.89 / 4.05 |
+| Selective | 16.64 / 26.07 | 14.48 / 21.41 |
+| Common    | 19.97 / 54.87 | 18.80 / 27.06 |
+| Filtered  | 19.06 / 23.86 | 19.47 / 27.30 |
 
-Local ingestion: **100,000 documents in 22.18 seconds**, approximately **4,509 documents/s**, in batches of 500. Intel Xeon E5-2680 v4, Bun 1.4.3. Each case/mode has five warmups and 50 measured requests, including HTTP and response decoding. Both modes share one process; no query-result cache. Local timings exclude Cloudflare regional network latency.
+Local ingestion: **100,000 documents in 23.32 seconds**, approximately **4,289 documents/s**, in batches of 500. Intel Xeon E5-2680 v4, Bun 1.4.3. Each case/mode has five warmups and 50 measured requests, including HTTP and response decoding. Both modes share one process; no query-result cache. Local timings exclude Cloudflare regional network latency.
+
+Immutable query catalogs now let cached queries recover global BM25 frequencies without reloading every segment header. After directory eviction, local regressions reduced range reads **33 → 4** for conjunctive queries and **19 → 4** for unfiltered score pruning. [Cache design and measurements](docs/performance.md#immutable-term-projections).
 
 Conjunctive segment pruning reduced local warm p50 from **14.11 to 6.83 ms** for `all` and **13.91 to 5.88 ms** for phrase queries in a separate 15,000-document, 30-segment workload. Impossible Bloom intersections avoid directory reads; exact live term frequencies avoid unnecessary postings. [Methodology and limits](docs/performance.md#conjunctive-query-pruning).
 
@@ -48,7 +50,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **92 Worker/tooling tests and 17 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **95 Worker/tooling tests and 17 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

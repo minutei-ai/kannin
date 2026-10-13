@@ -1,5 +1,5 @@
 import { Cause, Effect, Schema } from "effect";
-import { exports } from "cloudflare:workers";
+import { env, exports } from "cloudflare:workers";
 import {
   Segment,
   Directory,
@@ -8,7 +8,14 @@ import {
   segment_bloom_filter,
 } from "../dist/wasm/raio_engine";
 import type { DataRange } from "./protocol";
-import { StoredDocument, SegmentHeader, SegmentRange, Rejected } from "./protocol";
+import {
+  StoredDocument,
+  SegmentHeader,
+  SegmentRange,
+  SegmentTerms,
+  SegmentCacheProps,
+  Rejected,
+} from "./protocol";
 
 const buffers = new Map<string, Uint8Array>();
 const budget = { bytes: 0 };
@@ -16,7 +23,15 @@ const MAX_CACHE_BYTES = 12 * 1024 * 1024;
 const directories = new Map<string, { directory: Directory; bytes: number }>();
 const decodedBudget = { bytes: 0 };
 const MAX_DECODED_BYTES = 40 * 1024 * 1024;
+const termCatalogs = new Map<string, { dictionary: typeof SegmentTerms.Type; bytes: number }>();
+const termBudget = { bytes: 0 };
+const MAX_TERM_CACHE_BYTES = 4 * 1024 * 1024;
 const reads = {
+  termReads: 0,
+  termBytes: 0,
+  termMemoryHits: 0,
+  termWorkerCacheHits: 0,
+  termCacheApiHits: 0,
   rangeReads: 0,
   rangeBytes: 0,
   rangeCacheHits: 0,
@@ -25,21 +40,11 @@ const reads = {
   workerCacheMisses: 0,
   cacheApiHits: 0,
 };
-const bucketIds = new WeakMap<R2Bucket, number>();
-const bucketSequence = { value: 0 };
 const bloomBuffers = new Map<string, Uint8Array>();
 const bloomBudget = { bytes: 0 };
 const strings = Schema.fromJsonString(Schema.Array(Schema.String));
 const encodeStrings = Schema.encodeSync(strings);
 const decodeStrings = Schema.decodeSync(strings);
-
-function cachePrefix(bucket: R2Bucket, key: string) {
-  const existing = bucketIds.get(bucket);
-  if (existing !== undefined) return `${existing}:${key}`;
-  bucketSequence.value += 1;
-  bucketIds.set(bucket, bucketSequence.value);
-  return `${bucketSequence.value}:${key}`;
-}
 
 function remember(key: string, bytes: Uint8Array) {
   const previous = buffers.get(key);
@@ -56,8 +61,8 @@ function remember(key: string, bytes: Uint8Array) {
   }
 }
 
-export async function range(bucket: R2Bucket, key: string, offset: number, length: number) {
-  const cacheKey = cachePrefix(bucket, `${key}/${offset}/${length}`);
+export async function range(key: string, offset: number, length: number) {
+  const cacheKey = `${env.STORAGE_CACHE_SCOPE}:${key}/${offset}/${length}`;
   const cached = buffers.get(cacheKey);
   if (cached !== undefined) {
     reads.rangeCacheHits += 1;
@@ -70,7 +75,8 @@ export async function range(bucket: R2Bucket, key: string, offset: number, lengt
   url.searchParams.set("key", input.key);
   url.searchParams.set("offset", String(input.offset));
   url.searchParams.set("length", String(input.length));
-  const response = await exports.Segments.fetch(url);
+  const props = Schema.encodeSync(SegmentCacheProps)({ bucket: env.STORAGE_CACHE_SCOPE });
+  const response = await exports.Segments({ props }).fetch(url);
   const status = response.headers.get("cf-cache-status");
   if (status === "HIT") reads.workerCacheHits += 1;
   else if (status === "MISS") reads.workerCacheMisses += 1;
@@ -87,8 +93,8 @@ export async function range(bucket: R2Bucket, key: string, offset: number, lengt
   return bytes;
 }
 
-async function acquireDirectory(bucket: R2Bucket, key: string, headerBytes: number) {
-  const identity = cachePrefix(bucket, key);
+async function acquireDirectory(key: string, headerBytes: number) {
+  const identity = `${env.STORAGE_CACHE_SCOPE}:${key}`;
   const cached = directories.get(identity);
   if (cached !== undefined) {
     reads.directoryCacheHits += 1;
@@ -96,7 +102,7 @@ async function acquireDirectory(bucket: R2Bucket, key: string, headerBytes: numb
     directories.set(identity, cached);
     return cached.directory.retain();
   }
-  const bytes = await range(bucket, key, 0, headerBytes);
+  const bytes = await range(key, 0, headerBytes);
   const concurrent = directories.get(identity);
   if (concurrent !== undefined) return concurrent.directory.retain();
   const decoded = new Directory(bytes);
@@ -122,14 +128,13 @@ async function acquireDirectory(bucket: R2Bucket, key: string, headerBytes: numb
 
 export const withDirectory = Effect.fn("raio.withDirectory")(
   <A, E, R>(
-    bucket: R2Bucket,
     key: string,
     headerBytes: number,
     use: (directory: Directory) => Effect.Effect<A, E, R>,
   ) =>
     Effect.acquireUseRelease(
       Effect.tryPromise({
-        try: () => acquireDirectory(bucket, key, headerBytes),
+        try: () => acquireDirectory(key, headerBytes),
         catch: (cause) => {
           if (Schema.is(Rejected)(cause)) return cause;
           return new Cause.UnknownError(cause);
@@ -138,6 +143,59 @@ export const withDirectory = Effect.fn("raio.withDirectory")(
       use,
       (directory) => Effect.sync(() => directory.free()),
     ),
+);
+
+export const readTerms = Effect.fn("kannin.readTerms")(
+  (key: string, headerBytes: number, terms: string) =>
+    Effect.gen(function* () {
+      const props = { bucket: env.STORAGE_CACHE_SCOPE, terms };
+      const identity = `${env.STORAGE_CACHE_SCOPE}:${key}/${headerBytes}/${terms}`;
+      const cached = termCatalogs.get(identity);
+      if (cached !== undefined) {
+        reads.termMemoryHits += 1;
+        termCatalogs.delete(identity);
+        termCatalogs.set(identity, cached);
+        return cached.dictionary;
+      }
+      const url = new URL("https://terms.internal/catalog-v1");
+      url.searchParams.set("key", key);
+      url.searchParams.set("headerBytes", String(headerBytes));
+      const response = yield* Effect.tryPromise({
+        try: () => exports.Terms({ props }).fetch(url),
+        catch: (cause) => {
+          if (Schema.is(Rejected)(cause)) return cause;
+          return new Cause.UnknownError(cause);
+        },
+      });
+      reads.termReads += 1;
+      const status = response.headers.get("cf-cache-status");
+      if (status === "HIT") reads.termWorkerCacheHits += 1;
+      if (status !== "HIT" && response.headers.get("x-raio-cache") === "terms-api-hit")
+        reads.termCacheApiHits += 1;
+      const text = yield* Effect.tryPromise(() => response.text());
+      if (!response.ok)
+        return yield* new Rejected({ status: 503, message: "Immutable term catalog unavailable" });
+      const dictionary = yield* Schema.decodeEffect(Schema.fromJsonString(SegmentTerms))(text);
+      const length = new TextEncoder().encode(text).byteLength;
+      reads.termBytes += length;
+      const bytes = 4 * (length + new TextEncoder().encode(identity).byteLength) + 256;
+      if (bytes <= MAX_TERM_CACHE_BYTES) {
+        const concurrent = termCatalogs.get(identity);
+        if (concurrent !== undefined) {
+          termBudget.bytes -= concurrent.bytes;
+          termCatalogs.delete(identity);
+        }
+        while (termBudget.bytes + bytes > MAX_TERM_CACHE_BYTES) {
+          const oldest = termCatalogs.entries().next().value;
+          if (oldest === undefined) break;
+          termCatalogs.delete(oldest[0]);
+          termBudget.bytes -= oldest[1].bytes;
+        }
+        termCatalogs.set(identity, { dictionary, bytes });
+        termBudget.bytes += bytes;
+      }
+      return dictionary;
+    }),
 );
 
 export const buildSegment = Effect.fn("raio.buildSegment")(
@@ -179,7 +237,6 @@ export function bloomCandidates(encoded: string, values: ReadonlyArray<string>) 
 }
 
 export async function readDocument(
-  bucket: R2Bucket,
   key: string,
   headerBytes: number,
   data: typeof DataRange.Type,
@@ -191,13 +248,18 @@ export async function readDocument(
     throw new Rejected({ status: 503, message: "Invalid segment document range" });
   const page: { bytes: Uint8Array } = { bytes: new Uint8Array(0) };
   if (payload !== undefined) page.bytes = payload.subarray(data.offset, data.offset + data.length);
-  else page.bytes = await range(bucket, key, offset, data.length);
+  else page.bytes = await range(key, offset, data.length);
   const bytes = page.bytes;
   return Schema.decodeSync(Schema.fromJsonString(StoredDocument))(segment_document(bytes));
 }
 
-export function clearImmutableCache(bucket: R2Bucket, prefix: string) {
-  const identity = cachePrefix(bucket, prefix);
+export function clearImmutableCache(prefix: string) {
+  const identity = `${env.STORAGE_CACHE_SCOPE}:${prefix}`;
+  for (const [key, entry] of termCatalogs)
+    if (key.startsWith(`${identity}/`)) {
+      termCatalogs.delete(key);
+      termBudget.bytes -= entry.bytes;
+    }
   for (const [key, bytes] of buffers)
     if (key.startsWith(`${identity}/`)) {
       buffers.delete(key);
@@ -216,6 +278,7 @@ export function cacheUsage() {
     rangeCacheBytes: budget.bytes,
     directoryCacheChargedBytes: decodedBudget.bytes,
     bloomCacheBytes: bloomBudget.bytes,
+    termCacheBytes: termBudget.bytes,
     ...reads,
   };
 }

@@ -59,10 +59,11 @@ export const Worker = Cloudflare.Worker(
     return {
       main: join(import.meta.dir, "dist/worker/worker.js"),
       bundle: false,
-      cache: { enabled: true, crossVersionCache: false },
+      cache: { enabled: true, crossVersionCache: true },
       entrypoints: {
         default: { cache: { enabled: false } },
         Segments: { cache: { enabled: true } },
+        Terms: { cache: { enabled: true } },
       },
       compatibility: { date: "2026-10-01" },
       env: {

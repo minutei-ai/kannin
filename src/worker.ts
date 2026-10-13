@@ -8,6 +8,7 @@ import {
   tokenize,
   segment_document_terms,
   segment_filter,
+  segment_term_bound,
 } from "../dist/wasm/raio_engine";
 import module from "raio:wasm";
 import type { Row } from "./protocol";
@@ -47,10 +48,14 @@ import {
   Retirement,
   IndexMessage,
   SegmentRange,
+  TermProjectionProps,
+  TermProjectionRange,
+  SegmentCacheProps,
 } from "./protocol";
 import {
   range,
   withDirectory,
+  readTerms,
   buildSegment,
   bloom,
   bloomCandidates,
@@ -66,15 +71,21 @@ const wasm = initSync({ module });
 const SNAPSHOT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const SEGMENT_RETIREMENT_MS = 24 * 60 * 60 * 1000;
 
-export class Segments extends WorkerEntrypoint<Env> {
+export class Segments extends WorkerEntrypoint<Env, typeof SegmentCacheProps.Type> {
   override async fetch(request: Request) {
     const url = new URL(request.url);
+    const props = Schema.decodeExit(SegmentCacheProps)(this.ctx.props);
     const decoded = Schema.decodeUnknownExit(SegmentRange)({
       key: url.searchParams.get("key"),
       offset: Number(url.searchParams.get("offset")),
       length: Number(url.searchParams.get("length")),
     });
-    if (decoded._tag === "Failure" || request.method !== "GET")
+    if (
+      decoded._tag === "Failure" ||
+      request.method !== "GET" ||
+      props._tag === "Failure" ||
+      props.value.bucket !== this.env.STORAGE_CACHE_SCOPE
+    )
       return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });
     const input = decoded.value;
     const cacheKey = new URL(request.url);
@@ -125,6 +136,73 @@ const decodeRoot = Schema.decodeSync(Schema.fromJsonString(Root));
 const encodeRoot = Schema.encodeSync(Schema.fromJsonString(Root));
 const decodeLog = Schema.decodeSync(Schema.fromJsonString(Log));
 const encodeLog = Schema.encodeSync(Schema.fromJsonString(Log));
+export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Encoded> {
+  override async fetch(request: Request) {
+    const props = Schema.decodeExit(TermProjectionProps)(this.ctx.props);
+    const url = new URL(request.url);
+    const decoded = Schema.decodeUnknownExit(TermProjectionRange)({
+      key: url.searchParams.get("key"),
+      headerBytes: Number(url.searchParams.get("headerBytes")),
+    });
+    if (
+      request.method !== "GET" ||
+      props._tag === "Failure" ||
+      decoded._tag === "Failure" ||
+      props.value.bucket !== this.env.STORAGE_CACHE_SCOPE
+    )
+      return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });
+    const input = decoded.value;
+    const encodedTerms = this.ctx.props.terms;
+    const cacheKey = new URL(request.url);
+    cacheKey.hostname = "raio-terms.internal";
+    cacheKey.searchParams.set("bucket", props.value.bucket);
+    cacheKey.searchParams.set("terms", await sha256(encodedTerms));
+    const cache = await Effect.runPromise(
+      Effect.tryPromise(() => caches.open("raio-terms-v1")).pipe(
+        Effect.orElseSucceed(() => undefined),
+      ),
+    );
+    if (cache !== undefined) {
+      const cached = await Effect.runPromise(
+        Effect.tryPromise(() => cache.match(cacheKey)).pipe(Effect.orElseSucceed(() => undefined)),
+      );
+      if (cached !== undefined) {
+        const response = new Response(cached.body, cached);
+        response.headers.delete("cf-cache-status");
+        response.headers.set("x-raio-cache", "terms-api-hit");
+        return response;
+      }
+    }
+    const response = await Effect.runPromise(
+      withDirectory(input.key, input.headerBytes, (directory) =>
+        Schema.decodeEffect(Schema.fromJsonString(SegmentTerms))(directory.terms(encodedTerms)),
+      ).pipe(
+        Effect.flatMap(Schema.encodeEffect(SegmentTerms)),
+        Effect.map((dictionary) =>
+          Response.json(dictionary, {
+            headers: { "cache-control": "public, max-age=31536000, immutable" },
+          }),
+        ),
+        Effect.orElseSucceed(() =>
+          Response.json(
+            Schema.encodeSync(ErrorBody)({ error: "Immutable term catalog unavailable" }),
+            { status: 503, headers: { "cache-control": "no-store" } },
+          ),
+        ),
+      ),
+    );
+    if (response.ok && cache !== undefined)
+      this.ctx.waitUntil(
+        Effect.runPromise(
+          Effect.tryPromise(() => cache.put(cacheKey, response.clone())).pipe(
+            Effect.orElseSucceed(() => undefined),
+          ),
+        ),
+      );
+    return response;
+  }
+}
+
 const strings = Schema.fromJsonString(Schema.Array(Schema.String));
 const integers = Schema.fromJsonString(Schema.Array(Schema.Int));
 const Located = LocatedDocument.mapFields((fields) => ({
@@ -176,7 +254,7 @@ const readBody = Effect.fn("raio.readBody")(function* (request: Pick<Request, "h
   return new TextDecoder().decode(bytes);
 });
 
-async function locate(env: Env, ids: ReadonlyArray<string>, root: typeof Root.Type) {
+async function locate(ids: ReadonlyArray<string>, root: typeof Root.Type) {
   const found = new Map<string, typeof Located.Type>();
   for (const segment of root.segments.toReversed()) {
     const candidates = bloomCandidates(
@@ -185,7 +263,7 @@ async function locate(env: Env, ids: ReadonlyArray<string>, root: typeof Root.Ty
     );
     if (candidates.length === 0) continue;
     const rows = await Effect.runPromise(
-      withDirectory(env.STORAGE, segment.key, segment.headerBytes, (decoded) =>
+      withDirectory(segment.key, segment.headerBytes, (decoded) =>
         Effect.gen(function* () {
           const lookup = yield* Schema.encodeEffect(strings)(candidates);
           const dead = yield* Schema.encodeEffect(integers)(segment.dead);
@@ -205,12 +283,7 @@ async function vectorId(epoch: string, id: string, sequence: number) {
   return sha256(`${epoch}\0${id}\0${sequence}`);
 }
 
-async function textQuery(
-  env: Env,
-  input: typeof Query.Type,
-  root: typeof Root.Type,
-  timings: Headers,
-) {
+async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timings: Headers) {
   const started = Effect.runSync(Clock.currentTimeNanos);
   if (input.kind === "vector") return [];
   const words = tokenize(input.text).split(" ").filter(Boolean);
@@ -231,6 +304,7 @@ async function textQuery(
     .filter((candidate) => candidate.terms.length > 0)
     .map((candidate) => candidate.segment);
   const encodedTerms = Schema.encodeSync(strings)(terms);
+  const projectionTerms = Schema.encodeSync(TermProjectionProps.fields.terms)(terms.toSorted());
   const encodedFilters = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Filter)))(
     input.filters,
   );
@@ -238,13 +312,8 @@ async function textQuery(
     Effect.forEach(
       selected,
       (segment) =>
-        withDirectory(env.STORAGE, segment.key, segment.headerBytes, (decoded) =>
-          Effect.gen(function* () {
-            const dictionary = yield* Schema.decodeEffect(Schema.fromJsonString(SegmentTerms))(
-              decoded.terms(encodedTerms),
-            );
-            return { segment, dictionary };
-          }),
+        readTerms(segment.key, segment.headerBytes, projectionTerms).pipe(
+          Effect.map((dictionary) => ({ segment, dictionary })),
         ),
       { concurrency: 4 },
     ),
@@ -285,12 +354,20 @@ async function textQuery(
       continue;
     if (ranked.length === input.topK) {
       const bound = await Effect.runPromise(
-        withDirectory(env.STORAGE, segment.key, segment.headerBytes, (decoded) =>
-          Effect.gen(function* () {
-            const dead = yield* Schema.encodeEffect(integers)(segment.dead);
-            return decoded.upper_bound(encodedStatistics, encodedTerms, encodedFilters, dead);
-          }),
-        ),
+        Effect.gen(function* () {
+          if (input.filters.length === 0 && segment.dead.length === 0) {
+            const encoded = yield* Schema.encodeEffect(Schema.fromJsonString(SegmentTerms))(
+              dictionary,
+            );
+            return segment_term_bound(encodedStatistics, encoded);
+          }
+          return yield* withDirectory(segment.key, segment.headerBytes, (decoded) =>
+            Effect.gen(function* () {
+              const dead = yield* Schema.encodeEffect(integers)(segment.dead);
+              return decoded.upper_bound(encodedStatistics, encodedTerms, encodedFilters, dead);
+            }),
+          );
+        }),
       );
       const cutoff = ranked[ranked.length - 1];
       if (cutoff === undefined)
@@ -310,7 +387,7 @@ async function textQuery(
       statistics,
     });
     const result = await Effect.runPromise(
-      withDirectory(env.STORAGE, segment.key, segment.headerBytes, (decoded) =>
+      withDirectory(segment.key, segment.headerBytes, (decoded) =>
         Effect.acquireUseRelease(
           Effect.sync(() => decoded.ranker(ranking)),
           (ranker) =>
@@ -352,7 +429,7 @@ async function textQuery(
                           message: "Invalid posting range",
                         });
                       const bytes = yield* Effect.tryPromise({
-                        try: () => range(env.STORAGE, segment.key, start, length),
+                        try: () => range(segment.key, start, length),
                         catch: (cause) => {
                           if (Schema.is(Rejected)(cause)) return cause;
                           return new Cause.UnknownError(cause);
@@ -397,7 +474,6 @@ async function textQuery(
       (hit) =>
         Effect.gen(function* () {
           const metadata = yield* withDirectory(
-            env.STORAGE,
             hit.segment.key,
             hit.segment.headerBytes,
             (decoded) =>
@@ -412,7 +488,6 @@ async function textQuery(
           const document = yield* Effect.tryPromise({
             try: () =>
               readDocument(
-                env.STORAGE,
                 hit.segment.key,
                 hit.segment.headerBytes,
                 metadata.data,
@@ -469,7 +544,6 @@ async function vectorQuery(env: Env, input: typeof Query.Type, root: typeof Root
     metadata: Schema.decodeUnknownSync(candidate)(match.metadata),
   }));
   const current = await locate(
-    env,
     metadata.map((item) => item.metadata.id),
     root,
   );
@@ -490,7 +564,6 @@ async function vectorQuery(env: Env, input: typeof Query.Type, root: typeof Root
     );
     if (!matches) continue;
     const document = await readDocument(
-      env.STORAGE,
       location.segment.key,
       location.segment.headerBytes,
       location.document.data,
@@ -512,7 +585,7 @@ async function query(env: Env, input: typeof Query.Type, manifest: typeof Root.T
   if (manifest.sequence < (input.minimumSequence ?? 0))
     throw new Rejected({ status: 409, message: "Requested sequence is not committed" });
   const timings = new Headers();
-  const text = await textQuery(env, input, manifest, timings);
+  const text = await textQuery(input, manifest, timings);
   const vectors = await vectorQuery(env, input, manifest);
   const scores = new Map<string, typeof Row.Type>();
   if (input.kind === "hybrid") {
@@ -689,7 +762,7 @@ export class SearchNamespace extends DurableObject<Env> {
         }),
       );
     }
-    const prior = await locate(this.env, ids, current.manifest);
+    const prior = await locate(ids, current.manifest);
     const sequence = current.manifest.sequence + 1;
     const dead = new Map<string, number[]>();
     const removed = new Map<string, Map<string, number>>();
@@ -701,7 +774,6 @@ export class SearchNamespace extends DurableObject<Env> {
     const vectorDeletes: string[] = [];
     for (const location of prior.values()) {
       const source = await readDocument(
-        this.env.STORAGE,
         location.segment.key,
         location.segment.headerBytes,
         location.document.data,
@@ -862,7 +934,7 @@ export class SearchNamespace extends DurableObject<Env> {
       if (segment === undefined)
         throw new Rejected({ status: 503, message: "Missing rebuild segment" });
       const rows = await Effect.runPromise(
-        withDirectory(this.env.STORAGE, segment.key, segment.headerBytes, (directory) =>
+        withDirectory(segment.key, segment.headerBytes, (directory) =>
           Effect.gen(function* () {
             const dead = yield* Schema.encodeEffect(integers)(segment.dead);
             return yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Array(SegmentDocument)))(
@@ -875,7 +947,6 @@ export class SearchNamespace extends DurableObject<Env> {
         throw new Rejected({ status: 400, message: "Invalid rebuild row" });
       const selected = rows.slice(cursor.row, cursor.row + 100 - budget.processed);
       const current = await locate(
-        this.env,
         selected.map((row) => row.id),
         active,
       );
@@ -892,7 +963,6 @@ export class SearchNamespace extends DurableObject<Env> {
           continue;
         }
         const document = await readDocument(
-          this.env.STORAGE,
           location.segment.key,
           location.segment.headerBytes,
           location.document.data,
@@ -956,7 +1026,6 @@ export class SearchNamespace extends DurableObject<Env> {
         continue;
       }
       const live = await locate(
-        this.env,
         candidates.map((document) => document.id),
         current.manifest,
       );
@@ -1120,7 +1189,7 @@ export class SearchNamespace extends DurableObject<Env> {
         (row) => !dead.has(row),
       );
       const metadata = await Effect.runPromise(
-        withDirectory(this.env.STORAGE, segment.key, segment.headerBytes, (decoded) =>
+        withDirectory(segment.key, segment.headerBytes, (decoded) =>
           Effect.gen(function* () {
             const encoded = yield* Schema.encodeEffect(integers)(rows);
             return yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Array(SegmentDocument)))(
@@ -1130,14 +1199,12 @@ export class SearchNamespace extends DurableObject<Env> {
         ),
       );
       const payload = await range(
-        this.env.STORAGE,
         segment.key,
         segment.headerBytes,
         segment.bytes - segment.headerBytes,
       );
       for (const document of metadata) {
         const source = await readDocument(
-          this.env.STORAGE,
           segment.key,
           segment.headerBytes,
           document.data,
@@ -1407,7 +1474,7 @@ export class SearchNamespace extends DurableObject<Env> {
           if (operation === "rebuild") {
             this.current = undefined;
             this.acknowledgedReceipt = undefined;
-            clearImmutableCache(this.env.STORAGE, this.prefix);
+            clearImmutableCache(this.prefix);
             const { manifest } = yield* Effect.tryPromise({
               try: () => this.root(),
               catch: (cause) => {

@@ -203,6 +203,12 @@ export const CacheMetrics = Schema.Struct({
   rangeCacheBytes: Schema.Int,
   directoryCacheChargedBytes: Schema.Int,
   bloomCacheBytes: Schema.Int,
+  termCacheBytes: Schema.Int,
+  termReads: Schema.Int,
+  termBytes: Schema.Int,
+  termMemoryHits: Schema.Int,
+  termWorkerCacheHits: Schema.Int,
+  termCacheApiHits: Schema.Int,
   rangeReads: Schema.Int,
   rangeBytes: Schema.Int,
   rangeCacheHits: Schema.Int,
@@ -293,6 +299,15 @@ export const SegmentRange = Schema.Struct({
   ),
   offset: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   length: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 16777216 })),
+});
+export const TermProjectionProps = Schema.Struct({
+  bucket: Schema.String.check(Schema.isBetweenLength(1, 63)),
+  terms: Schema.fromJsonString(Schema.Array(Schema.String).check(Schema.isBetweenLength(1, 64))),
+});
+export const SegmentCacheProps = Schema.Struct({ bucket: TermProjectionProps.fields.bucket });
+export const TermProjectionRange = Schema.Struct({
+  key: SegmentRange.fields.key,
+  headerBytes: SegmentRange.fields.length,
 });
 export class Rejected extends Schema.TaggedError<Rejected>()("Rejected", {
   status: Schema.Int,

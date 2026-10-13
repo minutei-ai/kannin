@@ -226,3 +226,22 @@ test("query timings stay request scoped and preserve coordinator and gateway mea
     expect(response.headers.get("server-timing")).not.toContain("raio;dur=");
   }
 });
+
+test("warm namespace snapshots survive Cache API eviction only within their original age budget", async () => {
+  await request(worker, "warm-memory", "write", write([document("a", "warm namespace")]));
+  const input = { ...textQuery("warm"), consistency: "edge-eventual" };
+  expect((await request(worker, "warm-memory", "query", input)).status).toBe(200);
+  const cache = await (await worker.getCaches()).open("raio-snapshots-v1");
+  const key = new URL("https://raio-cache.internal/snapshots/warm-memory");
+  key.searchParams.set("bucket", "raio-test");
+  expect(await cache.delete(key)).toBe(true);
+  const bucket = await worker.getR2Bucket("STORAGE");
+  await bucket.put("namespaces/warm-memory/root.json", "corrupted canonical root");
+  const cached = await request(worker, "warm-memory", "query", input);
+  expect(cached.status).toBe(200);
+  expect(
+    Schema.decodeUnknownSync(QueryResult)(await cached.json()).rows.map((row) => row.id),
+  ).toEqual(["a"]);
+  await Effect.runPromise(Effect.sleep("1100 millis"));
+  expect((await request(worker, "warm-memory", "query", input)).status).toBe(503);
+});

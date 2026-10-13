@@ -7,12 +7,17 @@ export default definePlugin({
       meta: {
         type: "problem",
         schema: [],
-        messages: { forbidden: "Use explicit immutable state, typed failures and owned exports." },
+        messages: {
+          forbidden: "Use explicit immutable state, typed failures and owned exports.",
+          typescript: "Author TypeScript with Effect; JavaScript is a generated build artifact.",
+        },
       },
       create(context) {
         const reject = (node: ESTree.Node) => context.report({ node, messageId: "forbidden" });
         return {
-          Program() {
+          Program(node) {
+            if (/\.(?:js|jsx|mjs|cjs)$/.test(context.filename))
+              context.report({ node, messageId: "typescript" });
             for (const comment of context.sourceCode.getAllComments())
               context.report({ loc: comment.loc, messageId: "forbidden" });
           },

@@ -1411,6 +1411,26 @@ export class SearchNamespace extends DurableObject<Env> {
   }
 }
 
+const warmSnapshots = new Map<string, { snapshot: typeof Snapshot.Type; bytes: number }>();
+const warmSnapshotBudget = { bytes: 0 };
+const MAX_WARM_SNAPSHOT_BYTES = 4 * 1024 * 1024;
+
+function rememberSnapshot(key: string, snapshot: typeof Snapshot.Type, encoded: string) {
+  const prior = warmSnapshots.get(key);
+  if (prior) warmSnapshotBudget.bytes -= prior.bytes;
+  warmSnapshots.delete(key);
+  const bytes = new TextEncoder().encode(encoded).byteLength * 4;
+  if (bytes > MAX_WARM_SNAPSHOT_BYTES) return;
+  warmSnapshots.set(key, { snapshot, bytes });
+  warmSnapshotBudget.bytes += bytes;
+  while (warmSnapshotBudget.bytes > MAX_WARM_SNAPSHOT_BYTES) {
+    const oldest = warmSnapshots.entries().next().value;
+    if (!oldest) break;
+    warmSnapshots.delete(oldest[0]);
+    warmSnapshotBudget.bytes -= oldest[1].bytes;
+  }
+}
+
 const refreshSnapshot = Effect.fn("raio.refreshSnapshot")(function* (
   env: Env,
   namespace: string,
@@ -1428,11 +1448,10 @@ const refreshSnapshot = Effect.fn("raio.refreshSnapshot")(function* (
   );
   if (manifest.sequence < minimumSequence)
     return yield* new Rejected({ status: 409, message: "Requested sequence is not committed" });
+  const snapshot = { observedAt: now, manifest };
+  const encoded = yield* Schema.encodeEffect(Schema.fromJsonString(Snapshot))(snapshot);
+  rememberSnapshot(cacheKey.href, snapshot, encoded);
   if (cache) {
-    const encoded = yield* Schema.encodeEffect(Schema.fromJsonString(Snapshot))({
-      observedAt: now,
-      manifest,
-    });
     yield* Effect.tryPromise(() =>
       cache.put(
         cacheKey,
@@ -1463,40 +1482,67 @@ const edgeSnapshot = Effect.fn("raio.edgeSnapshot")(function* (
   const cache = yield* Effect.tryPromise(() => caches.open("raio-snapshots-v1")).pipe(
     Effect.orElseSucceed(() => undefined),
   );
-  if (cache) {
-    const cached = yield* Effect.tryPromise(() => cache.match(cacheKey)).pipe(
-      Effect.orElseSucceed(() => undefined),
-    );
-    if (cached) {
-      const snapshot = yield* Effect.tryPromise(() => cached.text()).pipe(
-        Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(Snapshot))),
+  const memory = warmSnapshots.get(cacheKey.href);
+  const selection = { snapshot: memory?.snapshot };
+  const observedAt = yield* Clock.currentTimeMillis;
+  if (
+    !selection.snapshot ||
+    observedAt < selection.snapshot.observedAt ||
+    observedAt - selection.snapshot.observedAt >= 1000 ||
+    selection.snapshot.manifest.sequence < minimumSequence
+  ) {
+    if (memory) {
+      warmSnapshots.delete(cacheKey.href);
+      warmSnapshotBudget.bytes -= memory.bytes;
+    }
+    selection.snapshot = undefined;
+    if (cache) {
+      const cached = yield* Effect.tryPromise(() => cache.match(cacheKey)).pipe(
         Effect.orElseSucceed(() => undefined),
       );
-      const selectedAt = yield* Clock.currentTimeMillis;
-      if (
-        snapshot &&
-        selectedAt >= snapshot.observedAt &&
-        selectedAt - snapshot.observedAt < 1000 &&
-        snapshot.manifest.sequence >= minimumSequence
-      ) {
-        if (selectedAt - snapshot.observedAt >= 250 && !snapshotRefreshes.has(cacheKey.href)) {
-          snapshotRefreshes.add(cacheKey.href);
-          const refresh = yield* Effect.forkDetach(
-            refreshSnapshot(env, namespace, 0, cacheKey, cache).pipe(
-              Effect.asVoid,
-              Effect.ignore,
-              Effect.ensuring(Effect.sync(() => snapshotRefreshes.delete(cacheKey.href))),
-            ),
+      if (cached) {
+        const encoded = yield* Effect.tryPromise(() => cached.text()).pipe(
+          Effect.orElseSucceed(() => undefined),
+        );
+        if (encoded !== undefined) {
+          const decoded = yield* Schema.decodeEffect(Schema.fromJsonString(Snapshot))(encoded).pipe(
+            Effect.orElseSucceed(() => undefined),
           );
-          ctx.waitUntil(
-            new Promise<void>((resolve) => {
-              refresh.addObserver(() => resolve());
-            }),
-          );
+          selection.snapshot = decoded;
+          if (decoded) rememberSnapshot(cacheKey.href, decoded, encoded);
         }
-        return snapshot.manifest;
       }
     }
+  }
+  const snapshot = selection.snapshot;
+  const selectedAt = yield* Clock.currentTimeMillis;
+  if (
+    snapshot &&
+    selectedAt >= snapshot.observedAt &&
+    selectedAt - snapshot.observedAt < 1000 &&
+    snapshot.manifest.sequence >= minimumSequence
+  ) {
+    const retained = warmSnapshots.get(cacheKey.href);
+    if (retained) {
+      warmSnapshots.delete(cacheKey.href);
+      warmSnapshots.set(cacheKey.href, retained);
+    }
+    if (selectedAt - snapshot.observedAt >= 250 && !snapshotRefreshes.has(cacheKey.href)) {
+      snapshotRefreshes.add(cacheKey.href);
+      const refresh = yield* Effect.forkDetach(
+        refreshSnapshot(env, namespace, 0, cacheKey, cache).pipe(
+          Effect.asVoid,
+          Effect.ignore,
+          Effect.ensuring(Effect.sync(() => snapshotRefreshes.delete(cacheKey.href))),
+        ),
+      );
+      ctx.waitUntil(
+        new Promise<void>((resolve) => {
+          refresh.addObserver(() => resolve());
+        }),
+      );
+    }
+    return snapshot.manifest;
   }
   return yield* refreshSnapshot(env, namespace, minimumSequence, cacheKey, cache);
 });

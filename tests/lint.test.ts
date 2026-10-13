@@ -4,19 +4,23 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, relative } from "node:path";
 
 const root = join(import.meta.dir, "..");
-const probe = Effect.fn("raio.lintProbe")(function* (source: string, parent: string = root) {
+const probe = Effect.fn("raio.lintProbe")(function* (
+  source: string,
+  parent: string = root,
+  extension: "ts" | "js" = "ts",
+) {
   return yield* Effect.acquireUseRelease(
     Effect.tryPromise(() => mkdtemp(join(parent, ".lint-probe-"))),
     (directory) =>
       Effect.gen(function* () {
-        const file = join(directory, "probe.ts");
+        const file = join(directory, `probe.${extension}`);
         yield* Effect.tryPromise(() => writeFile(file, source));
         yield* Effect.tryPromise(() =>
           writeFile(
             join(directory, "tsconfig.json"),
             JSON.stringify({
               extends: relative(directory, join(root, "tsconfig.json")),
-              include: ["*.ts"],
+              include: [`*.${extension}`],
             }),
           ),
         );
@@ -168,4 +172,10 @@ test("runtime file selection rejects comparator imports while allowing erased na
     ),
   );
   expect(erased.exitCode).toBe(0);
+});
+
+test("authored JavaScript is rejected by the native lint file selection", async () => {
+  const result = await Effect.runPromise(probe("export const value = 42;", root, "js"));
+  expect(result.exitCode).not.toBe(0);
+  expect(result.output).toContain("Author TypeScript with Effect");
 });

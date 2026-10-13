@@ -290,36 +290,61 @@ async function textQuery(env: Env, input: typeof Query.Type, root: typeof Root.T
           Effect.sync(() => decoded.ranker(ranking)),
           (ranker) =>
             Effect.gen(function* () {
-              const blocks = Object.entries(dictionary).flatMap(([term, metadata]) =>
-                metadata.blocks.map((block) => ({ term, block })),
-              );
+              const requested = Object.entries(dictionary);
               for (const offset of Array.from(
-                { length: Math.ceil(blocks.length / 4) },
+                { length: Math.ceil(requested.length / 4) },
                 (_, index) => index * 4,
               )) {
-                const window = blocks.slice(offset, offset + 4);
+                const window = requested.slice(offset, offset + 4);
                 const loaded = yield* Effect.forEach(
                   window,
-                  ({ term, block }) =>
+                  ([term, metadata]) =>
                     Effect.gen(function* () {
-                      const start = segment.headerBytes + block.data.offset;
-                      if (start + block.data.length > segment.bytes)
+                      const first = metadata.blocks[0];
+                      if (!first)
                         return yield* new Rejected({
                           status: 503,
-                          message: "Invalid posting block range",
+                          message: "Empty posting directory",
+                        });
+                      const span = { end: first.data.offset };
+                      for (const block of metadata.blocks) {
+                        if (block.data.offset !== span.end || block.data.length <= 0)
+                          return yield* new Rejected({
+                            status: 503,
+                            message: "Posting blocks are not contiguous",
+                          });
+                        span.end += block.data.length;
+                      }
+                      const start = segment.headerBytes + first.data.offset;
+                      const length = span.end - first.data.offset;
+                      if (
+                        start < segment.headerBytes ||
+                        start + length > segment.bytes ||
+                        length > 16777216
+                      )
+                        return yield* new Rejected({
+                          status: 503,
+                          message: "Invalid posting range",
                         });
                       const bytes = yield* Effect.tryPromise({
-                        try: () => range(env.STORAGE, segment.key, start, block.data.length),
+                        try: () => range(env.STORAGE, segment.key, start, length),
                         catch: (cause) => {
                           if (Schema.is(Rejected)(cause)) return cause;
                           return new Cause.UnknownError(cause);
                         },
                       });
-                      return { term, bytes };
+                      return { term, metadata, bytes, offset: first.data.offset };
                     }),
                   { concurrency: 4 },
                 );
-                for (const posting of loaded) ranker.add(posting.term, posting.bytes);
+                for (const posting of loaded)
+                  for (const block of posting.metadata.blocks) {
+                    const start = block.data.offset - posting.offset;
+                    ranker.add(
+                      posting.term,
+                      posting.bytes.subarray(start, start + block.data.length),
+                    );
+                  }
               }
               return yield* Schema.decodeEffect(Schema.fromJsonString(SegmentHits))(
                 ranker.finish(),

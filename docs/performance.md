@@ -35,3 +35,26 @@ Corpus SHA-256: `e23ae431deaee2436ee6674a7834e57663739b6c5bd723b7c9137c4ab123dbf
 An uncached canonical R2 manifest read can select a strongly consistent snapshot without a coordinator hop, but the deployed measurement was slower. On the same 100,000-document Raio corpus, direct-R2 strong p50 ranged from 263.0 to 294.0 ms and p95 from 403.5 to 495.9 ms. Edge p50 ranged from 65.3 to 116.1 ms. The fresh Turbopuffer comparator completed indexing before measurement; its strong p50 ranged from 49.6 to 50.3 ms. The direct-R2 request path was reverted, preserving the faster coordinator-backed strong path. This evidence does not prove that bucket placement alone explains the regression.
 
 The updated comparison driver waits for native Turbopuffer metadata to report an up-to-date index, with a bounded observation window, before running measured queries. The metadata response did not supply the declared unindexed row count during that observation, so progress reporting uses the native index status only. The comparator was deleted after the run. Further work must address R2 acquisition latency and cold edge directory-cache tails before a parity claim.
+
+## Bounded parallel-read follow-up
+
+The deployed implementation at `f00df9e` loads dictionaries and result documents with concurrency four and reads postings in windows of four blocks. On the same 100,000-document corpus, with a fresh comparator fully indexed before query measurement, the sequential results were:
+
+| Query     | Raio strong p50 / p95 ms | Raio edge p50 / p95 ms | Turbopuffer strong p50 / p95 ms |
+| --------- | -----------------------: | ---------------------: | ------------------------------: |
+| rare      |            181.4 / 215.2 |            55.9 / 86.1 |                    51.6 / 321.6 |
+| selective |            186.9 / 200.8 |           62.4 / 109.1 |                     49.5 / 52.6 |
+| common    |            197.3 / 216.4 |            73.0 / 98.7 |                     50.2 / 53.4 |
+| filtered  |            193.1 / 214.7 |           69.7 / 100.5 |                     50.5 / 53.2 |
+
+The comparator was deleted. One rare-query comparator tail reached 1,057.5 ms; the other comparator cases had p95 near 53 ms. Edge medians improved relative to the preceding measurements, but cold tails remain and the consistency contracts still differ.
+
+The separate `tooling/load.ts` driver checks every edge response against a strong baseline, including IDs, scores, revisions and corpus sequence. It ran mixed rare, selective, common and filtered requests on the same deployed corpus, in phases of 128 requests at concurrency 1, 4 and 16:
+
+| Concurrency |      p50 / p95 / p99 ms | Requests per second |
+| ----------: | ----------------------: | ------------------: |
+|           1 |  106.6 / 546.7 / 2455.8 |                 3.8 |
+|           4 |   91.3 / 350.6 / 1385.6 |                23.7 |
+|          16 | 122.0 / 1239.6 / 1983.8 |                37.7 |
+
+All 384 responses matched their strong baselines. These phases ran sequentially without resetting caches, so their throughput is not an isolated concurrency scaling comparison. The first phase included cold requests of 1.3, 3.3 and 7.3 seconds; the maximum observed latency was 7.3 seconds. This exposes a remaining cold-I/O problem despite improved warm medians. The later contiguous-term range implementation is separately verified by range-count tests and requires its own deployed comparison. This load run does not compare Turbopuffer throughput.

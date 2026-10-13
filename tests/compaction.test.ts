@@ -200,3 +200,34 @@ test("concurrent cold edge reads preserve posting order, scores and directory ow
   );
   expect(strong.rows).toEqual(reference.rows);
 });
+
+test("common terms load contiguous posting blocks with one range read per term", async () => {
+  await request(
+    worker,
+    "posting-ranges",
+    "write",
+    write(
+      Array.from({ length: 512 }, (_, index) =>
+        document(String(index).padStart(4, "0"), "coalesced postings"),
+      ),
+    ),
+  );
+  const before = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  const response = await request(
+    worker,
+    "posting-ranges",
+    "query",
+    textQuery("coalesced postings", 10),
+  );
+  expect(response.status).toBe(200);
+  const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+  expect(result.rows.map((row) => row.id)).toEqual(
+    Array.from({ length: 10 }, (_, index) => String(index).padStart(4, "0")),
+  );
+  const after = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(after.rangeReads - before.rangeReads).toBe(13);
+});

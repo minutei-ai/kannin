@@ -78,3 +78,5 @@ The deterministic local benchmark records corpus SHA-256, ingestion throughput, 
 ## License
 
 Apache-2.0. Third-party licenses remain with their packages. The declared Alchemy patch corrects native Vectorize binding type inference in version 2.0.0-beta.83; see [the patch record](docs/alchemy-patch.md).
+
+To exercise an already populated deterministic benchmark namespace, run `RAIO_LOAD_NAMESPACE=<owned-benchmark-namespace> bun tooling/load.ts` with `RAIO_URL` and `RAIO_API_TOKEN` supplied outside the repository. `RAIO_LOAD_REQUESTS` defaults to 128 per concurrency phase. The driver verifies every edge result against a strong baseline and reports concurrency 1, 4 and 16 separately. It does not mutate the corpus.

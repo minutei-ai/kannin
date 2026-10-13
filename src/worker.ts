@@ -1086,7 +1086,7 @@ const refreshSnapshot = Effect.fn("raio.refreshSnapshot")(function* (
         cacheKey,
         new Response(encoded, {
           headers: {
-            "cache-control": "public, max-age=1, must-revalidate",
+            "cache-control": "public, max-age=2, must-revalidate",
             "content-type": "application/json",
           },
         }),

@@ -24,12 +24,14 @@ const headers = new Headers({
   authorization: `Bearer ${Redacted.value(raioToken)}`,
   "content-type": "application/json",
 });
+console.error(`Comparator namespace: ${freshNamespace}`);
 await using cleanup = new AsyncDisposableStack();
 cleanup.defer(async () => {
   await comparator.deleteAll().catch((cause: unknown) => {
     if (Schema.is(Schema.Struct({ status: Schema.Literal(404) }))(cause)) return;
     throw cause;
   });
+  console.error(`Comparator deletion confirmed: ${freshNamespace}`);
 });
 const report = await (async () => {
   const hash = createHash("sha256");
@@ -126,6 +128,27 @@ const report = await (async () => {
       include_attributes: ["text", "title", "group", "year"],
     };
     if (name === "filtered") parameters.filters = ["group", "Eq", 42];
+    const settled = { probes: 0, ready: false };
+    for (const attempt of Array.from({ length: 12 }, (_, index) => index)) {
+      const probe = await comparator.query(parameters);
+      const remaining = probe.performance?.exhaustive_search_count;
+      if (remaining === undefined)
+        throw new Error("Comparator omitted its exhaustive-search metric");
+      settled.probes += 1;
+      if (remaining === 0) {
+        settled.ready = true;
+        break;
+      }
+      const state = await comparator.metadata();
+      console.error(
+        JSON.stringify({ case: name, index: state.index, exhaustiveSearchCount: remaining }),
+      );
+      if (attempt < 11) await Effect.runPromise(Effect.sleep("2 seconds"));
+    }
+    if (!settled.ready)
+      throw new Error(
+        "Comparator queries still scan unindexed rows after metadata reported readiness",
+      );
     const raioSamples: number[] = [];
     const turboSamples: number[] = [];
     const edgeSamples: number[] = [];
@@ -165,6 +188,8 @@ const report = await (async () => {
       const turbo = await comparator.query(parameters);
       const turboMs = performance.now() - second;
       if (!turbo.rows?.length) throw new Error("Empty Turbopuffer result");
+      if (turbo.performance?.exhaustive_search_count !== 0)
+        throw new Error("Comparator index readiness changed during measurement");
       if (iteration === 0) {
         cold.raio = raioMs;
         cold.edge = edgeMs;
@@ -185,6 +210,7 @@ const report = await (async () => {
     );
     reports.push({
       name,
+      comparatorReadiness: settled,
       firstQueryMs: cold,
       percentiles,
       samples,

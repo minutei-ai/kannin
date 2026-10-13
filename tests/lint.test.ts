@@ -44,6 +44,12 @@ test("strict lint accepts typed native Effect code", async () => {
     probe('import { Effect } from "effect"; export const program = Effect.succeed(42);'),
   );
   expect(result).toMatchObject({ exitCode: 0 });
+  const disposal = await Effect.runPromise(
+    probe(
+      "await using resource = new AsyncDisposableStack(); export const disposed = resource.disposed;",
+    ),
+  );
+  expect(disposal.exitCode).toBe(0);
 });
 
 test("strict lint rejects type errors, unsafe values, floating effects and promises", async () => {

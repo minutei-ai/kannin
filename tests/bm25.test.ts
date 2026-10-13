@@ -183,3 +183,45 @@ test("prototype-like terms remain ordinary terms across updates and deletions", 
   expect(deleted.status).toBe(200);
   expect((await search("prototype-terms", textQuery("constructor"))).rows).toEqual([]);
 });
+
+test("filtered ranking survives mask eviction, attribute changes and tombstones", async () => {
+  const documents = Array.from({ length: 200 }, (_, index) => ({
+    ...document(String(index).padStart(3, "0"), "target"),
+    attributes: { group: index % 25 },
+  }));
+  await request(worker, "filter-masks", "write", write(documents));
+  for (const group of Array.from({ length: 25 }, (_, index) => index)) {
+    const result = await search(
+      "filter-masks",
+      textQuery("target", 4, [{ field: "group", op: "eq", value: group }]),
+    );
+    expect(result.rows.map((row) => row.id)).toEqual(
+      documents
+        .filter((row) => row.attributes.group === group)
+        .map((row) => row.id)
+        .slice(0, 4),
+    );
+  }
+  await request(
+    worker,
+    "filter-masks",
+    "write",
+    write([{ ...document("000", "target"), attributes: { group: 999 } }]),
+  );
+  const old = await search(
+    "filter-masks",
+    textQuery("target", 4, [{ field: "group", op: "eq", value: 0 }]),
+  );
+  expect(old.rows.map((row) => row.id)).toEqual(["025", "050", "075", "100"]);
+  const updated = await search(
+    "filter-masks",
+    textQuery("target", 4, [{ field: "group", op: "eq", value: 999 }]),
+  );
+  expect(updated.rows.map((row) => row.id)).toEqual(["000"]);
+  await request(worker, "filter-masks", "write", write([], ["000"]));
+  const deleted = await search(
+    "filter-masks",
+    textQuery("target", 4, [{ field: "group", op: "eq", value: 999 }]),
+  );
+  expect(deleted.rows).toEqual([]);
+});

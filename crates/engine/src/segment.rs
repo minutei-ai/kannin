@@ -1,12 +1,20 @@
 use crate::normalize_text;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::rc::Rc;
 
 const MAGIC: &[u8; 8] = b"RAIOSEG1";
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 const BLOCK_SIZE: usize = 128;
+const FILTER_CACHE_BYTES: usize = 32 * 1024;
+
+#[derive(Clone, Default)]
+struct FilterMasks {
+    entries: VecDeque<(String, Vec<bool>, usize)>,
+    bytes: usize,
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -59,6 +67,8 @@ pub struct TermMeta {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Header {
+    #[serde(skip)]
+    filter_masks: RefCell<FilterMasks>,
     pub version: u32,
     pub documents: Vec<DocumentMeta>,
     pub terms: BTreeMap<String, TermMeta>,
@@ -71,6 +81,48 @@ pub struct Posting {
     pub row: u32,
     pub title: Vec<u32>,
     pub body: Vec<u32>,
+}
+
+impl Header {
+    fn allowed(&self, filters: &[Filter], dead: &[u32]) -> Result<Vec<bool>, String> {
+        let key = serde_json::to_string(filters).map_err(|cause| cause.to_string())?;
+        let cached = self
+            .filter_masks
+            .borrow()
+            .entries
+            .iter()
+            .find(|(existing, _, _)| existing == &key)
+            .map(|(_, mask, _)| mask.clone());
+        let mut allowed = vec![true; self.documents.len()];
+        if let Some(mask) = cached {
+            allowed = mask;
+        } else if !filters.is_empty() {
+            for (index, doc) in self.documents.iter().enumerate() {
+                let attributes: BTreeMap<String, serde_json::Value> =
+                    serde_json::from_str(doc.attributes.get())
+                        .map_err(|cause| cause.to_string())?;
+                allowed[index] = matches(&attributes, filters)?;
+            }
+            let bytes = key.capacity() + allowed.capacity() + 128;
+            if bytes <= FILTER_CACHE_BYTES {
+                let mut cache = self.filter_masks.borrow_mut();
+                while cache.bytes + bytes > FILTER_CACHE_BYTES || cache.entries.len() >= 16 {
+                    let Some((_, _, removed)) = cache.entries.pop_front() else {
+                        break;
+                    };
+                    cache.bytes -= removed;
+                }
+                cache.bytes += bytes;
+                cache.entries.push_back((key, allowed.clone(), bytes));
+            }
+        }
+        for row in dead {
+            *allowed
+                .get_mut(*row as usize)
+                .ok_or("Invalid deleted row")? = false;
+        }
+        Ok(allowed)
+    }
 }
 
 pub struct BuiltSegment {
@@ -307,6 +359,7 @@ pub fn build(mut documents: Vec<Document>) -> Result<BuiltSegment, String> {
         );
     }
     let header = Header {
+        filter_masks: RefCell::default(),
         version: 1,
         documents: metadata,
         terms,
@@ -410,7 +463,7 @@ pub fn bm25(
     idf * tf * 2.2 / (tf + 1.2)
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Filter {
     pub field: String,
     pub op: String,
@@ -521,19 +574,7 @@ impl Search {
         if mode == "phrase" && words.len() > 64 {
             return Err("Phrase exceeds budget".into());
         }
-        let mut allowed = vec![true; header.documents.len()];
-        if !filters.is_empty() {
-            for (index, doc) in header.documents.iter().enumerate() {
-                let attributes: BTreeMap<String, serde_json::Value> =
-                    serde_json::from_str(doc.attributes.get()).map_err(|e| e.to_string())?;
-                allowed[index] = matches(&attributes, filters)?;
-            }
-        }
-        for row in dead {
-            *allowed
-                .get_mut(*row as usize)
-                .ok_or("Invalid deleted row")? = false;
-        }
+        let allowed = header.allowed(filters, dead)?;
         Ok(Self {
             header,
             statistics,
@@ -827,7 +868,7 @@ pub mod wasm {
                         term.capacity() + 16 + meta.blocks.len() * size_of::<BlockMeta>()
                     })
                     .sum::<usize>();
-            documents + terms + size_of::<Header>() + 32
+            documents + terms + size_of::<Header>() + 32 + FILTER_CACHE_BYTES
         }
 
         pub fn terms(&self, terms: &str) -> Result<String, JsValue> {
@@ -840,11 +881,41 @@ pub mod wasm {
             serde_json::to_string(&selected).map_err(|e| error(e.to_string()))
         }
 
-        pub fn upper_bound(&self, statistics: &str, terms: &str) -> Result<f64, JsValue> {
+        pub fn upper_bound(
+            &self,
+            statistics: &str,
+            terms: &str,
+            filters: &str,
+            dead: &str,
+        ) -> Result<f64, JsValue> {
             let statistics: Statistics =
                 serde_json::from_str(statistics).map_err(|e| error(e.to_string()))?;
             let terms: Vec<String> =
                 serde_json::from_str(terms).map_err(|e| error(e.to_string()))?;
+            let filters: Vec<Filter> =
+                serde_json::from_str(filters).map_err(|cause| error(cause.to_string()))?;
+            let dead: Vec<u32> =
+                serde_json::from_str(dead).map_err(|cause| error(cause.to_string()))?;
+            let minima = if filters.is_empty() && dead.is_empty() {
+                Some((0, 0))
+            } else {
+                let allowed = self.header.allowed(&filters, &dead).map_err(error)?;
+                self.header
+                    .documents
+                    .iter()
+                    .zip(&allowed)
+                    .filter(|(_, allowed)| **allowed)
+                    .fold(None, |minimum, (document, _)| match minimum {
+                        Some((title, body)) => Some((
+                            u32::min(title, document.title_length),
+                            u32::min(body, document.body_length),
+                        )),
+                        None => Some((document.title_length, document.body_length)),
+                    })
+            };
+            let Some((title_minimum, body_minimum)) = minima else {
+                return Ok(0.0);
+            };
             let bound = terms
                 .iter()
                 .map(|term| {
@@ -859,8 +930,8 @@ pub mod wasm {
                                     bm25(
                                         block.max_title_tf,
                                         block.max_body_tf,
-                                        block.min_title_length,
-                                        block.min_body_length,
+                                        block.min_title_length.max(title_minimum),
+                                        block.min_body_length.max(body_minimum),
                                         &statistics,
                                         df,
                                     )
@@ -1006,5 +1077,41 @@ pub mod wasm {
         row: u32,
         id: &'a str,
         score: f64,
+    }
+}
+
+#[cfg(test)]
+mod filter_cache_tests {
+    use super::{Document, FILTER_CACHE_BYTES, Filter, build};
+    use serde_json::json;
+
+    #[test]
+    fn masks_are_bounded_and_tombstones_remain_query_local()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let document: Document = serde_json::from_value(json!({
+            "id": "a", "text": "target", "attributes": {"group": 0}
+        }))?;
+        let header = build(vec![document])?.header;
+        for index in 0..128 {
+            let filter = Filter {
+                field: "group".into(),
+                op: "eq".into(),
+                value: json!(format!("{}{}", "x".repeat(2500), index)),
+            };
+            assert_eq!(header.allowed(&[filter], &[])?, vec![false]);
+            let cache = header.filter_masks.borrow();
+            assert!(cache.bytes <= FILTER_CACHE_BYTES);
+            assert!(cache.entries.len() <= 16);
+        }
+        let filters = vec![Filter {
+            field: "group".into(),
+            op: "eq".into(),
+            value: json!(0),
+        }];
+        assert_eq!(header.allowed(&filters, &[])?, vec![true]);
+        assert_eq!(header.allowed(&filters, &[0])?, vec![false]);
+        assert_eq!(header.allowed(&filters, &[])?, vec![true]);
+        assert!(!serde_json::to_string(&header)?.contains("filter_masks"));
+        Ok(())
     }
 }

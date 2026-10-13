@@ -244,7 +244,11 @@ async function textQuery(env: Env, input: typeof Query.Type, root: typeof Root.T
               statistics,
             );
             const encoded = yield* Schema.encodeEffect(strings)(terms);
-            return decoded.upper_bound(corpus, encoded);
+            const filters = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Array(Filter)))(
+              input.filters,
+            );
+            const dead = yield* Schema.encodeEffect(integers)(segment.dead);
+            return decoded.upper_bound(corpus, encoded, filters, dead);
           }),
         ),
       );

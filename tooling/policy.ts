@@ -17,7 +17,7 @@ export default definePlugin({
               context.report({ loc: comment.loc, messageId: "forbidden" });
           },
           VariableDeclaration(node) {
-            if (node.kind !== "const") reject(node);
+            if (node.kind === "let" || node.kind === "var") reject(node);
           },
           ConditionalExpression: reject,
           SwitchStatement: reject,

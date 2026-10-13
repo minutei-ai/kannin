@@ -58,3 +58,18 @@ The separate `tooling/load.ts` driver checks every edge response against a stron
 |          16 | 122.0 / 1239.6 / 1983.8 |                37.7 |
 
 All 384 responses matched their strong baselines. These phases ran sequentially without resetting caches, so their throughput is not an isolated concurrency scaling comparison. The first phase included cold requests of 1.3, 3.3 and 7.3 seconds; the maximum observed latency was 7.3 seconds. This exposes a remaining cold-I/O problem despite improved warm medians. The later contiguous-term range implementation is separately verified by range-count tests and requires its own deployed comparison. This load run does not compare Turbopuffer throughput.
+
+## Contiguous-term range load follow-up
+
+The deployed implementation at `faa310e` retains the same corpus, scorer and concurrency bounds, and coalesces contiguous blocks into one read per requested term. Every response in a second 384-request load run again matched the strong baseline. The concurrency 1/4/16 phases respectively measured p50 of 104.6/89.3/110.6 ms, p95 of 542.0/190.3/1,090.5 ms and throughput of 5.4/29.1/45.4 requests per second. The maximum observed latency fell from 7.3 seconds to 3.4 seconds, but the first selective request still took 3.4 seconds. These are separate sequential load runs with cache warming and infrastructure variability; they support the range-read improvement but do not isolate its causal effect or establish parity. Cold dictionary acquisition, R2 snapshot acquisition and concurrent tails still require investigation.
+
+The sequential comparison after coalescing, using the same static 100,000-document corpus and a fresh up-to-date Turbopuffer index, produced:
+
+| Query     | Raio strong p50 / p95 ms | Raio edge p50 / p95 ms | Turbopuffer strong p50 / p95 ms |
+| --------- | -----------------------: | ---------------------: | ------------------------------: |
+| rare      |            165.3 / 194.8 |            53.4 / 77.2 |                     73.3 / 74.4 |
+| selective |            172.0 / 187.2 |            63.8 / 87.1 |                     72.5 / 73.6 |
+| common    |            181.6 / 196.7 |            68.7 / 95.7 |                   105.0 / 105.8 |
+| filtered  |            177.4 / 189.7 |           68.2 / 102.1 |                     98.2 / 99.3 |
+
+The comparator was deleted after the completed run. Edge medians were below this run's comparator medians, while strong Raio reads remained slower. Selective edge p99 still reached 691.7 ms. The earlier comparator runs had substantially lower medians, and this run did not test concurrent comparator throughput. These results support continued investigation; they do not establish general parity across consistency modes, cold state, concurrency or larger corpora.

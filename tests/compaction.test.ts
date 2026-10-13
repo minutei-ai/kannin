@@ -163,3 +163,40 @@ test("global score bounds skip R2 posting reads from noncompetitive segments", a
   );
   expect(after.rangeReads - before.rangeReads).toBeLessThanOrEqual(19);
 });
+
+test("concurrent cold edge reads preserve posting order, scores and directory ownership", async () => {
+  const corpus = Array.from({ length: 800 }, (_, index) =>
+    document(String(index).padStart(4, "0"), `rust ${"search ".repeat(index % 5)}engine`, {
+      group: index % 4,
+    }),
+  );
+  for (const offset of [0, 200, 400, 600])
+    expect(
+      (await request(worker, "parallel-cold", "write", write(corpus.slice(offset, offset + 200))))
+        .status,
+    ).toBe(200);
+  const input = {
+    ...textQuery("rust search", 20, [{ field: "group", op: "eq", value: 2 }]),
+    consistency: "edge-eventual",
+    minimumSequence: 4,
+  };
+  const results = await Promise.all(
+    Array.from({ length: 12 }, async () => {
+      const response = await request(worker, "parallel-cold", "query", input);
+      expect(response.status).toBe(200);
+      return Schema.decodeUnknownSync(QueryResult)(await response.json());
+    }),
+  );
+  const reference = results[0];
+  if (!reference) throw new Error("Missing reference response");
+  expect(reference.rows.length).toBe(20);
+  expect(reference.sequence).toBe(4);
+  for (const result of results) expect(result).toEqual(reference);
+  expect(reference.rows.every((row) => row.attributes.group === 2)).toBe(true);
+  const strong = Schema.decodeUnknownSync(QueryResult)(
+    await (
+      await request(worker, "parallel-cold", "query", textQuery("rust search", 20, input.filters))
+    ).json(),
+  );
+  expect(strong.rows).toEqual(reference.rows);
+});

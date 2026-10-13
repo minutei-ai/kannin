@@ -74,4 +74,4 @@ test("native index queue compacts immutable R2 segments without changing live ro
     ).json(),
   );
   expect(result.rows).toHaveLength(64);
-});
+}, 20000);

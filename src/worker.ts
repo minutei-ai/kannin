@@ -214,26 +214,30 @@ async function textQuery(env: Env, input: typeof Query.Type, root: typeof Root.T
   const selected = root.segments.filter(
     (segment) => bloomCandidates(segment.termBloom, terms).length > 0,
   );
-  const catalog = [];
+  const catalog = await Effect.runPromise(
+    Effect.forEach(
+      selected,
+      (segment) =>
+        withDirectory(env.STORAGE, segment.key, segment.headerBytes, (decoded) =>
+          Effect.gen(function* () {
+            const encoded = yield* Schema.encodeEffect(strings)(terms);
+            const dictionary = yield* Schema.decodeEffect(Schema.fromJsonString(SegmentTerms))(
+              decoded.terms(encoded),
+            );
+            return { segment, dictionary };
+          }),
+        ),
+      { concurrency: 4 },
+    ),
+  );
   const frequencies = new Map<string, number>();
-  for (const segment of selected) {
-    const dictionary = await Effect.runPromise(
-      withDirectory(env.STORAGE, segment.key, segment.headerBytes, (decoded) =>
-        Effect.gen(function* () {
-          const encoded = yield* Schema.encodeEffect(strings)(terms);
-          return yield* Schema.decodeEffect(Schema.fromJsonString(SegmentTerms))(
-            decoded.terms(encoded),
-          );
-        }),
-      ),
-    );
+  for (const { segment, dictionary } of catalog) {
     const removedFrequencies = new Map(Object.entries(segment.removedFrequencies));
     for (const [term, metadata] of Object.entries(dictionary))
       frequencies.set(
         term,
         (frequencies.get(term) ?? 0) + metadata.df - (removedFrequencies.get(term) ?? 0),
       );
-    catalog.push({ segment, dictionary });
   }
   const statistics = {
     documents: root.documents,
@@ -286,23 +290,37 @@ async function textQuery(env: Env, input: typeof Query.Type, root: typeof Root.T
           Effect.sync(() => decoded.ranker(ranking)),
           (ranker) =>
             Effect.gen(function* () {
-              for (const [term, metadata] of Object.entries(dictionary))
-                for (const block of metadata.blocks) {
-                  const offset = segment.headerBytes + block.data.offset;
-                  if (offset + block.data.length > segment.bytes)
-                    return yield* new Rejected({
-                      status: 503,
-                      message: "Invalid posting block range",
-                    });
-                  const bytes = yield* Effect.tryPromise({
-                    try: () => range(env.STORAGE, segment.key, offset, block.data.length),
-                    catch: (cause) => {
-                      if (Schema.is(Rejected)(cause)) return cause;
-                      return new Cause.UnknownError(cause);
-                    },
-                  });
-                  ranker.add(term, bytes);
-                }
+              const blocks = Object.entries(dictionary).flatMap(([term, metadata]) =>
+                metadata.blocks.map((block) => ({ term, block })),
+              );
+              for (const offset of Array.from(
+                { length: Math.ceil(blocks.length / 4) },
+                (_, index) => index * 4,
+              )) {
+                const window = blocks.slice(offset, offset + 4);
+                const loaded = yield* Effect.forEach(
+                  window,
+                  ({ term, block }) =>
+                    Effect.gen(function* () {
+                      const start = segment.headerBytes + block.data.offset;
+                      if (start + block.data.length > segment.bytes)
+                        return yield* new Rejected({
+                          status: 503,
+                          message: "Invalid posting block range",
+                        });
+                      const bytes = yield* Effect.tryPromise({
+                        try: () => range(env.STORAGE, segment.key, start, block.data.length),
+                        catch: (cause) => {
+                          if (Schema.is(Rejected)(cause)) return cause;
+                          return new Cause.UnknownError(cause);
+                        },
+                      });
+                      return { term, bytes };
+                    }),
+                  { concurrency: 4 },
+                );
+                for (const posting of loaded) ranker.add(posting.term, posting.bytes);
+              }
               return yield* Schema.decodeEffect(Schema.fromJsonString(SegmentHits))(
                 ranker.finish(),
               );
@@ -327,36 +345,50 @@ async function textQuery(env: Env, input: typeof Query.Type, root: typeof Root.T
     return 0;
   });
   const hits = ranked.slice(0, input.topK);
-  const rows: Array<typeof Row.Type> = [];
-  for (const hit of hits) {
-    const metadata = await Effect.runPromise(
-      withDirectory(env.STORAGE, hit.segment.key, hit.segment.headerBytes, (decoded) =>
+  return await Effect.runPromise(
+    Effect.forEach(
+      hits,
+      (hit) =>
         Effect.gen(function* () {
-          const encoded = yield* Schema.encodeEffect(integers)([hit.row]);
-          const matches = yield* Schema.decodeEffect(
-            Schema.fromJsonString(Schema.Tuple([SegmentDocument])),
-          )(decoded.rows(encoded));
-          return matches[0];
+          const metadata = yield* withDirectory(
+            env.STORAGE,
+            hit.segment.key,
+            hit.segment.headerBytes,
+            (decoded) =>
+              Effect.gen(function* () {
+                const encoded = yield* Schema.encodeEffect(integers)([hit.row]);
+                const matches = yield* Schema.decodeEffect(
+                  Schema.fromJsonString(Schema.Tuple([SegmentDocument])),
+                )(decoded.rows(encoded));
+                return matches[0];
+              }),
+          );
+          const document = yield* Effect.tryPromise({
+            try: () =>
+              readDocument(
+                env.STORAGE,
+                hit.segment.key,
+                hit.segment.headerBytes,
+                metadata.data,
+                hit.segment.bytes,
+              ),
+            catch: (cause) => {
+              if (Schema.is(Rejected)(cause)) return cause;
+              return new Cause.UnknownError(cause);
+            },
+          });
+          return {
+            id: document.id,
+            title: document.title ?? "",
+            text: document.text,
+            attributes: document.attributes,
+            revision: document.revision,
+            score: hit.score,
+          };
         }),
-      ),
-    );
-    const document = await readDocument(
-      env.STORAGE,
-      hit.segment.key,
-      hit.segment.headerBytes,
-      metadata.data,
-      hit.segment.bytes,
-    );
-    rows.push({
-      id: document.id,
-      title: document.title ?? "",
-      text: document.text,
-      attributes: document.attributes,
-      revision: document.revision,
-      score: hit.score,
-    });
-  }
-  return rows;
+      { concurrency: 4 },
+    ),
+  );
 }
 
 async function vectorQuery(env: Env, input: typeof Query.Type, root: typeof Root.Type) {

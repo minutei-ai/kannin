@@ -41,6 +41,9 @@ import {
   VectorRebuildSnapshot,
   VectorRebuildResult,
   NamespacePage,
+  Collection,
+  CollectionResult,
+  Retirement,
   IndexMessage,
   SegmentRange,
 } from "./protocol";
@@ -59,6 +62,8 @@ import {
 import { vectorMetadata, vectorPrefilter } from "./vector-filters";
 
 const wasm = initSync({ module });
+const SNAPSHOT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const SEGMENT_RETIREMENT_MS = 24 * 60 * 60 * 1000;
 
 export class Segments extends WorkerEntrypoint<Env> {
   override async fetch(request: Request) {
@@ -739,6 +744,9 @@ export class SearchNamespace extends DurableObject<Env> {
       const object = await this.env.STORAGE.get(key);
       if (!object)
         throw new Rejected({ status: 410, message: "Rebuild snapshot no longer exists" });
+      const now = Effect.runSync(Clock.currentTimeMillis);
+      if (now - object.uploaded.getTime() >= SNAPSHOT_RETENTION_MS)
+        throw new Rejected({ status: 410, message: "Rebuild snapshot expired after seven days" });
       const prior = Schema.decodeSync(Schema.fromJsonString(VectorRebuildSnapshot))(
         await object.text(),
       );
@@ -887,6 +895,106 @@ export class SearchNamespace extends DurableObject<Env> {
     return Response.json({ submitted: completed.size, visibility: "vectorize-eventual" });
   }
 
+  private async collect(input: typeof Collection.Type) {
+    const current = await this.root();
+    const now = Effect.runSync(Clock.currentTimeMillis);
+    if (current.manifest.segments.length > 16384)
+      throw new Rejected({
+        status: 503,
+        message: "Active root exceeds collection reference budget",
+      });
+    const pinned = new Set(current.manifest.segments.map((segment) => segment.key));
+    const counters = { scanned: 0, pinned: 0, marked: 0, deleted: 0, expiredSnapshots: 0 };
+    const snapshots: R2ListOptions = { prefix: `${this.prefix}/vector-rebuild/`, limit: 100 };
+    const checkpointBudget = { count: 0, bytes: 0 };
+    for (;;) {
+      const page = await this.env.STORAGE.list(snapshots);
+      checkpointBudget.count += page.objects.length;
+      if (checkpointBudget.count > 1024)
+        throw new Rejected({
+          status: 503,
+          message: "Too many rebuild checkpoints for bounded collection",
+        });
+      for (const checkpoint of page.objects) {
+        if (now - checkpoint.uploaded.getTime() >= SNAPSHOT_RETENTION_MS) {
+          await this.env.STORAGE.delete(checkpoint.key);
+          counters.expiredSnapshots += 1;
+          continue;
+        }
+        checkpointBudget.bytes += checkpoint.size;
+        if (checkpoint.size > 8 * 1024 * 1024 || checkpointBudget.bytes > 32 * 1024 * 1024)
+          throw new Rejected({
+            status: 503,
+            message: "Rebuild checkpoints exceed collection byte budget",
+          });
+        const object = await this.env.STORAGE.get(checkpoint.key);
+        if (!object)
+          throw new Rejected({
+            status: 503,
+            message: "Rebuild checkpoint disappeared during collection",
+          });
+        const saved = Schema.decodeSync(Schema.fromJsonString(VectorRebuildSnapshot))(
+          await object.text(),
+        );
+        for (const segment of saved.root.segments) {
+          pinned.add(segment.key);
+          if (pinned.size > 16384)
+            throw new Rejected({
+              status: 503,
+              message: "Checkpoint references exceed collection memory budget",
+            });
+        }
+      }
+      if (!page.truncated) break;
+      snapshots.cursor = page.cursor;
+    }
+    const options: R2ListOptions = { prefix: `${this.prefix}/segments/`, limit: 100 };
+    if (input.cursor !== undefined) options.cursor = input.cursor;
+    const page = await this.env.STORAGE.list(options);
+    for (const object of page.objects) {
+      counters.scanned += 1;
+      const markerKey = `${this.prefix}/retired/${await sha256(object.key)}.json`;
+      if (pinned.has(object.key)) {
+        counters.pinned += 1;
+        await this.env.STORAGE.delete(markerKey);
+        continue;
+      }
+      const marker = await this.env.STORAGE.get(markerKey);
+      if (marker) {
+        const retirement = Schema.decodeSync(Schema.fromJsonString(Retirement))(
+          await marker.text(),
+        );
+        if (retirement.key !== object.key)
+          throw new Rejected({
+            status: 503,
+            message: "Retirement marker belongs to another segment",
+          });
+        if (retirement.etag === object.etag && retirement.observedAt <= now) {
+          if (now - retirement.observedAt >= SEGMENT_RETIREMENT_MS) {
+            await this.env.STORAGE.delete(object.key);
+            await this.env.STORAGE.delete(markerKey);
+            counters.deleted += 1;
+          }
+          continue;
+        }
+      }
+      await this.env.STORAGE.put(
+        markerKey,
+        Schema.encodeSync(Schema.fromJsonString(Retirement))({
+          key: object.key,
+          etag: object.etag,
+          observedAt: now,
+        }),
+      );
+      counters.marked += 1;
+    }
+    if (page.truncated)
+      return Response.json(
+        Schema.encodeSync(CollectionResult)({ ...counters, cursor: page.cursor }),
+      );
+    return Response.json(Schema.encodeSync(CollectionResult)({ ...counters, cursor: null }));
+  }
+
   private async compact() {
     const current = await this.root();
     const ordered = current.manifest.segments.toSorted(
@@ -999,6 +1107,7 @@ export class SearchNamespace extends DurableObject<Env> {
         operation === "write" ||
         operation === "query" ||
         operation === "vector-rebuild" ||
+        operation === "collect" ||
         operation === "internal-vector-sync" ||
         operation === "internal-compact"
       )
@@ -1060,6 +1169,22 @@ export class SearchNamespace extends DurableObject<Env> {
             );
             return yield* Effect.tryPromise({
               try: () => this.rebuildVectors(input),
+              catch: (cause) => {
+                if (Schema.is(Rejected)(cause)) return cause;
+                return new Cause.UnknownError(cause);
+              },
+            });
+          }
+          if (operation === "collect") {
+            const input = yield* Schema.decodeEffect(Schema.fromJsonString(Collection), {
+              onExcessProperty: "error",
+            })(body.text).pipe(
+              Effect.mapError(
+                () => new Rejected({ status: 400, message: "Invalid collection cursor" }),
+              ),
+            );
+            return yield* Effect.tryPromise({
+              try: () => this.collect(input),
               catch: (cause) => {
                 if (Schema.is(Rejected)(cause)) return cause;
                 return new Cause.UnknownError(cause);
@@ -1348,6 +1473,7 @@ export default {
       "vector-rebuild": "POST",
       rebuild: "POST",
       compact: "POST",
+      collect: "POST",
     } satisfies Record<typeof Operation.Type, string>;
     if (request.method !== method[match[2]])
       return Response.json(Schema.encodeSync(ErrorBody)({ error: "Method not allowed" }), {
@@ -1379,7 +1505,18 @@ export default {
                   if (Schema.is(Rejected)(cause)) return cause;
                   return new Cause.UnknownError(cause);
                 },
-              });
+              }).pipe(
+                Effect.timeoutOrElse({
+                  duration: "30 seconds",
+                  orElse: () =>
+                    Effect.fail(
+                      new Rejected({
+                        status: 504,
+                        message: "Edge query exceeded its 30-second snapshot lease",
+                      }),
+                    ),
+                }),
+              );
           }
         }
         return yield* Effect.tryPromise(() =>

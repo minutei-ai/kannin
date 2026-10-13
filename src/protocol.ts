@@ -13,6 +13,7 @@ export const Operation = Schema.Literals([
   "vector-rebuild",
   "rebuild",
   "compact",
+  "collect",
 ]);
 export const Scalar = Schema.Union([Unicode, Schema.Finite, Schema.Boolean, Schema.Null]);
 export const FieldName = Schema.String.check(Schema.isPattern(/^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/));
@@ -149,6 +150,22 @@ export const VectorRebuildResult = Schema.Struct({
   row: Schema.Int,
   submitted: Schema.Int,
   complete: Schema.Boolean,
+});
+export const Collection = Schema.Struct({
+  cursor: Schema.optional(Schema.String.check(Schema.isBetweenLength(1, 4096))),
+});
+export const Retirement = Schema.Struct({
+  key: Schema.String,
+  etag: Schema.String,
+  observedAt: Schema.Finite,
+});
+export const CollectionResult = Schema.Struct({
+  cursor: Schema.Union([Schema.String, Schema.Null]),
+  scanned: Schema.Int,
+  pinned: Schema.Int,
+  marked: Schema.Int,
+  deleted: Schema.Int,
+  expiredSnapshots: Schema.Int,
 });
 export const NamespacePage = Schema.Struct({
   names: Schema.Array(NamespaceName),

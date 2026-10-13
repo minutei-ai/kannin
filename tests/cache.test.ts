@@ -98,3 +98,87 @@ test("concurrent cold edge queries share immutable range acquisition", async () 
   );
   expect(after.rangeReads - before.rangeReads).toBe(13);
 });
+
+for (const match of ["all", "phrase"] as const)
+  test(`${match} reads postings only from segments containing every query term`, async () => {
+    const namespace = `conjunctive-${match}`;
+    for (const index of Array.from({ length: 29 }, (_, ordinal) => ordinal))
+      await request(
+        worker,
+        namespace,
+        "write",
+        write([document(`partial-${index}`, "cloudflare storage")]),
+      );
+    await request(worker, namespace, "write", write([document("complete", "cloudflare rust")]));
+    const before = Schema.decodeUnknownSync(Health)(
+      await (await fetch(new URL("/health", await worker.ready))).json(),
+    );
+    const response = await request(worker, namespace, "query", {
+      ...textQuery("cloudflare rust cloudflare"),
+      match,
+      consistency: "edge-eventual",
+    });
+    expect(response.status).toBe(200);
+    const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+    if (match === "all") expect(result.rows.map((row) => row.id)).toEqual(["complete"]);
+    else expect(result.rows).toEqual([]);
+    const after = Schema.decodeUnknownSync(Health)(
+      await (await fetch(new URL("/health", await worker.ready))).json(),
+    );
+    if (match === "all") expect(after.rangeReads - before.rangeReads).toBe(33);
+    else expect(after.rangeReads - before.rangeReads).toBe(32);
+    const any = Schema.decodeUnknownSync(QueryResult)(
+      await (
+        await request(worker, namespace, "query", textQuery("cloudflare rust cloudflare", 100))
+      ).json(),
+    );
+    if (match === "all")
+      expect(result.rows[0]?.score).toBe(any.rows.find((row) => row.id === "complete")?.score);
+  });
+
+for (const match of ["all", "phrase"] as const)
+  test(`${match} rejects impossible segment intersections before reading directories`, async () => {
+    const namespace = `impossible-${match}`;
+    await request(worker, namespace, "write", write([document("left", "cloudflare")]));
+    await request(worker, namespace, "write", write([document("right", "rust")]));
+    const before = Schema.decodeUnknownSync(Health)(
+      await (await fetch(new URL("/health", await worker.ready))).json(),
+    );
+    const response = await request(worker, namespace, "query", {
+      ...textQuery("cloudflare rust"),
+      match,
+      consistency: "edge-eventual",
+    });
+    expect(response.status).toBe(200);
+    expect(Schema.decodeUnknownSync(QueryResult)(await response.json()).rows).toEqual([]);
+    const after = Schema.decodeUnknownSync(Health)(
+      await (await fetch(new URL("/health", await worker.ready))).json(),
+    );
+    expect(after.rangeReads - before.rangeReads).toBe(0);
+  });
+
+test("conjunctive pruning uses live frequencies after deleting the only shared-term document", async () => {
+  const namespace = "conjunctive-tombstones";
+  await request(
+    worker,
+    namespace,
+    "write",
+    write([document("deleted", "cloudflare rust"), document("live", "cloudflare storage")]),
+  );
+  await request(worker, namespace, "write", write([], ["deleted"]));
+  const before = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  const response = await request(worker, namespace, "query", {
+    ...textQuery("cloudflare rust"),
+    match: "all",
+    consistency: "edge-eventual",
+  });
+  expect(response.status).toBe(200);
+  expect(Schema.decodeUnknownSync(QueryResult)(await response.json()).rows).toEqual([]);
+  const after = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(after.rangeReads - before.rangeReads).toBe(0);
+  expect(after.directoryCacheHits - before.directoryCacheHits).toBe(1);
+});

@@ -13,12 +13,14 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Query     |        Strong | Edge eventual |
 | --------- | ------------: | ------------: |
-| Rare      |   3.46 / 5.58 |   3.06 / 4.26 |
-| Selective | 24.74 / 31.00 | 24.96 / 30.83 |
-| Common    | 26.50 / 33.22 | 28.71 / 36.22 |
-| Filtered  | 26.79 / 32.53 | 28.52 / 33.85 |
+| Rare      |   3.46 / 4.45 |   2.99 / 6.02 |
+| Selective | 23.87 / 30.14 | 23.12 / 30.51 |
+| Common    | 25.80 / 32.46 | 28.33 / 52.58 |
+| Filtered  | 26.60 / 33.69 | 26.69 / 32.74 |
 
-Local ingestion: **100,000 documents in 22.99 seconds**, approximately **4,350 documents/s**, in batches of 500. Intel Xeon E5-2680 v4, Bun 1.4.3. Each case/mode has five warmups and 50 measured requests, including HTTP and response decoding. Both modes share one process; no query-result cache. Local timings exclude Cloudflare regional network latency.
+Local ingestion: **100,000 documents in 22.18 seconds**, approximately **4,509 documents/s**, in batches of 500. Intel Xeon E5-2680 v4, Bun 1.4.3. Each case/mode has five warmups and 50 measured requests, including HTTP and response decoding. Both modes share one process; no query-result cache. Local timings exclude Cloudflare regional network latency.
+
+Conjunctive segment pruning reduced local warm p50 from **14.11 to 6.83 ms** for `all` and **13.91 to 5.88 ms** for phrase queries in a separate 15,000-document, 30-segment workload. Impossible Bloom intersections avoid directory reads; exact live term frequencies avoid unnecessary postings. [Methodology and limits](docs/performance.md#conjunctive-query-pruning).
 
 **100,000 documents · deployed Cloudflare · client in Brazil · milliseconds (p50 / p95)**
 
@@ -44,7 +46,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **87 Worker/tooling tests and 17 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **92 Worker/tooling tests and 17 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

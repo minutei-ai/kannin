@@ -99,3 +99,20 @@ The first phase became slower at the tail, despite similar medians. Dictionary a
 The native vector smoke now observes equality and numeric intervals independently within bounded windows. Equality visibility does not establish that a numeric predicate is already visible. An initial numeric check failed immediately after equality reached its target; later reads from the same namespace returned the expected five interval rows with the outbox already empty. This is provider visibility observation, not evidence of lost canonical state. Index acceptance and query visibility remain separate.
 
 A subsequent complete 100-vector native smoke passed with recall@10 of 1.0 for the controlled expected neighbors and all five numeric-interval candidates. Equality required 35 observations and the subsequent numeric window required eight; these are independent readiness checks, not a global index-ready guarantee.
+
+## Conjunctive query pruning
+
+`all` and phrase queries now use both the manifest Bloom intersection and exact live per-segment document frequencies before reading postings. This preserves global statistics from every candidate dictionary, repeated-word semantics, positional matching and tombstones. Immutable segment bytes and the Rust scorer are unchanged.
+
+Native workerd regressions first failed on the previous implementation: a 30-segment fixture read 62 ranges for `all` and 61 for a repeated-word phrase with no positional match. The optimized implementation reads 33 and 32 respectively, eliminating 29 unnecessary posting reads. A two-segment impossible intersection changed from two directory reads to zero. Deleting the only document containing a shared required term also skips postings, even while the immutable Bloom remains positive.
+
+A separate local workload wrote 30 batches of 500 documents: the first 29 segments contain `cloudflare storage`, and the final segment contains `cloudflare rust`. Each id is `<batch>-<row>`. Both queries use `cloudflare rust`, top-k 10, no filters and edge-eventual consistency. Each mode uses a separate namespace in the same process; five warmups precede 50 measured HTTP requests. All measured rows and scores equal the first response, and the before/after rows agree.
+
+| Mode   | Before p50 / p95 ms | After p50 / p95 ms | First-query range reads before / after |
+| ------ | ------------------- | ------------------ | -------------------------------------- |
+| all    | 14.11 / 18.43       | 6.83 / 9.56        | 46 / 17                                |
+| phrase | 13.91 / 20.05       | 5.88 / 7.66        | 46 / 17                                |
+
+The first query after ingestion measured 182.05 → 84.96 ms for `all` and 153.01 → 66.91 ms for phrase. Ingestion itself may warm immutable directories, so these are not fully cold-cache measurements. Separate runs and host variation limit causal timing attribution; the eliminated range reads are deterministic in the smaller regression. Directory bytes still dominate transfer: first-query range bytes changed from 335,477 to 331,678. Queries requiring all directories still pay that acquisition cost.
+
+The standard 100,000-document benchmark also passed: strong p50 was 3.46/23.87/25.80/26.60 ms for rare/selective/common/filtered cases, and edge p50 was 2.99/23.12/28.33/26.69 ms. This workload uses `any` matching, so it does not exercise conjunctive pruning. Its edge common-query p95 rose to 52.58 ms; it does not establish a universal improvement. Ingestion measured 22.18 seconds, approximately 4,509 documents/s. Corpus SHA-256 remains `e23ae431deaee2436ee6674a7834e57663739b6c5bd723b7c9137c4ab123dbfb`; Worker SHA-256 is `8e465d169bfe7927fe466cc1a46485b241fa1138b1c62dbb7047af13e41fb954`, and WASM SHA-256 remains `aaeae13235476d95e4949f5066d6dc5b1f68d2f8c3eba41b209b432dcdab8b57`.

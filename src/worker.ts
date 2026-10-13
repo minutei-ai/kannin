@@ -218,9 +218,18 @@ async function textQuery(
   if (terms.length > 64 || (input.match === "phrase" && words.length > 64))
     throw new Rejected({ status: 400, message: "Query exceeds 64 normalized terms" });
   if (terms.length === 0 || root.documents === 0) return [];
-  const selected = root.segments.filter(
-    (segment) => bloomCandidates(segment.termBloom, terms).length > 0,
-  );
+  const candidates = root.segments.map((segment) => ({
+    segment,
+    terms: bloomCandidates(segment.termBloom, terms),
+  }));
+  if (
+    (input.match === "all" || input.match === "phrase") &&
+    !candidates.some((candidate) => candidate.terms.length === terms.length)
+  )
+    return [];
+  const selected = candidates
+    .filter((candidate) => candidate.terms.length > 0)
+    .map((candidate) => candidate.segment);
   const encodedTerms = Schema.encodeSync(strings)(terms);
   const encodedFilters = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Filter)))(
     input.filters,
@@ -265,6 +274,15 @@ async function textQuery(
     score: number;
   }> = [];
   for (const { segment, dictionary } of catalog) {
+    if (Object.keys(dictionary).length === 0) continue;
+    if (
+      (input.match === "all" || input.match === "phrase") &&
+      terms.some((term) => {
+        const metadata = dictionary[term];
+        return metadata === undefined || metadata.df <= (segment.removedFrequencies[term] ?? 0);
+      })
+    )
+      continue;
     if (ranked.length === input.topK) {
       const bound = await Effect.runPromise(
         withDirectory(env.STORAGE, segment.key, segment.headerBytes, (decoded) =>

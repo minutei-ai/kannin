@@ -204,7 +204,13 @@ async function vectorId(epoch: string, id: string, sequence: number) {
   return sha256(`${epoch}\0${id}\0${sequence}`);
 }
 
-async function textQuery(env: Env, input: typeof Query.Type, root: typeof Root.Type) {
+async function textQuery(
+  env: Env,
+  input: typeof Query.Type,
+  root: typeof Root.Type,
+  timings: Headers,
+) {
+  const started = Effect.runSync(Clock.currentTimeNanos);
   if (input.kind === "vector") return [];
   const words = tokenize(input.text).split(" ").filter(Boolean);
   const terms = [...new Set(words)];
@@ -245,6 +251,8 @@ async function textQuery(env: Env, input: typeof Query.Type, root: typeof Root.T
     body_length: root.bodyLength,
     frequencies: Object.fromEntries(frequencies),
   };
+  const dictionaryEnded = Effect.runSync(Clock.currentTimeNanos);
+  timings.append("server-timing", `text_directory;dur=${Number(dictionaryEnded - started) / 1e6}`);
   const ranked: Array<{
     segment: (typeof Root.Type)["segments"][number];
     row: number;
@@ -369,8 +377,10 @@ async function textQuery(env: Env, input: typeof Query.Type, root: typeof Root.T
     if (a.id > b.id) return 1;
     return 0;
   });
+  const rankingEnded = Effect.runSync(Clock.currentTimeNanos);
+  timings.append("server-timing", `text_rank;dur=${Number(rankingEnded - dictionaryEnded) / 1e6}`);
   const hits = ranked.slice(0, input.topK);
-  return await Effect.runPromise(
+  const rows = await Effect.runPromise(
     Effect.forEach(
       hits,
       (hit) =>
@@ -414,6 +424,12 @@ async function textQuery(env: Env, input: typeof Query.Type, root: typeof Root.T
       { concurrency: 4 },
     ),
   );
+  const documentsEnded = Effect.runSync(Clock.currentTimeNanos);
+  timings.append(
+    "server-timing",
+    `text_documents;dur=${Number(documentsEnded - rankingEnded) / 1e6}`,
+  );
+  return rows;
 }
 
 async function vectorQuery(env: Env, input: typeof Query.Type, root: typeof Root.Type) {
@@ -484,7 +500,8 @@ async function vectorQuery(env: Env, input: typeof Query.Type, root: typeof Root
 async function query(env: Env, input: typeof Query.Type, manifest: typeof Root.Type) {
   if (manifest.sequence < (input.minimumSequence ?? 0))
     throw new Rejected({ status: 409, message: "Requested sequence is not committed" });
-  const text = await textQuery(env, input, manifest);
+  const timings = new Headers();
+  const text = await textQuery(env, input, manifest, timings);
   const vectors = await vectorQuery(env, input, manifest);
   const scores = new Map<string, typeof Row.Type>();
   if (input.kind === "hybrid") {
@@ -507,6 +524,7 @@ async function query(env: Env, input: typeof Query.Type, manifest: typeof Root.T
         sequence: manifest.sequence,
         consistency: input.consistency ?? "strong",
       }),
+      { headers: timings },
     );
   return Response.json(
     Schema.encodeSync(QueryResult)({
@@ -514,6 +532,7 @@ async function query(env: Env, input: typeof Query.Type, manifest: typeof Root.T
       sequence: manifest.sequence,
       consistency: "vectorize-eventual",
     }),
+    { headers: timings },
   );
 }
 
@@ -1368,7 +1387,7 @@ export class SearchNamespace extends DurableObject<Env> {
         }),
       );
       const ended = yield* Clock.currentTimeNanos;
-      delivered.headers.set("server-timing", `raio;dur=${Number(ended - started) / 1e6}`);
+      delivered.headers.append("server-timing", `raio;dur=${Number(ended - started) / 1e6}`);
       return delivered;
     }).pipe(
       Effect.catch((error) => {
@@ -1554,9 +1573,11 @@ export default {
                 status: 400,
                 message: "Edge consistency is supported for text queries only",
               });
+            const snapshotStarted = yield* Clock.currentTimeNanos;
             const manifest = yield* edgeSnapshot(ctx, env, namespace, input.minimumSequence ?? 0);
-            if (manifest)
-              return yield* Effect.tryPromise({
+            const snapshotEnded = yield* Clock.currentTimeNanos;
+            if (manifest) {
+              const evaluated = yield* Effect.tryPromise({
                 try: () => query(env, input, manifest),
                 catch: (cause) => {
                   if (Schema.is(Rejected)(cause)) return cause;
@@ -1574,6 +1595,12 @@ export default {
                     ),
                 }),
               );
+              evaluated.headers.append(
+                "server-timing",
+                `edge_snapshot;dur=${Number(snapshotEnded - snapshotStarted) / 1e6}`,
+              );
+              return evaluated;
+            }
           }
         }
         return yield* Effect.tryPromise(() =>

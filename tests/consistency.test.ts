@@ -201,3 +201,28 @@ test("a still-valid older snapshot serves immediately while native background wo
   }
   expect(state.refreshed).toBe(true);
 });
+
+test("query timings stay request scoped and preserve coordinator and gateway measurements", async () => {
+  await request(worker, "timing", "write", write([document("a", "measured rust search")]));
+  const responses = await Promise.all(
+    ["strong", "edge-eventual", "edge-eventual"].map((consistency) =>
+      request(worker, "timing", "query", { ...textQuery("rust"), consistency }),
+    ),
+  );
+  for (const response of responses) {
+    expect(response.status).toBe(200);
+    const timing = response.headers.get("server-timing");
+    expect(timing).not.toBeNull();
+    if (timing === null) throw new Error("Missing query timings");
+    for (const phase of ["text_directory", "text_rank", "text_documents", "gateway"])
+      expect(
+        timing.split(",").filter((entry) => entry.trim().startsWith(`${phase};dur=`)),
+      ).toHaveLength(1);
+    expect(response.headers.get("cache-control")).toBe("private, no-store");
+  }
+  expect(responses[0]?.headers.get("server-timing")).toContain("raio;dur=");
+  for (const response of responses.slice(1)) {
+    expect(response.headers.get("server-timing")).toContain("edge_snapshot;dur=");
+    expect(response.headers.get("server-timing")).not.toContain("raio;dur=");
+  }
+});

@@ -82,14 +82,18 @@ for (const concurrency of [1, 4, 16]) {
               message: "Concurrent load changed ranking or corpus sequence",
             });
           const ended = yield* Clock.currentTimeNanos;
-          return Number(ended - begin) / 1e6;
+          return {
+            ms: Number(ended - begin) / 1e6,
+            serverTiming: response.headers.get("server-timing"),
+          };
         }),
       { concurrency },
     ),
   );
   const ended = Effect.runSync(Clock.currentTimeNanos);
   const elapsedMs = Number(ended - started) / 1e6;
-  const ordered = results.toSorted((a, b) => a - b);
+  const durations = results.map((result) => result.ms);
+  const ordered = durations.toSorted((a, b) => a - b);
   const report = {
     concurrency,
     requests: results.length,
@@ -98,7 +102,8 @@ for (const concurrency of [1, 4, 16]) {
     p50: ordered[Math.floor((ordered.length - 1) * 0.5)],
     p95: ordered[Math.floor((ordered.length - 1) * 0.95)],
     p99: ordered[Math.floor((ordered.length - 1) * 0.99)],
-    samples: results,
+    samples: durations,
+    serverTimings: results.map((result) => result.serverTiming),
   };
   reports.push(report);
   console.error(

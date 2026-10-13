@@ -13,7 +13,11 @@ const size = Schema.decodeSync(
 )(Number(process.env.RAIO_BENCH_DOCUMENTS ?? 10000));
 const freshNamespace = `raio-bench-${crypto.randomUUID()}`;
 const reuse = Effect.runSync(Config.option(Config.String("RAIO_BENCH_REUSE_NAMESPACE")));
-const namespace = Option.match(reuse, {
+const resume = Effect.runSync(Config.option(Config.String("RAIO_BENCH_RESUME_NAMESPACE")));
+if (Option.isSome(reuse) && Option.isSome(resume))
+  throw new Error("Choose reuse or resume, not both");
+const target = Option.orElse(reuse, () => resume);
+const namespace = Option.match(target, {
   onNone: () => freshNamespace,
   onSome: Schema.decodeSync(Schema.String.check(Schema.isPattern(/^raio-bench-[a-f0-9-]{36}$/))),
 });
@@ -40,6 +44,16 @@ const report = await (async () => {
   console.error(
     `Benchmark namespace: ${namespace}; documents: ${size}; comparator region: ${region}`,
   );
+  if (Option.isSome(resume)) {
+    const existing = await fetch(new URL(`/v1/namespaces/${namespace}/metadata`, url), { headers });
+    if (!existing.ok) throw new Error(`Resume metadata failed: ${existing.status}`);
+    const prior = Schema.decodeUnknownSync(Metadata)(await existing.json());
+    if (prior.documents === 0 || prior.documents > size)
+      throw new Error("Resume requires a populated corpus no larger than the requested size");
+    console.error(
+      `Resuming acknowledged corpus: ${prior.documents} documents, sequence ${prior.sequence}`,
+    );
+  }
   for (const offset of Array.from(
     { length: Math.ceil(size / 500) },
     (_, ordinal) => ordinal * 500,
@@ -243,6 +257,7 @@ const report = await (async () => {
       ...ingestion,
       raioMs: Option.match(reuse, { onNone: () => ingestion.raioMs, onSome: () => null }),
       reusedRaioCorpus: Option.isSome(reuse),
+      resumedRaioCorpus: Option.isSome(resume),
     },
     reports,
     comparatorIndexing: indexing,

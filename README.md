@@ -33,6 +33,8 @@ Conjunctive segment pruning reduced local warm p50 from **14.11 to 6.83 ms** for
 
 These deployed measurements are from `faa310e`, before the latest warm-snapshot optimization, with the same five-warmup/50-sample methodology. Strong reads paid the coordinator hop outside Brazil. A separate mixed-query load run reached **45.4 requests/s at concurrency 16**, with **p95 1,090.5 ms**; all 384 responses matched strong baselines. Cold requests reached **3.4 seconds**. These results establish bounded measurements, not general Turbopuffer parity or million-document scale.
 
+The latest conjunctive runtime passed 12 native before/after result comparisons. A first common edge query still took **4.8 seconds**; cold directory acquisition remains unresolved.
+
 [Full deployed evidence](docs/performance.md) · [local methodology and contract comparison](docs/turbopuffer-contracts.md) · [SciFact ranking quality](docs/quality.md)
 
 ## Run

@@ -17,7 +17,8 @@
     "bench": "bun tooling/benchmark.ts",
     "prepare": "effect-tsgo patch --no-typescript --oxlint",
     "lint:ts": "oxlint --deny-warnings --report-unused-disable-directives src tooling tests alchemy.run.ts",
-    "lint:rust": "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings && cargo clippy --workspace --lib --target wasm32-unknown-unknown --release --locked -- -D warnings"
+    "lint:rust": "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings && cargo clippy --workspace --lib --target wasm32-unknown-unknown --release --locked -- -D warnings",
+    "quality": "bun run build && bun tooling/quality.ts"
   },
   "dependencies": {
     "effect": "4.0.4"

@@ -2,7 +2,7 @@
 
 Search on Cloudflare: an R2-native BM25 engine, volatile Durable Object coordination, and native Vectorize similarity search. Effect owns the HTTP contracts and operation boundaries. Rust compiles to WebAssembly for Unicode normalization, immutable compressed segments, positional postings and exact block-bound pruning. R2 stores the manifests, index segments, documents, tombstones, write logs, receipts and vector outbox. The application never uses Durable Object storage or a local database.
 
-**Status:** local validation and native Alchemy deployment passed. Real R2 writes, BM25 reads, queue submission, eventual Vectorize visibility and native Worker/Cache API hits have been exercised. A deployed 10,000-document BM25 comparison is recorded in [performance evidence](docs/performance.md); general parity, larger scale, vector recall and ranking quality remain unverified. Raio is inspired by object-storage search architecture; it is not a Turbopuffer implementation or API-compatible replacement.
+**Status:** local validation and native Alchemy deployment passed. Real R2 writes, BM25 reads, queue submission, eventual Vectorize visibility and native Worker/Cache API hits have been exercised. A deployed 10,000-document BM25 comparison is recorded in [performance evidence](docs/performance.md); general parity, million-document scale and vector recall remain unverified. [SciFact retrieval quality](docs/quality.md) passed a local workerd evaluation with independent judgments. Raio is inspired by object-storage search architecture; it is not a Turbopuffer implementation or API-compatible replacement.
 
 ## Build and test
 

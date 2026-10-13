@@ -36,7 +36,7 @@ const queries = new Map(
 );
 const judgments = new Map<string, Map<string, number>>();
 const known = new Set(documents.map((document) => document.id));
-const qrelLines = qrelBytes.trim().split("\n");
+const qrelLines = qrelBytes.trim().split(/\r?\n/);
 if (qrelLines[0] !== "query-id\tcorpus-id\tscore") throw new Error("Invalid judgment header");
 for (const line of qrelLines.slice(1)) {
   const [query, document, relevance] = Schema.decodeUnknownSync(judgment)(line.split("\t"));

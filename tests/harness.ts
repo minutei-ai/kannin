@@ -12,7 +12,7 @@ export async function startWorker(persistence?: string, consumeQueues = false) {
   });
   if (!bundle.success) throw new AggregateError(bundle.logs);
   const artifact = bundle.outputs[0];
-  if (!artifact) throw new Error("Missing vector fixture artifact");
+  if (artifact === undefined) throw new Error("Missing vector fixture artifact");
   const vectorScript = await artifact.text();
   const triggers = [];
   if (consumeQueues)

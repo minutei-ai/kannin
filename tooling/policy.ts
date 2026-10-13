@@ -1,7 +1,7 @@
 import { definePlugin, defineRule } from "@oxlint/plugins";
 import type { ESTree } from "@oxlint/plugins";
 export default definePlugin({
-  meta: { name: "raio" },
+  meta: { name: "kannin" },
   rules: {
     syntax: defineRule({
       meta: {

@@ -133,7 +133,7 @@ test("global segment pruning matches an independent exhaustive BM25 oracle", asy
     expect(found.rows.map((row) => row.id)).toEqual(scores.map((row) => row.id));
     for (const [index, row] of found.rows.entries()) {
       const expected = scores[index];
-      if (!expected) throw new Error("Missing reference row");
+      if (expected === undefined) throw new Error("Missing reference row");
       expect(row.score).toBeCloseTo(expected.score, 10);
     }
   }
@@ -188,7 +188,7 @@ test("concurrent cold edge reads preserve posting order, scores and directory ow
     }),
   );
   const reference = results[0];
-  if (!reference) throw new Error("Missing reference response");
+  if (reference === undefined) throw new Error("Missing reference response");
   expect(reference.rows.length).toBe(20);
   expect(reference.sequence).toBe(4);
   for (const result of results) expect(result).toEqual(reference);

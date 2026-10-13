@@ -30,7 +30,7 @@
     ],
     "eslint/eqeqeq": ["error", "always"],
     "eslint/no-debugger": "error",
-    "raio/syntax": "error",
+    "kannin/syntax": "error",
     "eslint/no-await-in-loop": "off",
     "unicorn/no-array-sort": "off",
     "eslint/no-underscore-dangle": [
@@ -38,7 +38,16 @@
       {
         "allow": ["_attempt", "_warmup", "_iteration", "_tag"]
       }
-    ]
+    ],
+    "effecttsgo/strict-boolean-expressions": "error",
+    "effecttsgo/unsafe-effect-type-assertion": "error",
+    "effecttsgo/any-unknown-in-error-context": "error",
+    "effecttsgo/process-env-in-effect": "error",
+    "effecttsgo/global-console-in-effect": "error",
+    "effecttsgo/global-date-in-effect": "error",
+    "effecttsgo/global-random-in-effect": "error",
+    "effecttsgo/global-timers-in-effect": "error",
+    "effecttsgo/crypto-random-uuid-in-effect": "error"
   },
   "ignorePatterns": ["node_modules/**", "target/**", "dist/**", "coverage/**"],
   "jsPlugins": ["./tooling/policy.ts"],

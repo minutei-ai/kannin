@@ -42,7 +42,7 @@ for (const query of queries) {
   });
   if (!response.ok) throw new Error(`Load baseline failed: ${response.status}`);
   const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
-  if (!result.rows.length) throw new Error("Load requires a populated benchmark corpus");
+  if (result.rows.length === 0) throw new Error("Load requires a populated benchmark corpus");
   baselines.push(Schema.encodeSync(Schema.fromJsonString(Schema.Array(Row)))(result.rows));
 }
 const reports = [];
@@ -55,7 +55,7 @@ for (const concurrency of [1, 4, 16]) {
         Effect.gen(function* () {
           const query = queries[index % queries.length];
           const baseline = baselines[index % queries.length];
-          if (!query || baseline === undefined)
+          if (query === undefined || baseline === undefined)
             return yield* new LoadFailure({ message: "Missing load case" });
           const begin = yield* Clock.currentTimeNanos;
           const encoded = yield* Schema.encodeEffect(Schema.fromJsonString(Query))({

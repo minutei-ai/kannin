@@ -12,10 +12,10 @@ test("native Cache API retains immutable ranges after the memory cache is discar
   expect(initial.status).toBe(200);
   const bucket = await worker.getR2Bucket("STORAGE");
   const root = await bucket.get("namespaces/cached/root.json");
-  if (!root) throw new Error("Missing root");
+  if (root === null) throw new Error("Missing root");
   const manifest = Schema.decodeSync(Schema.fromJsonString(Root))(await root.text());
   const segment = manifest.segments[0];
-  if (!segment) throw new Error("Missing committed segment");
+  if (segment === undefined) throw new Error("Missing committed segment");
   const caches = await worker.getCaches();
   const cache = await caches.open("raio-segments-v1");
   const key = new URL("https://raio-cache.internal/range");
@@ -25,7 +25,7 @@ test("native Cache API retains immutable ranges after the memory cache is discar
   key.searchParams.set("bucket", "raio-test");
   const cached = await cache.match(key);
   expect(cached).toBeDefined();
-  if (!cached) return;
+  if (cached === undefined) return;
   expect((await cached.arrayBuffer()).byteLength).toBe(segment.headerBytes);
   await request(worker, "cached", "rebuild", {});
   expect((await request(worker, "cached", "query", textQuery("original"))).status).toBe(200);

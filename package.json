@@ -8,17 +8,18 @@
     "build": "bun tooling/build.ts",
     "test": "bun run build && bun run test:built",
     "test:built": "cargo test --workspace --locked && bun test",
-    "check": "bun run format:check && bun run build && bun run lint:ts && bun run lint:rust && tsc --noEmit && bun run test:built",
+    "check": "bun run format:check && bun run build && bun run lint:ts && bun run lint:rust && bun run typecheck && bun run test:built",
     "format": "oxfmt . && cargo fmt --all",
     "format:check": "oxfmt --check . && cargo fmt --all -- --check",
     "dev": "bun run build && alchemy dev alchemy.run.ts --stage dev --profile minutei",
     "plan": "bun run build && alchemy plan alchemy.run.ts --profile minutei",
     "deploy": "bun run build && alchemy deploy alchemy.run.ts --profile minutei",
     "bench": "bun tooling/benchmark.ts",
-    "prepare": "effect-tsgo patch --no-typescript --oxlint",
-    "lint:ts": "oxlint --deny-warnings --report-unused-disable-directives src tooling tests alchemy.run.ts",
+    "prepare": "effect-tsgo patch --oxlint",
+    "lint:ts": "oxlint --deny-warnings --report-unused-disable-directives .",
     "lint:rust": "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings && cargo clippy --workspace --lib --target wasm32-unknown-unknown --release --locked -- -D warnings",
-    "quality": "bun run build && bun tooling/quality.ts"
+    "quality": "bun run build && bun tooling/quality.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "effect": "4.0.4"

@@ -13,6 +13,7 @@ pub enum LogError {
     TooLarge,
     InvalidHeader,
     InvalidLength,
+    InvalidEncodedLength(std::num::TryFromIntError),
     InvalidHeaderWidth(String),
     InvalidCompression(String),
     InvalidChecksum,
@@ -27,6 +28,7 @@ impl fmt::Display for LogError {
 
 impl std::error::Error for LogError {}
 
+#[doc = "# Errors\nRejects logs beyond the size budget or an unrepresentable encoded length."]
 pub fn encode_log(json: &str) -> Result<Vec<u8>, LogError> {
     if json.len() > MAX_LOG_BYTES {
         return Err(LogError::TooLarge);
@@ -34,12 +36,15 @@ pub fn encode_log(json: &str) -> Result<Vec<u8>, LogError> {
     let compressed = miniz_oxide::deflate::compress_to_vec_zlib(json.as_bytes(), 3);
     let mut output = Vec::with_capacity(HEADER_BYTES + compressed.len());
     output.extend_from_slice(MAGIC);
-    output.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    output.extend_from_slice(
+        &(u32::try_from(json.len()).map_err(LogError::InvalidEncodedLength)?).to_le_bytes(),
+    );
     output.extend_from_slice(&crc32fast::hash(json.as_bytes()).to_le_bytes());
     output.extend_from_slice(&compressed);
     Ok(output)
 }
 
+#[doc = "# Errors\nRejects invalid framing, size limits, compressed data, checksums, lengths, or UTF-8."]
 pub fn decode_log(bytes: &[u8]) -> Result<String, LogError> {
     if bytes.len() < HEADER_BYTES || &bytes[..8] != MAGIC {
         return Err(LogError::InvalidHeader);
@@ -88,16 +93,19 @@ pub mod wasm {
     use wasm_bindgen::prelude::*;
 
     #[wasm_bindgen]
+    #[doc = "# Errors\nRejects invalid log lengths or logs beyond the size budget."]
     pub fn pack(json: &str) -> Result<Vec<u8>, JsValue> {
         super::encode_log(json).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     #[wasm_bindgen]
+    #[doc = "# Errors\nRejects invalid frames, lengths, checksums, compression, or UTF-8."]
     pub fn unpack(bytes: &[u8]) -> Result<String, JsValue> {
         super::decode_log(bytes).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     #[wasm_bindgen]
+    #[must_use]
     pub fn tokenize(text: &str) -> String {
         super::normalize_text(text)
     }
@@ -108,7 +116,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unicode_search_is_case_and_accent_insensitive() -> Result<(), Box<dyn std::error::Error>> {
+    fn unicode_search_is_case_and_accent_insensitive() {
         assert_eq!(
             normalize_text("AÇÃO São ﬂores CAFÉ"),
             "acao sao flores cafe"
@@ -116,8 +124,6 @@ mod tests {
         assert_eq!(normalize_text("cafe\u{301}"), "cafe");
         assert_eq!(normalize_text("日本語 中文 rust🔥"), "日 本 語 中 文 rust");
         assert_eq!(normalize_text("\" OR * NEAR(a)"), "or near a");
-
-        Ok(())
     }
 
     #[test]

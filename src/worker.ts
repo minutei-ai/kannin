@@ -84,11 +84,11 @@ export class Segments extends WorkerEntrypoint<Env> {
         Effect.orElseSucceed(() => undefined),
       ),
     );
-    if (cache) {
+    if (cache !== undefined) {
       const cached = await Effect.runPromise(
         Effect.tryPromise(() => cache.match(cacheKey)).pipe(Effect.orElseSucceed(() => undefined)),
       );
-      if (cached) {
+      if (cached !== undefined) {
         const response = new Response(cached.body, cached);
         response.headers.delete("cf-cache-status");
         response.headers.set("x-raio-cache", "api-hit");
@@ -98,7 +98,7 @@ export class Segments extends WorkerEntrypoint<Env> {
     const object = await this.env.STORAGE.get(input.key, {
       range: { offset: input.offset, length: input.length },
     });
-    if (!object)
+    if (object === null)
       return new Response(null, { status: 404, headers: { "cache-control": "no-store" } });
     const bytes = await object.arrayBuffer();
     if (bytes.byteLength !== input.length)
@@ -111,7 +111,7 @@ export class Segments extends WorkerEntrypoint<Env> {
         etag: object.httpEtag,
       },
     });
-    if (cache)
+    if (cache !== undefined)
       this.ctx.waitUntil(
         Effect.runPromise(
           Effect.tryPromise(() => cache.put(cacheKey, response.clone())).pipe(Effect.ignore),
@@ -139,7 +139,7 @@ const Located = LocatedDocument.mapFields((fields) => ({
 const readBody = Effect.fn("raio.readBody")(function* (request: Pick<Request, "headers" | "body">) {
   if (request.headers.get("content-type")?.split(";")[0] !== "application/json")
     return yield* new Rejected({ status: 415, message: "Expected application/json" });
-  if (!request.body) return yield* new Rejected({ status: 400, message: "Missing body" });
+  if (request.body === null) return yield* new Rejected({ status: 400, message: "Missing body" });
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
   const count = { bytes: 0 };
@@ -182,7 +182,7 @@ async function locate(env: Env, ids: ReadonlyArray<string>, root: typeof Root.Ty
       segment.documentBloom,
       ids.filter((id) => !found.has(id)),
     );
-    if (!candidates.length) continue;
+    if (candidates.length === 0) continue;
     const rows = await Effect.runPromise(
       withDirectory(env.STORAGE, segment.key, segment.headerBytes, (decoded) =>
         Effect.gen(function* () {
@@ -216,7 +216,7 @@ async function textQuery(
   const terms = [...new Set(words)];
   if (terms.length > 64 || (input.match === "phrase" && words.length > 64))
     throw new Rejected({ status: 400, message: "Query exceeds 64 normalized terms" });
-  if (!terms.length || !root.documents) return [];
+  if (terms.length === 0 || root.documents === 0) return [];
   const selected = root.segments.filter(
     (segment) => bloomCandidates(segment.termBloom, terms).length > 0,
   );
@@ -277,7 +277,8 @@ async function textQuery(
         ),
       );
       const cutoff = ranked[ranked.length - 1];
-      if (!cutoff) throw new Rejected({ status: 503, message: "Invalid ranking cutoff" });
+      if (cutoff === undefined)
+        throw new Rejected({ status: 503, message: "Invalid ranking cutoff" });
       if (
         bound + 1e-12 < cutoff.score ||
         (bound === cutoff.score && segment.minimumId >= cutoff.id)
@@ -309,7 +310,7 @@ async function textQuery(
                   ([term, metadata]) =>
                     Effect.gen(function* () {
                       const first = metadata.blocks[0];
-                      if (!first)
+                      if (first === undefined)
                         return yield* new Rejected({
                           status: 503,
                           message: "Empty posting directory",
@@ -450,7 +451,7 @@ async function vectorQuery(env: Env, input: typeof Query.Type, root: typeof Root
     topK: 50,
     returnMetadata: "all",
   };
-  if (Object.keys(prefilter).length) options.filter = prefilter;
+  if (Object.keys(prefilter).length > 0) options.filter = prefilter;
   const result = await env.VECTORS.query([...input.vector], options);
   const candidate = Schema.Struct({ id: Schema.String, revision: Schema.Int });
   const metadata = result.matches.map((match) => ({
@@ -466,7 +467,7 @@ async function vectorQuery(env: Env, input: typeof Query.Type, root: typeof Root
   for (const item of metadata) {
     const location = current.get(item.metadata.id);
     if (
-      !location ||
+      location === undefined ||
       location.document.revision !== item.metadata.revision ||
       !location.document.vector
     )
@@ -548,9 +549,9 @@ export class SearchNamespace extends DurableObject<Env> {
   }
 
   private async root() {
-    if (this.current) return this.current;
+    if (this.current !== undefined) return this.current;
     const object = await this.env.STORAGE.get(`${this.prefix}/root.json`);
-    if (object) {
+    if (object !== null) {
       this.current = { manifest: decodeRoot(await object.text()), etag: object.etag };
       return this.current;
     }
@@ -558,7 +559,7 @@ export class SearchNamespace extends DurableObject<Env> {
       prefix: `${this.prefix}/receipts/`,
       limit: 1,
     });
-    if (acknowledged.objects.length)
+    if (acknowledged.objects.length > 0)
       throw new Rejected({
         status: 503,
         message: "R2 manifest missing for an acknowledged namespace",
@@ -585,12 +586,12 @@ export class SearchNamespace extends DurableObject<Env> {
     const options = { onlyIf: condition };
     const content = encodeRoot(manifest);
     const result: { object: R2Object | null } = { object: null };
-    if (etag)
+    if (etag !== null)
       result.object = await this.env.STORAGE.put(`${this.prefix}/root.json`, content, {
         onlyIf: { etagMatches: etag },
       });
     else result.object = await this.env.STORAGE.put(`${this.prefix}/root.json`, content, options);
-    if (!result.object)
+    if (result.object === null)
       throw new Rejected({
         status: 409,
         message: "R2 manifest changed; retry the operation with the same requestId",
@@ -602,7 +603,7 @@ export class SearchNamespace extends DurableObject<Env> {
   private async persistReceipt(receipt: typeof Receipt.Type) {
     const acknowledged = this.acknowledgedReceipt;
     if (
-      acknowledged &&
+      acknowledged !== undefined &&
       acknowledged.sequence === receipt.sequence &&
       acknowledged.digest === receipt.digest &&
       acknowledged.requestId === receipt.requestId
@@ -616,9 +617,9 @@ export class SearchNamespace extends DurableObject<Env> {
         onlyIf: { etagDoesNotMatch: "*" },
       },
     );
-    if (!stored) {
+    if (stored === null) {
       const existing = await this.env.STORAGE.get(key);
-      if (!existing)
+      if (existing === null)
         throw new Rejected({
           status: 503,
           message: "Committed receipt missing after conditional write",
@@ -648,17 +649,19 @@ export class SearchNamespace extends DurableObject<Env> {
     const ids = [...input.upserts.map((document) => document.id), ...input.deletes];
     if (new Set(ids).size !== ids.length)
       throw new Rejected({ status: 400, message: "Duplicate ids within a write" });
-    if (!input.reset && !ids.length) throw new Rejected({ status: 400, message: "Empty write" });
+    if (input.reset !== true && ids.length === 0)
+      throw new Rejected({ status: 400, message: "Empty write" });
     for (const document of input.upserts)
-      if (document.vector && document.vector.length !== 768)
+      if (document.vector !== undefined && document.vector.length !== 768)
         throw new Rejected({ status: 400, message: "Vector dimension must be 768" });
     const fingerprint = await sha256(Schema.encodeSync(Schema.fromJsonString(Write))(input));
     const current = await this.root();
-    if (current.manifest.lastReceipt) await this.persistReceipt(current.manifest.lastReceipt);
+    if (current.manifest.lastReceipt !== null)
+      await this.persistReceipt(current.manifest.lastReceipt);
     const priorObject = await this.env.STORAGE.get(
       `${this.prefix}/receipts/${await sha256(input.requestId)}.json`,
     );
-    if (priorObject) {
+    if (priorObject !== null) {
       const receipt = Schema.decodeSync(Schema.fromJsonString(Receipt))(await priorObject.text());
       if (receipt.digest !== fingerprint)
         throw new Rejected({
@@ -666,7 +669,7 @@ export class SearchNamespace extends DurableObject<Env> {
           message: "requestId already used with a different payload",
         });
       const pending = current.manifest.vectorJobs.find((job) => job.sequence === receipt.sequence);
-      if (pending) await this.enqueue(namespace, { namespace, ...pending });
+      if (pending !== undefined) await this.enqueue(namespace, { namespace, ...pending });
       if (receipt.sequence % 16 === 0) await this.enqueueCompaction(namespace, current.manifest);
       return Response.json(
         Schema.encodeSync(WriteResult)({
@@ -726,7 +729,7 @@ export class SearchNamespace extends DurableObject<Env> {
       };
     });
     const epoch = { value: current.manifest.vectorEpoch };
-    if (input.reset) {
+    if (input.reset === true) {
       segments.splice(0);
       totals.documents = 0;
       totals.title = 0;
@@ -746,7 +749,7 @@ export class SearchNamespace extends DurableObject<Env> {
     } as const;
     const encodedLog = pack(encodeLog(log));
     writes.push(() => this.env.STORAGE.put(logKey, encodedLog));
-    if (input.upserts.length) {
+    if (input.upserts.length > 0) {
       const built = await Effect.runPromise(
         buildSegment(input.upserts.map((document) => ({ ...document, revision: sequence }))),
       );
@@ -774,7 +777,7 @@ export class SearchNamespace extends DurableObject<Env> {
     if (stored.some((object) => object === null))
       throw new Rejected({ status: 503, message: "R2 immutable write failed" });
     const jobs = [...current.manifest.vectorJobs];
-    if (vectorDeletes.length || input.upserts.some((document) => document.vector))
+    if (vectorDeletes.length > 0 || input.upserts.some((document) => document.vector !== undefined))
       jobs.push({ log: logKey, sequence });
     const receipt = { sequence, requestId: input.requestId, digest: fingerprint };
     const manifest = {
@@ -818,7 +821,7 @@ export class SearchNamespace extends DurableObject<Env> {
       );
     } else {
       const object = await this.env.STORAGE.get(key);
-      if (!object)
+      if (object === null)
         throw new Rejected({ status: 410, message: "Rebuild snapshot no longer exists" });
       const now = Effect.runSync(Clock.currentTimeMillis);
       if (now - object.uploaded.getTime() >= SNAPSHOT_RETENTION_MS)
@@ -846,7 +849,8 @@ export class SearchNamespace extends DurableObject<Env> {
     const budget = { processed: 0 };
     while (cursor.segment < saved.root.segments.length && budget.processed < 100) {
       const segment = saved.root.segments[cursor.segment];
-      if (!segment) throw new Rejected({ status: 503, message: "Missing rebuild segment" });
+      if (segment === undefined)
+        throw new Rejected({ status: 503, message: "Missing rebuild segment" });
       const rows = await Effect.runPromise(
         withDirectory(this.env.STORAGE, segment.key, segment.headerBytes, (directory) =>
           Effect.gen(function* () {
@@ -870,7 +874,7 @@ export class SearchNamespace extends DurableObject<Env> {
         budget.processed += 1;
         const location = current.get(metadata.id);
         if (
-          !location ||
+          location === undefined ||
           !location.document.vector ||
           location.document.revision !== metadata.revision
         ) {
@@ -884,7 +888,7 @@ export class SearchNamespace extends DurableObject<Env> {
           location.document.data,
           location.segment.bytes,
         );
-        if (!document.vector)
+        if (document.vector === undefined)
           throw new Rejected({ status: 503, message: "Rebuild vector payload missing" });
         vectors.push({
           id: await vectorId(saved.root.vectorEpoch, document.id, document.revision),
@@ -902,8 +906,8 @@ export class SearchNamespace extends DurableObject<Env> {
         cursor.row = 0;
       }
     }
-    if (removed.length) await this.env.VECTORS.deleteByIds(removed);
-    if (vectors.length) await this.env.VECTORS.upsert(vectors);
+    if (removed.length > 0) await this.env.VECTORS.deleteByIds(removed);
+    if (vectors.length > 0) await this.env.VECTORS.upsert(vectors);
     const complete = cursor.segment === saved.root.segments.length;
     const result = {
       snapshot,
@@ -927,7 +931,8 @@ export class SearchNamespace extends DurableObject<Env> {
     );
     for (const job of jobs) {
       const object = await this.env.STORAGE.get(job.log);
-      if (!object) throw new Rejected({ status: 503, message: "Committed vector log missing" });
+      if (object === null)
+        throw new Rejected({ status: 503, message: "Committed vector log missing" });
       const log = decodeLog(unpack(new Uint8Array(await object.arrayBuffer())));
       if (log.sequence !== job.sequence)
         throw new Rejected({ status: 503, message: "Vector log sequence mismatch" });
@@ -936,8 +941,8 @@ export class SearchNamespace extends DurableObject<Env> {
         (_, ordinal) => ordinal * 100,
       ))
         await this.env.VECTORS.deleteByIds(log.vectorDeletes.slice(offset, offset + 100));
-      const candidates = log.write.upserts.filter((document) => document.vector);
-      if (log.vectorEpoch !== current.manifest.vectorEpoch || !candidates.length) {
+      const candidates = log.write.upserts.filter((document) => document.vector !== undefined);
+      if (log.vectorEpoch !== current.manifest.vectorEpoch || candidates.length === 0) {
         completed.add(job.sequence);
         continue;
       }
@@ -949,9 +954,9 @@ export class SearchNamespace extends DurableObject<Env> {
       const vectors = [];
       for (const document of candidates)
         if (
-          document.vector &&
+          document.vector !== undefined &&
           live.get(document.id)?.document.revision === log.sequence &&
-          live.get(document.id)?.document.vector
+          live.get(document.id)?.document.vector === true
         )
           vectors.push({
             id: await vectorId(log.vectorEpoch, document.id, log.sequence),
@@ -970,7 +975,7 @@ export class SearchNamespace extends DurableObject<Env> {
         await this.env.VECTORS.upsert(vectors.slice(offset, offset + 100));
       completed.add(job.sequence);
     }
-    if (completed.size)
+    if (completed.size > 0)
       await this.commit(
         {
           ...current.manifest,
@@ -1014,7 +1019,7 @@ export class SearchNamespace extends DurableObject<Env> {
             message: "Rebuild checkpoints exceed collection byte budget",
           });
         const object = await this.env.STORAGE.get(checkpoint.key);
-        if (!object)
+        if (object === null)
           throw new Rejected({
             status: 503,
             message: "Rebuild checkpoint disappeared during collection",
@@ -1046,7 +1051,7 @@ export class SearchNamespace extends DurableObject<Env> {
         continue;
       }
       const marker = await this.env.STORAGE.get(markerKey);
-      if (marker) {
+      if (marker !== null) {
         const retirement = Schema.decodeSync(Schema.fromJsonString(Retirement))(
           await marker.text(),
         );
@@ -1141,11 +1146,11 @@ export class SearchNamespace extends DurableObject<Env> {
     const retained = current.manifest.segments.filter(
       (segment) => !selected.some((source) => source.key === segment.key),
     );
-    if (documents.length) {
+    if (documents.length > 0) {
       const built = await Effect.runPromise(buildSegment(documents));
       const key = `${this.prefix}/segments/compact-${current.manifest.sequence}-${crypto.randomUUID()}.rsix`;
       const stored = await this.env.STORAGE.put(key, built.bytes);
-      if (!stored)
+      if (stored === null)
         throw new Rejected({ status: 503, message: "Compacted R2 segment write failed" });
       retained.push({
         key,
@@ -1200,7 +1205,7 @@ export class SearchNamespace extends DurableObject<Env> {
         body.text = yield* readBody(request);
       if (
         (operation === "compact" || operation === "vector-sync" || operation === "rebuild") &&
-        request.body
+        request.body !== null
       ) {
         const text = yield* readBody(request);
         yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Struct({})), {
@@ -1370,7 +1375,7 @@ export class SearchNamespace extends DurableObject<Env> {
             const job = current.manifest.vectorJobs.find(
               (pending) => pending.sequence === message.sequence,
             );
-            if (job && job.log !== message.log)
+            if (job !== undefined && job.log !== message.log)
               return yield* new Rejected({ status: 400, message: "Vector job log mismatch" });
             return yield* Effect.tryPromise({
               try: () => this.synchronizeVectors(message.sequence),
@@ -1427,7 +1432,7 @@ const MAX_WARM_SNAPSHOT_BYTES = 4 * 1024 * 1024;
 
 function rememberSnapshot(key: string, snapshot: typeof Snapshot.Type, encoded: string) {
   const prior = warmSnapshots.get(key);
-  if (prior) warmSnapshotBudget.bytes -= prior.bytes;
+  if (prior !== undefined) warmSnapshotBudget.bytes -= prior.bytes;
   warmSnapshots.delete(key);
   const bytes = new TextEncoder().encode(encoded).byteLength * 4;
   if (bytes > MAX_WARM_SNAPSHOT_BYTES) return;
@@ -1435,7 +1440,7 @@ function rememberSnapshot(key: string, snapshot: typeof Snapshot.Type, encoded: 
   warmSnapshotBudget.bytes += bytes;
   while (warmSnapshotBudget.bytes > MAX_WARM_SNAPSHOT_BYTES) {
     const oldest = warmSnapshots.entries().next().value;
-    if (!oldest) break;
+    if (oldest === undefined) break;
     warmSnapshots.delete(oldest[0]);
     warmSnapshotBudget.bytes -= oldest[1].bytes;
   }
@@ -1452,7 +1457,7 @@ const refreshSnapshot = Effect.fn("raio.refreshSnapshot")(function* (
   const object = yield* Effect.tryPromise(() =>
     env.STORAGE.get(`namespaces/${namespace}/root.json`),
   );
-  if (!object) return undefined;
+  if (object === null) return undefined;
   const manifest = yield* Effect.tryPromise(() => object.text()).pipe(
     Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(Root))),
   );
@@ -1461,7 +1466,7 @@ const refreshSnapshot = Effect.fn("raio.refreshSnapshot")(function* (
   const snapshot = { observedAt: now, manifest };
   const encoded = yield* Schema.encodeEffect(Schema.fromJsonString(Snapshot))(snapshot);
   rememberSnapshot(cacheKey.href, snapshot, encoded);
-  if (cache) {
+  if (cache !== undefined) {
     yield* Effect.tryPromise(() =>
       cache.put(
         cacheKey,
@@ -1496,21 +1501,21 @@ const edgeSnapshot = Effect.fn("raio.edgeSnapshot")(function* (
   const selection = { snapshot: memory?.snapshot };
   const observedAt = yield* Clock.currentTimeMillis;
   if (
-    !selection.snapshot ||
+    selection.snapshot === undefined ||
     observedAt < selection.snapshot.observedAt ||
     observedAt - selection.snapshot.observedAt >= 1000 ||
     selection.snapshot.manifest.sequence < minimumSequence
   ) {
-    if (memory) {
+    if (memory !== undefined) {
       warmSnapshots.delete(cacheKey.href);
       warmSnapshotBudget.bytes -= memory.bytes;
     }
     selection.snapshot = undefined;
-    if (cache) {
+    if (cache !== undefined) {
       const cached = yield* Effect.tryPromise(() => cache.match(cacheKey)).pipe(
         Effect.orElseSucceed(() => undefined),
       );
-      if (cached) {
+      if (cached !== undefined) {
         const encoded = yield* Effect.tryPromise(() => cached.text()).pipe(
           Effect.orElseSucceed(() => undefined),
         );
@@ -1519,7 +1524,7 @@ const edgeSnapshot = Effect.fn("raio.edgeSnapshot")(function* (
             Effect.orElseSucceed(() => undefined),
           );
           selection.snapshot = decoded;
-          if (decoded) rememberSnapshot(cacheKey.href, decoded, encoded);
+          if (decoded !== undefined) rememberSnapshot(cacheKey.href, decoded, encoded);
         }
       }
     }
@@ -1527,13 +1532,13 @@ const edgeSnapshot = Effect.fn("raio.edgeSnapshot")(function* (
   const snapshot = selection.snapshot;
   const selectedAt = yield* Clock.currentTimeMillis;
   if (
-    snapshot &&
+    snapshot !== undefined &&
     selectedAt >= snapshot.observedAt &&
     selectedAt - snapshot.observedAt < 1000 &&
     snapshot.manifest.sequence >= minimumSequence
   ) {
     const retained = warmSnapshots.get(cacheKey.href);
-    if (retained) {
+    if (retained !== undefined) {
       warmSnapshots.delete(cacheKey.href);
       warmSnapshots.set(cacheKey.href, retained);
     }
@@ -1593,7 +1598,7 @@ export default {
       });
     }
     const match = /^\/v1\/namespaces\/([^/]+)\/([^/]+)$/.exec(url.pathname);
-    if (!match || !Schema.is(NamespaceName)(match[1]) || !Schema.is(Operation)(match[2]))
+    if (match === null || !Schema.is(NamespaceName)(match[1]) || !Schema.is(Operation)(match[2]))
       return Response.json(Schema.encodeSync(ErrorBody)({ error: "Unknown route" }), {
         status: 404,
       });
@@ -1632,7 +1637,7 @@ export default {
             const snapshotStarted = yield* Clock.currentTimeNanos;
             const manifest = yield* edgeSnapshot(ctx, env, namespace, input.minimumSequence ?? 0);
             const snapshotEnded = yield* Clock.currentTimeNanos;
-            if (manifest) {
+            if (manifest !== undefined) {
               const evaluated = yield* Effect.tryPromise({
                 try: () => query(env, input, manifest),
                 catch: (cause) => {

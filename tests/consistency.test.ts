@@ -10,7 +10,7 @@ afterAll(() => worker.dispose());
 async function seedSnapshot(namespace: string, observedAt: number) {
   const bucket = await worker.getR2Bucket("STORAGE");
   const object = await bucket.get(`namespaces/${namespace}/root.json`);
-  if (!object) throw new Error("Missing manifest");
+  if (object === null) throw new Error("Missing manifest");
   const manifest = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
   const cache = await (await worker.getCaches()).open("raio-snapshots-v1");
   const key = new URL(`https://raio-cache.internal/snapshots/${namespace}`);
@@ -190,7 +190,7 @@ test("a still-valid older snapshot serves immediately while native background wo
   const state = { refreshed: false };
   for (const attempt of Array.from({ length: 20 }, (_, index) => index)) {
     const cached = await cache.match(key);
-    if (cached) {
+    if (cached !== undefined) {
       const snapshot = Schema.decodeSync(Schema.fromJsonString(Snapshot))(await cached.text());
       if (snapshot.manifest.sequence === 2) {
         state.refreshed = true;

@@ -55,7 +55,7 @@ test("BM25 term frequency and length normalization", async () => {
   );
   expect(found.rows.map((row) => row.id)).toEqual(["short", "long"]);
   const [first, second] = found.rows;
-  if (!first || !second) throw new Error("Expected two ranked rows");
+  if (first === undefined || second === undefined) throw new Error("Expected two ranked rows");
   expect(first.score).toBeGreaterThan(second.score);
 });
 

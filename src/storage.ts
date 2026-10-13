@@ -43,14 +43,14 @@ function cachePrefix(bucket: R2Bucket, key: string) {
 
 function remember(key: string, bytes: Uint8Array) {
   const previous = buffers.get(key);
-  if (previous) budget.bytes -= previous.byteLength;
+  if (previous !== undefined) budget.bytes -= previous.byteLength;
   buffers.delete(key);
   if (bytes.byteLength > MAX_CACHE_BYTES) return;
   buffers.set(key, bytes);
   budget.bytes += bytes.byteLength;
   while (budget.bytes > MAX_CACHE_BYTES) {
     const oldest = buffers.entries().next().value;
-    if (!oldest) break;
+    if (oldest === undefined) break;
     buffers.delete(oldest[0]);
     budget.bytes -= oldest[1].byteLength;
   }
@@ -59,7 +59,7 @@ function remember(key: string, bytes: Uint8Array) {
 export async function range(bucket: R2Bucket, key: string, offset: number, length: number) {
   const cacheKey = cachePrefix(bucket, `${key}/${offset}/${length}`);
   const cached = buffers.get(cacheKey);
-  if (cached) {
+  if (cached !== undefined) {
     reads.rangeCacheHits += 1;
     buffers.delete(cacheKey);
     buffers.set(cacheKey, cached);
@@ -90,7 +90,7 @@ export async function range(bucket: R2Bucket, key: string, offset: number, lengt
 async function acquireDirectory(bucket: R2Bucket, key: string, headerBytes: number) {
   const identity = cachePrefix(bucket, key);
   const cached = directories.get(identity);
-  if (cached) {
+  if (cached !== undefined) {
     reads.directoryCacheHits += 1;
     directories.delete(identity);
     directories.set(identity, cached);
@@ -98,7 +98,7 @@ async function acquireDirectory(bucket: R2Bucket, key: string, headerBytes: numb
   }
   const bytes = await range(bucket, key, 0, headerBytes);
   const concurrent = directories.get(identity);
-  if (concurrent) return concurrent.directory.retain();
+  if (concurrent !== undefined) return concurrent.directory.retain();
   const decoded = new Directory(bytes);
   const entry = { directory: decoded, bytes: decoded.heap_bytes() };
   if (entry.bytes > MAX_DECODED_BYTES) {
@@ -110,7 +110,7 @@ async function acquireDirectory(bucket: R2Bucket, key: string, headerBytes: numb
   }
   while (decodedBudget.bytes + entry.bytes > MAX_DECODED_BYTES) {
     const oldest = directories.entries().next().value;
-    if (!oldest) break;
+    if (oldest === undefined) break;
     directories.delete(oldest[0]);
     decodedBudget.bytes -= oldest[1].bytes;
     oldest[1].directory.free();
@@ -161,7 +161,7 @@ export function bloom(values: ReadonlyArray<string>) {
 
 export function bloomCandidates(encoded: string, values: ReadonlyArray<string>) {
   const cached = bloomBuffers.get(encoded);
-  if (cached) {
+  if (cached !== undefined) {
     bloomBuffers.delete(encoded);
     bloomBuffers.set(encoded, cached);
     return decodeStrings(segment_bloom_filter(cached, encodeStrings(values)));
@@ -171,7 +171,7 @@ export function bloomCandidates(encoded: string, values: ReadonlyArray<string>) 
   bloomBudget.bytes += bytes.byteLength;
   while (bloomBudget.bytes > 4 * 1024 * 1024) {
     const oldest = bloomBuffers.entries().next().value;
-    if (!oldest) break;
+    if (oldest === undefined) break;
     bloomBuffers.delete(oldest[0]);
     bloomBudget.bytes -= oldest[1].byteLength;
   }
@@ -190,7 +190,7 @@ export async function readDocument(
   if (offset < headerBytes || offset + data.length > totalBytes || data.length < 8)
     throw new Rejected({ status: 503, message: "Invalid segment document range" });
   const page: { bytes: Uint8Array } = { bytes: new Uint8Array(0) };
-  if (payload) page.bytes = payload.subarray(data.offset, data.offset + data.length);
+  if (payload !== undefined) page.bytes = payload.subarray(data.offset, data.offset + data.length);
   else page.bytes = await range(bucket, key, offset, data.length);
   const bytes = page.bytes;
   return Schema.decodeSync(Schema.fromJsonString(StoredDocument))(segment_document(bytes));

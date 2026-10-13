@@ -23,7 +23,7 @@ async function mature(namespace: string) {
   const markers = await bucket.list({ prefix: `namespaces/${namespace}/retired/` });
   for (const marker of markers.objects) {
     const object = await bucket.get(marker.key);
-    if (!object) throw new Error("Missing retirement marker");
+    if (object === null) throw new Error("Missing retirement marker");
     const saved = Schema.decodeSync(Schema.fromJsonString(Retirement))(await object.text());
     await bucket.put(
       marker.key,
@@ -92,12 +92,12 @@ test("a current segment cancels even an already mature retirement marker", async
   await request(worker, "repin", "write", write([document("a", "safe")]));
   const bucket = await worker.getR2Bucket("STORAGE", "raio");
   const rootObject = await bucket.get("namespaces/repin/root.json");
-  if (!rootObject) throw new Error("Missing manifest");
+  if (rootObject === null) throw new Error("Missing manifest");
   const root = Schema.decodeSync(Schema.fromJsonString(Root))(await rootObject.text());
   const segment = root.segments[0];
-  if (!segment) throw new Error("Missing segment");
+  if (segment === undefined) throw new Error("Missing segment");
   const object = await bucket.head(segment.key);
-  if (!object) throw new Error("Missing segment object");
+  if (object === null) throw new Error("Missing segment object");
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(segment.key));
   const hash = Array.from(new Uint8Array(digest), (byte) =>
     byte.toString(16).padStart(2, "0"),

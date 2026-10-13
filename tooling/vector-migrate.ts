@@ -10,7 +10,7 @@ const headers = {
 const page = { cursor: "", complete: false, namespaces: 0, submitted: 0 };
 while (!page.complete) {
   const target = new URL("/admin/namespaces", url);
-  if (page.cursor) target.searchParams.set("cursor", page.cursor);
+  if (page.cursor.length > 0) target.searchParams.set("cursor", page.cursor);
   const response = await fetch(target, { headers });
   if (!response.ok) throw new Error(`Namespace inventory failed: ${response.status}`);
   const inventory = Schema.decodeUnknownSync(NamespacePage)(await response.json());

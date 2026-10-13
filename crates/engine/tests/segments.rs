@@ -55,7 +55,7 @@ fn search(
         }
     }
     Ok(search
-        .finish()
+        .finish()?
         .into_iter()
         .map(|hit| (header.documents[hit.row as usize].id.clone(), hit.score))
         .collect())
@@ -230,23 +230,33 @@ fn block_pruning_matches_exhaustive_bm25_on_varied_documents()
             let body = raio_engine::normalize_text(&doc.text);
             let title_tokens: Vec<_> = title.split_whitespace().collect();
             let body_tokens: Vec<_> = body.split_whitespace().collect();
-            let score = ["alpha", "beta"]
+            let scores = ["alpha", "beta"]
                 .iter()
                 .map(|term| {
-                    let a = title_tokens.iter().filter(|word| **word == *term).count() as f64;
-                    let b = body_tokens.iter().filter(|word| **word == *term).count() as f64;
-                    let n = stats.documents as f64;
-                    let title_mean = stats.title_length as f64 / n;
-                    let body_mean = stats.body_length as f64 / n;
-                    let tf = 2.0 * a / (0.25 + 0.75 * title_tokens.len() as f64 / title_mean)
-                        + b / (0.25 + 0.75 * body_tokens.len() as f64 / body_mean);
-                    let df = stats.frequencies[*term] as f64;
-                    ((n - df + 0.5) / (df + 0.5) + 1.0).ln() * 2.2 * tf / (1.2 + tf)
+                    let a = f64::from(u32::try_from(
+                        title_tokens.iter().filter(|word| **word == *term).count(),
+                    )?);
+                    let b = f64::from(u32::try_from(
+                        body_tokens.iter().filter(|word| **word == *term).count(),
+                    )?);
+                    let n = f64::from(u32::try_from(stats.documents)?);
+                    let title_mean = f64::from(u32::try_from(stats.title_length)?) / n;
+                    let body_mean = f64::from(u32::try_from(stats.body_length)?) / n;
+                    let tf = 2.0 * a
+                        / (0.25
+                            + 0.75 * f64::from(u32::try_from(title_tokens.len())?) / title_mean)
+                        + b / (0.25
+                            + 0.75 * f64::from(u32::try_from(body_tokens.len())?) / body_mean);
+                    let df = f64::from(u32::try_from(stats.frequencies[*term])?);
+                    Ok::<_, Box<dyn std::error::Error>>(
+                        ((n - df + 0.5) / (df + 0.5)).ln_1p() * 2.2 * tf / (1.2 + tf),
+                    )
                 })
-                .sum::<f64>();
-            (doc.id.clone(), score)
+                .collect::<Result<Vec<_>, _>>()?;
+            let score = scores.into_iter().sum::<f64>();
+            Ok::<_, Box<dyn std::error::Error>>((doc.id.clone(), score))
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     expected.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let actual = search(docs, "alpha beta", "any", &[], &[], 10)?;
     assert_eq!(
@@ -280,15 +290,16 @@ fn equal_score_blocks_preserve_exact_top_k_ties() -> Result<(), Box<dyn std::err
 fn bloom_filters_have_no_false_negatives_and_bounded_false_positives()
 -> Result<(), Box<dyn std::error::Error>> {
     let values: Vec<_> = (0..1000).map(|index| format!("document-{index}")).collect();
-    let bloom = segment::bloom_build(&values);
-    assert!(
-        values
-            .iter()
-            .all(|value| segment::bloom_contains(&bloom, value))
-    );
-    let false_positives = (1000..11000)
-        .filter(|index| segment::bloom_contains(&bloom, &format!("document-{index}")))
-        .count();
+    let bloom = segment::bloom_build(&values)?;
+    for value in &values {
+        assert!(segment::bloom_contains(&bloom, value)?);
+    }
+    let mut false_positives = 0;
+    for index in 1000..11000 {
+        if segment::bloom_contains(&bloom, &format!("document-{index}"))? {
+            false_positives += 1;
+        }
+    }
     assert!(false_positives < 200, "{false_positives} false positives");
 
     Ok(())

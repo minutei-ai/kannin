@@ -11,14 +11,14 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 **100,000 documents · local workerd · warm queries · milliseconds (p50 / p95)**
 
-| Query     |         Strong | Edge eventual |
-| --------- | -------------: | ------------: |
-| Rare      |    4.39 / 5.35 |   3.19 / 5.50 |
-| Selective |  35.72 / 48.34 | 36.72 / 54.38 |
-| Common    |  37.68 / 50.09 | 39.38 / 54.62 |
-| Filtered  | 46.35 / 120.67 | 43.55 / 58.72 |
+| Query     |        Strong | Edge eventual |
+| --------- | ------------: | ------------: |
+| Rare      |   4.06 / 5.12 |   2.85 / 3.55 |
+| Selective | 40.37 / 53.99 | 38.73 / 55.00 |
+| Common    | 39.81 / 49.23 | 43.19 / 56.95 |
+| Filtered  | 46.77 / 68.24 | 41.84 / 50.65 |
 
-Local ingestion: **100,000 documents in 25.35 seconds**, approximately **3,945 documents/s**, in batches of 500. Intel Xeon E5-2680 v4, Bun 1.4.3. Each case/mode has five warmups and 50 measured requests, including HTTP and response decoding. Both modes share one process; no query-result cache. Local timings exclude Cloudflare regional network latency.
+Local ingestion: **100,000 documents in 24.69 seconds**, approximately **4,050 documents/s**, in batches of 500. Intel Xeon E5-2680 v4, Bun 1.4.3. Each case/mode has five warmups and 50 measured requests, including HTTP and response decoding. Both modes share one process; no query-result cache. Local timings exclude Cloudflare regional network latency.
 
 **100,000 documents · deployed Cloudflare · client in Brazil · milliseconds (p50 / p95)**
 
@@ -44,7 +44,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **80 Worker/tooling tests and 15 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, native and WASM Clippy, typechecking and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **84 Worker/tooling tests and 17 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

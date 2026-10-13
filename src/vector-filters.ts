@@ -35,7 +35,7 @@ export const vectorPrefilter = Effect.fn("raio.vectorPrefilter")(function* (
       filters.find(
         (filter) => filter.field === field && ["gt", "gte", "lt", "lte"].includes(filter.op),
       );
-    if (!selected) continue;
+    if (selected === undefined) continue;
     const candidate: VectorizeVectorMetadataFilter = { ...native };
     if (selected.op === "eq") candidate[`e${index}`] = { $eq: yield* scalarDigest(selected.value) };
     else if (selected.op === "in")

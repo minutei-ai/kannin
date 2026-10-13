@@ -51,7 +51,7 @@ for (const consistency of ["strong", "edge-eventual"] as const)
       const start = performance.now();
       const response = await request(worker, "benchmark", "query", query);
       const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
-      if (!result.rows.length) throw new Error("Empty benchmark result");
+      if (result.rows.length === 0) throw new Error("Empty benchmark result");
       if (result.consistency !== consistency)
         throw new Error("Benchmark consistency differs from requested contract");
       samples.push(performance.now() - start);

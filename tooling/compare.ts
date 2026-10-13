@@ -178,9 +178,9 @@ const report = await (async () => {
       });
       const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
       const raioMs = performance.now() - first;
-      if (!result.rows.length) throw new Error("Empty Raio result");
+      if (result.rows.length === 0) throw new Error("Empty Raio result");
       const ray = response.headers.get("cf-ray");
-      if (ray) rays.add(ray.split("-").at(-1) ?? ray);
+      if (ray !== null && ray.length > 0) rays.add(ray.split("-").at(-1) ?? ray);
       const edgeStarted = performance.now();
       const edgeResponse = await fetch(new URL(`/v1/namespaces/${namespace}/query`, url), {
         method: "POST",
@@ -201,7 +201,8 @@ const report = await (async () => {
       const second = performance.now();
       const turbo = await comparator.query(parameters);
       const turboMs = performance.now() - second;
-      if (!turbo.rows?.length) throw new Error("Empty Turbopuffer result");
+      if (turbo.rows === undefined || turbo.rows.length === 0)
+        throw new Error("Empty Turbopuffer result");
       if (turbo.performance?.exhaustive_search_count !== 0)
         throw new Error("Comparator index readiness changed during measurement");
       if (iteration === 0) {

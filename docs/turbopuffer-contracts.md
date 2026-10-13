@@ -19,16 +19,16 @@ Conditional document predicates, attribute ordering, aggregations, branching, au
 
 ## Local 100,000-document measurement
 
-The deterministic benchmark completed in native local workerd on an Intel Xeon E5-2680 v4 at 2.40 GHz with Bun 1.4.3. Batches of 500 ingested in 25.348 seconds, approximately 3,945 documents/second. Each query/mode received five warmups and 50 measured requests. Timings include HTTP and concrete response decoding. Strong mode runs before edge mode in the same process, so these are warm measurements, not independent cold starts. The benchmark checks successful concrete responses and requested consistency; ranking correctness is established by separate behavioral/oracle tests.
+The deterministic benchmark completed in native local workerd on an Intel Xeon E5-2680 v4 at 2.40 GHz with Bun 1.4.3. Batches of 500 ingested in 24.690 seconds, approximately 4,050 documents/second. Each query/mode received five warmups and 50 measured requests. Timings include HTTP and concrete response decoding. Strong mode runs before edge mode in the same process, so these are warm measurements, not independent cold starts. The benchmark checks successful concrete responses and requested consistency; ranking correctness is established by separate behavioral/oracle tests.
 
 | Query     | Strong p50 / p95 / p99 ms | Edge eventual p50 / p95 / p99 ms |
 | --------- | ------------------------- | -------------------------------- |
-| Rare      | 4.39 / 5.35 / 11.11       | 3.19 / 5.50 / 9.18               |
-| Selective | 35.72 / 48.34 / 74.20     | 36.72 / 54.38 / 84.00            |
-| Common    | 37.68 / 50.09 / 69.85     | 39.38 / 54.62 / 69.91            |
-| Filtered  | 46.35 / 120.67 / 159.78   | 43.55 / 58.72 / 100.79           |
+| Rare      | 4.06 / 5.12 / 14.07       | 2.85 / 3.55 / 9.55               |
+| Selective | 40.37 / 53.99 / 88.37     | 38.73 / 55.00 / 69.45            |
+| Common    | 39.81 / 49.23 / 74.56     | 43.19 / 56.95 / 69.12            |
+| Filtered  | 46.77 / 68.24 / 92.22     | 41.84 / 50.65 / 96.85            |
 
-Corpus SHA-256: `e23ae431deaee2436ee6674a7834e57663739b6c5bd723b7c9137c4ab123dbfb`. Measured Worker bundle SHA-256: `76d744b14fa73ca00b1f8e0ce49e12071e89856822d8a530f4d8f9627abf717a`. WASM SHA-256: `35595256f6fd20b846eea343a97795f79d2b405e54beba2608bda093f2db7cd3`. Later branding changes do not alter this historical bundle identity.
+Corpus SHA-256: `e23ae431deaee2436ee6674a7834e57663739b6c5bd723b7c9137c4ab123dbfb`. Measured Worker bundle SHA-256: `7bb1046650e39206d6981aaa15b85dca9daf2065b79f729391086daae6787e5a`. WASM SHA-256: `aaeae13235476d95e4949f5066d6dc5b1f68d2f8c3eba41b209b432dcdab8b57`. This measurement follows the checked-conversion and numerical cleanup required by full Clippy pedantic/nursery lint.
 
 The final process reported 245 immutable range reads and 6,335 memory range-cache hits across ingestion and all query phases, not per query. Local emulation does not include regional network round trips, native Worker Cache tiering, a real Vectorize index or Cloudflare production CPU billing. Cache budgets and the reported WASM allocation are not a measurement of total isolate heap. Compare these results with [separate deployed evidence](performance.md), never substitute local latency for regional service latency.
 

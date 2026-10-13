@@ -9,7 +9,11 @@ function metadataMatches(vector: VectorizeVector, filters: VectorizeVectorMetada
     const actual = vector.metadata?.[field];
     if (condition === null || typeof condition !== "object") return actual === condition;
     if ("$eq" in condition && actual !== condition.$eq) return false;
-    if ("$in" in condition && condition.$in && !condition.$in.some((value) => value === actual))
+    if (
+      "$in" in condition &&
+      condition.$in !== undefined &&
+      !condition.$in.some((value) => value === actual)
+    )
       return false;
     if (
       "$gt" in condition &&

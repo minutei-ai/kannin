@@ -84,6 +84,22 @@ pub struct Posting {
 }
 
 impl Header {
+    fn encode(&self, payload: &[u8]) -> Result<Vec<u8>, String> {
+        let json = serde_json::to_vec(self).map_err(|e| e.to_string())?;
+        if json.len() + payload.len() + 16 > MAX_BYTES {
+            return Err("Segment exceeds 16 MiB".into());
+        }
+        let mut bytes = Vec::with_capacity(json.len() + payload.len() + 16);
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(
+            &(u32::try_from(json.len()).map_err(|cause| cause.to_string())?).to_le_bytes(),
+        );
+        bytes.extend_from_slice(&crc32fast::hash(&json).to_le_bytes());
+        bytes.extend_from_slice(&json);
+        bytes.extend_from_slice(payload);
+        Ok(bytes)
+    }
+
     fn allowed(&self, filters: &[Filter], dead: &[u32]) -> Result<Vec<bool>, String> {
         let key = serde_json::to_string(filters).map_err(|cause| cause.to_string())?;
         let cached = self
@@ -133,10 +149,12 @@ pub struct BuiltSegment {
 fn append(payload: &mut Vec<u8>, data: &[u8]) -> Result<Range, String> {
     let compressed = miniz_oxide::deflate::compress_to_vec_zlib(data, 3);
     let range = Range {
-        offset: payload.len() as u32,
-        length: (compressed.len() + 8) as u32,
+        offset: u32::try_from(payload.len()).map_err(|cause| cause.to_string())?,
+        length: u32::try_from(compressed.len() + 8).map_err(|cause| cause.to_string())?,
     };
-    payload.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    payload.extend_from_slice(
+        &(u32::try_from(data.len()).map_err(|cause| cause.to_string())?).to_le_bytes(),
+    );
     payload.extend_from_slice(&crc32fast::hash(data).to_le_bytes());
     payload.extend_from_slice(&compressed);
     if payload.len() > MAX_BYTES {
@@ -145,6 +163,7 @@ fn append(payload: &mut Vec<u8>, data: &[u8]) -> Result<Range, String> {
     Ok(range)
 }
 
+#[doc = "# Errors\nRejects invalid framing, size budgets, decompression failures, and checksum or decoded-length mismatches."]
 pub fn decode_page(bytes: &[u8]) -> Result<Vec<u8>, String> {
     if bytes.len() < 8 || bytes.len() > MAX_BYTES {
         return Err("Invalid page size".into());
@@ -172,10 +191,10 @@ pub fn decode_page(bytes: &[u8]) -> Result<Vec<u8>, String> {
 
 fn put_int(mut value: u32, bytes: &mut Vec<u8>) {
     while value >= 128 {
-        bytes.push((value as u8) | 128);
+        bytes.push(value.to_le_bytes()[0] | 128);
         value >>= 7;
     }
-    bytes.push(value as u8);
+    bytes.push(value.to_le_bytes()[0]);
 }
 
 fn get_int(bytes: &[u8], offset: &mut usize) -> Result<u32, String> {
@@ -194,15 +213,21 @@ fn get_int(bytes: &[u8], offset: &mut usize) -> Result<u32, String> {
     Err("Overflowing varint".into())
 }
 
-fn encode_postings(postings: &[Posting]) -> Vec<u8> {
+fn encode_postings(postings: &[Posting]) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
-    put_int(postings.len() as u32, &mut bytes);
+    put_int(
+        u32::try_from(postings.len()).map_err(|cause| cause.to_string())?,
+        &mut bytes,
+    );
     let mut previous = 0;
     for posting in postings {
         put_int(posting.row - previous, &mut bytes);
         previous = posting.row;
         for positions in [&posting.title, &posting.body] {
-            put_int(positions.len() as u32, &mut bytes);
+            put_int(
+                u32::try_from(positions.len()).map_err(|cause| cause.to_string())?,
+                &mut bytes,
+            );
             let mut prior = 0;
             for position in positions {
                 put_int(position - prior, &mut bytes);
@@ -210,9 +235,10 @@ fn encode_postings(postings: &[Posting]) -> Vec<u8> {
             }
         }
     }
-    bytes
+    Ok(bytes)
 }
 
+#[doc = "# Errors\nRejects invalid pages, overflowing or truncated varints, excessive rows, duplicate positions, and trailing bytes."]
 pub fn decode_postings(bytes: &[u8]) -> Result<Vec<Posting>, String> {
     let data = decode_page(bytes)?;
     let mut offset = 0;
@@ -259,84 +285,36 @@ pub fn decode_postings(bytes: &[u8]) -> Result<Vec<Posting>, String> {
     Ok(rows)
 }
 
-pub fn build(mut documents: Vec<Document>) -> Result<BuiltSegment, String> {
-    if documents.is_empty() {
-        return Err("Segment must contain at least one document".into());
-    }
-    if documents.len() > 10000 {
-        return Err("Segment exceeds 10000 documents".into());
-    }
-    documents.sort_by(|a, b| a.id.encode_utf16().cmp(b.id.encode_utf16()));
-    if documents.windows(2).any(|pair| pair[0].id == pair[1].id) {
-        return Err("Duplicate segment ids".into());
-    }
-    let mut payload = Vec::new();
-    let mut metadata = Vec::new();
-    let mut lists: BTreeMap<String, Vec<Posting>> = BTreeMap::new();
-    let mut total_title_length = 0;
-    let mut total_body_length = 0;
-    for (row, document) in documents.iter().enumerate() {
-        let title = normalize_text(&document.title);
-        let body = normalize_text(&document.text);
-        let title_tokens: Vec<_> = title.split_whitespace().collect();
-        let body_tokens: Vec<_> = body.split_whitespace().collect();
-        total_title_length += title_tokens.len() as u64;
-        total_body_length += body_tokens.len() as u64;
-        let mut frequencies: BTreeMap<&str, Posting> = BTreeMap::new();
-        for (field, tokens) in [title_tokens.as_slice(), body_tokens.as_slice()]
-            .iter()
-            .enumerate()
-        {
-            for (position, token) in tokens.iter().enumerate() {
-                let posting = frequencies.entry(token).or_insert_with(|| Posting {
-                    row: row as u32,
-                    title: Vec::new(),
-                    body: Vec::new(),
-                });
-                if field == 0 {
-                    posting.title.push(position as u32);
-                } else {
-                    posting.body.push(position as u32);
-                }
-            }
-        }
-        for (term, posting) in frequencies {
-            lists.entry(term.into()).or_default().push(posting);
-        }
-        let json = serde_json::to_vec(document).map_err(|e| e.to_string())?;
-        let data = append(&mut payload, &json)?;
-        metadata.push(DocumentMeta {
-            id: document.id.clone(),
-            revision: document.revision,
-            title_length: title_tokens.len() as u32,
-            body_length: body_tokens.len() as u32,
-            attributes: serde_json::value::RawValue::from_string(
-                serde_json::to_string(&document.attributes).map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?,
-            data,
-            vector: document.vector.is_some(),
-        });
-    }
+fn encode_terms(
+    payload: &mut Vec<u8>,
+    metadata: &[DocumentMeta],
+    lists: BTreeMap<String, Vec<Posting>>,
+) -> Result<BTreeMap<String, TermMeta>, String> {
     let mut terms = BTreeMap::new();
     for (term, postings) in lists {
         let mut blocks = Vec::with_capacity(postings.len().div_ceil(BLOCK_SIZE));
         for chunk in postings.chunks(BLOCK_SIZE) {
-            let data = append(&mut payload, &encode_postings(chunk))?;
+            let data = append(payload, &encode_postings(chunk)?)?;
             blocks.push(BlockMeta {
                 first: chunk[0].row,
                 last: chunk[chunk.len() - 1].row,
-                count: chunk.len() as u32,
-                max_title_tf: chunk
-                    .iter()
-                    .map(|p| p.title.len() as u32)
-                    .max()
-                    .ok_or("Empty posting block")?,
-                max_body_tf: chunk
-                    .iter()
-                    .map(|p| p.body.len() as u32)
-                    .max()
-                    .ok_or("Empty posting block")?,
+                count: u32::try_from(chunk.len()).map_err(|cause| cause.to_string())?,
+                max_title_tf: u32::try_from(
+                    chunk
+                        .iter()
+                        .map(|posting| posting.title.len())
+                        .max()
+                        .ok_or("Empty posting block")?,
+                )
+                .map_err(|cause| cause.to_string())?,
+                max_body_tf: u32::try_from(
+                    chunk
+                        .iter()
+                        .map(|posting| posting.body.len())
+                        .max()
+                        .ok_or("Empty posting block")?,
+                )
+                .map_err(|cause| cause.to_string())?,
                 min_title_length: chunk
                     .iter()
                     .map(|p| metadata[p.row as usize].title_length)
@@ -353,11 +331,80 @@ pub fn build(mut documents: Vec<Document>) -> Result<BuiltSegment, String> {
         terms.insert(
             term,
             TermMeta {
-                df: postings.len() as u32,
+                df: u32::try_from(postings.len()).map_err(|cause| cause.to_string())?,
                 blocks: blocks.into_boxed_slice(),
             },
         );
     }
+    Ok(terms)
+}
+
+#[doc = "# Errors\nRejects empty or duplicate documents, wire-size overflow, serialization errors, and segments beyond the size budget."]
+pub fn build(mut documents: Vec<Document>) -> Result<BuiltSegment, String> {
+    if documents.is_empty() {
+        return Err("Segment must contain at least one document".into());
+    }
+    if documents.len() > 10000 {
+        return Err("Segment exceeds 10000 documents".into());
+    }
+    documents.sort_by(|a, b| a.id.encode_utf16().cmp(b.id.encode_utf16()));
+    if documents.windows(2).any(|pair| pair[0].id == pair[1].id) {
+        return Err("Duplicate segment ids".into());
+    }
+    let mut payload = Vec::new();
+    let mut metadata = Vec::new();
+    let mut lists: BTreeMap<String, Vec<Posting>> = BTreeMap::new();
+    let mut total_title_length = 0;
+    let mut total_body_length = 0;
+    for (index, document) in documents.iter().enumerate() {
+        let row = u32::try_from(index).map_err(|cause| cause.to_string())?;
+        let title = normalize_text(&document.title);
+        let body = normalize_text(&document.text);
+        let title_tokens: Vec<_> = title.split_whitespace().collect();
+        let body_tokens: Vec<_> = body.split_whitespace().collect();
+        total_title_length += title_tokens.len() as u64;
+        total_body_length += body_tokens.len() as u64;
+        let mut frequencies: BTreeMap<&str, Posting> = BTreeMap::new();
+        for (field, tokens) in [title_tokens.as_slice(), body_tokens.as_slice()]
+            .iter()
+            .enumerate()
+        {
+            for (position, token) in tokens.iter().enumerate() {
+                let posting = frequencies.entry(token).or_insert_with(|| Posting {
+                    row,
+                    title: Vec::new(),
+                    body: Vec::new(),
+                });
+                if field == 0 {
+                    posting
+                        .title
+                        .push(u32::try_from(position).map_err(|cause| cause.to_string())?);
+                } else {
+                    posting
+                        .body
+                        .push(u32::try_from(position).map_err(|cause| cause.to_string())?);
+                }
+            }
+        }
+        for (term, posting) in frequencies {
+            lists.entry(term.into()).or_default().push(posting);
+        }
+        let json = serde_json::to_vec(document).map_err(|e| e.to_string())?;
+        let data = append(&mut payload, &json)?;
+        metadata.push(DocumentMeta {
+            id: document.id.clone(),
+            revision: document.revision,
+            title_length: u32::try_from(title_tokens.len()).map_err(|cause| cause.to_string())?,
+            body_length: u32::try_from(body_tokens.len()).map_err(|cause| cause.to_string())?,
+            attributes: serde_json::value::RawValue::from_string(
+                serde_json::to_string(&document.attributes).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?,
+            data,
+            vector: document.vector.is_some(),
+        });
+    }
+    let terms = encode_terms(&mut payload, &metadata, lists)?;
     let header = Header {
         filter_masks: RefCell::default(),
         version: 1,
@@ -366,19 +413,11 @@ pub fn build(mut documents: Vec<Document>) -> Result<BuiltSegment, String> {
         total_title_length,
         total_body_length,
     };
-    let json = serde_json::to_vec(&header).map_err(|e| e.to_string())?;
-    if json.len() + payload.len() + 16 > MAX_BYTES {
-        return Err("Segment exceeds 16 MiB".into());
-    }
-    let mut bytes = Vec::with_capacity(json.len() + payload.len() + 16);
-    bytes.extend_from_slice(MAGIC);
-    bytes.extend_from_slice(&(json.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(&crc32fast::hash(&json).to_le_bytes());
-    bytes.extend_from_slice(&json);
-    bytes.extend_from_slice(&payload);
+    let bytes = header.encode(&payload)?;
     Ok(BuiltSegment { header, bytes })
 }
 
+#[doc = "# Errors\nRejects invalid framing, checksums, versions, ordering, frequencies, and posting directories."]
 pub fn parse_header(bytes: &[u8]) -> Result<(Header, usize), String> {
     if bytes.len() < 16 || &bytes[..8] != MAGIC {
         return Err("Invalid segment header".into());
@@ -414,13 +453,14 @@ pub fn parse_header(bytes: &[u8]) -> Result<(Header, usize), String> {
         return Err("Segment ids are not strictly sorted".into());
     }
     for term in header.terms.values() {
-        if term.df > header.documents.len() as u32 {
+        if term.df > u32::try_from(header.documents.len()).map_err(|cause| cause.to_string())? {
             return Err("Invalid term document frequency".into());
         }
         for block in &term.blocks {
-            if block.last >= header.documents.len() as u32
+            if block.last
+                >= u32::try_from(header.documents.len()).map_err(|cause| cause.to_string())?
                 || block.first > block.last
-                || block.count > BLOCK_SIZE as u32
+                || block.count as usize > BLOCK_SIZE
             {
                 return Err("Invalid posting block directory".into());
             }
@@ -437,6 +477,14 @@ pub struct Statistics {
     pub frequencies: BTreeMap<String, u64>,
 }
 
+fn count_as_f64(value: u64) -> f64 {
+    let [byte0, byte1, byte2, byte3, byte4, byte5, byte6, byte7] = value.to_le_bytes();
+    f64::from(u32::from_le_bytes([byte4, byte5, byte6, byte7])).mul_add(
+        4_294_967_296.0,
+        f64::from(u32::from_le_bytes([byte0, byte1, byte2, byte3])),
+    )
+}
+
 fn contribution(tf: u32, length: u32, average: f64) -> f64 {
     if tf == 0 {
         return 0.0;
@@ -445,6 +493,7 @@ fn contribution(tf: u32, length: u32, average: f64) -> f64 {
     f64::from(tf) / (0.25 + 0.75 * f64::from(length) / mean)
 }
 
+#[must_use]
 pub fn bm25(
     tf_title: u32,
     tf_body: u32,
@@ -456,10 +505,17 @@ pub fn bm25(
     if statistics.documents == 0 || df == 0 || df > statistics.documents {
         return 0.0;
     }
-    let n = statistics.documents as f64;
-    let tf = 2.0 * contribution(tf_title, len_title, statistics.title_length as f64 / n)
-        + contribution(tf_body, len_body, statistics.body_length as f64 / n);
-    let idf = ((n - df as f64 + 0.5) / (df as f64 + 0.5) + 1.0).ln();
+    let n = count_as_f64(statistics.documents);
+    let tf = contribution(
+        tf_title,
+        len_title,
+        count_as_f64(statistics.title_length) / n,
+    )
+    .mul_add(
+        2.0,
+        contribution(tf_body, len_body, count_as_f64(statistics.body_length) / n),
+    );
+    let idf = ((n - count_as_f64(df) + 0.5) / (count_as_f64(df) + 0.5)).ln_1p();
     idf * tf * 2.2 / (tf + 1.2)
 }
 
@@ -483,6 +539,7 @@ fn compare_number(value: &serde_json::Value, expected: &serde_json::Value, op: &
     false
 }
 
+#[doc = "# Errors\nRejects unknown operators or invalid exists predicates."]
 pub fn matches(
     attributes: &BTreeMap<String, serde_json::Value>,
     filters: &[Filter],
@@ -522,7 +579,7 @@ pub struct Hit {
 
 impl PartialEq for Hit {
     fn eq(&self, other: &Self) -> bool {
-        self.row == other.row && self.score == other.score
+        self.row == other.row && self.score.total_cmp(&other.score) == Ordering::Equal
     }
 }
 impl Eq for Hit {}
@@ -551,6 +608,7 @@ pub struct Search {
 }
 
 impl Search {
+    #[doc = "# Errors\nRejects invalid top-k, match mode, term budgets, attributes, or tombstone rows."]
     pub fn new(
         header: impl Into<Rc<Header>>,
         statistics: Statistics,
@@ -586,6 +644,7 @@ impl Search {
         })
     }
 
+    #[doc = "# Errors\nRejects unrequested terms, corrupt pages, invalid rows or positions, and unordered posting blocks."]
     pub fn add(&mut self, term: &str, bytes: &[u8]) -> Result<(), String> {
         if !self.words.iter().any(|word| word == term) {
             return Err("Unrequested posting term".into());
@@ -614,7 +673,7 @@ impl Search {
         Ok(())
     }
 
-    fn phrase(&self, postings: &[Option<&Posting>]) -> bool {
+    fn phrase(postings: &[Option<&Posting>]) -> bool {
         let Some(first) = postings.first().copied().flatten() else {
             return false;
         };
@@ -624,7 +683,10 @@ impl Search {
                 if postings.iter().enumerate().all(|(offset, p)| {
                     p.is_some_and(|p| {
                         let positions = if title { &p.title } else { &p.body };
-                        positions.binary_search(&(start + offset as u32)).is_ok()
+                        u32::try_from(offset)
+                            .ok()
+                            .and_then(|offset| start.checked_add(offset))
+                            .is_some_and(|position| positions.binary_search(&position).is_ok())
                     })
                 }) {
                     return true;
@@ -634,7 +696,55 @@ impl Search {
         false
     }
 
-    pub fn finish(&self) -> Vec<Hit> {
+    fn skippable_block_end(
+        &self,
+        terms: &[&String],
+        lists: &[&[Posting]],
+        cursors: &[usize],
+        cutoff: &Hit,
+        row: u32,
+    ) -> Option<u32> {
+        let mut end = u32::MAX;
+        let mut bound = 0.0;
+        for (index, list) in lists.iter().enumerate() {
+            if let Some(posting) = list.get(cursors[index])
+                && let Some(block) = self
+                    .header
+                    .terms
+                    .get(terms[index].as_str())
+                    .and_then(|term| {
+                        term.blocks
+                            .iter()
+                            .find(|block| block.first <= posting.row && block.last >= posting.row)
+                    })
+            {
+                end = end.min(block.last);
+                let df = self
+                    .statistics
+                    .frequencies
+                    .get(terms[index].as_str())
+                    .copied()
+                    .unwrap_or(0);
+                bound += bm25(
+                    block.max_title_tf,
+                    block.max_body_tf,
+                    block.min_title_length,
+                    block.min_body_length,
+                    &self.statistics,
+                    df,
+                );
+            }
+        }
+        if bound + 1e-12 < cutoff.score
+            || (bound.total_cmp(&cutoff.score) == Ordering::Equal && row >= cutoff.row)
+        {
+            return Some(end);
+        }
+        None
+    }
+
+    #[doc = "# Errors\nRejects posting frequencies that cannot fit the wire format."]
+    pub fn finish(&self) -> Result<Vec<Hit>, String> {
         let terms: Vec<_> = self
             .words
             .iter()
@@ -646,12 +756,11 @@ impl Search {
             .map(|term| {
                 self.lists
                     .get(term.as_str())
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[])
+                    .map_or(&[] as &[Posting], Vec::as_slice)
             })
             .collect();
         if self.mode != "any" && lists.iter().any(|list| list.is_empty()) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let mut cursors = vec![0usize; lists.len()];
         let mut heap: BinaryHeap<Hit> = BinaryHeap::new();
@@ -661,48 +770,15 @@ impl Search {
             .filter_map(|(i, list)| list.get(cursors[i]).map(|p| p.row))
             .min()
         {
-            if heap.len() == self.top_k {
-                let mut end = u32::MAX;
-                let mut bound = 0.0;
+            if heap.len() == self.top_k
+                && let Some(cutoff) = heap.peek()
+                && let Some(end) = self.skippable_block_end(&terms, &lists, &cursors, cutoff, row)
+            {
                 for (index, list) in lists.iter().enumerate() {
-                    if let Some(posting) = list.get(cursors[index])
-                        && let Some(block) =
-                            self.header
-                                .terms
-                                .get(terms[index].as_str())
-                                .and_then(|term| {
-                                    term.blocks.iter().find(|block| {
-                                        block.first <= posting.row && block.last >= posting.row
-                                    })
-                                })
-                    {
-                        end = end.min(block.last);
-                        let df = self
-                            .statistics
-                            .frequencies
-                            .get(terms[index].as_str())
-                            .copied()
-                            .unwrap_or(0);
-                        bound += bm25(
-                            block.max_title_tf,
-                            block.max_body_tf,
-                            block.min_title_length,
-                            block.min_body_length,
-                            &self.statistics,
-                            df,
-                        );
-                    }
+                    cursors[index] +=
+                        list[cursors[index]..].partition_point(|posting| posting.row <= end);
                 }
-                if let Some(cutoff) = heap.peek()
-                    && (bound + 1e-12 < cutoff.score
-                        || (bound == cutoff.score && row >= cutoff.row))
-                {
-                    for (index, list) in lists.iter().enumerate() {
-                        cursors[index] +=
-                            list[cursors[index]..].partition_point(|posting| posting.row <= end);
-                    }
-                    continue;
-                }
+                continue;
             }
             let mut selected = BTreeMap::new();
             let mut score = 0.0;
@@ -716,8 +792,8 @@ impl Search {
                         .copied()
                         .unwrap_or(0);
                     score += bm25(
-                        posting.title.len() as u32,
-                        posting.body.len() as u32,
+                        u32::try_from(posting.title.len()).map_err(|cause| cause.to_string())?,
+                        u32::try_from(posting.body.len()).map_err(|cause| cause.to_string())?,
                         meta.title_length,
                         meta.body_length,
                         &self.statistics,
@@ -732,7 +808,7 @@ impl Search {
                 continue;
             }
             if self.mode == "phrase"
-                && !self.phrase(
+                && !Self::phrase(
                     &self
                         .words
                         .iter()
@@ -752,7 +828,7 @@ impl Search {
         }
         let mut hits = heap.into_vec();
         hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.row.cmp(&b.row)));
-        hits
+        Ok(hits)
     }
 }
 
@@ -767,43 +843,65 @@ pub fn document_terms(document: &Document) -> Vec<String> {
 
 fn bloom_hash(text: &str, seed: u64) -> u64 {
     text.as_bytes().iter().fold(seed, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
     })
 }
 
-pub fn bloom_build(values: &[String]) -> Vec<u8> {
+#[doc = "# Errors\nRejects values beyond the bloom size budget or an unrepresentable bit index."]
+pub fn bloom_build(values: &[String]) -> Result<Vec<u8>, String> {
+    if values.len() > MAX_BYTES / 2 {
+        return Err("Bloom exceeds size budget".into());
+    }
     let mut bytes = vec![0u8; (values.len() * 2).max(8)];
     for value in values {
-        let a = bloom_hash(value, 0xcbf29ce484222325);
-        let b = bloom_hash(value, 0x84222325cbf29ce4) | 1;
+        let a = bloom_hash(value, 0xcbf2_9ce4_8422_2325);
+        let b = bloom_hash(value, 0x8422_2325_cbf2_9ce4) | 1;
         for index in 0u64..7 {
-            let bit = (a.wrapping_add(index.wrapping_mul(b)) % (bytes.len() as u64 * 8)) as usize;
+            let bit = usize::try_from(
+                a.wrapping_add(index.wrapping_mul(b))
+                    % (u64::try_from(bytes.len()).map_err(|cause| cause.to_string())? * 8),
+            )
+            .map_err(|cause| cause.to_string())?;
             bytes[bit / 8] |= 1 << (bit % 8);
         }
     }
-    bytes
+    Ok(bytes)
 }
 
-pub fn bloom_contains(bytes: &[u8], value: &str) -> bool {
+#[doc = "# Errors\nRejects an oversized bloom or an unrepresentable bit index."]
+pub fn bloom_contains(bytes: &[u8], value: &str) -> Result<bool, String> {
     if bytes.is_empty() {
-        return false;
+        return Ok(false);
     }
-    let a = bloom_hash(value, 0xcbf29ce484222325);
-    let b = bloom_hash(value, 0x84222325cbf29ce4) | 1;
-    (0u64..7).all(|index| {
-        let bit = (a.wrapping_add(index.wrapping_mul(b)) % (bytes.len() as u64 * 8)) as usize;
-        bytes[bit / 8] & (1 << (bit % 8)) != 0
-    })
+    if bytes.len() > MAX_BYTES {
+        return Err("Bloom exceeds size budget".into());
+    }
+    let a = bloom_hash(value, 0xcbf2_9ce4_8422_2325);
+    let b = bloom_hash(value, 0x8422_2325_cbf2_9ce4) | 1;
+    for index in 0u64..7 {
+        let bit = usize::try_from(
+            a.wrapping_add(index.wrapping_mul(b))
+                % (u64::try_from(bytes.len()).map_err(|cause| cause.to_string())? * 8),
+        )
+        .map_err(|cause| cause.to_string())?;
+        if bytes[bit / 8] & (1 << (bit % 8)) == 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(target_arch = "wasm32")]
 pub mod wasm {
-    use super::*;
+    use super::{
+        BlockMeta, BuiltSegment, Document, DocumentMeta, FILTER_CACHE_BYTES, Filter, Header,
+        Search, Statistics, TermMeta, bloom_build, bloom_contains, bm25, build, decode_page,
+        document_terms, matches, parse_header,
+    };
+    use serde::{Deserialize, Serialize};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::rc::Rc;
     use wasm_bindgen::prelude::*;
-
-    fn error(error: String) -> JsValue {
-        JsValue::from_str(&error)
-    }
 
     #[wasm_bindgen]
     pub struct Segment {
@@ -813,18 +911,22 @@ pub mod wasm {
     #[wasm_bindgen]
     impl Segment {
         #[wasm_bindgen(constructor)]
-        pub fn new(json: &str) -> Result<Segment, JsValue> {
+        #[doc = "# Errors\nRejects invalid input serialization or segment framing, size, and integrity constraints."]
+        pub fn new(json: &str) -> Result<Self, JsValue> {
             let documents: Vec<Document> =
-                serde_json::from_str(json).map_err(|e| error(e.to_string()))?;
+                serde_json::from_str(json).map_err(|e| JsValue::from_str(&e.to_string()))?;
             Ok(Self {
-                built: build(documents).map_err(error)?,
+                built: build(documents).map_err(|cause| JsValue::from_str(&cause))?,
             })
         }
+        #[must_use]
         pub fn bytes(&self) -> Vec<u8> {
             self.built.bytes.clone()
         }
+        #[doc = "# Errors\nRejects directory serialization errors."]
         pub fn header_json(&self) -> Result<String, JsValue> {
-            serde_json::to_string(&self.built.header).map_err(|cause| error(cause.to_string()))
+            serde_json::to_string(&self.built.header)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))
         }
     }
 
@@ -836,19 +938,22 @@ pub mod wasm {
     #[wasm_bindgen]
     impl Directory {
         #[wasm_bindgen(constructor)]
-        pub fn new(bytes: &[u8]) -> Result<Directory, JsValue> {
-            let (header, _) = parse_header(bytes).map_err(error)?;
+        #[doc = "# Errors\nRejects invalid input serialization or segment framing, size, and integrity constraints."]
+        pub fn new(bytes: &[u8]) -> Result<Self, JsValue> {
+            let (header, _) = parse_header(bytes).map_err(|cause| JsValue::from_str(&cause))?;
             Ok(Self {
                 header: Rc::new(header),
             })
         }
 
-        pub fn retain(&self) -> Directory {
+        #[must_use]
+        pub fn retain(&self) -> Self {
             Self {
                 header: self.header.clone(),
             }
         }
 
+        #[must_use]
         pub fn heap_bytes(&self) -> usize {
             let header = &self.header;
             let documents = header.documents.capacity() * size_of::<DocumentMeta>()
@@ -871,16 +976,18 @@ pub mod wasm {
             documents + terms + size_of::<Header>() + 32 + FILTER_CACHE_BYTES
         }
 
+        #[doc = "# Errors\nRejects invalid term JSON or directory serialization errors."]
         pub fn terms(&self, terms: &str) -> Result<String, JsValue> {
             let terms: Vec<String> =
-                serde_json::from_str(terms).map_err(|e| error(e.to_string()))?;
+                serde_json::from_str(terms).map_err(|e| JsValue::from_str(&e.to_string()))?;
             let selected: BTreeMap<_, _> = terms
                 .iter()
                 .filter_map(|term| self.header.terms.get(term).map(|meta| (term, meta)))
                 .collect();
-            serde_json::to_string(&selected).map_err(|e| error(e.to_string()))
+            serde_json::to_string(&selected).map_err(|e| JsValue::from_str(&e.to_string()))
         }
 
+        #[doc = "# Errors\nRejects invalid statistics, terms, filters, tombstones, or attributes."]
         pub fn upper_bound(
             &self,
             statistics: &str,
@@ -889,17 +996,20 @@ pub mod wasm {
             dead: &str,
         ) -> Result<f64, JsValue> {
             let statistics: Statistics =
-                serde_json::from_str(statistics).map_err(|e| error(e.to_string()))?;
+                serde_json::from_str(statistics).map_err(|e| JsValue::from_str(&e.to_string()))?;
             let terms: Vec<String> =
-                serde_json::from_str(terms).map_err(|e| error(e.to_string()))?;
-            let filters: Vec<Filter> =
-                serde_json::from_str(filters).map_err(|cause| error(cause.to_string()))?;
-            let dead: Vec<u32> =
-                serde_json::from_str(dead).map_err(|cause| error(cause.to_string()))?;
+                serde_json::from_str(terms).map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let filters: Vec<Filter> = serde_json::from_str(filters)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            let dead: Vec<u32> = serde_json::from_str(dead)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
             let minima = if filters.is_empty() && dead.is_empty() {
                 Some((0, 0))
             } else {
-                let allowed = self.header.allowed(&filters, &dead).map_err(error)?;
+                let allowed = self
+                    .header
+                    .allowed(&filters, &dead)
+                    .map_err(|cause| JsValue::from_str(&cause))?;
                 self.header
                     .documents
                     .iter()
@@ -920,79 +1030,84 @@ pub mod wasm {
                 .iter()
                 .map(|term| {
                     let df = statistics.frequencies.get(term).copied().unwrap_or(0);
-                    self.header
-                        .terms
-                        .get(term)
-                        .map(|meta| {
-                            meta.blocks
-                                .iter()
-                                .map(|block| {
-                                    bm25(
-                                        block.max_title_tf,
-                                        block.max_body_tf,
-                                        block.min_title_length.max(title_minimum),
-                                        block.min_body_length.max(body_minimum),
-                                        &statistics,
-                                        df,
-                                    )
-                                })
-                                .fold(0.0, f64::max)
-                        })
-                        .unwrap_or(0.0)
+                    self.header.terms.get(term).map_or(0.0, |meta| {
+                        meta.blocks
+                            .iter()
+                            .map(|block| {
+                                bm25(
+                                    block.max_title_tf,
+                                    block.max_body_tf,
+                                    block.min_title_length.max(title_minimum),
+                                    block.min_body_length.max(body_minimum),
+                                    &statistics,
+                                    df,
+                                )
+                            })
+                            .fold(0.0, f64::max)
+                    })
                 })
                 .sum();
             Ok(bound)
         }
 
+        #[doc = "# Errors\nRejects invalid ids or tombstones, row overflow, or result serialization errors."]
         pub fn lookup(&self, ids: &str, dead: &str) -> Result<String, JsValue> {
             let header = &self.header;
-            let ids: Vec<String> = serde_json::from_str(ids).map_err(|e| error(e.to_string()))?;
+            let ids: Vec<String> =
+                serde_json::from_str(ids).map_err(|e| JsValue::from_str(&e.to_string()))?;
             let dead: BTreeSet<u32> =
-                serde_json::from_str(dead).map_err(|e| error(e.to_string()))?;
-            let found: Vec<_> = ids
-                .iter()
-                .filter_map(|id| {
-                    header
-                        .documents
-                        .binary_search_by(|doc| doc.id.encode_utf16().cmp(id.encode_utf16()))
-                        .ok()
-                })
-                .filter(|row| !dead.contains(&(*row as u32)))
-                .map(|row| Located {
-                    row: row as u32,
-                    document: &header.documents[row],
-                })
-                .collect();
-            serde_json::to_string(&found).map_err(|e| error(e.to_string()))
+                serde_json::from_str(dead).map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let mut found = Vec::new();
+            for id in &ids {
+                if let Ok(index) = header
+                    .documents
+                    .binary_search_by(|doc| doc.id.encode_utf16().cmp(id.encode_utf16()))
+                {
+                    let row = u32::try_from(index)
+                        .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+                    if !dead.contains(&row) {
+                        found.push(Located {
+                            row,
+                            document: &header.documents[index],
+                        });
+                    }
+                }
+            }
+            serde_json::to_string(&found).map_err(|e| JsValue::from_str(&e.to_string()))
         }
 
+        #[doc = "# Errors\nRejects invalid tombstones, row overflow, or result serialization errors."]
         pub fn vectors(&self, dead: &str) -> Result<String, JsValue> {
-            let dead: BTreeSet<u32> =
-                serde_json::from_str(dead).map_err(|cause| error(cause.to_string()))?;
-            let documents: Vec<_> = self
-                .header
-                .documents
-                .iter()
-                .enumerate()
-                .filter(|(row, doc)| doc.vector && !dead.contains(&(*row as u32)))
-                .map(|(_, doc)| doc)
-                .collect();
-            serde_json::to_string(&documents).map_err(|cause| error(cause.to_string()))
+            let dead: BTreeSet<u32> = serde_json::from_str(dead)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            let mut documents = Vec::new();
+            for (index, doc) in self.header.documents.iter().enumerate() {
+                let row =
+                    u32::try_from(index).map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+                if doc.vector && !dead.contains(&row) {
+                    documents.push(doc);
+                }
+            }
+            serde_json::to_string(&documents).map_err(|cause| JsValue::from_str(&cause.to_string()))
         }
 
+        #[doc = "# Errors\nRejects invalid row JSON, missing rows, or result serialization errors."]
         pub fn rows(&self, rows: &str) -> Result<String, JsValue> {
             let header = &self.header;
-            let rows: Vec<u32> = serde_json::from_str(rows).map_err(|e| error(e.to_string()))?;
+            let rows: Vec<u32> =
+                serde_json::from_str(rows).map_err(|e| JsValue::from_str(&e.to_string()))?;
             let selected = rows
                 .iter()
                 .map(|row| header.documents.get(*row as usize).ok_or("Invalid row"))
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| error(e.into()))?;
-            serde_json::to_string(&selected).map_err(|e| error(e.to_string()))
+                .map_err(JsValue::from_str)?;
+            serde_json::to_string(&selected).map_err(|e| JsValue::from_str(&e.to_string()))
         }
 
+        #[doc = "# Errors\nRejects invalid query JSON, filters, term budgets, top-k, or match mode."]
         pub fn ranker(&self, query: &str) -> Result<Ranker, JsValue> {
-            let input: Input = serde_json::from_str(query).map_err(|e| error(e.to_string()))?;
+            let input: Input =
+                serde_json::from_str(query).map_err(|e| JsValue::from_str(&e.to_string()))?;
             let search = Search::new(
                 self.header.clone(),
                 input.statistics,
@@ -1002,7 +1117,7 @@ pub mod wasm {
                 &input.dead,
                 &input.filters,
             )
-            .map_err(error)?;
+            .map_err(|cause| JsValue::from_str(&cause))?;
             Ok(Ranker { search })
         }
     }
@@ -1014,42 +1129,53 @@ pub mod wasm {
     }
 
     #[wasm_bindgen]
+    #[doc = "# Errors\nRejects corrupt pages or invalid document serialization."]
     pub fn segment_document(bytes: &[u8]) -> Result<String, JsValue> {
-        let decoded = decode_page(bytes).map_err(error)?;
+        let decoded = decode_page(bytes).map_err(|cause| JsValue::from_str(&cause))?;
         let document: Document =
-            serde_json::from_slice(&decoded).map_err(|e| error(e.to_string()))?;
-        serde_json::to_string(&document).map_err(|e| error(e.to_string()))
+            serde_json::from_slice(&decoded).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        serde_json::to_string(&document).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     #[wasm_bindgen]
+    #[doc = "# Errors\nRejects invalid document JSON or term serialization errors."]
     pub fn segment_document_terms(json: &str) -> Result<String, JsValue> {
-        let document: Document = serde_json::from_str(json).map_err(|e| error(e.to_string()))?;
-        serde_json::to_string(&document_terms(&document)).map_err(|e| error(e.to_string()))
+        let document: Document =
+            serde_json::from_str(json).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        serde_json::to_string(&document_terms(&document))
+            .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     #[wasm_bindgen]
+    #[doc = "# Errors\nRejects invalid attributes, filters, or operators."]
     pub fn segment_filter(attributes: &str, filters: &str) -> Result<bool, JsValue> {
         let attributes: BTreeMap<String, serde_json::Value> =
-            serde_json::from_str(attributes).map_err(|e| error(e.to_string()))?;
+            serde_json::from_str(attributes).map_err(|e| JsValue::from_str(&e.to_string()))?;
         let filters: Vec<Filter> =
-            serde_json::from_str(filters).map_err(|e| error(e.to_string()))?;
-        matches(&attributes, &filters).map_err(error)
+            serde_json::from_str(filters).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        matches(&attributes, &filters).map_err(|cause| JsValue::from_str(&cause))
     }
 
     #[wasm_bindgen]
+    #[doc = "# Errors\nRejects invalid values or bloom size/index budgets."]
     pub fn segment_bloom(values: &str) -> Result<Vec<u8>, JsValue> {
-        let values: Vec<String> = serde_json::from_str(values).map_err(|e| error(e.to_string()))?;
-        Ok(bloom_build(&values))
+        let values: Vec<String> =
+            serde_json::from_str(values).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        bloom_build(&values).map_err(|cause| JsValue::from_str(&cause))
     }
 
     #[wasm_bindgen]
+    #[doc = "# Errors\nRejects invalid values, bloom budgets, or result serialization errors."]
     pub fn segment_bloom_filter(bytes: &[u8], values: &str) -> Result<String, JsValue> {
-        let values: Vec<String> = serde_json::from_str(values).map_err(|e| error(e.to_string()))?;
-        let selected: Vec<_> = values
-            .iter()
-            .filter(|value| bloom_contains(bytes, value))
-            .collect();
-        serde_json::to_string(&selected).map_err(|e| error(e.to_string()))
+        let values: Vec<String> =
+            serde_json::from_str(values).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let mut selected = Vec::new();
+        for value in &values {
+            if bloom_contains(bytes, value).map_err(|cause| JsValue::from_str(&cause))? {
+                selected.push(value);
+            }
+        }
+        serde_json::to_string(&selected).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     #[wasm_bindgen]
@@ -1069,11 +1195,18 @@ pub mod wasm {
 
     #[wasm_bindgen]
     impl Ranker {
+        #[doc = "# Errors\nRejects invalid requested terms, pages, rows, positions, or block ordering."]
         pub fn add(&mut self, term: &str, bytes: &[u8]) -> Result<(), JsValue> {
-            self.search.add(term, bytes).map_err(error)
+            self.search
+                .add(term, bytes)
+                .map_err(|cause| JsValue::from_str(&cause))
         }
+        #[doc = "# Errors\nRejects posting frequency overflow or result serialization errors."]
         pub fn finish(&self) -> Result<String, JsValue> {
-            let hits = self.search.finish();
+            let hits = self
+                .search
+                .finish()
+                .map_err(|cause| JsValue::from_str(&cause))?;
             let ranked: Vec<_> = hits
                 .iter()
                 .map(|hit| Ranked {
@@ -1082,7 +1215,7 @@ pub mod wasm {
                     score: hit.score,
                 })
                 .collect();
-            serde_json::to_string(&ranked).map_err(|cause| error(cause.to_string()))
+            serde_json::to_string(&ranked).map_err(|cause| JsValue::from_str(&cause.to_string()))
         }
     }
 
@@ -1126,6 +1259,35 @@ mod filter_cache_tests {
         assert_eq!(header.allowed(&filters, &[0])?, vec![false]);
         assert_eq!(header.allowed(&filters, &[])?, vec![true]);
         assert!(!serde_json::to_string(&header)?.contains("filter_masks"));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod numeric_contract_tests {
+    use super::{bloom_build, bloom_contains, count_as_f64};
+
+    #[test]
+    fn statistic_conversion_rounds_full_width_counts_without_truncation() {
+        let cases: [(u64, f64); 6] = [
+            (0, 0.0),
+            (u64::from(u32::MAX), 4_294_967_295.0),
+            (u64::from(u32::MAX) + 1, 4_294_967_296.0),
+            (9_007_199_254_740_993, 9_007_199_254_740_992.0),
+            (9_007_199_254_740_995, 9_007_199_254_740_996.0),
+            (u64::MAX, 18_446_744_073_709_551_616.0),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(count_as_f64(value).to_bits(), expected.to_bits());
+        }
+    }
+
+    #[test]
+    fn empty_bloom_remains_valid_and_oversized_bloom_is_rejected()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert!(!bloom_contains(&[], "a")?);
+        assert!(!bloom_contains(&bloom_build(&[])?, "a")?);
+        assert!(bloom_contains(&vec![0; super::MAX_BYTES + 1], "a").is_err());
         Ok(())
     }
 }

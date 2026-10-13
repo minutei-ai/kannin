@@ -4,10 +4,11 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, relative } from "node:path";
 
 const root = join(import.meta.dir, "..");
-const probe = Effect.fn("raio.lintProbe")(function* (
+const probe = Effect.fn("kannin.lintProbe")(function* (
   source: string,
   parent: string = root,
   extension: "ts" | "js" = "ts",
+  mode: "lint" | "compiler" = "lint",
 ) {
   return yield* Effect.acquireUseRelease(
     Effect.tryPromise(() => mkdtemp(join(parent, ".lint-probe-"))),
@@ -24,7 +25,11 @@ const probe = Effect.fn("raio.lintProbe")(function* (
             }),
           ),
         );
-        const child = Bun.spawn(["bunx", "oxlint", "--deny-warnings", "--no-ignore", file], {
+        const commands = {
+          lint: ["bunx", "oxlint", "--deny-warnings", "--no-ignore", file],
+          compiler: ["bunx", "tsc", "--noEmit", "--project", join(directory, "tsconfig.json")],
+        };
+        const child = Bun.spawn(commands[mode], {
           cwd: root,
           stdout: "pipe",
           stderr: "pipe",
@@ -37,6 +42,46 @@ const probe = Effect.fn("raio.lintProbe")(function* (
           ]),
         );
         return { output: result[0] + result[1], exitCode: result[2] };
+      }),
+    (directory) =>
+      Effect.tryPromise(() => rm(directory, { recursive: true, force: true })).pipe(Effect.orDie),
+  );
+});
+
+const rustProbe = Effect.fn("kannin.rustLintProbe")(function* (source: string) {
+  return yield* Effect.acquireUseRelease(
+    Effect.tryPromise(() => mkdtemp(join(root, ".lint-probe-"))),
+    (directory) =>
+      Effect.gen(function* () {
+        const manifest = yield* Effect.tryPromise(() => readFile(join(root, "Cargo.toml"), "utf8"));
+        const policy = manifest
+          .slice(manifest.indexOf("[workspace.lints.rust]"), manifest.indexOf("[profile.release]"))
+          .replaceAll("[workspace.lints.", "[lints.");
+        yield* Effect.tryPromise(() => mkdir(join(directory, "src")));
+        yield* Effect.tryPromise(() =>
+          writeFile(
+            join(directory, "Cargo.toml"),
+            '[package]\nname = "lint-probe"\nversion = "0.0.0"\nedition = "2024"\n[workspace]\n' +
+              policy,
+          ),
+        );
+        yield* Effect.tryPromise(() => writeFile(join(directory, "src/lib.rs"), source));
+        const child = Bun.spawn(
+          ["cargo", "clippy", "--offline", "--all-targets", "--", "-D", "warnings"],
+          {
+            cwd: directory,
+            stdout: "pipe",
+            stderr: "pipe",
+          },
+        );
+        const output = yield* Effect.tryPromise(() =>
+          Promise.all([
+            new Response(child.stdout).text(),
+            new Response(child.stderr).text(),
+            child.exited,
+          ]),
+        );
+        return { output: output[0] + output[1], exitCode: output[2] };
       }),
     (directory) =>
       Effect.tryPromise(() => rm(directory, { recursive: true, force: true })).pipe(Effect.orDie),
@@ -85,64 +130,20 @@ test("syntax policy rejects mutable declarations, assertions and exception plumb
     ),
   );
   expect(result.exitCode).not.toBe(0);
-  expect(result.output).toContain("raio(syntax)");
+  expect(result.output).toContain("kannin(syntax)");
   expect(result.output).toContain("consistent-type-assertions");
 });
 
 test("Rust policy rejects unsafe, panic, unwrap, placeholders and lint suppression", async () => {
   const result = await Effect.runPromise(
-    Effect.acquireUseRelease(
-      Effect.tryPromise(() => mkdtemp(join(root, ".lint-probe-"))),
-      (directory) =>
-        Effect.gen(function* () {
-          const manifest = yield* Effect.tryPromise(() =>
-            readFile(join(root, "Cargo.toml"), "utf8"),
-          );
-          const policy = manifest
-            .slice(
-              manifest.indexOf("[workspace.lints.rust]"),
-              manifest.indexOf("[profile.release]"),
-            )
-            .replaceAll("[workspace.lints.", "[lints.");
-          yield* Effect.tryPromise(() => mkdir(join(directory, "src")));
-          yield* Effect.tryPromise(() =>
-            writeFile(
-              join(directory, "Cargo.toml"),
-              '[package]\nname = "lint-probe"\nversion = "0.0.0"\nedition = "2024"\n[workspace]\n' +
-                policy,
-            ),
-          );
-          yield* Effect.tryPromise(() =>
-            writeFile(
-              join(directory, "src/lib.rs"),
-              [
-                "#[allow(dead_code)]",
-                "pub fn probe(value: Option<u8>) -> u8 { value.unwrap() }",
-                'pub fn failure() { panic!("failure"); }',
-                "pub fn placeholder() { todo!(); }",
-                "pub unsafe fn forbidden() {}",
-              ].join("\n"),
-            ),
-          );
-          const child = Bun.spawn(
-            ["cargo", "clippy", "--offline", "--all-targets", "--", "-D", "warnings"],
-            {
-              cwd: directory,
-              stdout: "pipe",
-              stderr: "pipe",
-            },
-          );
-          const output = yield* Effect.tryPromise(() =>
-            Promise.all([
-              new Response(child.stdout).text(),
-              new Response(child.stderr).text(),
-              child.exited,
-            ]),
-          );
-          return { output: output[0] + output[1], exitCode: output[2] };
-        }),
-      (directory) =>
-        Effect.tryPromise(() => rm(directory, { recursive: true, force: true })).pipe(Effect.orDie),
+    rustProbe(
+      [
+        "#[allow(dead_code)]",
+        "pub fn probe(value: Option<u8>) -> u8 { value.unwrap() }",
+        'pub fn failure() { panic!("failure"); }',
+        "pub fn placeholder() { todo!(); }",
+        "pub unsafe fn forbidden() {}",
+      ].join("\n"),
     ),
   );
   expect(result.exitCode).not.toBe(0);
@@ -178,4 +179,62 @@ test("authored JavaScript is rejected by the native lint file selection", async 
   const result = await Effect.runPromise(probe("export const value = 42;", root, "js"));
   expect(result.exitCode).not.toBe(0);
   expect(result.output).toContain("Author TypeScript with Effect");
+});
+
+test("the patched native compiler rejects floating Effect values independently of Oxlint", async () => {
+  const valid = await Effect.runPromise(
+    probe(
+      'import { Effect } from "effect"; export const program = Effect.succeed(42);',
+      root,
+      "ts",
+      "compiler",
+    ),
+  );
+  expect(valid.exitCode).toBe(0);
+  const invalid = await Effect.runPromise(
+    probe('import { Effect } from "effect"; Effect.succeed(42);', root, "ts", "compiler"),
+  );
+  expect(invalid.exitCode).not.toBe(0);
+  expect(invalid.output).toContain("floatingEffect");
+});
+
+test("strict boolean lint rejects implicit truthiness and accepts explicit conditions", async () => {
+  const invalid = await Effect.runPromise(
+    probe(
+      "export function implicit(value: string | undefined) { if (value) return value.length; return 0; }",
+    ),
+  );
+  expect(invalid.exitCode).not.toBe(0);
+  expect(invalid.output).toContain("strict-boolean-expressions");
+  const valid = await Effect.runPromise(
+    probe(
+      "export function explicit(value: string | undefined) { if (value !== undefined && value.length > 0) return value.length; return 0; }",
+    ),
+  );
+  expect(valid.exitCode).toBe(0);
+});
+
+test("Rust pedantic casts are forbidden even under a matching lint expectation", async () => {
+  const result = await Effect.runPromise(
+    rustProbe(
+      "#[expect(clippy::cast_possible_truncation)]\npub fn truncated(value: u64) -> u8 { value as u8 }",
+    ),
+  );
+  expect(result.exitCode).not.toBe(0);
+  expect(result.output).toContain("E0453");
+  expect(result.output).toContain("cast_possible_truncation");
+});
+
+test("Rust rejects integer precision loss and accepts a checked conversion", async () => {
+  const invalid = await Effect.runPromise(
+    rustProbe("#[must_use]\npub fn imprecise(value: u64) -> f64 { value as f64 }"),
+  );
+  expect(invalid.exitCode).not.toBe(0);
+  expect(invalid.output).toContain("cast_precision_loss");
+  const valid = await Effect.runPromise(
+    rustProbe(
+      '#[doc = "# Errors\nRejects values larger than one byte."]\npub fn checked(value: u64) -> Result<u8, std::num::TryFromIntError> { u8::try_from(value) }',
+    ),
+  );
+  expect(valid.exitCode).toBe(0);
 });

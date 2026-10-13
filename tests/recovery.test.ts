@@ -21,7 +21,7 @@ test("R2 manifest repairs a lost receipt without committing the write twice", as
   const receipts = (await bucket.list({ prefix: `${namespacePrefix}/receipts/` })).objects;
   expect(receipts.length).toBe(1);
   const receipt = receipts[0];
-  if (!receipt) throw new Error("Missing committed receipt");
+  if (receipt === undefined) throw new Error("Missing committed receipt");
   await bucket.delete(receipt.key);
   await worker.unsafeEvictDurableObject("raio", "SearchNamespace", { name: "lost-receipt" });
   expect((await request(worker, "lost-receipt", "write", input)).status).toBe(200);
@@ -46,7 +46,7 @@ test("a stale manifest ETag rejects the commit and its segment stays invisible",
   const bucket = await worker.getR2Bucket("STORAGE", "raio");
   const rootKey = `${await prefix("cas")}/root.json`;
   const current = await bucket.get(rootKey);
-  if (!current) throw new Error("Missing R2 root");
+  if (current === null) throw new Error("Missing R2 root");
   const root = Schema.decodeSync(Schema.fromJsonString(Root))(await current.text());
   await bucket.put(rootKey, JSON.stringify({ ...root, testRace: true }));
   const input = write([document("b", "after")]);
@@ -84,7 +84,7 @@ test("a missing committed segment fails closed on cold read", async () => {
   const bucket = await worker.getR2Bucket("STORAGE", "raio");
   const objects = (await bucket.list({ prefix: `${await prefix("missing")}/segments/` })).objects;
   const segment = objects[0];
-  if (!segment) throw new Error("Missing committed segment");
+  if (segment === undefined) throw new Error("Missing committed segment");
   await bucket.delete(segment.key);
   expect((await request(worker, "missing", "query", textQuery("term"))).status).toBe(503);
 });

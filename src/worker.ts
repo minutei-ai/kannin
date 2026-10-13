@@ -922,6 +922,9 @@ export class SearchNamespace extends DurableObject<Env> {
       .filter((job) => sequence === undefined || job.sequence === sequence)
       .slice(0, 16);
     const completed = new Set<number>();
+    const fields = Schema.decodeSync(Schema.fromJsonString(VectorFilterFields))(
+      this.env.VECTOR_FILTER_FIELDS,
+    );
     for (const job of jobs) {
       const object = await this.env.STORAGE.get(job.log);
       if (!object) throw new Rejected({ status: 503, message: "Committed vector log missing" });
@@ -933,9 +936,23 @@ export class SearchNamespace extends DurableObject<Env> {
         (_, ordinal) => ordinal * 100,
       ))
         await this.env.VECTORS.deleteByIds(log.vectorDeletes.slice(offset, offset + 100));
+      const candidates = log.write.upserts.filter((document) => document.vector);
+      if (log.vectorEpoch !== current.manifest.vectorEpoch || !candidates.length) {
+        completed.add(job.sequence);
+        continue;
+      }
+      const live = await locate(
+        this.env,
+        candidates.map((document) => document.id),
+        current.manifest,
+      );
       const vectors = [];
-      for (const document of log.write.upserts)
-        if (document.vector)
+      for (const document of candidates)
+        if (
+          document.vector &&
+          live.get(document.id)?.document.revision === log.sequence &&
+          live.get(document.id)?.document.vector
+        )
           vectors.push({
             id: await vectorId(log.vectorEpoch, document.id, log.sequence),
             values: [...document.vector],
@@ -943,14 +960,7 @@ export class SearchNamespace extends DurableObject<Env> {
             metadata: {
               id: document.id,
               revision: log.sequence,
-              ...(await Effect.runPromise(
-                vectorMetadata(
-                  document.attributes,
-                  Schema.decodeSync(Schema.fromJsonString(VectorFilterFields))(
-                    this.env.VECTOR_FILTER_FIELDS,
-                  ),
-                ),
-              )),
+              ...(await Effect.runPromise(vectorMetadata(document.attributes, fields))),
             },
           });
       for (const offset of Array.from(
@@ -1553,7 +1563,7 @@ export default {
     if (request.method === "GET" && url.pathname === "/health")
       return Response.json(
         Schema.encodeSync(Health)({
-          name: "raio",
+          name: "kannin",
           version: "0.1.0",
           engine: "rust-wasm-r2",
           vectors: "cloudflare-vectorize",

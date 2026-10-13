@@ -1,6 +1,6 @@
 # Architecture and completion gates
 
-Raio is a separate OSS repository. No Minutei production data, fixtures, secrets, or services are bundled.
+Kannin is a separate OSS repository. No Minutei production data, fixtures, secrets, or services are bundled.
 
 ## Ownership
 
@@ -33,7 +33,7 @@ The original goal is an OSS Cloudflare-native search system with performance com
 
 Benchmarks from the discarded local-database prototype do not describe this R2 engine. The Rust scorer has exact block pruning, positional phrase matching and live global frequencies, but comparable latency and quality still need measurement. Immutable ranges and segment compaction must be tuned using request/byte/CPU evidence, preserving exact ranking, filtering, mutation and recovery behavior.
 
-Architectural research: [Tidepool](https://github.com/milannair/tidepool), [Zeppelin](https://github.com/zepdb/zeppelin), and [Turbopuffer architecture](https://turbopuffer.com/docs/architecture). Their storage designs are research references; no performance numbers from those projects are claimed as Raio measurements, and no upstream implementation was copied into this repository.
+Architectural research: [Tidepool](https://github.com/milannair/tidepool), [Zeppelin](https://github.com/zepdb/zeppelin), and [Turbopuffer architecture](https://turbopuffer.com/docs/architecture). Their storage designs are research references; no performance numbers from those projects are claimed as Kannin measurements, and no upstream implementation was copied into this repository.
 
 ## Cloudflare cache ownership
 
@@ -72,3 +72,5 @@ Query responses expose request-scoped Server-Timing for dictionary acquisition, 
 The benchmark bucket's recorded physical location is `enam`. Cloudflare currently lists R2 hints for western/eastern North America, western/eastern Europe, Asia-Pacific and Oceania, and does not list a South America hint. Hints apply at creation and are best effort; a bucket's existing location cannot be relocated by updating its hint. This is a deployment constraint, not proof that geography explains every measured delay. See [R2 data location](https://developers.cloudflare.com/r2/reference/data-location/).
 
 Warm edge namespaces retain decoded snapshots in an isolate-owned LRU before using Cache API. Entries keep their original R2 observation timestamp; neither a memory hit nor Cache API rehydration extends freshness. The cache is capped at 4 MiB of conservative charge, using four times the encoded UTF-8 size per snapshot; oversized snapshots bypass this layer. Namespace and bucket identity stay in the key. Invalid ages and insufficient sequence barriers bypass memory and trigger the existing fresh-read path. Strong reads never use either snapshot cache. Cache API remains the shared data-center layer and immutable segment ranges retain the native Workers Cache regional tiers.
+
+Vector synchronization still processes version-specific deletions, but only submits upserts whose epoch and revision remain live in the canonical R2 root. Superseded jobs are acknowledged without allocating obsolete provider vectors. The indexed-field configuration is decoded once per synchronization operation. This removes unnecessary mutation and storage work; it does not reclaim vectors that an older provider mutation already made visible before the revision changed.

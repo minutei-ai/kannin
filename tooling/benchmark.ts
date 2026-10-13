@@ -9,6 +9,8 @@ const size = Schema.decodeSync(
   Schema.Int.check(Schema.isBetween({ minimum: 1000, maximum: 1000000 })),
 )(Number(process.env.RAIO_BENCH_DOCUMENTS ?? 10000));
 const worker = await startWorker();
+await using cleanup = new AsyncDisposableStack();
+cleanup.defer(() => worker.dispose());
 const bundleSha256 = Bun.CryptoHasher.hash(
   "sha256",
   await Bun.file(new URL("../dist/worker/worker.js", import.meta.url)).arrayBuffer(),
@@ -30,32 +32,44 @@ for (const offset of Array.from({ length: Math.ceil(size / 500) }, (_, ordinal) 
 }
 const ingestMs = performance.now() - ingestion;
 const reports = [];
-for (const [name, query] of [
+const queries = [
   ["rare", textQuery("unique42")],
   ["selective", textQuery("group42")],
   ["common", textQuery("cloudflare rust")],
   ["filtered", textQuery("cloudflare", 10, [{ field: "group", op: "eq", value: 42 }])],
-] as const) {
-  for (const _warmup of Array.from({ length: 5 }, (_, ordinal) => ordinal)) {
-    const response = await request(worker, "benchmark", "query", query);
-    if (!response.ok) throw new Error(`Warmup failed ${response.status}`);
-    await response.arrayBuffer();
+] as const;
+for (const consistency of ["strong", "edge-eventual"] as const)
+  for (const [name, selected] of queries) {
+    const query = { ...selected, consistency };
+    for (const _warmup of Array.from({ length: 5 }, (_, ordinal) => ordinal)) {
+      const response = await request(worker, "benchmark", "query", query);
+      if (!response.ok) throw new Error(`Warmup failed ${response.status}`);
+      await response.arrayBuffer();
+    }
+    const samples = [];
+    for (const _iteration of Array.from({ length: 50 }, (_, ordinal) => ordinal)) {
+      const start = performance.now();
+      const response = await request(worker, "benchmark", "query", query);
+      const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+      if (!result.rows.length) throw new Error("Empty benchmark result");
+      if (result.consistency !== consistency)
+        throw new Error("Benchmark consistency differs from requested contract");
+      samples.push(performance.now() - start);
+    }
+    const ordered = [...samples].sort((a, b) => a - b);
+    reports.push({
+      name,
+      consistency,
+      p50: ordered[24],
+      p95: ordered[47],
+      p99: ordered[49],
+      samples,
+    });
   }
-  const samples = [];
-  for (const _iteration of Array.from({ length: 50 }, (_, ordinal) => ordinal)) {
-    const start = performance.now();
-    const response = await request(worker, "benchmark", "query", query);
-    const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
-    if (!result.rows.length) throw new Error("Empty benchmark result");
-    samples.push(performance.now() - start);
-  }
-  const ordered = [...samples].sort((a, b) => a - b);
-  reports.push({ name, p50: ordered[24], p95: ordered[47], p99: ordered[49], samples });
-}
 const health = Schema.decodeUnknownSync(Health)(
   await (await fetch(new URL("/health", await worker.ready))).json(),
 );
-await worker.dispose();
+await cleanup.disposeAsync();
 console.log(
   JSON.stringify(
     {

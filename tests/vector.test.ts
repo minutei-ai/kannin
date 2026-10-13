@@ -316,3 +316,60 @@ test("rebuild cursor validation and namespace reset cannot silently change the s
     ).status,
   ).toBe(409);
 });
+
+test("obsolete queued revisions do not allocate extra provider vectors", async () => {
+  await mode("/healthy");
+  const service = await worker.getWorker("vectors");
+  const count = Schema.Struct({ vectors: Schema.Int, pending: Schema.Int });
+  const before = Schema.decodeUnknownSync(count)(
+    await (await service.fetch("http://fixture/healthy")).json(),
+  );
+  for (const revision of [1, 2, 3])
+    await request(worker, "skip-obsolete", "write", {
+      requestId: `revision-${revision}`,
+      upserts: [{ id: "a", text: `lexical ${revision}`, attributes: {}, vector: vector(1) }],
+      deletes: [],
+    });
+  expect((await request(worker, "skip-obsolete", "vector-sync", {})).status).toBe(200);
+  const after = Schema.decodeUnknownSync(count)(
+    await (await service.fetch("http://fixture/healthy")).json(),
+  );
+  expect(after.vectors - before.vectors).toBe(1);
+  const result = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, "skip-obsolete", "query", vectorQuery())).json(),
+  );
+  expect(result.rows.map((row) => row.text)).toEqual(["lexical 3"]);
+  expect(
+    Schema.decodeUnknownSync(Metadata)(
+      await (await request(worker, "skip-obsolete", "metadata")).json(),
+    ).vectorOutbox,
+  ).toBe(0);
+});
+
+test("reset before vector synchronization drops allocations for the retired epoch", async () => {
+  const service = await worker.getWorker("vectors");
+  const count = Schema.Struct({ vectors: Schema.Int, pending: Schema.Int });
+  const before = Schema.decodeUnknownSync(count)(
+    await (await service.fetch("http://fixture/healthy")).json(),
+  );
+  await request(worker, "skip-old-epoch", "write", {
+    requestId: "old",
+    upserts: [{ id: "a", text: "old epoch", attributes: {}, vector: vector(1) }],
+    deletes: [],
+  });
+  await request(worker, "skip-old-epoch", "write", {
+    requestId: "reset",
+    reset: true,
+    upserts: [{ id: "b", text: "new epoch", attributes: {}, vector: vector(1) }],
+    deletes: [],
+  });
+  expect((await request(worker, "skip-old-epoch", "vector-sync", {})).status).toBe(200);
+  const after = Schema.decodeUnknownSync(count)(
+    await (await service.fetch("http://fixture/healthy")).json(),
+  );
+  expect(after.vectors - before.vectors).toBe(1);
+  const result = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, "skip-old-epoch", "query", vectorQuery())).json(),
+  );
+  expect(result.rows.map((row) => row.id)).toEqual(["b"]);
+});

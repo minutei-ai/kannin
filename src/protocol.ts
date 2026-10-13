@@ -218,7 +218,7 @@ export const Metadata = Schema.Struct({
   cache: CacheMetrics,
 });
 export const Health = Schema.Struct({
-  name: Schema.Literal("raio"),
+  name: Schema.Literal("kannin"),
   version: Schema.Literal("0.1.0"),
   engine: Schema.Literal("rust-wasm-r2"),
   vectors: Schema.Literal("cloudflare-vectorize"),

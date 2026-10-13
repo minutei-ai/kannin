@@ -1,8 +1,8 @@
-# Raio
+# Kannin
 
 Search on Cloudflare: an R2-native BM25 engine, volatile Durable Object coordination, and native Vectorize similarity search. Effect owns the HTTP contracts and operation boundaries. Rust compiles to WebAssembly for Unicode normalization, immutable compressed segments, positional postings and exact block-bound pruning. R2 stores the manifests, index segments, documents, tombstones, write logs, receipts and vector outbox. The application never uses Durable Object storage or a local database.
 
-**Status:** local validation and native Alchemy deployment passed. Real R2 writes, BM25 reads, queue submission, eventual Vectorize visibility and native Worker/Cache API hits have been exercised. A deployed 10,000-document BM25 comparison is recorded in [performance evidence](docs/performance.md); general parity, million-document scale and vector recall remain unverified. [SciFact retrieval quality](docs/quality.md) passed a local workerd evaluation with independent judgments. Raio is inspired by object-storage search architecture; it is not a Turbopuffer implementation or API-compatible replacement.
+**Status:** local validation and native Alchemy deployment passed. Real R2 writes, BM25 reads, queue submission, eventual Vectorize visibility and native Worker/Cache API hits have been exercised. Deployed 10,000- and 100,000-document BM25 comparisons are recorded in [performance evidence](docs/performance.md); general parity, million-document scale and vector recall remain unverified. [SciFact retrieval quality](docs/quality.md) passed a local workerd evaluation with independent judgments. Kannin is inspired by object-storage search architecture; it is not a Turbopuffer implementation or API-compatible replacement.
 
 ## Build and test
 
@@ -19,6 +19,8 @@ The tests execute the compiled Rust/WASM Worker inside workerd with native local
 ## Deploy
 
 Alchemy declares the Worker, R2 bucket, coordinator namespace, 768-dimensional cosine Vectorize index, vector and compaction job queues with dedicated dead-letter queues. Alchemy owns deployment; there is no Wrangler infrastructure configuration. Local `dev` stages use local infrastructure state. Other stages use Alchemy's Cloudflare state store.
+
+The public project is Kannin. The existing `Raio` Alchemy stack, `RAIO_*` configuration keys, Rust artifact names and internal cache identifiers retain their deployment identity so renaming the repository does not recreate infrastructure or abandon data.
 
 Commands default to the native Alchemy `minutei` profile. Configure Cloudflare credentials through Alchemy and supply `RAIO_API_TOKEN` privately:
 
@@ -75,10 +77,12 @@ RAIO_BENCH_DOCUMENTS=100000 bun run bench
 
 The deterministic local benchmark records corpus SHA-256, ingestion throughput, and 50 measured samples after five warmups for rare, selective, common, and filtered BM25 queries. These are local workerd timings, including HTTP transport and response validation. They are not Cloudflare production timings or evidence of Turbopuffer parity. No result cache is used to improve repeated benchmark queries.
 
+See [the published-contract comparison and local evidence](docs/turbopuffer-contracts.md).
+
 ## License
 
 MIT. Third-party licenses remain with their packages. The declared Alchemy patch corrects native Vectorize binding type inference in version 2.0.0-beta.83; see [the patch record](docs/alchemy-patch.md).
 
 To exercise an already populated deterministic benchmark namespace, run `RAIO_LOAD_NAMESPACE=<owned-benchmark-namespace> bun tooling/load.ts` with `RAIO_URL` and `RAIO_API_TOKEN` supplied outside the repository. `RAIO_LOAD_REQUESTS` defaults to 128 per concurrency phase. The driver verifies every edge result against a strong baseline and reports concurrency 1, 4 and 16 separately. It does not mutate the corpus.
 
-For an interrupted native ingestion, `RAIO_BENCH_RESUME_NAMESPACE=<owned-benchmark-namespace>` replays the deterministic batches with the original request IDs. R2 receipts prevent duplicate commits and reject payload changes. Resume verifies a nonempty existing corpus no larger than the requested size; a fresh Turbopuffer comparator is created and cleaned up independently. `RAIO_BENCH_REUSE_NAMESPACE` skips completed Raio ingestion instead. These options are mutually exclusive. Keep the executable corpus and requested size unchanged when resuming.
+For an interrupted native ingestion, `RAIO_BENCH_RESUME_NAMESPACE=<owned-benchmark-namespace>` replays the deterministic batches with the original request IDs. R2 receipts prevent duplicate commits and reject payload changes. Resume verifies a nonempty existing corpus no larger than the requested size; a fresh Turbopuffer comparator is created and cleaned up independently. `RAIO_BENCH_REUSE_NAMESPACE` skips completed Kannin ingestion instead. These options are mutually exclusive. Keep the executable corpus and requested size unchanged when resuming.

@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "raio",
+      "name": "kannin",
       "dependencies": {
         "effect": "4.0.4",
       },

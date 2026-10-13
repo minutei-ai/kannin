@@ -1,0 +1,41 @@
+# Turbopuffer contract comparison
+
+Kannin targets the object-storage architecture and search behavior documented by Turbopuffer, with Cloudflare-native execution. It exposes its own API. Passing local tests establishes the behaviors below; it does not establish equivalent production availability, latency or ANN recall.
+
+Reference pages checked on 2026-10-13: [guarantees](https://turbopuffer.com/docs/guarantees), [performance guidance](https://turbopuffer.com/docs/performance), and [query API](https://turbopuffer.com/docs/query). These pages evolve. The performance guidance describes workload optimizations without a universal numerical latency SLA against which a local emulator could certify parity.
+
+| Published capability                                 | Kannin behavior                                                                                                                                         | Local evidence and limits                                                                                                                                                             |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Durable object-storage writes and atomic batches     | Immutable R2 objects become visible through one conditional manifest commit; durable request receipts make retries idempotent                           | `worker.test.ts` concurrent writes, invalid batches and conflicting request ids; `recovery.test.ts` lost receipt, stale ETag, orphan objects and complete workerd restart             |
+| Latest reads by default; configurable eventual reads | Strong text queries use the coordinator; explicit edge snapshots have a selection age below one second and an optional minimum sequence                 | `consistency.test.ts` strong defaults, update/delete barriers, future sequences, expired/future snapshots and failed canonical reads; Vectorize visibility remains eventual           |
+| Object storage as the stateful dependency            | R2 owns all canonical records, postings, manifests, logs, receipts and outboxes; coordinator memory is disposable                                       | Full workerd restart recovers from persisted local R2; Vectorize is an additional derived dependency selected for Cloudflare vectors                                                  |
+| Smart caching and small ranged object reads          | Compressed immutable ranges, decoded directories and filter masks have bounded memory caches; Cache API and native Worker Cache serve immutable objects | `cache.test.ts` memory eviction, immutable Cache API hits, stale-document reconciliation and private gateway; native Worker Cache is verified separately from local emulation         |
+| Warm namespaces                                      | A bounded L1 decoded manifest cache avoids repeated snapshot decoding while retaining the original freshness timestamp                                  | `consistency.test.ts` Cache API eviction plus canonical corruption: cached data survives only within its original age budget; no result cache or promise of permanently resident data |
+| Full-text ranking and filters                        | Rust/WASM BM25F, live namespace-wide statistics, phrase/all/any matching and filters before top-k                                                       | `bm25.test.ts`, Rust exhaustive-score/pruning oracles and SciFact judgments; tokenizer configuration and scores are not claimed identical to Turbopuffer                              |
+| Vector and hybrid retrieval                          | Vectorize cosine search, supported metadata pushdown, live R2 reconciliation and reciprocal rank fusion                                                 | `vector.test.ts` failure/retry, stale revisions, deletion, isolation, filter selectivity and rebuild cursors; fixture vectors do not establish provider ANN quality                   |
+| Background indexing                                  | Cloudflare Queues dispatch bounded compaction and vector synchronization with R2-backed recovery                                                        | `queue.test.ts`, `compaction.test.ts`, `vector.test.ts`; lexical segment construction still happens during writes rather than on separate indexing nodes                              |
+
+Conditional document predicates, attribute ordering, aggregations, branching, automatic namespace sharding and the complete Turbopuffer API are not implemented. Text top-k is limited to 100, vector/hybrid to 50; writes have the bounds declared in the protocol. Negative/existence or unconfigured vector filters may underfill the provider candidate window. These differences remain part of the public contract rather than being silently ignored.
+
+## Local 100,000-document measurement
+
+The deterministic benchmark completed in native local workerd on an Intel Xeon E5-2680 v4 at 2.40 GHz with Bun 1.4.3. Batches of 500 ingested in 25.348 seconds, approximately 3,945 documents/second. Each query/mode received five warmups and 50 measured requests. Timings include HTTP and concrete response decoding. Strong mode runs before edge mode in the same process, so these are warm measurements, not independent cold starts. The benchmark checks successful concrete responses and requested consistency; ranking correctness is established by separate behavioral/oracle tests.
+
+| Query     | Strong p50 / p95 / p99 ms | Edge eventual p50 / p95 / p99 ms |
+| --------- | ------------------------- | -------------------------------- |
+| Rare      | 4.39 / 5.35 / 11.11       | 3.19 / 5.50 / 9.18               |
+| Selective | 35.72 / 48.34 / 74.20     | 36.72 / 54.38 / 84.00            |
+| Common    | 37.68 / 50.09 / 69.85     | 39.38 / 54.62 / 69.91            |
+| Filtered  | 46.35 / 120.67 / 159.78   | 43.55 / 58.72 / 100.79           |
+
+Corpus SHA-256: `e23ae431deaee2436ee6674a7834e57663739b6c5bd723b7c9137c4ab123dbfb`. Measured Worker bundle SHA-256: `76d744b14fa73ca00b1f8e0ce49e12071e89856822d8a530f4d8f9627abf717a`. WASM SHA-256: `35595256f6fd20b846eea343a97795f79d2b405e54beba2608bda093f2db7cd3`. Later branding changes do not alter this historical bundle identity.
+
+The final process reported 245 immutable range reads and 6,335 memory range-cache hits across ingestion and all query phases, not per query. Local emulation does not include regional network round trips, native Worker Cache tiering, a real Vectorize index or Cloudflare production CPU billing. Cache budgets and the reported WASM allocation are not a measurement of total isolate heap. Compare these results with [separate deployed evidence](performance.md), never substitute local latency for regional service latency.
+
+## Cost reductions with observable behavior
+
+Immutable range coalescing reduces R2 calls without changing exact scoring. Bounded warm caches reduce repeated object transfer and decoding; Cache API is local to the serving data center and may evict entries, as described in [Cloudflare's Cache API contract](https://developers.cloudflare.com/workers/runtime-apis/cache/). Every cache miss retains an R2 path, and authorization stays outside shared HTTP caches.
+
+Vector synchronization skips obsolete revisions and retired epochs before allocating provider vectors. Local regressions verify that three queued revisions allocate one current vector and that a reset before synchronization allocates only the new epoch. Already submitted obsolete vectors are not reclaimed by this optimization. Segment collection reclaims retired R2 objects after a tested quarantine; durable logs and receipts remain retained. Actual cost depends on storage, operations, Worker CPU, coordination, queues and Vectorize usage; this project does not claim an unconditional price advantage.
+
+Reproduce the gate with `bun run check` and the local measurement with `RAIO_BENCH_DOCUMENTS=100000 bun run bench`. Ranking quality has its own [dataset and methodology](quality.md).

@@ -49,6 +49,10 @@ export async function startWorker(persistence?: string, consumeQueues = false) {
             },
           },
           env: {
+            VECTOR_FILTER_FIELDS: {
+              type: "text" as const,
+              value: '["group","year","category","__proto__","flag"]',
+            },
             API_TOKEN: { type: "text" as const, value: "local-test-token" },
             STORAGE: { type: "r2" as const, name: "raio-test" },
             STORAGE_CACHE_SCOPE: { type: "text" as const, value: "raio-test" },

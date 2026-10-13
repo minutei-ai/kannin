@@ -10,13 +10,18 @@ export const Operation = Schema.Literals([
   "query",
   "metadata",
   "vector-sync",
+  "vector-rebuild",
   "rebuild",
   "compact",
 ]);
 export const Scalar = Schema.Union([Unicode, Schema.Finite, Schema.Boolean, Schema.Null]);
-export const Attributes = Schema.Record(
-  Schema.String.check(Schema.isPattern(/^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/)),
-  Scalar,
+export const FieldName = Schema.String.check(Schema.isPattern(/^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/));
+export const Attributes = Schema.Record(FieldName, Scalar);
+export const VectorFilterFields = Schema.Array(FieldName).check(
+  Schema.isMaxLength(5),
+  Schema.makeFilter(
+    (fields) => new Set(fields).size === fields.length || "Duplicate indexed field",
+  ),
 );
 export const Vector = Schema.Array(
   Schema.Finite.check(
@@ -46,22 +51,22 @@ export const Write = Schema.Struct({
 export const StoredDocument = Document.mapFields((fields) => ({ ...fields, revision: Schema.Int }));
 export const Filter = Schema.Union([
   Schema.Struct({
-    field: Schema.String.check(Schema.isPattern(/^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/)),
+    field: FieldName,
     op: Schema.Literals(["eq", "ne"]),
     value: Scalar,
   }),
   Schema.Struct({
-    field: Schema.String.check(Schema.isPattern(/^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/)),
+    field: FieldName,
     op: Schema.Literals(["gt", "gte", "lt", "lte"]),
     value: Schema.Finite,
   }),
   Schema.Struct({
-    field: Schema.String.check(Schema.isPattern(/^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/)),
+    field: FieldName,
     op: Schema.Literal("in"),
     value: Schema.Array(Scalar).check(Schema.isBetweenLength(1, 32)),
   }),
   Schema.Struct({
-    field: Schema.String.check(Schema.isPattern(/^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/)),
+    field: FieldName,
     op: Schema.Literal("exists"),
     value: Schema.Boolean,
   }),
@@ -121,6 +126,33 @@ export const Root = Schema.Struct({
 export const Snapshot = Schema.Struct({
   observedAt: Schema.Finite,
   manifest: Root,
+});
+export const VectorRebuildSnapshot = Schema.Struct({ root: Root, fields: VectorFilterFields });
+export const VectorRebuild = Schema.Struct({
+  snapshot: Schema.optional(Schema.String.check(Schema.isPattern(/^[a-f0-9-]{36}$/))),
+  segment: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  row: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+}).check(
+  Schema.makeFilter((cursor) => {
+    if (cursor.snapshot === undefined)
+      return (
+        (cursor.segment === undefined && cursor.row === undefined) || "Cursor requires a snapshot"
+      );
+    return (
+      (cursor.segment !== undefined && cursor.row !== undefined) || "Incomplete rebuild cursor"
+    );
+  }),
+);
+export const VectorRebuildResult = Schema.Struct({
+  snapshot: Schema.Union([Schema.String, Schema.Null]),
+  segment: Schema.Int,
+  row: Schema.Int,
+  submitted: Schema.Int,
+  complete: Schema.Boolean,
+});
+export const NamespacePage = Schema.Struct({
+  names: Schema.Array(NamespaceName),
+  cursor: Schema.Union([Schema.String, Schema.Null]),
 });
 export const Log = Schema.Struct({
   version: Schema.Literal(1),

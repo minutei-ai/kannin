@@ -1,6 +1,6 @@
 import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
-import { QueryResult, Metadata } from "../src/protocol";
+import { QueryResult, Metadata, VectorRebuildResult } from "../src/protocol";
 import { request, startWorker } from "./harness";
 
 const worker = await startWorker();
@@ -131,4 +131,188 @@ test("hybrid combines lexical and vector ranking using RRF", async () => {
     ).json(),
   );
   expect(filtered.rows.map((row) => row.id)).toEqual(["vector"]);
+});
+
+test("native metadata equality finds eligible vectors outside the unfiltered top fifty", async () => {
+  const upserts = Array.from({ length: 120 }, (_, index) => {
+    const attributes = { group: "distractor", year: 2020 };
+    const values = vector(1);
+    if (index >= 100) {
+      attributes.group = "eligible";
+      values[0] = 0.6;
+      values[1] = 0.8;
+    }
+    return { id: String(index), text: "lexical", attributes, vector: values };
+  });
+  await request(worker, "prefilter", "write", { requestId: "seed", upserts, deletes: [] });
+  await request(worker, "prefilter", "vector-sync", {});
+  for (const filters of [
+    [{ field: "group", op: "eq", value: "eligible" }],
+    [{ field: "group", op: "in", value: ["eligible", "absent"] }],
+  ]) {
+    const response = await request(worker, "prefilter", "query", { ...vectorQuery(), filters });
+    expect(response.status).toBe(200);
+    const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+    expect(result.rows.length).toBe(10);
+    expect(result.rows.every((row) => row.attributes.group === "eligible")).toBe(true);
+  }
+});
+
+test("typed scalar hashes preserve null, booleans and strings beyond sixty-four UTF8 bytes", async () => {
+  const long = "ação".repeat(40);
+  await request(worker, "scalar-index", "write", {
+    requestId: "seed",
+    deletes: [],
+    upserts: [
+      {
+        id: "string",
+        text: "lexical",
+        attributes: { category: long, flag: "true" },
+        vector: vector(1),
+      },
+      {
+        id: "boolean",
+        text: "lexical",
+        attributes: { category: null, flag: true },
+        vector: vector(1),
+      },
+      { id: "missing", text: "lexical", attributes: {}, vector: vector(1) },
+    ],
+  });
+  await request(worker, "scalar-index", "vector-sync", {});
+  for (const [field, value, id] of [
+    ["category", long, "string"],
+    ["category", null, "boolean"],
+    ["flag", true, "boolean"],
+    ["flag", "true", "string"],
+  ] as const) {
+    const result = Schema.decodeUnknownSync(QueryResult)(
+      await (
+        await request(worker, "scalar-index", "query", {
+          ...vectorQuery(),
+          filters: [{ field, op: "eq", value }],
+        })
+      ).json(),
+    );
+    expect(result.rows.map((row) => row.id)).toEqual([id]);
+  }
+});
+
+test("numeric metadata ranges apply before candidate limits and retain exact residual predicates", async () => {
+  const upserts = Array.from({ length: 100 }, (_, index) => ({
+    id: String(index),
+    text: "lexical",
+    attributes: { year: index },
+    vector: vector(1),
+  }));
+  await request(worker, "range-index", "write", { requestId: "seed", upserts, deletes: [] });
+  await request(worker, "range-index", "vector-sync", {});
+  const result = Schema.decodeUnknownSync(QueryResult)(
+    await (
+      await request(worker, "range-index", "query", {
+        ...vectorQuery(),
+        filters: [
+          { field: "year", op: "gte", value: 80 },
+          { field: "year", op: "lt", value: 90 },
+        ],
+      })
+    ).json(),
+  );
+  expect(result.rows.length).toBe(10);
+  expect(
+    result.rows.every(
+      (row) => Number(row.attributes.year) >= 80 && Number(row.attributes.year) < 90,
+    ),
+  ).toBe(true);
+});
+
+test("R2-backed rebuild cursors resume after provider failure and reconcile intervening mutations", async () => {
+  const upserts = Array.from({ length: 205 }, (_, index) => ({
+    id: String(index).padStart(3, "0"),
+    text: "lexical",
+    attributes: { group: "old" },
+    vector: vector(1),
+  }));
+  await request(worker, "rebuild-index", "write", { requestId: "seed", upserts, deletes: [] });
+  const first = Schema.decodeUnknownSync(VectorRebuildResult)(
+    await (await request(worker, "rebuild-index", "vector-rebuild", {})).json(),
+  );
+  expect(first.complete).toBe(false);
+  expect(first.submitted).toBe(100);
+  if (first.snapshot === null) throw new Error("Missing rebuild snapshot");
+  const cursor = { snapshot: first.snapshot, segment: first.segment, row: first.row };
+  await request(worker, "rebuild-index", "write", {
+    requestId: "changed",
+    upserts: [{ id: "150", text: "updated", attributes: { group: "new" }, vector: vector(1) }],
+    deletes: ["151"],
+  });
+  await mode("/fail");
+  expect((await request(worker, "rebuild-index", "vector-rebuild", cursor)).status).toBe(503);
+  await mode("/healthy");
+  const second = Schema.decodeUnknownSync(VectorRebuildResult)(
+    await (await request(worker, "rebuild-index", "vector-rebuild", cursor)).json(),
+  );
+  expect(second.submitted).toBe(98);
+  expect(second.complete).toBe(false);
+  const last = Schema.decodeUnknownSync(VectorRebuildResult)(
+    await (
+      await request(worker, "rebuild-index", "vector-rebuild", {
+        snapshot: first.snapshot,
+        segment: second.segment,
+        row: second.row,
+      })
+    ).json(),
+  );
+  expect(last.complete).toBe(true);
+  expect(last.submitted).toBe(5);
+  await request(worker, "rebuild-index", "vector-sync", {});
+  const changed = Schema.decodeUnknownSync(QueryResult)(
+    await (
+      await request(worker, "rebuild-index", "query", {
+        ...vectorQuery(),
+        filters: [{ field: "group", op: "eq", value: "new" }],
+      })
+    ).json(),
+  );
+  expect(changed.rows.map((row) => row.id)).toEqual(["150"]);
+  expect(changed.rows[0]?.text).toBe("updated");
+});
+
+test("rebuild cursor validation and namespace reset cannot silently change the selected snapshot", async () => {
+  for (const cursor of [
+    { row: 1 },
+    { snapshot: crypto.randomUUID() },
+    { segment: 2 },
+    { snapshot: "../unsafe", segment: 0, row: 0 },
+  ])
+    expect((await request(worker, "invalid-rebuild", "vector-rebuild", cursor)).status).toBe(400);
+  await request(worker, "reset-rebuild", "write", {
+    requestId: "seed",
+    deletes: [],
+    upserts: Array.from({ length: 101 }, (_, index) => ({
+      id: String(index),
+      text: "lexical",
+      attributes: {},
+      vector: vector(1),
+    })),
+  });
+  const first = Schema.decodeUnknownSync(VectorRebuildResult)(
+    await (await request(worker, "reset-rebuild", "vector-rebuild", {})).json(),
+  );
+  if (first.snapshot === null) throw new Error("Missing rebuild snapshot");
+  await request(worker, "reset-rebuild", "write", {
+    requestId: "reset",
+    reset: true,
+    upserts: [],
+    deletes: [],
+  });
+  expect(
+    (
+      await request(worker, "reset-rebuild", "vector-rebuild", {
+        snapshot: first.snapshot,
+        segment: first.segment,
+        row: first.row,
+      })
+    ).status,
+  ).toBe(409);
 });

@@ -36,6 +36,11 @@ import {
   Write,
   WriteResult,
   VectorMessage,
+  VectorFilterFields,
+  VectorRebuild,
+  VectorRebuildSnapshot,
+  VectorRebuildResult,
+  NamespacePage,
   IndexMessage,
   SegmentRange,
 } from "./protocol";
@@ -50,6 +55,8 @@ import {
   clearImmutableCache,
   cacheUsage,
 } from "./storage";
+
+import { vectorMetadata, vectorPrefilter } from "./vector-filters";
 
 const wasm = initSync({ module });
 
@@ -356,11 +363,17 @@ async function vectorQuery(env: Env, input: typeof Query.Type, root: typeof Root
       status: 400,
       message: "Vector and hybrid topK is limited to 50 by the Vectorize metadata contract",
     });
-  const result = await env.VECTORS.query([...input.vector], {
+  const fields = Schema.decodeSync(Schema.fromJsonString(VectorFilterFields))(
+    env.VECTOR_FILTER_FIELDS,
+  );
+  const prefilter = await Effect.runPromise(vectorPrefilter(input.filters, fields));
+  const options: VectorizeQueryOptions = {
     namespace: root.vectorEpoch,
     topK: 50,
     returnMetadata: "all",
-  });
+  };
+  if (Object.keys(prefilter).length) options.filter = prefilter;
+  const result = await env.VECTORS.query([...input.vector], options);
   const candidate = Schema.Struct({ id: Schema.String, revision: Schema.Int });
   const metadata = result.matches.map((match) => ({
     match,
@@ -709,6 +722,116 @@ export class SearchNamespace extends DurableObject<Env> {
     );
   }
 
+  private async rebuildVectors(input: typeof VectorRebuild.Type) {
+    const fields = Schema.decodeSync(Schema.fromJsonString(VectorFilterFields))(
+      this.env.VECTOR_FILTER_FIELDS,
+    );
+    const snapshot = input.snapshot ?? crypto.randomUUID();
+    const key = `${this.prefix}/vector-rebuild/${snapshot}.json`;
+    const saved = { root: (await this.root()).manifest, fields };
+    if (input.snapshot === undefined) {
+      await this.env.STORAGE.put(
+        key,
+        Schema.encodeSync(Schema.fromJsonString(VectorRebuildSnapshot))(saved),
+        { onlyIf: { etagDoesNotMatch: "*" } },
+      );
+    } else {
+      const object = await this.env.STORAGE.get(key);
+      if (!object)
+        throw new Rejected({ status: 410, message: "Rebuild snapshot no longer exists" });
+      const prior = Schema.decodeSync(Schema.fromJsonString(VectorRebuildSnapshot))(
+        await object.text(),
+      );
+      if (JSON.stringify(prior.fields) !== JSON.stringify(fields))
+        throw new Rejected({ status: 409, message: "Indexed fields changed during rebuild" });
+      saved.root = prior.root;
+    }
+    const cursor = { segment: input.segment ?? 0, row: input.row ?? 0 };
+    if (cursor.segment > saved.root.segments.length)
+      throw new Rejected({ status: 400, message: "Invalid rebuild segment" });
+    if (cursor.segment === saved.root.segments.length && cursor.row !== 0)
+      throw new Rejected({ status: 400, message: "Invalid completed cursor" });
+    const active = (await this.root()).manifest;
+    if (active.vectorEpoch !== saved.root.vectorEpoch)
+      throw new Rejected({
+        status: 409,
+        message: "Namespace reset during rebuild; start a new snapshot",
+      });
+    const vectors: VectorizeVector[] = [];
+    const removed: string[] = [];
+    const budget = { processed: 0 };
+    while (cursor.segment < saved.root.segments.length && budget.processed < 100) {
+      const segment = saved.root.segments[cursor.segment];
+      if (!segment) throw new Rejected({ status: 503, message: "Missing rebuild segment" });
+      const rows = await Effect.runPromise(
+        withDirectory(this.env.STORAGE, segment.key, segment.headerBytes, (directory) =>
+          Effect.gen(function* () {
+            const dead = yield* Schema.encodeEffect(integers)(segment.dead);
+            return yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Array(SegmentDocument)))(
+              directory.vectors(dead),
+            );
+          }),
+        ),
+      );
+      if (cursor.row > rows.length)
+        throw new Rejected({ status: 400, message: "Invalid rebuild row" });
+      const selected = rows.slice(cursor.row, cursor.row + 100 - budget.processed);
+      const current = await locate(
+        this.env,
+        selected.map((row) => row.id),
+        active,
+      );
+      for (const metadata of selected) {
+        cursor.row += 1;
+        budget.processed += 1;
+        const location = current.get(metadata.id);
+        if (
+          !location ||
+          !location.document.vector ||
+          location.document.revision !== metadata.revision
+        ) {
+          removed.push(await vectorId(saved.root.vectorEpoch, metadata.id, metadata.revision));
+          continue;
+        }
+        const document = await readDocument(
+          this.env.STORAGE,
+          location.segment.key,
+          location.segment.headerBytes,
+          location.document.data,
+          location.segment.bytes,
+        );
+        if (!document.vector)
+          throw new Rejected({ status: 503, message: "Rebuild vector payload missing" });
+        vectors.push({
+          id: await vectorId(saved.root.vectorEpoch, document.id, document.revision),
+          values: [...document.vector],
+          namespace: saved.root.vectorEpoch,
+          metadata: {
+            id: document.id,
+            revision: document.revision,
+            ...(await Effect.runPromise(vectorMetadata(document.attributes, fields))),
+          },
+        });
+      }
+      if (cursor.row === rows.length) {
+        cursor.segment += 1;
+        cursor.row = 0;
+      }
+    }
+    if (removed.length) await this.env.VECTORS.deleteByIds(removed);
+    if (vectors.length) await this.env.VECTORS.upsert(vectors);
+    const complete = cursor.segment === saved.root.segments.length;
+    const result = {
+      snapshot,
+      ...cursor,
+      submitted: vectors.length,
+      complete,
+    };
+    if (complete)
+      return Response.json(Schema.encodeSync(VectorRebuildResult)({ ...result, snapshot: null }));
+    return Response.json(Schema.encodeSync(VectorRebuildResult)(result));
+  }
+
   private async synchronizeVectors(sequence?: number) {
     const current = await this.root();
     const jobs = current.manifest.vectorJobs
@@ -733,7 +856,18 @@ export class SearchNamespace extends DurableObject<Env> {
             id: await vectorId(log.vectorEpoch, document.id, log.sequence),
             values: [...document.vector],
             namespace: log.vectorEpoch,
-            metadata: { id: document.id, revision: log.sequence },
+            metadata: {
+              id: document.id,
+              revision: log.sequence,
+              ...(await Effect.runPromise(
+                vectorMetadata(
+                  document.attributes,
+                  Schema.decodeSync(Schema.fromJsonString(VectorFilterFields))(
+                    this.env.VECTOR_FILTER_FIELDS,
+                  ),
+                ),
+              )),
+            },
           });
       for (const offset of Array.from(
         { length: Math.ceil(vectors.length / 100) },
@@ -864,6 +998,7 @@ export class SearchNamespace extends DurableObject<Env> {
       if (
         operation === "write" ||
         operation === "query" ||
+        operation === "vector-rebuild" ||
         operation === "internal-vector-sync" ||
         operation === "internal-compact"
       )
@@ -909,6 +1044,22 @@ export class SearchNamespace extends DurableObject<Env> {
             );
             return yield* Effect.tryPromise({
               try: async () => query(this.env, input, (await this.root()).manifest),
+              catch: (cause) => {
+                if (Schema.is(Rejected)(cause)) return cause;
+                return new Cause.UnknownError(cause);
+              },
+            });
+          }
+          if (operation === "vector-rebuild") {
+            const input = yield* Schema.decodeEffect(Schema.fromJsonString(VectorRebuild), {
+              onExcessProperty: "error",
+            })(body.text).pipe(
+              Effect.mapError(
+                () => new Rejected({ status: 400, message: "Invalid rebuild cursor" }),
+              ),
+            );
+            return yield* Effect.tryPromise({
+              try: () => this.rebuildVectors(input),
               catch: (cause) => {
                 if (Schema.is(Rejected)(cause)) return cause;
                 return new Cause.UnknownError(cause);
@@ -1167,6 +1318,23 @@ export default {
       return Response.json(Schema.encodeSync(ErrorBody)({ error: "Unauthorized" }), {
         status: 401,
       });
+    if (url.pathname === "/admin/namespaces" && request.method === "GET") {
+      const options: R2ListOptions = { prefix: "namespaces/", delimiter: "/", limit: 100 };
+      const cursor = url.searchParams.get("cursor");
+      if (cursor !== null) options.cursor = cursor;
+      const result = await env.STORAGE.list(options);
+      const names = result.delimitedPrefixes.map((prefix) =>
+        prefix.slice("namespaces/".length, -1),
+      );
+      const page = { names: Schema.decodeSync(Schema.Array(NamespaceName))(names) };
+      if (result.truncated)
+        return Response.json(Schema.encodeSync(NamespacePage)({ ...page, cursor: result.cursor }), {
+          headers: { "cache-control": "private, no-store" },
+        });
+      return Response.json(Schema.encodeSync(NamespacePage)({ ...page, cursor: null }), {
+        headers: { "cache-control": "private, no-store" },
+      });
+    }
     const match = /^\/v1\/namespaces\/([^/]+)\/([^/]+)$/.exec(url.pathname);
     if (!match || !Schema.is(NamespaceName)(match[1]) || !Schema.is(Operation)(match[2]))
       return Response.json(Schema.encodeSync(ErrorBody)({ error: "Unknown route" }), {
@@ -1177,6 +1345,7 @@ export default {
       query: "POST",
       metadata: "GET",
       "vector-sync": "POST",
+      "vector-rebuild": "POST",
       rebuild: "POST",
       compact: "POST",
     } satisfies Record<typeof Operation.Type, string>;

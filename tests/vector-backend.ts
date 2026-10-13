@@ -4,6 +4,37 @@ const vectors = new Map<string, VectorizeVector>();
 const pending: VectorizeVector[] = [];
 const control = { fail: false, deferred: false };
 
+function metadataMatches(vector: VectorizeVector, filters: VectorizeVectorMetadataFilter) {
+  return Object.entries(filters).every(([field, condition]) => {
+    const actual = vector.metadata?.[field];
+    if (condition === null || typeof condition !== "object") return actual === condition;
+    if ("$eq" in condition && actual !== condition.$eq) return false;
+    if ("$in" in condition && condition.$in && !condition.$in.some((value) => value === actual))
+      return false;
+    if (
+      "$gt" in condition &&
+      (typeof actual !== "number" || typeof condition.$gt !== "number" || actual <= condition.$gt)
+    )
+      return false;
+    if (
+      "$gte" in condition &&
+      (typeof actual !== "number" || typeof condition.$gte !== "number" || actual < condition.$gte)
+    )
+      return false;
+    if (
+      "$lt" in condition &&
+      (typeof actual !== "number" || typeof condition.$lt !== "number" || actual >= condition.$lt)
+    )
+      return false;
+    if (
+      "$lte" in condition &&
+      (typeof actual !== "number" || typeof condition.$lte !== "number" || actual > condition.$lte)
+    )
+      return false;
+    return true;
+  });
+}
+
 export class VectorBackend extends WorkerEntrypoint {
   async upsert(input: VectorizeVector[]) {
     if (control.fail) throw new Error("Injected Vectorize failure");
@@ -27,6 +58,7 @@ export class VectorBackend extends WorkerEntrypoint {
     const norm = Math.sqrt(values.reduce((sum, value) => sum + value * value, 0));
     const matches = [...vectors.values()]
       .filter((vector) => vector.namespace === options.namespace)
+      .filter((vector) => metadataMatches(vector, options.filter ?? {}))
       .map((vector) => {
         const magnitude = Math.sqrt(
           [...vector.values].reduce((sum, value) => sum + value * value, 0),

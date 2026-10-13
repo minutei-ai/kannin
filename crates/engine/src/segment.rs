@@ -966,6 +966,20 @@ pub mod wasm {
             serde_json::to_string(&found).map_err(|e| error(e.to_string()))
         }
 
+        pub fn vectors(&self, dead: &str) -> Result<String, JsValue> {
+            let dead: BTreeSet<u32> =
+                serde_json::from_str(dead).map_err(|cause| error(cause.to_string()))?;
+            let documents: Vec<_> = self
+                .header
+                .documents
+                .iter()
+                .enumerate()
+                .filter(|(row, doc)| doc.vector && !dead.contains(&(*row as u32)))
+                .map(|(_, doc)| doc)
+                .collect();
+            serde_json::to_string(&documents).map_err(|cause| error(cause.to_string()))
+        }
+
         pub fn rows(&self, rows: &str) -> Result<String, JsValue> {
             let header = &self.header;
             let rows: Vec<u32> = serde_json::from_str(rows).map_err(|e| error(e.to_string()))?;

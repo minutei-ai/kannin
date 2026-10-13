@@ -1,0 +1,48 @@
+# Architecture and completion gates
+
+Raio is a separate OSS repository. No Minutei production data, fixtures, secrets, or services are bundled.
+
+## Ownership
+
+The Worker authenticates and routes a canonical namespace to one volatile Durable Object coordinator. Each object serializes operations with an instance-owned Effect semaphore. Concurrent namespaces remain independent. The application never calls `ctx.storage` and never opens a local database. The coordinator caches the R2 manifest; all searchable data and recovery state belong to R2. Rust/WASM owns immutable index construction, positional postings, field-normalized BM25, exact block-bound pruning, filters, log compression, integrity checks and the shared text normalization used for both indexing and queries.
+
+R2 owns canonical mutation logs, receipts, index segments and the atomic root. A write's sequence is assigned by the namespace coordinator. The segment and log are stored before a conditional root update. The root, rather than object listing, defines which documents committed. Receipt acknowledgement and queue submission follow that commit. A request may fail after committing in R2; retry the same request id and payload. The manifest retains the last receipt so an interrupted receipt write can be repaired before another mutation. Receipt and log retention are currently unbounded and need an explicit operating policy before a production release.
+
+Each immutable segment has a versioned, CRC-checked header and independently compressed, length-bounded, CRC-checked document/posting pages. Postings encode local row ids, title/body term frequencies and token positions with delta varints. A block directory stores ranges and conservative frequency/length bounds. R2 range reads fetch only needed posting pages and result documents. A process-owned LRU stores at most 12 MiB of immutable range bytes. Decoded Rust directories have a separate 40 MiB conservatively charged budget and deterministic reference-counted leases; decoded Bloom bitsets have a 4 MiB budget. These caches are disposable. Blooms in the root prune unrelated segment reads. Tombstoned rows and per-segment removed document frequencies keep namespace-wide scoring correct across updates and deletions.
+
+Recovery loads the root and its referenced index objects; it does not replay a database or require the log to construct a hot index. Losing all coordinator memory therefore preserves committed state. Native Cloudflare Queues schedule bounded compaction; explicit compaction also builds a new immutable segment from live records and activates it with root CAS. Original document revisions, attributes, vectors and global statistics survive physical moves. Superseded objects remain in R2 until a verified garbage collector is implemented. CRC32 detects accidental corruption; bucket authorization, rather than CRC32, controls who may modify canonical objects.
+
+Vectorize owns the ANN index. The R2 root references pending vector jobs, whose payloads are canonical logs. Native Cloudflare Queues schedule them, with a dedicated dead-letter queue. Upserts and deletes are submitted in batches of at most 100, and completed jobs are removed with manifest CAS. Lost acknowledgements cause safe replay with deterministic revision-specific vector ids. Acceptance is distinct from visibility. Vector ids incorporate namespace epoch, document id, and revision, so a reordered old mutation cannot replace a newer vector. Query results are reconciled with live R2 records. Until native metadata indexes and pre-filtering are implemented, vector filters can underfill top-k because they operate on a bounded candidate set. The local vector fixture tests transport and synchronization behavior; it cannot establish ANN recall or service guarantees.
+
+## Resource limits
+
+HTTP JSON bodies are bounded to 1,900,000 bytes. A write accepts at most 1,000 upserts and 1,000 deletes. Duplicate ids across a batch are rejected. Rust log decoding is bounded to 2 MiB, including decompression bombs. Index segments are capped at 10,000 documents and 16 MiB encoded bytes, with independently bounded page decode. Text queries accept at most 100 results and 64 distinct normalized terms; phrases are capped at 64 tokens. Vector/hybrid top-k is capped at 50 by native full-metadata retrieval. Filters have at most sixteen conditions, each `in` list capped at 32 scalar values. Vector dimensions are currently fixed at 768 in the owning Alchemy resource and validated at the API. Compaction reads each selected segment payload in one bounded range and decodes live document pages from that buffer, avoiding one R2 call per document. A window has at most eight segments and 8 MiB of decoded documents.
+
+One namespace is currently coordinated by one Durable Object; that object's memory is disposable. The R2 manifest and number of segments still need scale-bound validation. Sharded manifest directories, distributed BM25 statistics, export pagination, request rate limits and per-namespace credentials are not implemented. There is one deployment-owner API credential. This must not be advertised as a hosted tenant authorization system.
+
+## Requested delivery gate
+
+The original goal is an OSS Cloudflare-native search system with performance comparable to Turbopuffer. Local functional checks alone cannot complete that goal. Remaining evidence includes:
+
+1. Native Alchemy deployment, exercising the compiled Worker, real R2, volatile coordination, queues and Vectorize bindings. The local-stage Alchemy plan and native production deployment have passed. Native smoke checks exercised R2 writes, text reads, asynchronous vector visibility, and Worker/Cache API hits. Broad workload and failure validation remains required.
+2. Native Vectorize metadata pre-filtering, real asynchronous visibility checks, failure recovery and ANN recall measurements.
+3. Obsolete-object and log retention, and storage/recovery tests at the intended namespace scale.
+4. Comparable full-text and hybrid workloads with identical documents, queries, filters, concurrency, region and consistency against Turbopuffer, recording p50/p95/p99, throughput, bytes and cost.
+5. Quality judgments or a public retrieval corpus, measuring ranking quality independently of latency; independent correctness checks for updates, resets, restart and partial commits.
+6. OSS publication, release reproducibility, CI and dependency/license checks.
+
+Benchmarks from the discarded local-database prototype do not describe this R2 engine. The Rust scorer has exact block pruning, positional phrase matching and live global frequencies, but comparable latency and quality still need measurement. Immutable ranges and segment compaction must be tuned using request/byte/CPU evidence, preserving exact ranking, filtering, mutation and recovery behavior.
+
+Architectural research: [Tidepool](https://github.com/milannair/tidepool), [Zeppelin](https://github.com/zepdb/zeppelin), and [Turbopuffer architecture](https://turbopuffer.com/docs/architecture). Their storage designs are research references; no performance numbers from those projects are claimed as Raio measurements, and no upstream implementation was copied into this repository.
+
+## Cloudflare cache ownership
+
+Immutable segment ranges pass through the internal `Segments` Worker entrypoint. Alchemy enables native Workers Cache for that entrypoint and disables it for the authenticated gateway. Workers Cache supplies regional tiers and request collapsing without running the entrypoint on a hit. The internal response is keyed by the immutable segment object key, byte offset and length; cross-version Worker caching is disabled. Cache API inside the entrypoint retains ranges in the originating data center, with bucket identity included in its private key. It is an additional best-effort derived layer, not canonical storage. Neither cache stores credentials or mutable manifests. Missing and truncated objects use `no-store`. The public gateway has no route for raw segment bytes.
+
+A manifest commit changes the live segment set and tombstones before query evaluation. Cached old bytes therefore cannot restore removed rows. No purge is needed to keep mutations correct; immutable bytes can remain cached until eviction. Local workerd tests exercise Cache API, memory eviction, namespace separation and mutation reconciliation. Native Workers Cache, regional tiers and request collapsing require deployed evidence because the local emulator does not implement them.
+
+R2 public custom-domain CDN caching, Smart Tiered Cache for public buckets, and Cache Reserve are separate Cloudflare capabilities. They are not enabled by an R2 binding or a `cache.put` call. The bucket remains private; this architecture uses the internal Worker cache path instead of exposing canonical documents through a public bucket domain.
+
+References: [Workers Cache](https://developers.cloudflare.com/workers/cache/), [Cache API](https://developers.cloudflare.com/workers/runtime-apis/cache/), [R2 consistency](https://developers.cloudflare.com/r2/reference/consistency/).
+
+Native cache smoke evidence recorded both Workers Cache hits and Cache API hits after clearing the volatile range/directory caches. The authenticated metadata endpoint exposes process-scoped cache counters; these distinguish native cache fills from memory reuse and are not a billing meter. The local gate currently passes 51 Bun tests and 14 Rust tests, including negative lint probes. Performance parity and retrieval quality remain unverified.

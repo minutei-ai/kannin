@@ -1,0 +1,71 @@
+{
+  "$schema": "./node_modules/@effect/tsgo/oxlint-schema.json",
+  "extends": ["./node_modules/@effect/tsgo/oxlint-presets/strict.json"],
+  "plugins": ["typescript", "unicorn", "oxc", "import", "effecttsgo"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error",
+    "perf": "error"
+  },
+  "options": {
+    "typeAware": true,
+    "typeCheck": true
+  },
+  "rules": {
+    "typescript/no-explicit-any": "error",
+    "typescript/no-floating-promises": "error",
+    "typescript/no-misused-promises": "error",
+    "typescript/no-unsafe-assignment": "error",
+    "typescript/no-unsafe-argument": "error",
+    "typescript/no-unsafe-call": "error",
+    "typescript/no-unsafe-member-access": "error",
+    "typescript/no-unsafe-return": "error",
+    "typescript/no-non-null-assertion": "error",
+    "typescript/consistent-type-imports": "error",
+    "typescript/consistent-type-assertions": [
+      "error",
+      {
+        "assertionStyle": "never"
+      }
+    ],
+    "eslint/eqeqeq": ["error", "always"],
+    "eslint/no-debugger": "error",
+    "raio/syntax": "error",
+    "eslint/no-await-in-loop": "off",
+    "unicorn/no-array-sort": "off",
+    "eslint/no-underscore-dangle": [
+      "error",
+      {
+        "allow": ["_attempt", "_warmup", "_iteration", "_tag"]
+      }
+    ]
+  },
+  "ignorePatterns": ["node_modules/**", "target/**", "dist/**", "coverage/**"],
+  "jsPlugins": ["./tooling/policy.ts"],
+  "overrides": [
+    {
+      "files": ["src/**/*.ts"],
+      "rules": {
+        "eslint/no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "group": [
+                  "alchemy",
+                  "alchemy/*",
+                  "node:*",
+                  "bun:sqlite",
+                  "better-sqlite3",
+                  "@effect/sql-*"
+                ],
+                "allowTypeImports": true,
+                "message": "Runtime search storage belongs to R2; provisioning and host tooling stay outside the Worker."
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

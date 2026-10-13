@@ -1,0 +1,45 @@
+[workspace]
+members = ["crates/engine"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.96"
+license = "Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+unreachable_pub = "deny"
+unused_qualifications = "deny"
+unused_lifetimes = "deny"
+unfulfilled_lint_expectations = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+dbg_macro = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+let_underscore_must_use = "deny"
+unused_result_ok = "deny"
+mem_forget = "deny"
+exit = "deny"
+wildcard_dependencies = "deny"
+map_err_ignore = "deny"
+large_stack_arrays = "deny"
+large_stack_frames = "deny"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+strip = true
+overflow-checks = true

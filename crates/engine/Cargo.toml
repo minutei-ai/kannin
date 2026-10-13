@@ -1,0 +1,23 @@
+[package]
+name = "raio-engine"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+crc32fast = "1.5.0"
+miniz_oxide = "0.9.0"
+unicode-normalization = "0.1.25"
+unicode-segmentation = "1.13.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "=0.2.129"

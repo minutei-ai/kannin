@@ -1,0 +1,84 @@
+import { createHash } from "node:crypto";
+import { cpus } from "node:os";
+import { Schema } from "effect";
+import { QueryResult, Health } from "../src/protocol";
+import { document, request, startWorker, textQuery, write } from "../tests/harness";
+
+const size = Schema.decodeSync(
+  Schema.Int.check(Schema.isBetween({ minimum: 1000, maximum: 1000000 })),
+)(Number(process.env.RAIO_BENCH_DOCUMENTS ?? 10000));
+const worker = await startWorker();
+const bundleSha256 = Bun.CryptoHasher.hash(
+  "sha256",
+  await Bun.file(new URL("../dist/worker/worker.js", import.meta.url)).arrayBuffer(),
+  "hex",
+);
+const wasmSha256 = Bun.CryptoHasher.hash(
+  "sha256",
+  await Bun.file(new URL("../dist/worker/raio_engine_bg.wasm", import.meta.url)).arrayBuffer(),
+  "hex",
+);
+const ingestion = performance.now();
+const corpusHash = createHash("sha256");
+for (const offset of Array.from({ length: Math.ceil(size / 500) }, (_, ordinal) => ordinal * 500)) {
+  const documents = Array.from({ length: Math.min(500, size - offset) }, (_, index) => {
+    const id = offset + index;
+    return document(
+      String(id),
+      `cloudflare rust search group${id % 100} unique${id} ${"storage latency durable object ".repeat(8 + (id % 8))}`,
+      { group: id % 100, year: 2020 + (id % 7) },
+    );
+  });
+  corpusHash.update(JSON.stringify(documents));
+  const response = await request(worker, "benchmark", "write", write(documents));
+  if (!response.ok)
+    throw new Error(`Ingestion failed: ${response.status} ${await response.text()}`);
+}
+const ingestMs = performance.now() - ingestion;
+const reports = [];
+for (const [name, query] of [
+  ["rare", textQuery("unique42")],
+  ["selective", textQuery("group42")],
+  ["common", textQuery("cloudflare rust")],
+  ["filtered", textQuery("cloudflare", 10, [{ field: "group", op: "eq", value: 42 }])],
+] as const) {
+  for (const _warmup of Array.from({ length: 5 }, (_, ordinal) => ordinal)) {
+    const response = await request(worker, "benchmark", "query", query);
+    if (!response.ok) throw new Error(`Warmup failed ${response.status}`);
+    await response.arrayBuffer();
+  }
+  const samples = [];
+  for (const _iteration of Array.from({ length: 50 }, (_, ordinal) => ordinal)) {
+    const start = performance.now();
+    const response = await request(worker, "benchmark", "query", query);
+    const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+    if (!result.rows.length) throw new Error("Empty benchmark result");
+    samples.push(performance.now() - start);
+  }
+  const ordered = [...samples].sort((a, b) => a - b);
+  reports.push({ name, p50: ordered[24], p95: ordered[47], p99: ordered[49], samples });
+}
+const health = Schema.decodeUnknownSync(Health)(
+  await (await fetch(new URL("/health", await worker.ready))).json(),
+);
+await worker.dispose();
+console.log(
+  JSON.stringify(
+    {
+      runtime: "local-workerd",
+      cpu: cpus()[0]?.model,
+      bun: Bun.version,
+      bundleSha256,
+      wasmSha256,
+      documents: size,
+      corpusSha256: corpusHash.digest("hex"),
+      ingestMs,
+      documentsPerSecond: (size / ingestMs) * 1000,
+      reports,
+      health,
+      turbopufferComparison: "not measured",
+    },
+    null,
+    2,
+  ),
+);

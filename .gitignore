@@ -1,0 +1,8 @@
+node_modules/
+target/
+dist/
+.alchemy/
+.env*
+!\.env.example
+.local/
+.lint-probe-*/

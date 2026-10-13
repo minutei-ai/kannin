@@ -1,0 +1,15 @@
+# Raio
+
+Raio is a standalone OSS repository. Keep deployment-specific configuration and credentials outside its tracked tree.
+
+R2 owns all canonical search state. Never introduce SQLite, FTS5, D1, KV or Durable Object storage for documents, postings, manifests, receipts or outboxes. Durable Objects coordinate operations using disposable memory. Vectorize owns vector search.
+
+Effect Schema owns runtime contracts in `src/protocol.ts`. Decode external values at their boundary. Preserve declared failures and native failure causes. Rust owns tokenization, compressed immutable segments, positional postings, BM25 scoring and exact pruning. Filters, tombstones and live global statistics must apply before text top-k.
+
+Alchemy owns infrastructure in `alchemy.run.ts`; commands use the native `minutei` profile. Keep secrets outside the repository. Inspect the resolved installed APIs before adding adapters or package patches. Never publish provisioning imports into the Worker bundle.
+
+Cache only immutable segment bytes and derived immutable structures. Authenticate every public namespace request. Mutable manifests and authorization never enter shared HTTP caches. Cache misses, eviction or unavailability must preserve canonical R2 behavior. Keep cache identities scoped to their bucket and object version.
+
+Use `bun run check` as the local gate. It includes formatting, native and WASM Clippy, Rust/WASM build, strict type-aware Oxlint with the official Effect preset, typechecking, and workerd/Rust tests. Lint rejection probes must remain executable. Fix findings without suppressions. Keep generated outputs generator-owned and scratch artifacts outside this repository.
+
+Report local checks, Cloudflare deployment, real Vectorize behavior, ranking quality and comparable Turbopuffer benchmarks separately. Never infer performance parity from synthetic local results. Maintain public limits and remaining delivery gates in the README and architecture document.

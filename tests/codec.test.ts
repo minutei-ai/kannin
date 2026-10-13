@@ -12,7 +12,8 @@ test("real WASM log codec survives Unicode and rejects corrupted compressed data
   const bytes = pack(input);
   expect(bytes.length).toBeLessThan(input.length / 5);
   expect(unpack(bytes)).toBe(input);
-  bytes[12] ^= 1;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  view.setUint8(12, view.getUint8(12) ^ 1);
   expect(() => unpack(bytes)).toThrow("InvalidChecksum");
 });
 

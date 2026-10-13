@@ -20,7 +20,9 @@ test("R2 manifest repairs a lost receipt without committing the write twice", as
   const namespacePrefix = await prefix("lost-receipt");
   const receipts = (await bucket.list({ prefix: `${namespacePrefix}/receipts/` })).objects;
   expect(receipts.length).toBe(1);
-  await bucket.delete(receipts[0].key);
+  const receipt = receipts[0];
+  if (!receipt) throw new Error("Missing committed receipt");
+  await bucket.delete(receipt.key);
   await worker.unsafeEvictDurableObject("raio", "SearchNamespace", { name: "lost-receipt" });
   expect((await request(worker, "lost-receipt", "write", input)).status).toBe(200);
   const result = Schema.decodeUnknownSync(QueryResult)(
@@ -81,7 +83,9 @@ test("a missing committed segment fails closed on cold read", async () => {
   await request(worker, "missing", "write", write([document("a", "term")]));
   const bucket = await worker.getR2Bucket("STORAGE", "raio");
   const objects = (await bucket.list({ prefix: `${await prefix("missing")}/segments/` })).objects;
-  await bucket.delete(objects[0].key);
+  const segment = objects[0];
+  if (!segment) throw new Error("Missing committed segment");
+  await bucket.delete(segment.key);
   expect((await request(worker, "missing", "query", textQuery("term"))).status).toBe(503);
 });
 
@@ -111,7 +115,7 @@ test("a full workerd restart restores records using only R2", async () => {
     await (await request(second, "restart", "query", textQuery("persistent"))).json(),
   );
   expect(found.rows.map((row) => row.id)).toEqual(["a"]);
-  expect(found.rows[0].attributes).toEqual({ source: "r2" });
+  expect(found.rows[0]?.attributes).toEqual({ source: "r2" });
   await second.dispose();
   await rm(persistence, { recursive: true, force: true });
 });

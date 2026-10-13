@@ -21,7 +21,7 @@ test("title has a deliberate BM25 weight above body", async () => {
       document("body", "cloudflare common words"),
     ]),
   );
-  expect((await search("title", textQuery("cloudflare"))).rows[0].id).toBe("title");
+  expect((await search("title", textQuery("cloudflare"))).rows[0]?.id).toBe("title");
 });
 
 test("any, all, and phrase matching have distinct semantics", async () => {
@@ -48,9 +48,11 @@ test("any, all, and phrase matching have distinct semantics", async () => {
 
 test("repeated query words do not multiply BM25 scores", async () => {
   await request(worker, "repeated", "write", write([document("a", "rust rust cloudflare")]));
-  expect((await search("repeated", textQuery("rust"))).rows[0].score).toEqual(
-    (await search("repeated", textQuery("rust rust rust"))).rows[0].score,
-  );
+  const first = await search("repeated", textQuery("rust"));
+  const repeated = await search("repeated", textQuery("rust rust rust"));
+  expect(first.rows).toHaveLength(1);
+  expect(repeated.rows).toHaveLength(1);
+  expect(first.rows.map((row) => row.score)).toEqual(repeated.rows.map((row) => row.score));
 });
 
 test("punctuation-only queries return empty results", async () => {
@@ -68,9 +70,9 @@ test("unicode and accents normalize identically in documents and queries", async
       document("de", "Über ﬂores"),
     ]),
   );
-  expect((await search("unicode", textQuery("SAO ACAO CAFE"))).rows[0].id).toBe("pt");
-  expect((await search("unicode", textQuery("日本語"))).rows[0].id).toBe("cjk");
-  expect((await search("unicode", textQuery("uber flores"))).rows[0].id).toBe("de");
+  expect((await search("unicode", textQuery("SAO ACAO CAFE"))).rows[0]?.id).toBe("pt");
+  expect((await search("unicode", textQuery("日本語"))).rows[0]?.id).toBe("cjk");
+  expect((await search("unicode", textQuery("uber flores"))).rows[0]?.id).toBe("de");
 });
 
 test("rare terms outrank common terms with namespace-wide statistics", async () => {
@@ -78,7 +80,7 @@ test("rare terms outrank common terms with namespace-wide statistics", async () 
     document(`common-${index}`, "common padding"),
   );
   await request(worker, "idf", "write", write([...documents, document("rare", "rare padding")]));
-  expect((await search("idf", textQuery("common rare"))).rows[0].id).toBe("rare");
+  expect((await search("idf", textQuery("common rare"))).rows[0]?.id).toBe("rare");
 });
 
 test("filter booleans and numbers do not compare equal", async () => {
@@ -155,4 +157,29 @@ test("reset replaces a namespace without affecting another", async () => {
     Schema.decodeUnknownSync(Metadata)(await (await request(worker, "reset", "metadata")).json())
       .documents,
   ).toBe(1);
+});
+
+test("prototype-like terms remain ordinary terms across updates and deletions", async () => {
+  const initial = await request(
+    worker,
+    "prototype-terms",
+    "write",
+    write([document("a", "constructor constructor rust"), document("b", "constructor worker")]),
+  );
+  expect(initial.status).toBe(200);
+  const first = await search("prototype-terms", textQuery("constructor"));
+  expect(first.rows.map((row) => row.id)).toEqual(["a", "b"]);
+  const updated = await request(
+    worker,
+    "prototype-terms",
+    "write",
+    write([document("a", "replacement rust")]),
+  );
+  expect(updated.status).toBe(200);
+  expect(
+    (await search("prototype-terms", textQuery("constructor"))).rows.map((row) => row.id),
+  ).toEqual(["b"]);
+  const deleted = await request(worker, "prototype-terms", "write", write([], ["b"]));
+  expect(deleted.status).toBe(200);
+  expect((await search("prototype-terms", textQuery("constructor"))).rows).toEqual([]);
 });

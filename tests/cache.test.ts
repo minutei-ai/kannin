@@ -15,6 +15,7 @@ test("native Cache API retains immutable ranges after the memory cache is discar
   if (!root) throw new Error("Missing root");
   const manifest = Schema.decodeSync(Schema.fromJsonString(Root))(await root.text());
   const segment = manifest.segments[0];
+  if (!segment) throw new Error("Missing committed segment");
   const caches = await worker.getCaches();
   const cache = await caches.open("raio-segments-v1");
   const key = new URL("https://raio-cache.internal/range");

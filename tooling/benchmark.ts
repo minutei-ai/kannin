@@ -2,7 +2,8 @@ import { createHash } from "node:crypto";
 import { cpus } from "node:os";
 import { Schema } from "effect";
 import { QueryResult, Health } from "../src/protocol";
-import { document, request, startWorker, textQuery, write } from "../tests/harness";
+import { request, startWorker, textQuery, write } from "../tests/harness";
+import { corpus } from "./corpus";
 
 const size = Schema.decodeSync(
   Schema.Int.check(Schema.isBetween({ minimum: 1000, maximum: 1000000 })),
@@ -21,14 +22,7 @@ const wasmSha256 = Bun.CryptoHasher.hash(
 const ingestion = performance.now();
 const corpusHash = createHash("sha256");
 for (const offset of Array.from({ length: Math.ceil(size / 500) }, (_, ordinal) => ordinal * 500)) {
-  const documents = Array.from({ length: Math.min(500, size - offset) }, (_, index) => {
-    const id = offset + index;
-    return document(
-      String(id),
-      `cloudflare rust search group${id % 100} unique${id} ${"storage latency durable object ".repeat(8 + (id % 8))}`,
-      { group: id % 100, year: 2020 + (id % 7) },
-    );
-  });
+  const documents = corpus(offset, size);
   corpusHash.update(JSON.stringify(documents));
   const response = await request(worker, "benchmark", "write", write(documents));
   if (!response.ok)

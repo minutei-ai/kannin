@@ -131,8 +131,11 @@ test("global segment pruning matches an independent exhaustive BM25 oracle", asy
       await (await request(worker, "oracle", "query", textQuery("alpha beta", 20, filters))).json(),
     );
     expect(found.rows.map((row) => row.id)).toEqual(scores.map((row) => row.id));
-    for (const [index, row] of found.rows.entries())
-      expect(row.score).toBeCloseTo(scores[index].score, 10);
+    for (const [index, row] of found.rows.entries()) {
+      const expected = scores[index];
+      if (!expected) throw new Error("Missing reference row");
+      expect(row.score).toBeCloseTo(expected.score, 10);
+    }
   }
 });
 

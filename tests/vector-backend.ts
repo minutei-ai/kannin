@@ -31,10 +31,11 @@ export class VectorBackend extends WorkerEntrypoint {
         const magnitude = Math.sqrt(
           [...vector.values].reduce((sum, value) => sum + value * value, 0),
         );
-        const dot = [...vector.values].reduce(
-          (sum, value, index) => sum + value * values[index],
-          0,
-        );
+        const dot = [...vector.values].reduce((sum, value, index) => {
+          const other = values[index];
+          if (other === undefined) throw new Error("Query dimension mismatch");
+          return sum + value * other;
+        }, 0);
         return {
           id: vector.id,
           namespace: vector.namespace,

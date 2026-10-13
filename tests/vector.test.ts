@@ -82,7 +82,7 @@ test("delayed obsolete vectors cannot impersonate newer document revisions", asy
     await (await request(worker, "revision", "query", vectorQuery())).json(),
   );
   expect(found.rows.map((row) => row.text)).toEqual(["new"]);
-  expect(found.rows[0].score).toBeCloseTo(0.6);
+  expect(found.rows[0]?.score).toBeCloseTo(0.6);
 });
 
 test("deletion hides stale Vectorize results immediately", async () => {
@@ -120,8 +120,8 @@ test("hybrid combines lexical and vector ranking using RRF", async () => {
   const result = Schema.decodeUnknownSync(QueryResult)(
     await (await request(worker, "hybrid", "query", query("hybrid"))).json(),
   );
-  expect(result.rows[0].id).toBe("both");
-  expect(result.rows[0].score).toBeCloseTo(2 / 61);
+  expect(result.rows[0]?.id).toBe("both");
+  expect(result.rows[0]?.score).toBeCloseTo(2 / 61);
   const filtered = Schema.decodeUnknownSync(QueryResult)(
     await (
       await request(worker, "hybrid", "query", {

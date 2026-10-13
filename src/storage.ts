@@ -97,6 +97,8 @@ async function acquireDirectory(bucket: R2Bucket, key: string, headerBytes: numb
     return cached.directory.retain();
   }
   const bytes = await range(bucket, key, 0, headerBytes);
+  const concurrent = directories.get(identity);
+  if (concurrent) return concurrent.directory.retain();
   const decoded = new Directory(bytes);
   const entry = { directory: decoded, bytes: decoded.heap_bytes() };
   if (entry.bytes > MAX_DECODED_BYTES) {

@@ -57,7 +57,8 @@
                   "node:*",
                   "bun:sqlite",
                   "better-sqlite3",
-                  "@effect/sql-*"
+                  "@effect/sql-*",
+                  "@turbopuffer/*"
                 ],
                 "allowTypeImports": true,
                 "message": "Runtime search storage belongs to R2; provisioning and host tooling stay outside the Worker."

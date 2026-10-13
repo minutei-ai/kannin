@@ -1,12 +1,12 @@
 import { expect, test } from "bun:test";
 import { Effect } from "effect";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 
 const root = join(import.meta.dir, "..");
-const probe = Effect.fn("raio.lintProbe")(function* (source: string) {
+const probe = Effect.fn("raio.lintProbe")(function* (source: string, parent: string = root) {
   return yield* Effect.acquireUseRelease(
-    Effect.tryPromise(() => mkdtemp(join(root, ".lint-probe-"))),
+    Effect.tryPromise(() => mkdtemp(join(parent, ".lint-probe-"))),
     (directory) =>
       Effect.gen(function* () {
         const file = join(directory, "probe.ts");
@@ -14,7 +14,10 @@ const probe = Effect.fn("raio.lintProbe")(function* (source: string) {
         yield* Effect.tryPromise(() =>
           writeFile(
             join(directory, "tsconfig.json"),
-            JSON.stringify({ extends: "../tsconfig.json", include: ["*.ts"] }),
+            JSON.stringify({
+              extends: relative(directory, join(root, "tsconfig.json")),
+              include: ["*.ts"],
+            }),
           ),
         );
         const child = Bun.spawn(["bunx", "oxlint", "--deny-warnings", "--no-ignore", file], {
@@ -141,4 +144,22 @@ test("Rust policy rejects unsafe, panic, unwrap, placeholders and lint suppressi
     "allow_attributes",
   ])
     expect(result.output).toContain(rule);
+});
+
+test("runtime file selection rejects comparator imports while allowing erased native types", async () => {
+  const runtime = await Effect.runPromise(
+    probe(
+      'import Turbopuffer from "@turbopuffer/turbopuffer"; export const comparator = Turbopuffer;',
+      join(root, "src"),
+    ),
+  );
+  expect(runtime.exitCode).not.toBe(0);
+  expect(runtime.output).toContain("no-restricted-imports");
+  const erased = await Effect.runPromise(
+    probe(
+      'import type Turbopuffer from "@turbopuffer/turbopuffer"; export type Comparator = Turbopuffer;',
+      join(root, "src"),
+    ),
+  );
+  expect(erased.exitCode).toBe(0);
 });

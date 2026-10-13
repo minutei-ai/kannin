@@ -8,7 +8,7 @@ Effect Schema owns runtime contracts in `src/protocol.ts`. Decode external value
 
 Alchemy owns infrastructure in `alchemy.run.ts`; commands use the native `minutei` profile. Keep secrets outside the repository. Inspect the resolved installed APIs before adding adapters or package patches. Never publish provisioning imports into the Worker bundle.
 
-Cache only immutable segment bytes and derived immutable structures. Authenticate every public namespace request. Mutable manifests and authorization never enter shared HTTP caches. Cache misses, eviction or unavailability must preserve canonical R2 behavior. Keep cache identities scoped to their bucket and object version.
+Cache immutable segment bytes and derived immutable structures. The explicit edge-eventual text contract may cache a point-in-time manifest for less than one second, measured from before the R2 read; minimumSequence bypasses an insufficient snapshot. Strong reads never use snapshot caches. Authenticate every public namespace request. Authorization never enters shared HTTP caches. Snapshot caches remain internal and bucket/namespace scoped. Cache misses, eviction or unavailability must preserve canonical R2 behavior. Keep cache identities scoped to their bucket and object version.
 
 Use `bun run check` as the local gate. It includes formatting, native and WASM Clippy, Rust/WASM build, strict type-aware Oxlint with the official Effect preset, typechecking, and workerd/Rust tests. Lint rejection probes must remain executable. Fix findings without suppressions. Keep generated outputs generator-owned and scratch artifacts outside this repository.
 

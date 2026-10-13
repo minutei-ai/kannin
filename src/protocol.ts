@@ -5,6 +5,14 @@ const Unicode = Schema.String.check(
 );
 export const Id = Unicode.check(Schema.isBetweenLength(1, 128));
 export const NamespaceName = Schema.String.check(Schema.isPattern(/^[a-zA-Z0-9_-]{1,64}$/));
+export const Operation = Schema.Literals([
+  "write",
+  "query",
+  "metadata",
+  "vector-sync",
+  "rebuild",
+  "compact",
+]);
 export const Scalar = Schema.Union([Unicode, Schema.Finite, Schema.Boolean, Schema.Null]);
 export const Attributes = Schema.Record(
   Schema.String.check(Schema.isPattern(/^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/)),
@@ -59,6 +67,8 @@ export const Filter = Schema.Union([
   }),
 ]);
 const QueryFields = {
+  consistency: Schema.optional(Schema.Literals(["strong", "edge-eventual"])),
+  minimumSequence: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   topK: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 100 })),
   filters: Schema.Array(Filter).check(Schema.isMaxLength(16)),
 };
@@ -108,6 +118,10 @@ export const Root = Schema.Struct({
     }),
   ),
 });
+export const Snapshot = Schema.Struct({
+  observedAt: Schema.Finite,
+  manifest: Root,
+});
 export const Log = Schema.Struct({
   version: Schema.Literal(1),
   sequence: Schema.Int.check(Schema.isGreaterThan(0)),
@@ -128,7 +142,7 @@ export const Row = Schema.Struct({
 export const QueryResult = Schema.Struct({
   rows: Schema.Array(Row),
   sequence: Schema.Int,
-  consistency: Schema.Literals(["strong", "vectorize-eventual"]),
+  consistency: Schema.Literals(["strong", "edge-eventual", "vectorize-eventual"]),
 });
 export const WriteResult = Schema.Struct({
   sequence: Schema.Int,
@@ -191,7 +205,7 @@ export const SegmentTerm = Schema.Struct({ df: Schema.Int, blocks: Schema.Array(
 export const SegmentTerms = Schema.Record(Schema.String, SegmentTerm);
 export const SegmentHeader = Schema.Struct({
   version: Schema.Literal(1),
-  documents: Schema.Array(SegmentDocument),
+  documents: Schema.NonEmptyArray(SegmentDocument),
   terms: SegmentTerms,
   total_title_length: Schema.Int,
   total_body_length: Schema.Int,

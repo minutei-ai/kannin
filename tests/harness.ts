@@ -11,7 +11,9 @@ export async function startWorker(persistence?: string, consumeQueues = false) {
     external: ["cloudflare:workers"],
   });
   if (!bundle.success) throw new AggregateError(bundle.logs);
-  const vectorScript = await bundle.outputs[0].text();
+  const artifact = bundle.outputs[0];
+  if (!artifact) throw new Error("Missing vector fixture artifact");
+  const vectorScript = await artifact.text();
   const triggers = [];
   if (consumeQueues)
     triggers.push(

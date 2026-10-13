@@ -54,7 +54,9 @@ test("BM25 term frequency and length normalization", async () => {
     await (await request(state.worker, "ranking", "query", textQuery("cloudflare"))).json(),
   );
   expect(found.rows.map((row) => row.id)).toEqual(["short", "long"]);
-  expect(found.rows[0].score).toBeGreaterThan(found.rows[1].score);
+  const [first, second] = found.rows;
+  if (!first || !second) throw new Error("Expected two ranked rows");
+  expect(first.score).toBeGreaterThan(second.score);
 });
 
 test("update and deletion remove obsolete posting lists", async () => {

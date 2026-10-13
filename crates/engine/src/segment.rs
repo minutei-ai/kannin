@@ -208,6 +208,9 @@ pub fn decode_postings(bytes: &[u8]) -> Result<Vec<Posting>, String> {
 }
 
 pub fn build(mut documents: Vec<Document>) -> Result<BuiltSegment, String> {
+    if documents.is_empty() {
+        return Err("Segment must contain at least one document".into());
+    }
     if documents.len() > 10000 {
         return Err("Segment exceeds 10000 documents".into());
     }

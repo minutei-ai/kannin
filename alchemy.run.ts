@@ -114,7 +114,13 @@ export default Alchemy.Stack(
       queueId: jobs.queueId,
       scriptName: worker.workerName,
       deadLetterQueue: deadLetters.queueName,
-      settings: { batchSize: 1, maxConcurrency: 1, maxRetries: 5, retryDelay: 60 },
+      settings: {
+        batchSize: 16,
+        maxConcurrency: 4,
+        maxWaitTimeMs: 1000,
+        maxRetries: 5,
+        retryDelay: 60,
+      },
     });
     const indexJobs = yield* IndexJobs;
     const indexDeadLetters = yield* IndexDeadLetters;
@@ -122,7 +128,13 @@ export default Alchemy.Stack(
       queueId: indexJobs.queueId,
       scriptName: worker.workerName,
       deadLetterQueue: indexDeadLetters.queueName,
-      settings: { batchSize: 1, maxConcurrency: 1, maxRetries: 5, retryDelay: 60 },
+      settings: {
+        batchSize: 8,
+        maxConcurrency: 4,
+        maxWaitTimeMs: 1000,
+        maxRetries: 5,
+        retryDelay: 60,
+      },
     });
     return { url: worker.url };
   }),

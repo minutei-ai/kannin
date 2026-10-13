@@ -2,7 +2,7 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 
 const vectors = new Map<string, VectorizeVector>();
 const pending: VectorizeVector[] = [];
-const control = { fail: false, deferred: false };
+const control = { fail: false, deferred: false, upsertCalls: 0 };
 
 function metadataMatches(vector: VectorizeVector, filters: VectorizeVectorMetadataFilter) {
   return Object.entries(filters).every(([field, condition]) => {
@@ -41,6 +41,7 @@ function metadataMatches(vector: VectorizeVector, filters: VectorizeVectorMetada
 
 export class VectorBackend extends WorkerEntrypoint {
   async upsert(input: VectorizeVector[]) {
+    control.upsertCalls += 1;
     if (control.fail) throw new Error("Injected Vectorize failure");
     for (const vector of input) {
       if (control.deferred) pending.push(vector);
@@ -101,6 +102,10 @@ export default {
     control.deferred = operation === "/defer";
     if (operation === "/commit-reversed")
       for (const vector of pending.splice(0).toReversed()) vectors.set(vector.id, vector);
-    return Response.json({ vectors: vectors.size, pending: pending.length });
+    return Response.json({
+      vectors: vectors.size,
+      pending: pending.length,
+      upsertCalls: control.upsertCalls,
+    });
   },
 };

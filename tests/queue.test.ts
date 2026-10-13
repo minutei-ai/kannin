@@ -1,6 +1,6 @@
 import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
-import { Metadata, QueryResult, Root } from "../src/protocol";
+import { Metadata, QueryResult, Root, VectorMessage } from "../src/protocol";
 import { request, startWorker } from "./harness";
 
 const worker = await startWorker(undefined, true);
@@ -75,3 +75,43 @@ test("native index queue compacts immutable R2 segments without changing live ro
   );
   expect(result.rows).toHaveLength(64);
 }, 20000);
+
+test("a malformed queue message retries alone while a healthy namespace is acknowledged", async () => {
+  const namespace = "queue-sibling";
+  const dormant = await startWorker();
+  await using cleanup = new AsyncDisposableStack();
+  cleanup.defer(() => dormant.dispose());
+  const values = [1, ...Array.from({ length: 767 }, () => 0)];
+  expect(
+    (
+      await request(dormant, namespace, "write", {
+        requestId: "sibling",
+        upserts: [{ id: "a", text: "healthy sibling", attributes: {}, vector: values }],
+        deletes: [],
+      })
+    ).status,
+  ).toBe(200);
+  const bucket = await dormant.getR2Bucket("STORAGE");
+  const object = await bucket.get(`namespaces/${namespace}/root.json`);
+  if (object === null) throw new Error("Missing queued root");
+  const root = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
+  const job = root.vectorJobs[0];
+  if (job === undefined) throw new Error("Missing queued job");
+  const service = await dormant.getWorker();
+  const input = Schema.encodeSync(VectorMessage)({ namespace, ...job });
+  const result = await service.queue("raio-vector-jobs", [
+    {
+      id: "malformed",
+      timestamp: new Date(0),
+      attempts: 1,
+      body: { namespace, sequence: "invalid", log: job.log },
+    },
+    { id: "healthy", timestamp: new Date(0), attempts: 1, body: input },
+  ]);
+  expect(result.explicitAcks).toContain("healthy");
+  expect(result.retryMessages.map((message) => message.msgId)).toEqual(["malformed"]);
+  expect(
+    Schema.decodeUnknownSync(Metadata)(await (await request(dormant, namespace, "metadata")).json())
+      .vectorOutbox,
+  ).toBe(0);
+});

@@ -1,5 +1,5 @@
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
-import { Cause, Clock, Effect, Schema, Semaphore } from "effect";
+import { Cause, Clock, Effect, Match, Schema, Semaphore } from "effect";
 import type { Env } from "../alchemy.run";
 import {
   initSync,
@@ -36,6 +36,7 @@ import {
   Write,
   WriteResult,
   VectorMessage,
+  VectorSyncResult,
   VectorFilterFields,
   VectorRebuild,
   VectorRebuildSnapshot,
@@ -220,15 +221,18 @@ async function textQuery(
   const selected = root.segments.filter(
     (segment) => bloomCandidates(segment.termBloom, terms).length > 0,
   );
+  const encodedTerms = Schema.encodeSync(strings)(terms);
+  const encodedFilters = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Filter)))(
+    input.filters,
+  );
   const catalog = await Effect.runPromise(
     Effect.forEach(
       selected,
       (segment) =>
         withDirectory(env.STORAGE, segment.key, segment.headerBytes, (decoded) =>
           Effect.gen(function* () {
-            const encoded = yield* Schema.encodeEffect(strings)(terms);
             const dictionary = yield* Schema.decodeEffect(Schema.fromJsonString(SegmentTerms))(
-              decoded.terms(encoded),
+              decoded.terms(encodedTerms),
             );
             return { segment, dictionary };
           }),
@@ -251,6 +255,7 @@ async function textQuery(
     body_length: root.bodyLength,
     frequencies: Object.fromEntries(frequencies),
   };
+  const encodedStatistics = Schema.encodeSync(Schema.fromJsonString(SearchStatistics))(statistics);
   const dictionaryEnded = Effect.runSync(Clock.currentTimeNanos);
   timings.append("server-timing", `text_directory;dur=${Number(dictionaryEnded - started) / 1e6}`);
   const ranked: Array<{
@@ -264,15 +269,8 @@ async function textQuery(
       const bound = await Effect.runPromise(
         withDirectory(env.STORAGE, segment.key, segment.headerBytes, (decoded) =>
           Effect.gen(function* () {
-            const corpus = yield* Schema.encodeEffect(Schema.fromJsonString(SearchStatistics))(
-              statistics,
-            );
-            const encoded = yield* Schema.encodeEffect(strings)(terms);
-            const filters = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Array(Filter)))(
-              input.filters,
-            );
             const dead = yield* Schema.encodeEffect(integers)(segment.dead);
-            return decoded.upper_bound(corpus, encoded, filters, dead);
+            return decoded.upper_bound(encodedStatistics, encodedTerms, encodedFilters, dead);
           }),
         ),
       );
@@ -372,12 +370,6 @@ async function textQuery(
     });
     ranked.splice(input.topK);
   }
-  ranked.sort((a, b) => {
-    if (a.score !== b.score) return b.score - a.score;
-    if (a.id < b.id) return -1;
-    if (a.id > b.id) return 1;
-    return 0;
-  });
   const rankingEnded = Effect.runSync(Clock.currentTimeNanos);
   timings.append("server-timing", `text_rank;dur=${Number(rankingEnded - dictionaryEnded) / 1e6}`);
   const hits = ranked.slice(0, input.topK);
@@ -920,11 +912,11 @@ export class SearchNamespace extends DurableObject<Env> {
     return Response.json(Schema.encodeSync(VectorRebuildResult)(result));
   }
 
-  private async synchronizeVectors(sequence?: number) {
+  private async synchronizeVectors() {
     const current = await this.root();
-    const jobs = current.manifest.vectorJobs
-      .filter((job) => sequence === undefined || job.sequence === sequence)
-      .slice(0, 16);
+    const jobs = current.manifest.vectorJobs.slice(0, 16);
+    const vectors: VectorizeVector[] = [];
+    const deletes: string[] = [];
     const completed = new Set<number>();
     const fields = Schema.decodeSync(Schema.fromJsonString(VectorFilterFields))(
       this.env.VECTOR_FILTER_FIELDS,
@@ -936,11 +928,10 @@ export class SearchNamespace extends DurableObject<Env> {
       const log = decodeLog(unpack(new Uint8Array(await object.arrayBuffer())));
       if (log.sequence !== job.sequence)
         throw new Rejected({ status: 503, message: "Vector log sequence mismatch" });
-      for (const offset of Array.from(
-        { length: Math.ceil(log.vectorDeletes.length / 100) },
-        (_, ordinal) => ordinal * 100,
-      ))
-        await this.env.VECTORS.deleteByIds(log.vectorDeletes.slice(offset, offset + 100));
+      for (const id of log.vectorDeletes) {
+        deletes.push(id);
+        if (deletes.length === 100) await this.env.VECTORS.deleteByIds(deletes.splice(0));
+      }
       const candidates = log.write.upserts.filter((document) => document.vector !== undefined);
       if (log.vectorEpoch !== current.manifest.vectorEpoch || candidates.length === 0) {
         completed.add(job.sequence);
@@ -951,13 +942,12 @@ export class SearchNamespace extends DurableObject<Env> {
         candidates.map((document) => document.id),
         current.manifest,
       );
-      const vectors = [];
       for (const document of candidates)
         if (
           document.vector !== undefined &&
           live.get(document.id)?.document.revision === log.sequence &&
           live.get(document.id)?.document.vector === true
-        )
+        ) {
           vectors.push({
             id: await vectorId(log.vectorEpoch, document.id, log.sequence),
             values: [...document.vector],
@@ -968,13 +958,12 @@ export class SearchNamespace extends DurableObject<Env> {
               ...(await Effect.runPromise(vectorMetadata(document.attributes, fields))),
             },
           });
-      for (const offset of Array.from(
-        { length: Math.ceil(vectors.length / 100) },
-        (_, ordinal) => ordinal * 100,
-      ))
-        await this.env.VECTORS.upsert(vectors.slice(offset, offset + 100));
+          if (vectors.length === 100) await this.env.VECTORS.upsert(vectors.splice(0));
+        }
       completed.add(job.sequence);
     }
+    if (deletes.length > 0) await this.env.VECTORS.deleteByIds(deletes);
+    if (vectors.length > 0) await this.env.VECTORS.upsert(vectors);
     if (completed.size > 0)
       await this.commit(
         {
@@ -983,7 +972,12 @@ export class SearchNamespace extends DurableObject<Env> {
         },
         current.etag,
       );
-    return Response.json({ submitted: completed.size, visibility: "vectorize-eventual" });
+    return Response.json(
+      Schema.encodeSync(VectorSyncResult)({
+        submitted: completed.size,
+        visibility: "vectorize-eventual",
+      }),
+    );
   }
 
   private async collect(input: typeof Collection.Type) {
@@ -1377,8 +1371,15 @@ export class SearchNamespace extends DurableObject<Env> {
             );
             if (job !== undefined && job.log !== message.log)
               return yield* new Rejected({ status: 400, message: "Vector job log mismatch" });
+            if (job === undefined) {
+              const completed = yield* Schema.encodeEffect(VectorSyncResult)({
+                submitted: 0,
+                visibility: "vectorize-eventual",
+              });
+              return Response.json(completed);
+            }
             return yield* Effect.tryPromise({
-              try: () => this.synchronizeVectors(message.sequence),
+              try: () => this.synchronizeVectors(),
               catch: (cause) => {
                 if (Schema.is(Rejected)(cause)) return cause;
                 return new Cause.UnknownError(cause);
@@ -1691,38 +1692,63 @@ export default {
     return outgoing;
   },
   async queue(batch: MessageBatch, env: Env) {
-    for (const message of batch.messages) {
-      if (Schema.is(IndexMessage)(message.body) && !Schema.is(VectorMessage)(message.body)) {
-        const input = Schema.decodeSync(IndexMessage, { onExcessProperty: "error" })(message.body);
-        const response = await env.NAMESPACES.get(env.NAMESPACES.idFromName(input.namespace)).fetch(
-          `http://internal/v1/namespaces/${input.namespace}/internal-compact`,
-          {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: Schema.encodeSync(Schema.fromJsonString(IndexMessage))(input),
+    await Effect.runPromise(
+      Effect.forEach(
+        batch.messages,
+        Effect.fn("kannin.consumeJob")(
+          function* (message) {
+            const input = yield* Schema.decodeUnknownEffect(
+              Schema.Union([VectorMessage, IndexMessage]),
+              { onExcessProperty: "error" },
+            )(message.body);
+            const stub = env.NAMESPACES.get(env.NAMESPACES.idFromName(input.namespace));
+            const response = yield* Match.value(input).pipe(
+              Match.when(
+                (job) => "log" in job,
+                (job) =>
+                  Schema.encodeEffect(Schema.fromJsonString(VectorMessage))(job).pipe(
+                    Effect.flatMap((body) =>
+                      Effect.tryPromise(() =>
+                        stub.fetch(
+                          `http://internal/v1/namespaces/${job.namespace}/internal-vector-sync`,
+                          {
+                            method: "POST",
+                            headers: { "content-type": "application/json" },
+                            body,
+                          },
+                        ),
+                      ),
+                    ),
+                  ),
+              ),
+              Match.orElse((job) =>
+                Schema.encodeEffect(Schema.fromJsonString(IndexMessage))(job).pipe(
+                  Effect.flatMap((body) =>
+                    Effect.tryPromise(() =>
+                      stub.fetch(
+                        `http://internal/v1/namespaces/${job.namespace}/internal-compact`,
+                        {
+                          method: "POST",
+                          headers: { "content-type": "application/json" },
+                          body,
+                        },
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            );
+            yield* Effect.tryPromise(() => response.arrayBuffer());
+            if (!response.ok) {
+              message.retry();
+              return;
+            }
+            message.ack();
           },
-        );
-        if (!response.ok) {
-          message.retry();
-          continue;
-        }
-        message.ack();
-        continue;
-      }
-      const input = Schema.decodeUnknownSync(VectorMessage)(message.body);
-      const response = await env.NAMESPACES.get(env.NAMESPACES.idFromName(input.namespace)).fetch(
-        `http://internal/v1/namespaces/${input.namespace}/internal-vector-sync`,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: Schema.encodeSync(Schema.fromJsonString(VectorMessage))(input),
-        },
-      );
-      if (!response.ok) {
-        message.retry();
-        continue;
-      }
-      message.ack();
-    }
+          (effect, message) => effect.pipe(Effect.catch(() => Effect.sync(() => message.retry()))),
+        ),
+        { concurrency: 4 },
+      ),
+    );
   },
 };

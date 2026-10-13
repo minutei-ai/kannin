@@ -277,6 +277,10 @@ export const RankingInput = Schema.Struct({
 export const SegmentHits = Schema.Array(
   Schema.Struct({ row: Schema.Int, id: Id, score: Schema.Finite }),
 );
+export const VectorSyncResult = Schema.Struct({
+  submitted: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 16 })),
+  visibility: Schema.Literal("vectorize-eventual"),
+});
 export const VectorMessage = Schema.Struct({
   namespace: NamespaceName,
   log: Schema.String,

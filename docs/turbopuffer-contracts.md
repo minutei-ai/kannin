@@ -19,16 +19,16 @@ Conditional document predicates, attribute ordering, aggregations, branching, au
 
 ## Local 100,000-document measurement
 
-The deterministic benchmark completed in native local workerd on an Intel Xeon E5-2680 v4 at 2.40 GHz with Bun 1.4.3. Batches of 500 ingested in 24.690 seconds, approximately 4,050 documents/second. Each query/mode received five warmups and 50 measured requests. Timings include HTTP and concrete response decoding. Strong mode runs before edge mode in the same process, so these are warm measurements, not independent cold starts. The benchmark checks successful concrete responses and requested consistency; ranking correctness is established by separate behavioral/oracle tests.
+The deterministic benchmark completed in native local workerd on an Intel Xeon E5-2680 v4 at 2.40 GHz with Bun 1.4.3. Batches of 500 ingested in 22.988 seconds, approximately 4,350 documents/second. Each query/mode received five warmups and 50 measured requests. Timings include HTTP and concrete response decoding. Strong mode runs before edge mode in the same process, so these are warm measurements, not independent cold starts. The benchmark checks successful concrete responses and requested consistency; ranking correctness is established by separate behavioral/oracle tests.
 
 | Query     | Strong p50 / p95 / p99 ms | Edge eventual p50 / p95 / p99 ms |
 | --------- | ------------------------- | -------------------------------- |
-| Rare      | 4.06 / 5.12 / 14.07       | 2.85 / 3.55 / 9.55               |
-| Selective | 40.37 / 53.99 / 88.37     | 38.73 / 55.00 / 69.45            |
-| Common    | 39.81 / 49.23 / 74.56     | 43.19 / 56.95 / 69.12            |
-| Filtered  | 46.77 / 68.24 / 92.22     | 41.84 / 50.65 / 96.85            |
+| Rare      | 3.46 / 5.58 / 13.35       | 3.06 / 4.26 / 6.37               |
+| Selective | 24.74 / 31.00 / 33.86     | 24.96 / 30.83 / 34.17            |
+| Common    | 26.50 / 33.22 / 51.40     | 28.71 / 36.22 / 51.77            |
+| Filtered  | 26.79 / 32.53 / 47.75     | 28.52 / 33.85 / 34.34            |
 
-Corpus SHA-256: `e23ae431deaee2436ee6674a7834e57663739b6c5bd723b7c9137c4ab123dbfb`. Measured Worker bundle SHA-256: `7bb1046650e39206d6981aaa15b85dca9daf2065b79f729391086daae6787e5a`. WASM SHA-256: `aaeae13235476d95e4949f5066d6dc5b1f68d2f8c3eba41b209b432dcdab8b57`. This measurement follows the checked-conversion and numerical cleanup required by full Clippy pedantic/nursery lint.
+Corpus SHA-256: `e23ae431deaee2436ee6674a7834e57663739b6c5bd723b7c9137c4ab123dbfb`. Measured Worker bundle SHA-256: `a5405f2b28ac91283952dc6a3214242f8f44a9a2016ea5d7ca6011f028ae4443`. WASM SHA-256: `aaeae13235476d95e4949f5066d6dc5b1f68d2f8c3eba41b209b432dcdab8b57`. This measurement follows the query-serialization and queue-batching changes; the WASM scorer is unchanged from the prior lint-hardening measurement.
 
 The final process reported 245 immutable range reads and 6,335 memory range-cache hits across ingestion and all query phases, not per query. Local emulation does not include regional network round trips, native Worker Cache tiering, a real Vectorize index or Cloudflare production CPU billing. Cache budgets and the reported WASM allocation are not a measurement of total isolate heap. Compare these results with [separate deployed evidence](performance.md), never substitute local latency for regional service latency.
 
@@ -39,3 +39,5 @@ Immutable range coalescing reduces R2 calls without changing exact scoring. Boun
 Vector synchronization skips obsolete revisions and retired epochs before allocating provider vectors. Local regressions verify that three queued revisions allocate one current vector and that a reset before synchronization allocates only the new epoch. Already submitted obsolete vectors are not reclaimed by this optimization. Segment collection reclaims retired R2 objects after a tested quarantine; durable logs and receipts remain retained. Actual cost depends on storage, operations, Worker CPU, coordination, queues and Vectorize usage; this project does not claim an unconditional price advantage.
 
 Reproduce the gate with `bun run check` and the local measurement with `RAIO_BENCH_DOCUMENTS=100000 bun run bench`. Ranking quality has its own [dataset and methodology](quality.md).
+
+Queue regression evidence: one native workerd service-binding delivery drains sixteen committed jobs using one provider-fixture upsert call and one owning root commit; a seventeenth job remains pending. Duplicate delivery submits zero jobs. This measures request batching and canonical state transitions, not real Vectorize indexing throughput. Provider buffers stay capped at 100 entries and failure leaves jobs in the canonical outbox for idempotent retry.

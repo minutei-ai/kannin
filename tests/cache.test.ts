@@ -1,6 +1,6 @@
 import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
-import { Root, QueryResult, Metadata } from "../src/protocol";
+import { Root, QueryResult, Metadata, Health } from "../src/protocol";
 import { document, request, startWorker, textQuery, write } from "./harness";
 
 const worker = await startWorker();
@@ -62,4 +62,39 @@ test("the authenticated gateway never exposes the immutable segment entrypoint",
   );
   expect(response.status).toBe(401);
   await response.arrayBuffer();
+});
+
+test("concurrent cold edge queries share immutable range acquisition", async () => {
+  const namespace = "shared-cold-ranges";
+  await request(
+    worker,
+    namespace,
+    "write",
+    write(
+      Array.from({ length: 128 }, (_, index) =>
+        document(String(index).padStart(4, "0"), "shared cold storage"),
+      ),
+    ),
+  );
+  const before = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  const results = await Promise.all(
+    Array.from({ length: 12 }, async () => {
+      const response = await request(worker, namespace, "query", {
+        ...textQuery("shared storage"),
+        consistency: "edge-eventual",
+      });
+      expect(response.status).toBe(200);
+      return Schema.decodeUnknownSync(QueryResult)(await response.json());
+    }),
+  );
+  for (const result of results)
+    expect(result.rows.map((row) => row.id)).toEqual(
+      Array.from({ length: 10 }, (_, index) => String(index).padStart(4, "0")),
+    );
+  const after = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(after.rangeReads - before.rangeReads).toBe(13);
 });

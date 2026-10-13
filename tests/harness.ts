@@ -20,7 +20,7 @@ export async function startWorker(persistence?: string, consumeQueues = false) {
       ...["raio-vector-jobs", "raio-index-jobs"].map((name) => ({
         type: "queue" as const,
         name,
-        maxBatchSize: 1,
+        maxBatchSize: 16,
         maxBatchTimeout: 0,
         maxRetries: 2,
         retryDelay: 1,

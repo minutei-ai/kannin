@@ -1,6 +1,13 @@
 import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
-import { QueryResult, Metadata, VectorRebuildResult } from "../src/protocol";
+import {
+  QueryResult,
+  Metadata,
+  VectorRebuildResult,
+  Root,
+  VectorMessage,
+  VectorSyncResult,
+} from "../src/protocol";
 import { request, startWorker } from "./harness";
 
 const worker = await startWorker();
@@ -372,4 +379,76 @@ test("reset before vector synchronization drops allocations for the retired epoc
     await (await request(worker, "skip-old-epoch", "query", vectorQuery())).json(),
   );
   expect(result.rows.map((row) => row.id)).toEqual(["b"]);
+});
+
+test("one queue delivery drains sixteen committed jobs with one vector mutation batch", async () => {
+  await mode("/healthy");
+  const namespace = "queue-window";
+  for (const index of Array.from({ length: 17 }, (_, value) => value))
+    expect(
+      (
+        await request(worker, namespace, "write", {
+          requestId: `queued-${index}`,
+          upserts: [
+            { id: `doc-${index}`, text: "queued vectors", attributes: {}, vector: vector(1) },
+          ],
+          deletes: [],
+        })
+      ).status,
+    ).toBe(200);
+  const bucket = await worker.getR2Bucket("STORAGE");
+  const object = await bucket.get(`namespaces/${namespace}/root.json`);
+  if (object === null) throw new Error("Missing queued root");
+  const root = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
+  const first = root.vectorJobs[0];
+  const last = root.vectorJobs[16];
+  if (first === undefined || last === undefined) throw new Error("Expected seventeen queued jobs");
+  const bindings = await worker.getDurableObjectNamespace("NAMESPACES");
+  const stub = bindings.get(bindings.idFromName(namespace));
+  const controlSchema = Schema.Struct({ upsertCalls: Schema.Int });
+  const backend = await worker.getWorker("vectors");
+  const before = Schema.decodeUnknownSync(controlSchema)(
+    await (await backend.fetch("http://fixture/control")).json(),
+  );
+  const response = await stub.fetch(
+    `http://internal/v1/namespaces/${namespace}/internal-vector-sync`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: Schema.encodeSync(Schema.fromJsonString(VectorMessage))({ namespace, ...first }),
+    },
+  );
+  expect(response.status).toBe(200);
+  const result = Schema.decodeUnknownSync(VectorSyncResult)(await response.json());
+  expect(result.submitted).toBe(16);
+  const after = Schema.decodeUnknownSync(controlSchema)(
+    await (await backend.fetch("http://fixture/control")).json(),
+  );
+  expect(after.upsertCalls - before.upsertCalls).toBe(1);
+  expect(
+    Schema.decodeUnknownSync(Metadata)(await (await request(worker, namespace, "metadata")).json())
+      .vectorOutbox,
+  ).toBe(1);
+  const duplicate = await stub.fetch(
+    `http://internal/v1/namespaces/${namespace}/internal-vector-sync`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: Schema.encodeSync(Schema.fromJsonString(VectorMessage))({ namespace, ...first }),
+    },
+  );
+  expect(Schema.decodeUnknownSync(VectorSyncResult)(await duplicate.json()).submitted).toBe(0);
+  const final = await stub.fetch(
+    `http://internal/v1/namespaces/${namespace}/internal-vector-sync`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: Schema.encodeSync(Schema.fromJsonString(VectorMessage))({ namespace, ...last }),
+    },
+  );
+  expect(Schema.decodeUnknownSync(VectorSyncResult)(await final.json()).submitted).toBe(1);
+  expect(
+    Schema.decodeUnknownSync(Metadata)(await (await request(worker, namespace, "metadata")).json())
+      .vectorOutbox,
+  ).toBe(0);
 });

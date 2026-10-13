@@ -1491,57 +1491,6 @@ export default {
           })(body).pipe(
             Effect.mapError(() => new Rejected({ status: 400, message: "Invalid query contract" })),
           );
-          if (input.kind === "text" && input.consistency !== "edge-eventual") {
-            const selectedAt = yield* Clock.currentTimeMillis;
-            const object = yield* Effect.tryPromise(() =>
-              env.STORAGE.get(`namespaces/${namespace}/root.json`),
-            );
-            if (object) {
-              const manifest = yield* Effect.tryPromise(() => object.text()).pipe(
-                Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(Root))),
-              );
-              return yield* Effect.tryPromise({
-                try: () => query(env, input, manifest),
-                catch: (cause) => {
-                  if (Schema.is(Rejected)(cause)) return cause;
-                  return new Cause.UnknownError(cause);
-                },
-              }).pipe(
-                Effect.timeoutOrElse({
-                  duration: "30 seconds",
-                  orElse: () =>
-                    Effect.fail(
-                      new Rejected({
-                        status: 504,
-                        message: "Strong query exceeded its 30-second snapshot lease",
-                      }),
-                    ),
-                }),
-                Effect.flatMap((result) =>
-                  Effect.gen(function* () {
-                    const ended = yield* Clock.currentTimeMillis;
-                    if (ended - selectedAt >= 30000)
-                      return yield* new Rejected({
-                        status: 504,
-                        message: "Strong query exceeded its 30-second snapshot lease",
-                      });
-                    return result;
-                  }),
-                ),
-              );
-            }
-            const receipts = yield* Effect.tryPromise(() =>
-              env.STORAGE.list({
-                prefix: `namespaces/${namespace}/receipts/`,
-                limit: 1,
-              }),
-            );
-            if (receipts.objects.length)
-              return yield* new Rejected({
-                status: 503,
-                message: "R2 manifest missing for an acknowledged namespace",
-              });
-          }
           if (input.consistency === "edge-eventual") {
             if (input.kind !== "text")
               return yield* new Rejected({

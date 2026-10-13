@@ -314,3 +314,30 @@ test("term projections share immutable metadata while phrase order, filters and 
   expect(changed.rows.map((row) => row.id)).toEqual(["right"]);
   expect(changed.sequence).toBe(2);
 });
+
+test("segment priority finds the equal-score winner before reading lower-priority postings", async () => {
+  const namespace = "catalog-priority";
+  for (const index of Array.from({ length: 16 }, (_, ordinal) => 15 - ordinal))
+    await request(
+      worker,
+      namespace,
+      "write",
+      write([document(String(index).padStart(5, "0"), "equal terms")]),
+    );
+  const before = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  const found = Schema.decodeUnknownSync(QueryResult)(
+    await (
+      await request(worker, namespace, "query", {
+        ...textQuery("equal terms", 1),
+        consistency: "edge-eventual",
+      })
+    ).json(),
+  );
+  expect(found.rows.map((row) => row.id)).toEqual(["00000"]);
+  const after = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(after.rangeReads - before.rangeReads).toBe(19);
+});

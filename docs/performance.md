@@ -141,3 +141,23 @@ Selective, common and filtered strong medians fell approximately 30%, 23% and 28
 Worker SHA-256: `6f0254f21549930e8e728e2b4107e36480a1b6650043f8400eb7bcabdaf203ad`. WASM SHA-256: `a99ca9af338335f621d1b945b3a948afafec250bfddae4d4b18bcfc53bc3b7f7`. The corpus SHA-256 remains `e23ae431deaee2436ee6674a7834e57663739b6c5bd723b7c9137c4ab123dbfb`. Independent SciFact judgments remain nDCG@10 0.67306, recall@10 0.79567 and MRR@10 0.64181. Immutable R2 segment bytes and framing are unchanged.
 
 A fresh native baseline on the preceding deployed runtime completed the concurrency 1 and 4 phases with 64 matched responses each, then returned HTTP 503 during concurrency 16 and aborted. The completed phases recorded p50/p95 83.05/170.99 ms and 84.00/424.26 ms respectively. The interrupted phase is not a completed benchmark; its response body was not recorded, so the underlying failure is unclassified. Cache state is uncontrolled, and no successful scaling or before/after claim is based on that partial run.
+
+Runtime `db3a373` deployed successfully and its CI passed. The subsequent native mixed-query run completed all 192 result checks, including concurrency 16, without HTTP errors. Each response matched its strong baseline in ids, scores, attributes, revisions and sequence.
+
+| Concurrency | Requests | p50 / p95 / p99 ms         | Requests per second |
+| ----------- | -------- | -------------------------- | ------------------- |
+| 1           | 64       | 95.86 / 1807.06 / 2338.51  | 3.51                |
+| 4           | 64       | 91.08 / 829.00 / 1579.01   | 18.00               |
+| 16          | 64       | 100.59 / 1647.09 / 1978.92 | 28.53               |
+
+These tails are slower than the completed phases of the preceding partial baseline. The new run's success does not classify or prove resolution of the earlier 503, and the timings do not establish a native latency win. The first directory interval reached 2.36 seconds. Twelve additional native conjunctive checks retained exactly the pre-optimization rows and scores, but first-query latency still reached 1.72 seconds. Cold acquisition remains open.
+
+A subsequent strong query observed 32 term-catalog reads with 32 native Workers Cache hits and sixteen range reads with sixteen native Workers Cache hits. The term responses transferred 242,640 bytes, with no L1 term hits in that observed process. Reading metadata immediately after the query confirmed the counters. An earlier idle-process metadata read returned zero counters, so these remain process observations rather than persistent billing totals. This verifies native cache delivery of projections; retention across a separate deployment is not inferred from this same-version observation.
+
+## Segment evaluation priority
+
+Reusable unfiltered bounds now prioritize segments by descending potential score, breaking ties with the physical minimum document id in UTF-16 order. A regression writing sixteen equal-score segments in reverse id order first read 49 ranges; after prioritization it reads nineteen and returns the same lowest-id winner. The independent score oracle and mutation/Unicode tests remain green.
+
+Computing extra unfiltered bounds for filtered segments regressed the first local follow-up's filtered median to 26.47 ms. The final implementation computes priority bounds only for unfiltered segments without tombstones; other segments retain their existing eligible-document bound. A repeat measured filtered strong median 20.57 ms. This preserves exact pruning and avoids that redundant bound work, without claiming universal timing improvement.
+
+The final 100,000-document run measured strong p50/p95 of 3.45/4.85, 18.43/26.98, 20.15/26.29 and 20.57/33.00 ms for rare/selective/common/filtered queries. Edge values were 3.03/3.76, 14.29/22.08, 21.81/41.22 and 22.59/43.64 ms. Ingestion measured 22.50 seconds, approximately 4,445 documents/s. The corpus and WASM hashes are unchanged from the projection run; Worker SHA-256 is `5864ee5aff2abe71154a7325016be93b4b27ebb1d79d624b1b4dc04f048115ae`.

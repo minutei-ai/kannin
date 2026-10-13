@@ -334,6 +334,28 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
     frequencies: Object.fromEntries(frequencies),
   };
   const encodedStatistics = Schema.encodeSync(Schema.fromJsonString(SearchStatistics))(statistics);
+  const prioritized = catalog
+    .map((entry) => {
+      if (input.filters.length > 0 || entry.segment.dead.length > 0)
+        return { segment: entry.segment, dictionary: entry.dictionary, bound: undefined };
+      return {
+        segment: entry.segment,
+        dictionary: entry.dictionary,
+        bound: segment_term_bound(
+          encodedStatistics,
+          Schema.encodeSync(Schema.fromJsonString(SegmentTerms))(entry.dictionary),
+        ),
+      };
+    })
+    .sort((left, right) => {
+      if (left.bound === undefined && right.bound === undefined) return 0;
+      if (left.bound === undefined) return 1;
+      if (right.bound === undefined) return -1;
+      if (left.bound !== right.bound) return right.bound - left.bound;
+      if (left.segment.minimumId < right.segment.minimumId) return -1;
+      if (left.segment.minimumId > right.segment.minimumId) return 1;
+      return 0;
+    });
   const dictionaryEnded = Effect.runSync(Clock.currentTimeNanos);
   timings.append("server-timing", `text_directory;dur=${Number(dictionaryEnded - started) / 1e6}`);
   const ranked: Array<{
@@ -342,7 +364,7 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
     id: string;
     score: number;
   }> = [];
-  for (const { segment, dictionary } of catalog) {
+  for (const { segment, dictionary, bound: unfilteredBound } of prioritized) {
     if (Object.keys(dictionary).length === 0) continue;
     if (
       (input.match === "all" || input.match === "phrase") &&
@@ -355,12 +377,7 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
     if (ranked.length === input.topK) {
       const bound = await Effect.runPromise(
         Effect.gen(function* () {
-          if (input.filters.length === 0 && segment.dead.length === 0) {
-            const encoded = yield* Schema.encodeEffect(Schema.fromJsonString(SegmentTerms))(
-              dictionary,
-            );
-            return segment_term_bound(encodedStatistics, encoded);
-          }
+          if (unfilteredBound !== undefined) return unfilteredBound;
           return yield* withDirectory(segment.key, segment.headerBytes, (decoded) =>
             Effect.gen(function* () {
               const dead = yield* Schema.encodeEffect(integers)(segment.dead);

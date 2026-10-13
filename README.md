@@ -13,12 +13,12 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Query     |        Strong | Edge eventual |
 | --------- | ------------: | ------------: |
-| Rare      |   4.10 / 8.10 |   2.89 / 4.05 |
-| Selective | 16.64 / 26.07 | 14.48 / 21.41 |
-| Common    | 19.97 / 54.87 | 18.80 / 27.06 |
-| Filtered  | 19.06 / 23.86 | 19.47 / 27.30 |
+| Rare      |   3.45 / 4.85 |   3.03 / 3.76 |
+| Selective | 18.43 / 26.98 | 14.29 / 22.08 |
+| Common    | 20.15 / 26.29 | 21.81 / 41.22 |
+| Filtered  | 20.57 / 33.00 | 22.59 / 43.64 |
 
-Local ingestion: **100,000 documents in 23.32 seconds**, approximately **4,289 documents/s**, in batches of 500. Intel Xeon E5-2680 v4, Bun 1.4.3. Each case/mode has five warmups and 50 measured requests, including HTTP and response decoding. Both modes share one process; no query-result cache. Local timings exclude Cloudflare regional network latency.
+Local ingestion: **100,000 documents in 22.50 seconds**, approximately **4,445 documents/s**, in batches of 500. Intel Xeon E5-2680 v4, Bun 1.4.3. Each case/mode has five warmups and 50 measured requests, including HTTP and response decoding. Both modes share one process; no query-result cache. Local timings exclude Cloudflare regional network latency.
 
 Immutable query catalogs now let cached queries recover global BM25 frequencies without reloading every segment header. After directory eviction, local regressions reduced range reads **33 → 4** for conjunctive queries and **19 → 4** for unfiltered score pruning. [Cache design and measurements](docs/performance.md#immutable-term-projections).
 
@@ -35,7 +35,7 @@ Conjunctive segment pruning reduced local warm p50 from **14.11 to 6.83 ms** for
 
 These deployed measurements are from `faa310e`, before the latest warm-snapshot optimization, with the same five-warmup/50-sample methodology. Strong reads paid the coordinator hop outside Brazil. A separate mixed-query load run reached **45.4 requests/s at concurrency 16**, with **p95 1,090.5 ms**; all 384 responses matched strong baselines. Cold requests reached **3.4 seconds**. These results establish bounded measurements, not general Turbopuffer parity or million-document scale.
 
-The latest conjunctive runtime passed 12 native before/after result comparisons. A first common edge query still took **4.8 seconds**; cold directory acquisition remains unresolved.
+The native projection runtime passed **192 mixed-query checks plus 12 conjunctive comparisons**, and native Workers Cache hits were observed for the catalogs. Its concurrency-1 p95 was **1.8 seconds**, so cold acquisition remains unresolved.
 
 [Full deployed evidence](docs/performance.md) · [local methodology and contract comparison](docs/turbopuffer-contracts.md) · [SciFact ranking quality](docs/quality.md)
 
@@ -50,7 +50,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **95 Worker/tooling tests and 17 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **96 Worker/tooling tests and 17 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

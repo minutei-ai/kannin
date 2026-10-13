@@ -81,3 +81,21 @@ The query responses in the latest sequential run still reported 22,000 exhaustiv
 To exercise an already populated deterministic benchmark namespace, run `RAIO_LOAD_NAMESPACE=<owned-benchmark-namespace> bun tooling/load.ts` with `RAIO_URL` and `RAIO_API_TOKEN` supplied outside the repository. `RAIO_LOAD_REQUESTS` defaults to 128 per concurrency phase. The driver verifies every edge result against a strong baseline and reports concurrency 1, 4 and 16 separately. It does not mutate the corpus.
 
 For an interrupted native ingestion, `RAIO_BENCH_RESUME_NAMESPACE=<owned-benchmark-namespace>` replays the deterministic batches with the original request IDs. R2 receipts prevent duplicate commits and reject payload changes. Resume verifies a nonempty existing corpus no larger than the requested size; a fresh Turbopuffer comparator is created and cleaned up independently. `RAIO_BENCH_REUSE_NAMESPACE` skips completed Kannin ingestion instead. These options are mutually exclusive. Keep the executable corpus and requested size unchanged when resuming.
+
+## Queue batching and query encoding follow-up
+
+The implementation at `e966ac4` reuses encoded terms, filters and global statistics per text query, removes a redundant final sort, and batches committed vector jobs through native Queues. A repeated local 100,000-document benchmark measured strong p50 of 3.46/24.74/26.50/26.79 ms for rare/selective/common/filtered queries, compared with 4.06/40.37/39.81/46.77 ms before this change. Local ingestion measured 4,350 documents/s. These sequential runs use the same corpus and unchanged WASM scorer; system variation still prevents attributing every difference to one code change.
+
+Two deployed load runs used the same static corpus, client and 64 mixed-query requests per concurrency phase. All 192 responses in each run matched the strong baseline, including ids, scores, revisions and sequence.
+
+| Concurrency | Before p50 / p95 ms | After p50 / p95 ms | Before / after requests per second |
+| ----------- | ------------------- | ------------------ | ---------------------------------- |
+| 1           | 57.3 / 110.1        | 56.7 / 223.6       | 6.0 / 4.7                          |
+| 4           | 75.9 / 799.1        | 62.4 / 269.8       | 21.0 / 28.8                        |
+| 16          | 90.9 / 1362.7       | 104.8 / 1208.0     | 28.8 / 35.6                        |
+
+The first phase became slower at the tail, despite similar medians. Dictionary acquisition remains the largest cold interval. Phases run sequentially, caches are not reset between phases, and deployment changes process/cache state. The higher concurrency measurements improved in this run, but they do not establish isolated scaling, a universal improvement or Turbopuffer parity.
+
+The native vector smoke now observes equality and numeric intervals independently within bounded windows. Equality visibility does not establish that a numeric predicate is already visible. An initial numeric check failed immediately after equality reached its target; later reads from the same namespace returned the expected five interval rows with the outbox already empty. This is provider visibility observation, not evidence of lost canonical state. Index acceptance and query visibility remain separate.
+
+A subsequent complete 100-vector native smoke passed with recall@10 of 1.0 for the controlled expected neighbors and all five numeric-interval candidates. Equality required 35 observations and the subsequent numeric window required eight; these are independent readiness checks, not a global index-ready guarantee.

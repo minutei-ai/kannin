@@ -40,7 +40,7 @@ import {
   SegmentDocument,
   DataRange,
   SegmentHits,
-  SegmentTerms,
+  PostingSpans,
   TermCatalog,
   TermCatalogBatch,
   LocatedDocument,
@@ -451,10 +451,9 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
           Effect.sync(() => decoded.ranker(ranking)),
           (ranker) =>
             Effect.gen(function* () {
-              const postingDirectory = yield* Schema.decodeEffect(
-                Schema.fromJsonString(SegmentTerms),
-              )(decoded.terms(projectionTerms));
-              const requested = Object.entries(postingDirectory);
+              const requested = yield* Schema.decodeEffect(Schema.fromJsonString(PostingSpans))(
+                ranker.posting_spans(),
+              );
               for (const offset of Array.from(
                 { length: Math.ceil(requested.length / 4) },
                 (_, index) => index * 4,
@@ -462,7 +461,7 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
                 const window = requested.slice(offset, offset + 4);
                 const loaded = yield* Effect.forEach(
                   window,
-                  ([term, metadata]) =>
+                  (metadata) =>
                     Effect.gen(function* () {
                       const first = metadata.blocks[0];
                       if (first === undefined)
@@ -472,12 +471,16 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
                         });
                       const span = { end: first.data.offset };
                       for (const block of metadata.blocks) {
-                        if (block.data.offset !== span.end || block.data.length <= 0)
+                        if (
+                          block.data.offset < span.end ||
+                          block.data.offset - span.end > 4096 ||
+                          block.data.length <= 0
+                        )
                           return yield* new Rejected({
                             status: 503,
-                            message: "Posting blocks are not contiguous",
+                            message: "Invalid posting span gap",
                           });
-                        span.end += block.data.length;
+                        span.end = block.data.offset + block.data.length;
                       }
                       const start = segment.headerBytes + first.data.offset;
                       const length = span.end - first.data.offset;
@@ -497,7 +500,7 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
                           return new Cause.UnknownError(cause);
                         },
                       });
-                      return { term, metadata, bytes, offset: first.data.offset };
+                      return { term: metadata.term, metadata, bytes, offset: first.data.offset };
                     }),
                   { concurrency: 4 },
                 );

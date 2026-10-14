@@ -285,6 +285,9 @@ export const SegmentBlock = Schema.Struct({
 });
 export const SegmentTerm = Schema.Struct({ df: Schema.Int, blocks: Schema.Array(SegmentBlock) });
 export const SegmentTerms = Schema.Record(Schema.String, SegmentTerm);
+export const PostingSpans = Schema.Array(
+  Schema.Struct({ term: Schema.String, blocks: Schema.NonEmptyArray(SegmentBlock) }),
+);
 export const EligibleMinimum = Schema.Union([
   Schema.Null,
   Schema.Tuple([

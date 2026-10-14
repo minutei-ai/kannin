@@ -1294,3 +1294,23 @@ Native Alchemy deployment and its Vectorize metadata migration succeeded. The mi
 | 16          | 214.79 / 962.64       | 182.96 / 2037.30       | 294.33 / 958.46                 |
 
 A separate post-deploy all/phrase load completed 96 further exact-result comparisons at concurrency 1/4/16. Its p50 values were 84.17/105.53/428.99 ms and p95 values 226.13/978.30/1441.83 ms. This validates native intersection/phrase behavior after the cursor change; it has no paired pre-change timing baseline.
+
+### Eligible posting acquisition and decode
+
+Rust now projects posting spans from the ranker's existing filter/tombstone mask before Worker acquisition. A block is omitted only when every row in its interval is excluded. This may retain blocks containing gaps in their actual postings, but cannot discard an eligible match. Complete immutable catalogs still own live global document frequencies and score bounds. Selected pages retain their independent CRC/position checks; score arithmetic and term order are unchanged.
+
+An initial implementation split at every excluded block. On a 1,000-document workerd fixture with two eligible intervals, this saved only 1,041 total acquired bytes while increasing range reads from 13 to 15; median query time worsened from 48.03 to 54.53 ms. That version was rejected. The retained implementation bridges individual excluded gaps up to 4 KiB, decodes only selected pages and splits at larger gaps. The Worker validates gap, order and total span limits before fetching.
+
+Nine alternating local workerd pairs per pattern included three warmups and six measured samples per variant. All 72 complete query results matched. Unfiltered and interleaved fixtures retained the same reads/bytes. The clustered fixture retained 13 reads and 147,713 bytes, with medians 50.97 to 49.29 ms; its p95 worsened from 57.72 to 79.12 ms. The interleaved median worsened from 50.12 to 52.84 ms. Tombstones retained 12 reads but cut bytes from 2,436 to 1,232, with medians 39.51 to 38.42 ms. The small local samples are mixed, not a traffic-wide latency claim.
+
+A separate local Bun/WASM comparison measured projection, ranker creation, posting decoding and finishing together on 10,000-document fixtures. Twelve cases covered unfiltered/clustered/interleaved/tombstoned data and any/all/phrase. Fifteen alternating pairs ran sixteen complete pipelines each, with three warmups excluded from timing; all 5,760 outputs matched serialized rows and scores. Clustered filtering reduced decoded pages from 158 to 6 and median pipeline time by 95.7–96.0%; tombstones reduced pages to 4 and medians by 90.4–90.8%. Unfiltered/interleaved controls retained 158 pages and improved by 3.8–6.8%. Decoded page bytes are not necessarily transferred bytes because short excluded gaps remain in acquired spans. These are local pipeline timings, not native CPU receipts.
+
+The final gate passed 25 Rust and 126 Bun/workerd tests, including full-versus-selected any/all/phrase results across excluded intervals, tombstones and the 4,096/4,097-byte gap boundary. Native deployment and its Vectorize metadata migration succeeded. Three strong queries on the same owned 1,000-document fixture preserved the pre-deploy rows, scores and sequence. The first post-deploy query reused a cached immutable header, so its 2,435 acquired bytes cannot be compared with the pre-deploy cold 147,713 bytes as a pruning gain. All fixture documents were deleted through the owning write operation and metadata confirmed zero live documents; normal R2 history retention still applies.
+
+The million-document before/after/repeated load retained 288 exact-result comparisons. A separate post-deploy all/phrase load retained another 96, with p50 83.60/87.69/374.28 ms at concurrency 1/4/16. The ordinary workload below still has mixed client latency and does not establish native CPU savings, a general speedup or Turbopuffer parity. Cache/isolate/network conditions were uncontrolled.
+
+| Concurrency | Baseline p50 / p95 ms | Candidate p50 / p95 ms | Repeated candidate p50 / p95 ms |
+| ----------- | --------------------- | ---------------------- | ------------------------------- |
+| 1           | 81.22 / 167.03        | 71.05 / 480.54         | 81.10 / 249.57                  |
+| 4           | 98.29 / 848.86        | 76.19 / 1274.24        | 108.13 / 917.43                 |
+| 16          | 397.77 / 1635.68      | 182.45 / 1261.73       | 236.20 / 999.20                 |

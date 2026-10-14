@@ -317,6 +317,122 @@ fn posting_directory_rejects_reordered_and_overlapping_rows()
 }
 
 #[test]
+fn eligible_posting_spans_preserve_scores_across_gaps_and_tombstones()
+-> Result<(), Box<dyn std::error::Error>> {
+    let docs = (0..512)
+        .map(|index| {
+            let mut doc = document(format!("{index:05}"), "alpha beta alpha");
+            doc.attributes.insert(
+                "group".into(),
+                serde_json::json!(!(128..384).contains(&index)),
+            );
+            doc
+        })
+        .collect();
+    let built = segment::build(docs)?;
+    let (header, base) = segment::parse_header(&built.bytes)?;
+    let filters = [Filter {
+        field: "group".into(),
+        op: "eq".into(),
+        value: serde_json::json!(true),
+    }];
+    for mode in ["any", "all", "phrase"] {
+        for dead in [Vec::new(), (0..128).collect()] {
+            let mut selected = Search::new(
+                header.clone(),
+                statistics(&header),
+                "alpha beta alpha",
+                mode,
+                100,
+                &dead,
+                &filters,
+            )?;
+            let mut exhaustive = Search::new(
+                header.clone(),
+                statistics(&header),
+                "alpha beta alpha",
+                mode,
+                100,
+                &dead,
+                &filters,
+            )?;
+            let spans = selected.posting_spans();
+            assert_eq!(spans.len(), 2);
+            assert_eq!(
+                spans.iter().map(|span| span.blocks.len()).sum::<usize>(),
+                if dead.is_empty() { 4 } else { 2 },
+            );
+            let pages: Vec<_> = spans
+                .iter()
+                .flat_map(|span| {
+                    span.blocks.iter().map(|block| {
+                        let start = base + block.data.offset as usize;
+                        (
+                            span.term.to_owned(),
+                            start,
+                            start + block.data.length as usize,
+                        )
+                    })
+                })
+                .collect();
+            for (term, start, end) in pages {
+                selected.add(&term, &built.bytes[start..end])?;
+            }
+            for (term, metadata) in &header.terms {
+                for block in &metadata.blocks {
+                    let start = base + block.data.offset as usize;
+                    exhaustive.add(
+                        term,
+                        &built.bytes[start..start + block.data.length as usize],
+                    )?;
+                }
+            }
+            assert_eq!(selected.finish()?, exhaustive.finish()?);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn posting_spans_bound_gap_overfetch() -> Result<(), Box<dyn std::error::Error>> {
+    let docs = (0..384)
+        .map(|index| {
+            let mut doc = document(format!("{index:05}"), "alpha");
+            doc.attributes.insert(
+                "group".into(),
+                serde_json::json!(!(128..256).contains(&index)),
+            );
+            doc
+        })
+        .collect();
+    let built = segment::build(docs)?;
+    for gap in [4096, 4097] {
+        let mut header = built.header.clone();
+        let metadata = header.terms.get_mut("alpha").ok_or("Missing term")?;
+        metadata.blocks[0].data.offset = 0;
+        metadata.blocks[0].data.length = 10;
+        metadata.blocks[2].data.offset = 10 + gap;
+        let selected = Search::new(
+            header,
+            statistics(&built.header),
+            "alpha",
+            "any",
+            10,
+            &[],
+            &[Filter {
+                field: "group".into(),
+                op: "eq".into(),
+                value: serde_json::json!(true),
+            }],
+        )?;
+        let spans = selected.posting_spans();
+        assert_eq!(spans.len(), if gap == 4096 { 1 } else { 2 });
+        assert_eq!(spans.iter().map(|span| span.blocks.len()).sum::<usize>(), 2);
+    }
+    Ok(())
+}
+
+#[test]
 fn bloom_filters_have_no_false_negatives_and_bounded_false_positives()
 -> Result<(), Box<dyn std::error::Error>> {
     let values: Vec<_> = (0..1000).map(|index| format!("document-{index}")).collect();

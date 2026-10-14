@@ -739,7 +739,49 @@ pub struct Search {
     pub lists: BTreeMap<String, Vec<Posting>>,
 }
 
+#[derive(Serialize)]
+pub struct PostingSpan<'a> {
+    pub term: &'a str,
+    pub blocks: Vec<&'a BlockMeta>,
+}
+
 impl Search {
+    #[must_use]
+    pub fn posting_spans(&self) -> Vec<PostingSpan<'_>> {
+        let unrestricted = self.allowed.iter().all(|allowed| *allowed);
+        let terms: BTreeSet<_> = self.words.iter().collect();
+        let mut spans: Vec<PostingSpan<'_>> = Vec::new();
+        for term in terms {
+            let Some(metadata) = self.header.terms.get(term) else {
+                continue;
+            };
+            let mut blocks: Vec<&BlockMeta> = Vec::new();
+            for block in &metadata.blocks {
+                if unrestricted
+                    || self.allowed[block.first as usize..=block.last as usize]
+                        .iter()
+                        .any(|allowed| *allowed)
+                {
+                    if blocks.last().is_some_and(|previous| {
+                        u64::from(block.data.offset)
+                            > u64::from(previous.data.offset)
+                                + u64::from(previous.data.length)
+                                + 4096
+                    }) {
+                        spans.push(PostingSpan {
+                            term,
+                            blocks: std::mem::take(&mut blocks),
+                        });
+                    }
+                    blocks.push(block);
+                }
+            }
+            if !blocks.is_empty() {
+                spans.push(PostingSpan { term, blocks });
+            }
+        }
+        spans
+    }
     #[doc = "# Errors\nRejects invalid top-k, match mode, term budgets, attributes, or tombstone rows."]
     pub fn new(
         header: impl Into<Rc<Header>>,
@@ -1904,6 +1946,11 @@ pub mod wasm {
 
     #[wasm_bindgen]
     impl Ranker {
+        #[doc = "# Errors\nRejects posting span serialization errors."]
+        pub fn posting_spans(&self) -> Result<String, JsValue> {
+            serde_json::to_string(&self.search.posting_spans())
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))
+        }
         #[doc = "# Errors\nRejects invalid requested terms, pages, rows, positions, or block ordering."]
         pub fn add(&mut self, term: &str, bytes: &[u8]) -> Result<(), JsValue> {
             self.search

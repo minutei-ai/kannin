@@ -551,3 +551,21 @@ Native diagnostics used the unchanged million-document corpus. Each query append
 All six post-deploy diagnostics returned exact baseline rows and scores. All three observations improved in both runs, but single observations with uncontrolled cache/isolate/network state cannot establish a causal general latency percentage.
 
 A separate 96-request mixed load retained exact strong rows/scores and acknowledged sequence. Concurrency 1/4/16 measured p50 62.63/65.99/176.19 ms, p95 527.87/960.33/912.96 ms and throughput 8.24/14.43/25.07 requests/s. Relative to the preceding latest snapshot run, concurrency-four p95 and concurrency-sixteen medians regressed. The README reports this latest load; previous measurements remain above. New-selector/filter misses still take seconds, and first-use lease reliability, native peak memory and fully indexed Turbopuffer parity remain open.
+
+## Borrowed overview serialization
+
+Runtime `e74f8ba` serializes overview dictionaries and block tuples directly from borrowed directory entries. Native Serde `collect_map` and `collect_seq` retain ordered JSON while removing copied term strings, a second BTreeMap and allocated per-term bounds vectors. The cache format, CRC framing, decoded-size limit, filter minima and exact scoring contract are unchanged.
+
+An alternating old/new WASM comparison used the same 5,000-document segment, 50 warmup pairs and 100 measured pairs. Every compressed output was byte-identical to the old implementation. Building an overview measured before/after p50 2.947/2.403 ms and p95 3.098/2.563 ms. This is an operation-level measurement, not a whole-query claim. A codec regression independently compares framed overviews with the concrete Schema-encoded directory summaries/minima for empty, matching and empty-result predicates. The full gate passed 113 Worker/tooling tests and 18 Rust tests; deployment completed.
+
+Native diagnostics reused the million-document corpus and the preceding section's absent-token/always-true fresh-year-filter method. Every query forced a new overview filter identity; immutable range and directory caches remained eligible. Exact row scores matched both the strong baseline and the saved preceding-version responses.
+
+| Query     | Before ms | First after ms | Second fresh-filter run ms |
+| --------- | --------: | -------------: | -------------------------: |
+| Selective |   4250.74 |        4312.38 |                    3843.30 |
+| Common    |   3459.93 |        4096.91 |                    3324.12 |
+| Filtered  |   3563.92 |        3591.01 |                    3094.19 |
+
+All first-run observations regressed; all second-run observations improved. The cache/isolate/network state was uncontrolled, so the local serialization gain does not establish a causal native latency improvement.
+
+All 96 mixed-load responses retained exact strong rows/scores and the acknowledged sequence. Concurrency 1/4/16 measured p50 62.58/61.89/255.18 ms, p95 387.82/250.70/1,189.85 ms and throughput 8.30/28.21/21.20 requests/s. Relative to the preceding direct-projection load, concurrency-four tails improved substantially, while concurrency-sixteen median, tail and throughput regressed. The README reports this latest load. New-selector/filter misses still take seconds; first-use lease reliability, native peak memory and fully indexed Turbopuffer parity remain open.

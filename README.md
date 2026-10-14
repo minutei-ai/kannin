@@ -11,13 +11,13 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 **1,000,000 documents · deployed Cloudflare · client in Brazil · edge reads with acknowledged sequence barrier**
 
-| Concurrency | p50 ms |  p95 ms | Requests/s |
-| ----------: | -----: | ------: | ---------: |
-|           1 |  84.18 | 1023.91 |       3.58 |
-|           4 | 105.94 |  868.16 |      13.76 |
-|          16 | 143.22 | 1391.12 |      19.15 |
+| Concurrency | p50 ms | p95 ms | Requests/s |
+| ----------: | -----: | -----: | ---------: |
+|           1 |  60.09 | 526.21 |       7.93 |
+|           4 |  63.13 | 432.11 |      25.82 |
+|          16 | 110.42 | 806.83 |      26.62 |
 
-Runtime `07368b6`; 32 mixed-query requests per phase. All 96 edge responses matched strong rows and scores. Compressed segment overviews reuse immutable metadata across query selectors; repeated new selectors still took **1.28–2.74 seconds**. Cache state and network variation limit attribution. Mixed-load medians and tails regressed in the latest run, and an earlier edge request hit its 30-second lease; successful later runs do not prove that first-use failure resolved.
+Runtime `1572b02`; latest of two post-deploy runs, with 32 mixed-query requests per phase. All 192 post-deploy edge responses matched strong rows and scores. Valid in-memory snapshots now bypass Cache API acquisition. Compressed segment overviews reuse immutable metadata across query selectors; repeated new selectors still took **1.28–2.74 seconds**. Cache state and network variation limit attribution. Repeated native runs show mixed improvements and regressions, and an earlier edge request hit its 30-second lease; successful later runs do not prove that first-use failure resolved.
 
 The local million-document workload measured strong common/filtered p50 of **127/126 ms** across 2,000 uncompacted segments. These emulator results exclude native network latency. Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10** across 300 queries. Eight native vector/hybrid fixture cases also retained exact rows and scores.
 

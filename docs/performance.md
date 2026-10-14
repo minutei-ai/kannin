@@ -508,3 +508,28 @@ Three paired WASM runs used the same 5,000-document segment, 12,908-byte compres
 The complete local gate passed 113 Worker/tooling tests and 18 Rust tests. Deployment completed. Native new-selector observations on the unchanged million-document corpus returned exact strong rows and scores: selective 2,450 ms, common 1,285 ms and filtered 2,740 ms. Compared with the preceding batch-cache repeat, two improved and the filtered case regressed. Existing segment caches remained eligible; this was not a fully cold namespace test.
 
 All 96 mixed-load responses matched strong baselines and the acknowledged sequence barrier. Concurrency 1/4/16 measured p50 84.18/105.94/143.22 ms, p95 1,023.91/868.16/1,391.12 ms and throughput 3.58/13.76/19.15 requests/s. All phases regressed relative to the preceding run. Server timings include snapshot reads and ranking work as well as overview processing; cache, isolate and network state were not controlled. No causal overall speedup or Turbopuffer parity is claimed. First-use lease reliability and native peak memory remain open.
+
+## Memory snapshot acquisition
+
+Runtime `1572b02` skips `caches.open` when a bucket-scoped in-memory snapshot satisfies the original less-than-one-second selection bound and minimumSequence. Cache API acquisition for a background refresh occurs inside the detached request-owned task. Cold and insufficient memory reads still use the existing Cache API/R2 path. No snapshot age or consistency contract changed.
+
+A local workerd run used 1,000 documents, 20 warmups and 80 measured edge queries, checking every sequence and row count. Before/after total p50 was 4.495/4.433 ms and p95 6.515/7.023 ms; snapshot phase p95, rounded by the existing Server-Timing instrumentation, changed from 1 ms to 0 ms. This demonstrates removal of an awaited native cache acquisition, but does not establish a total-latency improvement. The full gate passed 113 Worker/tooling and 18 Rust tests, including snapshot expiry, cache eviction, large manifests and sequence barriers. Deployment completed.
+
+Two native loads immediately before deployment and two after used the same million-document corpus. Each run measured 32 mixed queries at concurrency 1/4/16 with exact strong-baseline rows/scores and sequence checks. All 384 edge responses passed.
+
+| Run      | Concurrency | p50 ms |  p95 ms | Requests/s |
+| -------- | ----------: | -----: | ------: | ---------: |
+| Before 1 |           1 |  64.16 |  372.69 |       8.75 |
+| Before 1 |           4 |  78.02 |  754.57 |      18.24 |
+| Before 1 |          16 | 140.90 |  701.60 |      23.21 |
+| Before 2 |           1 |  82.41 |  820.04 |       5.38 |
+| Before 2 |           4 |  78.37 |  533.84 |      17.35 |
+| Before 2 |          16 | 123.86 |  861.37 |      29.45 |
+| After 1  |           1 |  80.69 |  603.34 |       6.08 |
+| After 1  |           4 |  83.73 |  783.66 |      19.32 |
+| After 1  |          16 | 146.77 | 1077.28 |      28.90 |
+| After 2  |           1 |  60.09 |  526.21 |       7.93 |
+| After 2  |           4 |  63.13 |  432.11 |      25.82 |
+| After 2  |          16 | 110.42 |  806.83 |      26.62 |
+
+The second post-deploy run improved all medians relative to both preceding baseline runs, while the first post-deploy run regressed several phases. Concurrency-sixteen p95 remained above the first baseline. Isolate, cache and network state were uncontrolled; these measurements do not establish a causal overall speedup. The README reports the latest run, with both runs retained here. New-selector latency, first-use lease reliability, native peak memory and fully indexed Turbopuffer parity remain open.

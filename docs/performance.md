@@ -347,3 +347,21 @@ Native validation on the existing 100,000-document corpus completed 192 requests
 | 16          | 70.04 / 476.57      | 87.64 / 402.16           | 76.84 / 448.84           |
 
 A separate native vector/hybrid run completed all 200 requests on the existing 96-vector corpus with exactly the same rows and scores as the preceding ANN-cache run. Vector-10 and hybrid-10 p50/p95 were 185.67/260.89 and 189.59/270.98 ms. Native large-corpus throughput, selective edge tails, ingestion range work and cold service latency remain open.
+
+## Batched exact segment score bounds
+
+Runtime `19d3e0f` evaluates at most 64 compact catalogs in one WASM call, decoding shared namespace statistics once per batch. Bound values and segment order remain unchanged; the caller checks finite values and returned cardinality before priority sorting. Canonical R2 formats and private catalog-v3 cache shape remain unchanged. The full local gate passed 107 Worker/tooling and 18 Rust tests, and SciFact's three aggregate metrics remained identical.
+
+The isolated comparison uses 2,000 identical old/new catalog inputs with varied eligibility minima, including null. Every bound is bit-identical. With five warmups and thirty measured iterations, p50/p95 changed from 6.64/10.67 to 5.35/7.48 ms. The baseline pre-encodes each catalog, while the batched loop encodes its windows during measurement; this does not isolate all caller serialization work.
+
+A full workerd comparison ingests 2,000 one-document segments in each version, then runs five warmups and thirty measured strong queries. Before p50/p95 was 135.76/203.50 ms; after was 95.25/206.46 ms. All rows and scores match across versions and every repeated request, with sequence 2,000 verified. The baseline Worker was compiled from preceding public commit `2561bc6` with its preserved WASM and the same resolved dependencies outside the tracked repository. This small-document workload stresses segment count; it is not a rerun of the million-document corpus. Separate processes and host variation limit causal attribution, and p95 rose slightly.
+
+The native before/after loads reused the unchanged 100,000-document corpus. Each completed 192 requests and checked every result against its strong baseline. The measured loads use explicit edge eventual consistency with an acknowledged sequence barrier.
+
+| Concurrency | Before p50 / p95 ms | After p50 / p95 ms | Before / after requests/s |
+| ----------- | ------------------- | ------------------ | ------------------------- |
+| 1           | 59.38 / 100.71      | 47.49 / 86.20      | 14.71 / 16.17             |
+| 4           | 60.06 / 115.37      | 50.89 / 137.86     | 50.74 / 50.87             |
+| 16          | 73.60 / 444.26      | 60.80 / 465.50     | 105.77 / 121.47           |
+
+All measured medians decreased, but two p95 values increased and concurrency-4 throughput was effectively unchanged. Provider/network variation, deployment and cache state remain uncontrolled; these results support a bounded improvement, not general parity or attribution of the whole latency change to this batch operation. Native million-document proof, selective edge tails, cold service latency and ingestion range work remain open.

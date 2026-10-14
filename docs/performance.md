@@ -1168,3 +1168,19 @@ A fair local WASM comparison calls the existing batched Bloom reader and the com
 | 10000 | unique    |       20000 |               12836 |       1.3687 |         1.0672 |       2.3999 |         1.7878 |
 
 The prototype improved local batched-query medians by 20–24% and retained the previously observed false-positive tradeoff. No inserted membership was lost. The product's Bloom implementation, dependencies, root format, readers and deployed data remain unchanged. The codec and all scratch tests/builds remain outside the tracked tree. A product adoption still requires a bounded constructor, batched multi-filter reader validation, an explicit one-step migration of canonical roots and pinned rebuild snapshots, native corpus acquisition-cost comparison, and independent live performance evidence. A smaller/faster synthetic membership filter does not by itself establish faster full search.
+
+## Bounded compact-filter construction and copy conversion
+
+The temporary constructor now rejects more than 250,000 input keys before allocating its hashed-key array. It sorts/deduplicates the 64-bit keys before native construction; a 10,000-element repeated-key input retained membership, and 250,001 inputs were rejected. A release binary with fifty-thousand, two-hundred-thousand and two-hundred-fifty-thousand key cases was measured independently of compilation. It sampled first/middle/last memberships for the large cases; earlier small-fixture tests still check every inserted membership.
+
+|   Keys | Frame bytes | Native build ms |
+| -----: | ----------: | --------------: |
+|  50000 |       61476 |           17.00 |
+| 200000 |      233508 |           66.11 |
+| 250000 |      290852 |           81.10 |
+
+The native process maximum RSS was 30,992 KiB across this sequential experiment, including input strings, allocator retention and process overhead. It is not a deployed Worker peak-memory measurement and does not prove the constructor fits alongside all production caches.
+
+A local workerd-backed copy rehearsal seeded 2,000 documents in four segments, including vectors so an incomplete rebuild retained a pinned checkpoint. The test loaded immutable segment headers from R2, built document/term filters with the checked WASM codec, checked every inserted ID/term, and wrote converted root/checkpoint copies under a separate rehearsal prefix. It preserved canonical sequence and the checkpoint's ordered segment references. The copy's Schema-encoded root shrank from 12,408 to 10,280 bytes. Queries against the untouched original root remained identical. This does not validate querying a converted canonical root, cutover concurrency, migration resumption/CAS, expired or multiple checkpoints, or a real-data migration. No product dependency or persistent production format changed.
+
+The proof leaves the actual adoption gate open: codec lookup must be integrated with batched filtering, construction must be checked in workerd under production memory pressure, and the single migration must update canonical and pinned views with retries that preserve concurrent committed writes and source identities. The copy rehearsal is preparation for that gate, not completion of it.

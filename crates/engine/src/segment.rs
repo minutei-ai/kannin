@@ -1014,6 +1014,49 @@ pub mod wasm {
         minimum: Option<(u32, u32)>,
     }
 
+    struct OverviewBounds<'a>(&'a [BlockMeta]);
+
+    impl Serialize for OverviewBounds<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.collect_seq(self.0.iter().map(|block| {
+                (
+                    block.max_title_tf,
+                    block.max_body_tf,
+                    block.min_title_length,
+                    block.min_body_length,
+                )
+            }))
+        }
+    }
+
+    #[derive(Serialize)]
+    struct OverviewSummary<'a> {
+        df: u32,
+        bounds: OverviewBounds<'a>,
+    }
+
+    struct OverviewDictionary<'a>(&'a BTreeMap<String, TermMeta>);
+
+    impl Serialize for OverviewDictionary<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.collect_map(self.0.iter().map(|(term, meta)| {
+                (
+                    term,
+                    OverviewSummary {
+                        df: meta.df,
+                        bounds: OverviewBounds(&meta.blocks),
+                    },
+                )
+            }))
+        }
+    }
+
+    #[derive(Serialize)]
+    struct DirectoryOverview<'a> {
+        dictionary: OverviewDictionary<'a>,
+        minimum: Option<(u32, u32)>,
+    }
+
     struct SelectedTerms<'a> {
         requested: &'a BTreeSet<String>,
     }
@@ -1315,13 +1358,8 @@ pub mod wasm {
         pub fn overview(&self, filters: &str) -> Result<Vec<u8>, JsValue> {
             let filters: Vec<Filter> = serde_json::from_str(filters)
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
-            let overview = Overview {
-                dictionary: self
-                    .header
-                    .terms
-                    .iter()
-                    .map(|(term, meta)| (term.clone(), TermSummary::from(meta)))
-                    .collect(),
+            let overview = DirectoryOverview {
+                dictionary: OverviewDictionary(&self.header.terms),
                 minimum: self
                     .header
                     .eligible_minimum(&filters)

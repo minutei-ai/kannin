@@ -70,6 +70,18 @@ test("compressed overviews preserve term bounds and exact filter minima across s
       Schema.decodeUnknownSync(Schema.Array(Filter))(filters),
     );
     const overview = directory.overview(encodedFilters);
+    expect(overview).toEqual(
+      pack(
+        Schema.encodeSync(Schema.fromJsonString(TermCatalog))({
+          dictionary: Schema.decodeSync(Schema.fromJsonString(TermSummaries))(
+            directory.summary('["cafe","cloudflare","rust","title"]'),
+          ),
+          minimum: Schema.decodeSync(Schema.fromJsonString(EligibleMinimum))(
+            directory.minimum(encodedFilters),
+          ),
+        }),
+      ).slice(8),
+    );
     for (const terms of [["rust"], ["cafe", "absent"], ["cloudflare", "rust"]]) {
       const encodedTerms = JSON.stringify(terms);
       expect(

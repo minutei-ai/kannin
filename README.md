@@ -49,6 +49,8 @@ A separate native operational comparison measured strong p50 **169–192 ms**, e
 
 The latest deployed change admits larger edge snapshots within a **24 MiB charged memory budget**. A native warm repetition at concurrency 1/4/16 measured p50 **89/82/114 ms**, with p95 **615/499/1,146 ms**. The first post-deploy run had worse tails; all 288 before/after edge responses agreed with strong baselines. [All runs and memory limits](docs/performance.md#large-edge-snapshot-budget).
 
+Native projections now batch up to sixteen segments per call. The latest mixed-query load measured p50 **80/91/196 ms** at concurrency 1/4/16, with exact strong/edge agreement; its initial p95 reached **3.52 seconds**. New projection selectors still took **4.35–4.61 seconds** in individual diagnostics. A full-header cache experiment was reverted after worse total latency. [Retained behavior and all measurements](docs/performance.md#batched-native-query-projections).
+
 ## Run
 
 Requires Bun, Rust 1.96 with `wasm32-unknown-unknown`, and `wasm-bindgen-cli` 0.2.129.

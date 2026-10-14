@@ -406,3 +406,21 @@ Three native load runs used the same million-document corpus, 32 requests per co
 |          16 |    349.73 / 1341.91 |         445.59 / 1632.40 |        114.47 / 1145.73 |
 
 Before throughput was 3.44/12.46/20.75 requests/s at concurrency 1/4/16; first after was 4.44/9.59/18.98, and warm after was 4.82/22.59/23.07. Initial post-deploy tails and high-concurrency throughput regressed; the warm repetition improved medians and p95 relative to the baseline. Deployment, cache state, network variation and the small sample prevent attributing the whole difference to the budget. Initial catalog acquisition, the earlier 30-second edge timeout and native concurrent tails remain unresolved.
+
+## Batched native query projections
+
+Runtime `e3e4e17` introduced native cached projections for groups of up to sixteen immutable directories. Runtime `13c257a` schedules four batches concurrently with sequential directory reads inside each request, preserving the previous four-read bound per query. Runtime `8059479` restores that same implementation after an unsuccessful full-header experiment. R2 root and index formats are unchanged; `catalog-v4` and its private cache namespace separate the array response from older projections. Per-segment query projections retain the four-MiB charged memory budget. `termReads` counts acquired catalogs and `termRequests` counts native requests.
+
+A workerd regression with thirty-three segments verifies three native calls rather than thirty-three, including the final partial batch. A different eligibility predicate requires new projections and retains namespace-wide document frequencies and exact filtered scores. The complete retained implementation passes 109 Worker/tooling and 18 Rust tests, including the existing phrase, revision, tombstone, cache isolation and independent ranking regressions.
+
+Native diagnostics append a unique absent token to each query, preserving its exact result while forcing a new projection selector. Each variant is checked against the corresponding strong base query. The million-document corpus, segment caches and prior requests remain in place; this isolates new projection selection, not a completely cold storage environment. Each cell is one observation, not a percentile:
+
+| Query     | Individual projections ms | Serial batches ms | Four batch lanes ms | Full-header experiment ms |
+| --------- | ------------------------: | ----------------: | ------------------: | ------------------------: |
+| selective |                  5,110.80 |          6,385.32 |            4,462.44 |                  6,974.86 |
+| common    |                  4,245.13 |          5,989.52 |            4,349.80 |                  4,618.98 |
+| filtered  |                  4,361.26 |          6,605.73 |            4,611.44 |                  5,399.78 |
+
+All twelve responses returned HTTP 200 and matched their respective base rows and scores exactly. Batching reduces native calls; only the selective lane observation improved over the individual-projection baseline. The full-header variant reused immutable bytes across selectors and passed 110 Worker/tooling plus 18 Rust tests, but increased total latency and moved full directory decoding to the caller. It was reverted, including its entrypoint, transport schemas and tests. A smaller directory interval in one case did not justify retaining higher total cost. Deployment, cache state and provider variation remain uncontrolled.
+
+A final native mixed-query load against the restored implementation verified all ninety-six edge responses against strong baselines at sequence 2,000 and one million documents. Concurrency 1/4/16 p50 was 79.90/91.20/195.90 ms, p95 was 3,517.22/750.73/1,451.56 ms and throughput was 2.01/15.63/21.89 requests/s. The initial phase had substantial tails after redeployment. These results do not establish general latency improvement or Turbopuffer parity. First-use projection acquisition and concurrent tails remain open.

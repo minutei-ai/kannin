@@ -1348,3 +1348,9 @@ Native Alchemy deployment and its Vectorize metadata migration succeeded. Baseli
 | 1           | 103.44 / 409.22       | 95.92 / 526.06         | 115.88 / 687.58                 |
 | 4           | 114.34 / 912.33       | 100.35 / 853.64        | 90.82 / 427.38                  |
 | 16          | 169.13 / 1184.05      | 166.43 / 1231.61       | 193.69 / 1116.75                |
+
+### Rejected individual-page Cache API probe
+
+A temporary candidate checked up to four private individual-page Cache API entries before acquiring a cold merged document span. Complete hits decoded/CRC-checked pages in result order; partial hits and cache errors fell back to the existing merged acquisition. Memory-resident pages and merged buffers bypassed the probe. Canonical R2 format and query contracts were unaffected.
+
+A local workerd comparison used four cache states with 40 documents and eleven alternating pairs per state, excluding three warmups. All 88 complete query results preserved rows and scores. With every individual page present, range acquisitions fell from 5 to 2 and medians from 23.11 to 21.81 ms. Empty-cache medians worsened from 29.80 to 38.06 ms, partial-cache medians from 19.94 to 30.46 ms and an already cached merged span from 9.91 to 25.26 ms; these controls retained the same acquired ranges/bytes. Direct lookup overhead outweighed the narrow benefit. The prototype's 25 Rust and 130 Bun/workerd tests passed, but it was removed before any native deployment. Production retains direct merged acquisition and the existing individual memory-cache fallback. The measurements do not establish native Cache API namespace visibility or origin-transfer savings.

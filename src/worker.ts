@@ -1923,6 +1923,48 @@ const refreshSnapshot = Effect.fn("raio.refreshSnapshot")(function* (
     return undefined;
   return snapshot.manifest;
 });
+async function acquireCachedSnapshot(cacheKey: URL, minimumSequence: number) {
+  return Effect.runPromise(
+    Effect.gen(function* () {
+      const cache = yield* Effect.tryPromise(() => caches.open("raio-snapshots-v2")).pipe(
+        Effect.orElseSucceed(() => undefined),
+      );
+      if (cache === undefined) return { cache, snapshot: undefined, rejected: false };
+      const cached = yield* Effect.tryPromise(() => cache.match(cacheKey)).pipe(
+        Effect.orElseSucceed(() => undefined),
+      );
+      if (cached === undefined) return { cache, snapshot: undefined, rejected: false };
+      const metadata = Schema.decodeUnknownExit(SnapshotCacheHeaders)({
+        "x-raio-observed-at": cached.headers.get("x-raio-observed-at"),
+        "x-raio-sequence": cached.headers.get("x-raio-sequence"),
+      });
+      const selectedAt = yield* Clock.currentTimeMillis;
+      if (
+        metadata._tag !== "Success" ||
+        selectedAt < metadata.value["x-raio-observed-at"] ||
+        selectedAt - metadata.value["x-raio-observed-at"] >= 1000 ||
+        metadata.value["x-raio-sequence"] < minimumSequence
+      ) {
+        snapshotMetrics.snapshotCacheRejected += 1;
+        const body = cached.body;
+        if (body !== null) yield* Effect.tryPromise(() => body.cancel()).pipe(Effect.ignore);
+        return { cache, snapshot: undefined, rejected: true };
+      }
+      const encoded = yield* Effect.tryPromise(() => cached.arrayBuffer()).pipe(
+        Effect.orElseSucceed(() => undefined),
+      );
+      if (encoded === undefined) return { cache, snapshot: undefined, rejected: false };
+      snapshotMetrics.snapshotCacheDecodes += 1;
+      const decoded = yield* readSnapshotFrame(encoded).pipe(Effect.orElseSucceed(() => undefined));
+      if (decoded !== undefined)
+        rememberSnapshot(cacheKey.href, decoded.snapshot, decoded.payload, encoded.byteLength);
+      return { cache, snapshot: decoded?.snapshot, rejected: false };
+    }),
+  );
+}
+const pendingCachedSnapshots = new Map<string, ReturnType<typeof acquireCachedSnapshot>>();
+const MAX_PENDING_CACHED_SNAPSHOTS = 64;
+
 const snapshotRefreshes = new Set<string>();
 
 const edgeSnapshot = Effect.fn("raio.edgeSnapshot")(function* (
@@ -1945,51 +1987,21 @@ const edgeSnapshot = Effect.fn("raio.edgeSnapshot")(function* (
     selection.snapshot.manifest.sequence < minimumSequence
   ) {
     selection.snapshot = undefined;
-    cache.value = yield* Effect.tryPromise(() => caches.open("raio-snapshots-v2")).pipe(
-      Effect.orElseSucceed(() => undefined),
-    );
-    if (cache.value !== undefined) {
-      const selectedCache = cache.value;
-      const cached = yield* Effect.tryPromise(() => selectedCache.match(cacheKey)).pipe(
-        Effect.orElseSucceed(() => undefined),
-      );
-      if (cached !== undefined) {
-        const metadata = Schema.decodeUnknownExit(SnapshotCacheHeaders)({
-          "x-raio-observed-at": cached.headers.get("x-raio-observed-at"),
-          "x-raio-sequence": cached.headers.get("x-raio-sequence"),
-        });
-        const cacheSelectedAt = yield* Clock.currentTimeMillis;
-        if (
-          metadata._tag === "Success" &&
-          cacheSelectedAt >= metadata.value["x-raio-observed-at"] &&
-          cacheSelectedAt - metadata.value["x-raio-observed-at"] < 1000 &&
-          metadata.value["x-raio-sequence"] >= minimumSequence
-        ) {
-          const encoded = yield* Effect.tryPromise(() => cached.arrayBuffer()).pipe(
-            Effect.orElseSucceed(() => undefined),
-          );
-          if (encoded !== undefined) {
-            snapshotMetrics.snapshotCacheDecodes += 1;
-            const decoded = yield* readSnapshotFrame(encoded).pipe(
-              Effect.orElseSucceed(() => undefined),
-            );
-            selection.snapshot = decoded?.snapshot;
-            if (decoded !== undefined)
-              rememberSnapshot(
-                cacheKey.href,
-                decoded.snapshot,
-                decoded.payload,
-                encoded.byteLength,
-              );
-          }
-        } else {
-          snapshotMetrics.snapshotCacheRejected += 1;
-          timings.append("server-timing", "edge_snapshot_cache_rejected");
-          const body = cached.body;
-          if (body !== null) yield* Effect.tryPromise(() => body.cancel()).pipe(Effect.ignore);
-        }
-      }
+    const identity = `${cacheKey.href}/minimumSequence=${minimumSequence}`;
+    const pending = pendingCachedSnapshots.get(identity);
+    const acquisition = { read: pending };
+    if (acquisition.read === undefined) {
+      const read = acquireCachedSnapshot(cacheKey, minimumSequence);
+      if (pendingCachedSnapshots.size < MAX_PENDING_CACHED_SNAPSHOTS) {
+        acquisition.read = read.finally(() => pendingCachedSnapshots.delete(identity));
+        pendingCachedSnapshots.set(identity, acquisition.read);
+      } else acquisition.read = read;
     }
+    const read = acquisition.read;
+    const acquired = yield* Effect.tryPromise(() => read);
+    cache.value = acquired.cache;
+    selection.snapshot = acquired.snapshot;
+    if (acquired.rejected) timings.append("server-timing", "edge_snapshot_cache_rejected");
   }
   const snapshot = selection.snapshot;
   const selectedAt = yield* Clock.currentTimeMillis;

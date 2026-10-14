@@ -273,6 +273,38 @@ test("an expired or future-dated snapshot is rejected even if Cache API retains 
   }
 });
 
+test("overlapping cache snapshots decode one body and preserve future sequence barriers", async () => {
+  const namespace = "shared-cache-snapshot";
+  await request(worker, namespace, "write", write([document("a", "shared cache snapshot")]));
+  await seedSnapshot(namespace, Effect.runSync(Clock.currentTimeMillis));
+  const before = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  const responses = await Promise.all(
+    Array.from({ length: 16 }, (_, index) =>
+      request(worker, namespace, "query", {
+        ...textQuery("shared"),
+        consistency: "edge-eventual",
+        minimumSequence: 1 + Number(index % 4 === 3),
+      }),
+    ),
+  );
+  for (const [index, response] of responses.entries()) {
+    if (index % 4 === 3) {
+      expect(response.status).toBe(409);
+      continue;
+    }
+    expect(response.status).toBe(200);
+    const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+    expect(result.sequence).toBe(1);
+    expect(result.rows.map((row) => row.id)).toEqual(["a"]);
+  }
+  const after = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(after.snapshotCacheDecodes - before.snapshotCacheDecodes).toBe(1);
+});
+
 test("fresh cache headers cannot make an expired snapshot body eligible", async () => {
   const namespace = "edge-header-body-age";
   await request(worker, namespace, "write", write([document("a", "old text")]));

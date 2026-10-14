@@ -1456,3 +1456,33 @@ Three million-document edge loads completed 288 exact strong-baseline comparison
 | Repeated after |          16 | 339.15 | 1449.17 |
 
 These whole-query observations remain mixed, especially at concurrency sixteen. The first after-deploy load's slow requests included snapshot fallback/selection and preparation waits; native clocks do not isolate CPU. The repeated load ran after fixture cleanup. The controlled WASM gain applies to new filters with large unused attributes; native peak-memory and stable whole-query latency remain outstanding.
+
+### Shared Cache API snapshot acquisition
+
+R2 snapshot acquisition was already shared, but simultaneous callers could independently match and decode the same Cache API frame. Pending-only sharing now covers the cache lookup, body consumption and decoded frame, keyed by physical bucket/namespace and minimumSequence. Admission is capped at 64 pending identities, with independent acquisition above the cap. Completion/failure removes the entry. Every caller still enforces the original one-second age and its sequence barrier after acquisition; incompatible barriers do not share cached-body admission. Memory TTL, cache format, R2 ownership and strong reads are unchanged.
+
+Two local workerd comparisons used sixteen simultaneous queries, ten alternating baseline/candidate pairs per state and two excluded warmup pairs. States were a small frame, a roughly 5 MiB frame and a cache miss. The large fixture pads a valid all-positive document Bloom in an otherwise canonical one-document root; it is synthetic acquisition evidence. Each comparison completed 960 queries. The repetition compared complete returned rows/scores across both versions.
+
+| State              | First baseline/candidate median ms | Repeated baseline/candidate median ms |
+| :----------------- | ---------------------------------: | ------------------------------------: |
+| Small cached frame |                      63.81 / 59.16 |                         56.76 / 58.74 |
+| Large cached frame |                      76.47 / 63.31 |                         58.57 / 64.00 |
+| Cache miss         |                      55.35 / 55.57 |                         52.44 / 57.40 |
+
+Large-frame decode counts across eight measured batches fell from 26 to 8 in the first run and 11 to 8 in the repetition. The previous path decoded up to seven copies in a batch; the shared path decoded one in every batch. The gain is eliminated duplicate work, not a consistent median latency improvement: when the baseline rarely duplicated decoding, candidate medians were worse. Decoded input volume is not origin transfer, provider CPU or peak-memory proof. The full gate passed 31 Rust and 133 Bun/workerd tests, including overlapping cached reads with independent future sequence barriers. Existing expired/future headers, stale bodies, malformed frames, canonical recovery and authentication tests remain active.
+
+Native deployment and the Vectorize metadata migration succeeded. Before/after/repeated edge loads on the million-document corpus completed 288 exact strong-baseline comparisons at sequence 2,000. Four future barriers requesting sequence 2,001 returned 409 through canonical fallback. A native health observation retained 5,448,863 payload bytes under a 21,795,676-byte snapshot charge, within the unchanged 24 MiB charged limit; this is not actual peak-heap telemetry.
+
+| Run            | Concurrency | p50 ms |  p95 ms |
+| :------------- | ----------: | -----: | ------: |
+| Before         |           1 |  80.58 |  746.28 |
+| Before         |           4 |  83.93 | 1175.20 |
+| Before         |          16 | 298.75 | 1105.47 |
+| After          |           1 |  71.61 |  533.47 |
+| After          |           4 | 118.49 | 1367.80 |
+| After          |          16 | 157.45 | 1885.44 |
+| Repeated after |           1 | 130.13 |  438.97 |
+| Repeated after |           4 |  99.42 | 1303.63 |
+| Repeated after |          16 | 349.91 | 1393.29 |
+
+The initial after-deploy load overlapped the future-barrier probe; the repetition ran after that probe completed. These observations do not establish a uniform native latency improvement. Pending-only sharing is retained for the demonstrated reduction in duplicate cache lookup/body decoding. Stable whole-query latency, actual peak memory and controlled indexed Turbopuffer comparison remain delivery gates.

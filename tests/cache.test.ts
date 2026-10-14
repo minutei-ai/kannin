@@ -151,6 +151,41 @@ test("term projection batches preserve global frequencies and filter eligibility
   );
   expect(after.termRequests - acquired.termRequests).toBe(9);
   expect(after.termReads - acquired.termReads).toBe(129);
+  expect(after.termBytes - acquired.termBytes).toBeLessThan(
+    (acquired.termBytes - before.termBytes) / 2,
+  );
+  const changedTerms = Schema.decodeUnknownSync(QueryResult)(
+    await (
+      await request(
+        worker,
+        namespace,
+        "query",
+        textQuery("shared cold", 10, [{ field: "group", op: "eq", value: 1 }]),
+      )
+    ).json(),
+  );
+  expect(changedTerms.rows).toEqual(filtered.rows);
+  const changed = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(changed.termRequests - after.termRequests).toBe(9);
+  expect(changed.termCacheBytes).toBeLessThanOrEqual(4 * 1024 * 1024);
+  const repeat = Schema.decodeUnknownSync(QueryResult)(
+    await (
+      await request(
+        worker,
+        namespace,
+        "query",
+        textQuery("shared cold", 10, [{ field: "group", op: "eq", value: 1 }]),
+      )
+    ).json(),
+  );
+  expect(repeat.rows).toEqual(filtered.rows);
+  const warm = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(warm.termRequests - changed.termRequests).toBe(0);
+  expect(warm.termMemoryHits - changed.termMemoryHits).toBe(129);
 });
 
 test("incremental writes retain partial immutable term catalogs and recompute live scores", async () => {

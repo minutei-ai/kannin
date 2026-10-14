@@ -344,7 +344,7 @@ export const TermProjectionRange = Schema.Struct({
 });
 export const TermProjectionProps = Schema.Struct({
   bucket: Schema.String.check(Schema.isBetweenLength(1, 63)),
-  terms: Schema.fromJsonString(Schema.Array(Schema.String).check(Schema.isBetweenLength(1, 64))),
+  terms: Schema.fromJsonString(Schema.Array(Schema.String).check(Schema.isMaxLength(64))),
   filters: Schema.fromJsonString(Schema.Array(Filter).check(Schema.isMaxLength(16))),
   ranges: Schema.Array(TermProjectionRange).check(Schema.isBetweenLength(1, 16)),
 });

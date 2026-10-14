@@ -1052,4 +1052,39 @@ An age-recovery-only deployment completed a 96-response native filter load with 
 |           4 |       64 |  81.00 |  885.96 |      18.98 |
 |          16 |       64 |  95.94 | 1530.77 |      36.43 |
 
-No response in either completed load carried the fallback marker, so the formerly failing native expiration condition was not exercised and no universal reliability claim is made. A separate authenticated native future-sequence request against the populated corpus did carry the coordinator fallback timing and returned 409, preserving the uncommitted barrier. Cache/isolate/network conditions remain uncontrolled, peak-memory proof and fully indexed Turbopuffer comparison remain outstanding. The shared-catalog candidate is still separate and unpromoted; its native comparison must be repeated against this recovered acquisition path.
+No response in either completed load carried the fallback marker, so the formerly failing native expiration condition was not exercised and no universal reliability claim is made. A separate authenticated native future-sequence request against the populated corpus did carry the coordinator fallback timing and returned 409, preserving the uncommitted barrier. Cache/isolate/network conditions remain uncontrolled, peak-memory proof and fully indexed Turbopuffer comparison remain outstanding. The following section records the shared-catalog repeat against this recovery path.
+
+## Shared term dictionaries and eligibility minima
+
+The process cache now owns one bounded entry per bucket, immutable segment key and header length, with dictionaries indexed by term selector and eligibility minima indexed by filter selector. This replaces complete duplicated catalog entries per selector/filter combination. Missing-part groups preserve order, acquire only missing data and retain query-local references across cache eviction. The total conservative charge remains capped at four MiB. The native internal projection accepts zero terms for eligibility-only acquisition; public text queries retain their existing contract. Physical frequencies and minima remain immutable, and live global statistics/tombstones are recomputed against the chosen root.
+
+The 129-segment local regression initially received 14,392 bytes on a filter change after a 14,457-byte initial response. It now requires less than half the initial response bytes while preserving exact rows/scores. It also covers changed terms with retained filters, a subsequent zero-request warm query with 129 complete memory hits, the cache budget and incremental-write/tombstone behavior. The integrated default gate passed 21 Rust and 118 Worker/tooling tests with 1,105 assertions.
+
+The native million-document comparison used `cloudflare` with no filter and group filters 42/43/44. Every phase used 32 requests. Baseline, first candidate and two repeated candidate loads all completed; all 384 edge responses matched strong rows/scores and sequence 2,000. No separate warmup was used, and cache/isolate/network conditions were uncontrolled. None of these responses used coordinator recovery.
+
+| Configuration        | Concurrency | p50 ms |  p95 ms | Requests/s |
+| :------------------- | ----------: | -----: | ------: | ---------: |
+| Baseline             |           1 |  81.14 |  900.50 |       4.31 |
+| Baseline             |           4 | 104.96 |  888.25 |      12.19 |
+| Baseline             |          16 | 631.56 | 1077.35 |      15.80 |
+| Shared first         |           1 | 167.87 |  878.58 |       3.05 |
+| Shared first         |           4 | 215.25 | 1032.42 |       9.91 |
+| Shared first         |          16 | 695.14 | 1332.16 |      13.07 |
+| Shared repeat        |           1 |  88.56 |  481.67 |       5.40 |
+| Shared repeat        |           4 |  90.74 |  282.23 |      27.53 |
+| Shared repeat        |          16 | 265.32 | 1157.42 |      16.10 |
+| Shared second repeat |           1 | 131.56 |  810.06 |       3.56 |
+| Shared second repeat |           4 | 121.16 |  885.56 |      12.70 |
+| Shared second repeat |          16 | 218.40 | 1031.04 |      15.82 |
+
+First-load medians and throughput regressed. Repeated concurrency-sixteen medians improved against this reference, but lower concurrency and throughput remained mixed. This is not evidence of a uniform whole-query speedup. A separate read-only native coordinator diagnostic observed 200 segment catalogs: initial dictionary/minimum acquisition transferred 101,243 bytes, while each new filter acquired 7,013 bytes (93% less than the initial payload). A second cycle of all four queries transferred zero catalog bytes, made zero catalog requests and recorded 200 complete memory hits per query. The resulting cache charge was 754,268 bytes. Counters are process-scoped; this short sequential diagnostic is distinct from the uncontrolled edge load and is not a per-request billing meter.
+
+The change is retained for demonstrated transfer reduction and dictionary/minimum reuse, not a universal latency claim. The general rare/selective/common/filter workload then completed another 96 exact edge responses at the same corpus sequence, for 480 verified responses across these five complete loads. Its latest values are shown below and in the README; they are a different query mix from the shared-filter comparison.
+
+| Concurrency | p50 ms |  p95 ms | Requests/s |
+| ----------: | -----: | ------: | ---------: |
+|           1 | 136.11 | 1091.42 |       3.51 |
+|           4 | 105.80 |  699.75 |      17.33 |
+|          16 | 468.70 | 1289.97 |      19.50 |
+
+Source and deployment include snapshot coordinator recovery. First-use expiration recovery was not exercised in these completed loads; native peak-memory proof and fully indexed Turbopuffer parity remain unverified.

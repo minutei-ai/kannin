@@ -193,3 +193,24 @@ A second native load completed all 192 strong-baseline comparisons without HTTP 
 The concurrency-1 median became slower. Separate sequential runs, deployment and cache warming limit timing attribution, and the completed second run does not classify or prove resolution of the first 503. Ranking acquisition intervals decreased: `text_rank` maxima changed from 1442/2160/1421 ms to 44/271/498 ms. Dictionary maxima were 110/109/146 ms after the change. Native clocks measure elapsed I/O intervals here, not isolated CPU. An immediate filtered strong query observed native projection/range HIT counters with about 2.17 MiB of decoded directory charge; the counters are process scoped and include preceding work.
 
 SciFact's 300 judgments retained nDCG@10 0.67306, recall@10 0.79567 and MRR@10 0.64181. Local checks passed 100 Worker/tooling tests and 17 Rust tests, including strict lint and compiler rejection probes. General latency guarantees, the unclassified intermittent 503 and broad vector/hybrid throughput remain open.
+
+## Vector document materialization and hybrid execution
+
+A vector top-1 regression previously read all twenty candidate document pages; it now reads one and returns the same row. Canonical revision/epoch, vector presence and residual filters are validated before slicing eligible candidates. Validation and page reads each have concurrency four and retain provider order. The root's empty document count short-circuits the provider after input validation. Filter encoding is reused per query. Hybrid branches now start concurrently over one root view, while text-only responses avoid a duplicate map/sort at the outer query boundary.
+
+A local native-workerd experiment uses 100 documents with identical unit vectors, sequential padded ids and `lexical cloudflare rust` text. Each case has five warmups and thirty measured requests; every measured row and score equals its initial result and the pre-change result. The Vectorize backend is a deterministic contract fixture, so these figures measure adapter/materialization overhead and cannot establish native ANN speed.
+
+| Mode   | Top-k | Before p50 / p95 ms | After p50 / p95 ms |
+| ------ | ----- | ------------------- | ------------------ |
+| vector | 1     | 23.45 / 34.02       | 10.12 / 13.00      |
+| vector | 10    | 22.60 / 27.67       | 12.51 / 16.48      |
+| vector | 50    | 24.70 / 45.28       | 20.97 / 24.13      |
+| hybrid | 1     | 25.14 / 37.61       | 10.73 / 16.71      |
+| hybrid | 10    | 23.78 / 31.98       | 17.25 / 22.85      |
+| hybrid | 50    | 34.61 / 41.15       | 34.99 / 41.97      |
+
+An intermediate vector-only change measured hybrid top-50 p50 34.14 ms; parallelization did not demonstrate an additional local gain on this CPU-bound fixture. Native provider I/O requires separate proof. `vector_index`, `vector_reconcile` and `vector_documents` server timings now separate the relevant intervals, including I/O rather than isolated CPU.
+
+A read-only native pre-change baseline reused the previously validated 100-vector corpus. It covered vector/hybrid top-k 1/10/50 plus filtered top-10, with five warmups and twenty measured requests per case. All 200 responses retained a stable ranking, revision and sequence within each case; vector medians were 283.93/278.56/278.55 ms and filtered 258.22 ms, while hybrid medians were 288.03/288.53/298.66 ms and filtered 263.43 ms. This is a controlled small-corpus baseline, not broad ANN recall evidence. Live Alchemy tailing was enabled during the run; no 503 or exception was observed in the returned stream, and the client checked every response. The historical failure remains unclassified.
+
+Unexpected failures now emit native Effect error records before transport mapping at the term projection, namespace coordinator and gateway. Server-side rejections are recorded too; expected client errors do not enter this path. The public generic error response is unchanged. This enables future live-tail diagnosis without retries or a claim that the historical 503 has been resolved. The complete local gate passed 101 Worker/tooling tests and 17 Rust tests.

@@ -1,5 +1,14 @@
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
-import { Cause, Clock, Effect, Match, Schema, Semaphore } from "effect";
+import {
+  Array as EffectArray,
+  Cause,
+  Clock,
+  Effect,
+  Match,
+  Option,
+  Schema,
+  Semaphore,
+} from "effect";
 import type { Env } from "../alchemy.run";
 import {
   initSync,
@@ -196,6 +205,9 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
           Response.json(dictionary, {
             headers: { "cache-control": "public, max-age=31536000, immutable" },
           }),
+        ),
+        Effect.tapError((error) =>
+          Effect.logError("kannin.termProjection", { key: input.key, error }),
         ),
         Effect.orElseSucceed(() =>
           Response.json(
@@ -535,7 +547,12 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
   return rows;
 }
 
-async function vectorQuery(env: Env, input: typeof Query.Type, root: typeof Root.Type) {
+async function vectorQuery(
+  env: Env,
+  input: typeof Query.Type,
+  root: typeof Root.Type,
+  timings: Headers,
+) {
   if (input.kind === "text") return [];
   if (input.vector.length !== 768)
     throw new Rejected({ status: 400, message: "Vector dimension must be 768" });
@@ -544,6 +561,10 @@ async function vectorQuery(env: Env, input: typeof Query.Type, root: typeof Root
       status: 400,
       message: "Vector and hybrid topK is limited to 50 by the Vectorize metadata contract",
     });
+  if (root.documents === 0) return [];
+  const encodedFilters = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Filter)))(
+    input.filters,
+  );
   const fields = Schema.decodeSync(Schema.fromJsonString(VectorFilterFields))(
     env.VECTOR_FILTER_FIELDS,
   );
@@ -554,7 +575,10 @@ async function vectorQuery(env: Env, input: typeof Query.Type, root: typeof Root
     returnMetadata: "all",
   };
   if (Object.keys(prefilter).length > 0) options.filter = prefilter;
+  const indexStarted = Effect.runSync(Clock.currentTimeNanos);
   const result = await env.VECTORS.query([...input.vector], options);
+  const indexEnded = Effect.runSync(Clock.currentTimeNanos);
+  timings.append("server-timing", `vector_index;dur=${Number(indexEnded - indexStarted) / 1e6}`);
   const candidate = Schema.Struct({ id: Schema.String, revision: Schema.Int });
   const metadata = result.matches.map((match) => ({
     match,
@@ -564,46 +588,90 @@ async function vectorQuery(env: Env, input: typeof Query.Type, root: typeof Root
     metadata.map((item) => item.metadata.id),
     root,
   );
-  const rows: Array<typeof Row.Type> = [];
-  for (const item of metadata) {
-    const location = current.get(item.metadata.id);
-    if (
-      location === undefined ||
-      location.document.revision !== item.metadata.revision ||
-      !location.document.vector
-    )
-      continue;
-    const expected = await vectorId(root.vectorEpoch, item.metadata.id, item.metadata.revision);
-    if (item.match.id !== expected) continue;
-    const matches = segment_filter(
-      Schema.encodeSync(Schema.fromJsonString(Attributes))(location.document.attributes),
-      Schema.encodeSync(Schema.fromJsonString(Schema.Array(Filter)))(input.filters),
-    );
-    if (!matches) continue;
-    const document = await readDocument(
-      location.segment.key,
-      location.segment.headerBytes,
-      location.document.data,
-      location.segment.bytes,
-    );
-    rows.push({
-      id: document.id,
-      title: document.title ?? "",
-      text: document.text,
-      attributes: document.attributes,
-      revision: document.revision,
-      score: item.match.score,
-    });
-  }
-  return rows.slice(0, input.topK);
+  const eligible = await Effect.runPromise(
+    Effect.forEach(
+      metadata,
+      (item) =>
+        Effect.gen(function* () {
+          const location = current.get(item.metadata.id);
+          if (
+            location === undefined ||
+            location.document.revision !== item.metadata.revision ||
+            !location.document.vector
+          )
+            return Option.none();
+          const expected = yield* Effect.tryPromise(() =>
+            vectorId(root.vectorEpoch, item.metadata.id, item.metadata.revision),
+          );
+          if (item.match.id !== expected) return Option.none();
+          const attributes = yield* Schema.encodeEffect(Schema.fromJsonString(Attributes))(
+            location.document.attributes,
+          );
+          if (!segment_filter(attributes, encodedFilters)) return Option.none();
+          return Option.some({ location, score: item.match.score });
+        }),
+      { concurrency: 4 },
+    ).pipe(Effect.map(EffectArray.getSomes)),
+  );
+  const reconciled = Effect.runSync(Clock.currentTimeNanos);
+  timings.append("server-timing", `vector_reconcile;dur=${Number(reconciled - indexEnded) / 1e6}`);
+  const rows = await Effect.runPromise(
+    Effect.forEach(
+      eligible.slice(0, input.topK),
+      (item) =>
+        Effect.gen(function* () {
+          const document = yield* Effect.tryPromise({
+            try: () =>
+              readDocument(
+                item.location.segment.key,
+                item.location.segment.headerBytes,
+                item.location.document.data,
+                item.location.segment.bytes,
+              ),
+            catch: (cause) => {
+              if (Schema.is(Rejected)(cause)) return cause;
+              return new Cause.UnknownError(cause);
+            },
+          });
+          return {
+            id: document.id,
+            title: document.title ?? "",
+            text: document.text,
+            attributes: document.attributes,
+            revision: document.revision,
+            score: item.score,
+          };
+        }),
+      { concurrency: 4 },
+    ),
+  );
+  const materialized = Effect.runSync(Clock.currentTimeNanos);
+  timings.append(
+    "server-timing",
+    `vector_documents;dur=${Number(materialized - reconciled) / 1e6}`,
+  );
+  return rows;
 }
 
 async function query(env: Env, input: typeof Query.Type, manifest: typeof Root.Type) {
   if (manifest.sequence < (input.minimumSequence ?? 0))
     throw new Rejected({ status: 409, message: "Requested sequence is not committed" });
   const timings = new Headers();
-  const text = await textQuery(input, manifest, timings);
-  const vectors = await vectorQuery(env, input, manifest);
+  if (input.kind === "text") {
+    const rows = await textQuery(input, manifest, timings);
+    return Response.json(
+      Schema.encodeSync(QueryResult)({
+        rows,
+        sequence: manifest.sequence,
+        consistency: input.consistency ?? "strong",
+      }),
+      { headers: timings },
+    );
+  }
+  const [text, vectors] = await Promise.all([
+    textQuery(input, manifest, timings),
+    vectorQuery(env, input, manifest, timings),
+  ]);
   const scores = new Map<string, typeof Row.Type>();
   if (input.kind === "hybrid") {
     for (const list of [text, vectors])
@@ -618,15 +686,6 @@ async function query(env: Env, input: typeof Query.Type, manifest: typeof Root.T
       return 0;
     })
     .slice(0, input.topK);
-  if (input.kind === "text")
-    return Response.json(
-      Schema.encodeSync(QueryResult)({
-        rows,
-        sequence: manifest.sequence,
-        consistency: input.consistency ?? "strong",
-      }),
-      { headers: timings },
-    );
   return Response.json(
     Schema.encodeSync(QueryResult)({
       rows,
@@ -1508,6 +1567,10 @@ export class SearchNamespace extends DurableObject<Env> {
       delivered.headers.append("server-timing", `raio;dur=${Number(ended - started) / 1e6}`);
       return delivered;
     }).pipe(
+      Effect.tapError((error) => {
+        if (Schema.is(Rejected)(error) && error.status < 500) return Effect.void;
+        return Effect.logError("kannin.namespace", { namespace, operation, error });
+      }),
       Effect.catch((error) => {
         this.current = undefined;
         this.acknowledgedReceipt = undefined;
@@ -1771,6 +1834,10 @@ export default {
           env.NAMESPACES.get(env.NAMESPACES.idFromName(namespace)).fetch(request),
         );
       }).pipe(
+        Effect.tapError((error) => {
+          if (Schema.is(Rejected)(error) && error.status < 500) return Effect.void;
+          return Effect.logError("kannin.gateway", { namespace, operation, error });
+        }),
         Effect.catch((error) => {
           if (Schema.is(Rejected)(error))
             return Effect.succeed(

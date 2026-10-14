@@ -7,6 +7,7 @@ import {
   Root,
   VectorMessage,
   VectorSyncResult,
+  Health,
 } from "../src/protocol";
 import { request, startWorker } from "./harness";
 
@@ -451,4 +452,32 @@ test("one queue delivery drains sixteen committed jobs with one vector mutation 
     Schema.decodeUnknownSync(Metadata)(await (await request(worker, namespace, "metadata")).json())
       .vectorOutbox,
   ).toBe(0);
+});
+
+test("vector top-k materializes only the requested live document pages", async () => {
+  const namespace = "vector-pages";
+  await request(worker, namespace, "write", {
+    requestId: "pages",
+    upserts: Array.from({ length: 20 }, (_, index) => ({
+      id: String(index).padStart(4, "0"),
+      text: "lexical",
+      attributes: {},
+      vector: vector(1),
+    })),
+    deletes: [],
+  });
+  await request(worker, namespace, "vector-sync", {});
+  const before = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  const response = await request(worker, namespace, "query", { ...vectorQuery(), topK: 1 });
+  const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+  expect(response.headers.get("server-timing")).toContain("vector_index;dur=");
+  expect(response.headers.get("server-timing")).toContain("vector_reconcile;dur=");
+  expect(response.headers.get("server-timing")).toContain("vector_documents;dur=");
+  expect(result.rows.map((row) => row.id)).toEqual(["0000"]);
+  const after = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(after.rangeReads - before.rangeReads).toBe(1);
 });

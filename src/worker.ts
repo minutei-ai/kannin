@@ -1696,6 +1696,7 @@ function rememberSnapshot(key: string, snapshot: typeof Snapshot.Type, encoded: 
 
 const snapshotMetrics = { snapshotR2Reads: 0, snapshotSharedReads: 0 };
 async function acquireSnapshot(
+  ctx: ExecutionContext,
   env: Env,
   namespace: string,
   observedAt: number,
@@ -1710,22 +1711,25 @@ async function acquireSnapshot(
   const encoded = Schema.encodeSync(Schema.fromJsonString(Snapshot))(snapshot);
   rememberSnapshot(cacheKey.href, snapshot, encoded);
   if (cache !== undefined) {
-    await cache
-      .put(
-        cacheKey,
-        new Response(encoded, {
-          headers: {
-            "cache-control": "public, max-age=2, must-revalidate",
-            "content-type": "application/json",
-          },
-        }),
-      )
-      .catch(() => undefined);
+    ctx.waitUntil(
+      cache
+        .put(
+          cacheKey,
+          new Response(encoded, {
+            headers: {
+              "cache-control": "public, max-age=2, must-revalidate",
+              "content-type": "application/json",
+            },
+          }),
+        )
+        .catch(() => undefined),
+    );
   }
   return snapshot;
 }
 const pendingSnapshots = new Map<string, ReturnType<typeof acquireSnapshot>>();
 const refreshSnapshot = Effect.fn("raio.refreshSnapshot")(function* (
+  ctx: ExecutionContext,
   env: Env,
   namespace: string,
   minimumSequence: number,
@@ -1735,7 +1739,7 @@ const refreshSnapshot = Effect.fn("raio.refreshSnapshot")(function* (
   const selected = { read: pendingSnapshots.get(cacheKey.href) };
   if (selected.read === undefined) {
     const now = yield* Clock.currentTimeMillis;
-    selected.read = acquireSnapshot(env, namespace, now, cacheKey, cache).finally(() =>
+    selected.read = acquireSnapshot(ctx, env, namespace, now, cacheKey, cache).finally(() =>
       pendingSnapshots.delete(cacheKey.href),
     );
     pendingSnapshots.set(cacheKey.href, selected.read);
@@ -1823,7 +1827,7 @@ const edgeSnapshot = Effect.fn("raio.edgeSnapshot")(function* (
           const refreshCache = yield* Effect.tryPromise(() =>
             caches.open("raio-snapshots-v1"),
           ).pipe(Effect.orElseSucceed(() => undefined));
-          yield* refreshSnapshot(env, namespace, 0, cacheKey, refreshCache);
+          yield* refreshSnapshot(ctx, env, namespace, 0, cacheKey, refreshCache);
         }).pipe(
           Effect.asVoid,
           Effect.ignore,
@@ -1838,7 +1842,7 @@ const edgeSnapshot = Effect.fn("raio.edgeSnapshot")(function* (
     }
     return snapshot.manifest;
   }
-  return yield* refreshSnapshot(env, namespace, minimumSequence, cacheKey, cache.value);
+  return yield* refreshSnapshot(ctx, env, namespace, minimumSequence, cacheKey, cache.value);
 });
 
 export default {

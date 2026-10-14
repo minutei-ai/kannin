@@ -1138,6 +1138,84 @@ pub mod wasm {
         Eligibility,
     }
 
+    struct SelectedAttributes<'a>(&'a BTreeSet<&'a str>);
+
+    impl<'de> serde::de::DeserializeSeed<'de> for SelectedAttributes<'_> {
+        type Value = BTreeMap<String, serde_json::Value>;
+
+        fn deserialize<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_map(self)
+        }
+    }
+
+    impl<'de> serde::de::Visitor<'de> for SelectedAttributes<'_> {
+        type Value = BTreeMap<String, serde_json::Value>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an attribute object")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut selected = BTreeMap::new();
+            while let Some(field) = map.next_key::<String>()? {
+                let value = map.next_value::<serde_json::Value>()?;
+                if self.0.contains(field.as_str()) {
+                    selected.insert(field, value);
+                }
+            }
+            Ok(selected)
+        }
+    }
+
+    struct SelectedGroup<'a>(&'a BTreeSet<&'a str>);
+
+    impl<'de> serde::de::DeserializeSeed<'de> for SelectedGroup<'_> {
+        type Value = (BTreeMap<String, serde_json::Value>, u32, u32);
+
+        fn deserialize<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            if self.0.len() > 8 {
+                return Self::Value::deserialize(deserializer);
+            }
+            deserializer.deserialize_tuple(3, self)
+        }
+    }
+
+    impl<'de> serde::de::Visitor<'de> for SelectedGroup<'_> {
+        type Value = (BTreeMap<String, serde_json::Value>, u32, u32);
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("attributes and two unsigned minimum lengths")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> Result<Self::Value, A::Error> {
+            let attributes = sequence
+                .next_element_seed(SelectedAttributes(self.0))?
+                .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+            let title = sequence
+                .next_element::<u32>()?
+                .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+            let body = sequence
+                .next_element::<u32>()?
+                .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
+            if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(serde::de::Error::invalid_length(4, &self));
+            }
+            Ok((attributes, title, body))
+        }
+    }
+
     struct EligibleGroups<'a>(&'a [Filter]);
 
     impl<'de> serde::de::DeserializeSeed<'de> for EligibleGroups<'_> {
@@ -1163,9 +1241,10 @@ pub mod wasm {
             mut sequence: A,
         ) -> Result<Self::Value, A::Error> {
             let mut minimum = None;
+            let fields = self.0.iter().map(|filter| filter.field.as_str()).collect();
             let mut present = false;
             while let Some((attributes, title, body)) =
-                sequence.next_element::<(BTreeMap<String, serde_json::Value>, u32, u32)>()?
+                sequence.next_element_seed(SelectedGroup(&fields))?
             {
                 present = true;
                 if matches(&attributes, self.0).map_err(serde::de::Error::custom)? {

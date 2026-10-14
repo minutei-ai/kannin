@@ -460,3 +460,23 @@ Native million-document diagnostics reused the same corpus and filter predicates
 All nine responses matched their strong base rows and scores. The first selective observation and the repeated filtered observation regressed relative to the baseline. These variations prevent a universal latency claim or attributing every change to the memory branch; cache locality and first-use acquisition still require work.
 
 The subsequent native mixed-query load verified all ninety-six edge responses against strong baselines at one million documents and sequence 2,000. Concurrency 1/4/16 p50 was 70.95/109.58/146.22 ms, p95 was 696.96/929.67/578.04 ms and throughput was 5.35/10.87/36.48 requests/s. Concurrency-sixteen p95 and throughput improved relative to the previous overview load, while concurrency-four p50, p95 and throughput regressed. The thirty-two samples per phase, prior cache warming and provider variation keep general throughput and parity claims unproven. New selectors remain above one second, and the earlier thirty-second first-use edge failure remains unproven resolved.
+
+## Selective overview deserialization
+
+Runtime `12d5aa0` uses a native Serde map visitor to project a compressed overview without retaining its entire dictionary. Each term summary is still deserialized and validated; only requested entries are inserted into the returned map. The root reader preserves duplicate/unknown-field rejection, nullable minima and trailing-data validation. CRC and decoded-size checks are unchanged. The projection retains at most sixty-four requested terms instead of the complete dictionary. This reduces retained entries, not a measured peak-isolate memory guarantee.
+
+The complete gate and CI passed with 113 Worker/tooling and 18 Rust tests. A new independent fixture uses standard zlib compression and CRC to generate valid frames with malformed unrequested values, duplicate/unknown root fields or trailing data; every invalid projection is rejected. Existing filter, phrase, revision, live-frequency and cache-recovery regressions passed. SciFact's 300-query quality metrics remained exactly unchanged, as did all eight retained native vector/hybrid cases.
+
+A WASM microbenchmark builds a 5,000-document segment and projects three requested names from its 12,908-byte overview. Each run has ten warmups and fifty measured projections, with every result checked against the original directory. An initial isolated baseline measured 8.16/8.63 ms p50/p95; that observation was not stable. Three subsequent alternating before/after process pairs produced:
+
+| Pair | Before p50 / p95 ms | After p50 / p95 ms |
+| ---: | ------------------: | -----------------: |
+|    1 |         4.35 / 4.48 |        2.77 / 2.87 |
+|    2 |         4.65 / 5.91 |        2.75 / 3.20 |
+|    3 |         4.45 / 4.63 |        2.86 / 3.30 |
+
+All projected dictionaries and minima matched. This isolates the WASM projection on a controlled segment; it is not native network latency. Separate processes and host variation limit causal attribution.
+
+Native new-selector observations against the same million-document corpus measured selective/common/filtered before at 1,267.88/2,699.87/2,560.87 ms and after at 1,840.68/1,070.71/2,029.95 ms. Every result matched its strong base rows and scores. Selective total latency regressed while the directory interval decreased slightly, and its snapshot interval increased from 345 to 554 ms. These individual observations do not establish a universal improvement.
+
+The subsequent complete native mixed-query load retained one million documents and sequence 2,000; all ninety-six edge responses matched strong baselines. Concurrency 1/4/16 p50 was 66.92/78.14/139.78 ms, p95 was 369.75/655.99/1,118.67 ms and throughput was 7.24/20.23/25.76 requests/s. Relative to the preceding memory-path load, concurrency-one and concurrency-four improved while concurrency-sixteen p95 and throughput regressed. The sample size, deployment, prior warming and network variation keep causal and parity claims bounded. Initial acquisition remains above one second, high-concurrency tails remain open, and the earlier edge lease failure is not proven resolved.

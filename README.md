@@ -37,6 +37,8 @@ These deployed measurements are from `faa310e`, before the latest warm-snapshot 
 
 The filtered-projection run passed **192 mixed-query checks**, with concurrency-1 p50/p95 **159 / 223 ms** and concurrency-16 p95 **815 ms**, reaching **46.1 requests/s**. The first post-deploy load aborted on an unclassified 503; a completed repeat does not prove that failure resolved. Broad vector/hybrid throughput and general latency guarantees remain open.
 
+Native vector/hybrid validation passed 200 before/after comparisons on a controlled 100-vector corpus. Latest medians were **288–326 ms**; this run was slower than its baseline despite reduced page reads. [Retrieval measurements and platform limits](docs/performance.md#vector-document-materialization-and-hybrid-execution).
+
 [Full deployed evidence](docs/performance.md) · [local methodology and contract comparison](docs/turbopuffer-contracts.md) · [SciFact ranking quality](docs/quality.md)
 
 ## Run

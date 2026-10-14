@@ -214,3 +214,20 @@ An intermediate vector-only change measured hybrid top-50 p50 34.14 ms; parallel
 A read-only native pre-change baseline reused the previously validated 100-vector corpus. It covered vector/hybrid top-k 1/10/50 plus filtered top-10, with five warmups and twenty measured requests per case. All 200 responses retained a stable ranking, revision and sequence within each case; vector medians were 283.93/278.56/278.55 ms and filtered 258.22 ms, while hybrid medians were 288.03/288.53/298.66 ms and filtered 263.43 ms. This is a controlled small-corpus baseline, not broad ANN recall evidence. Live Alchemy tailing was enabled during the run; no 503 or exception was observed in the returned stream, and the client checked every response. The historical failure remains unclassified.
 
 Unexpected failures now emit native Effect error records before transport mapping at the term projection, namespace coordinator and gateway. Server-side rejections are recorded too; expected client errors do not enter this path. The public generic error response is unchanged. This enables future live-tail diagnosis without retries or a claim that the historical 503 has been resolved. The complete local gate passed 101 Worker/tooling tests and 17 Rust tests.
+
+Runtime `2ffcafc` deployed successfully. The native post-change run completed the same 200 checks, with every case's ids, scores, attributes, revisions and sequence exactly equal to the pre-change run. Live Alchemy tailing recorded no 503 or exception during either controlled retrieval run.
+
+| Mode   | Top-k | Filtered | Before p50 / p95 ms | After p50 / p95 ms |
+| ------ | ----- | -------- | ------------------- | ------------------ |
+| vector | 1     | no       | 283.93 / 297.57     | 303.33 / 334.31    |
+| vector | 10    | no       | 278.56 / 297.81     | 293.30 / 331.62    |
+| vector | 50    | no       | 278.55 / 294.25     | 310.74 / 437.66    |
+| vector | 10    | yes      | 258.22 / 283.71     | 288.01 / 317.63    |
+| hybrid | 1     | no       | 288.03 / 306.62     | 288.76 / 303.64    |
+| hybrid | 10    | no       | 288.53 / 323.54     | 298.20 / 749.06    |
+| hybrid | 50    | no       | 298.66 / 324.80     | 326.24 / 439.86    |
+| hybrid | 10    | yes      | 263.43 / 280.32     | 290.63 / 388.60    |
+
+The native run became slower in most cases despite fewer document reads and lower local adapter cost. Provider/network variation and deployment/cache state are uncontrolled. These results establish correct native behavior, not a native latency win. Post-change index interval medians were 115–131 ms; reconciliation/document medians were zero in the native I/O clock, which does not isolate CPU. Gateway medians added about 127 ms beyond the coordinator in unfiltered vector cases.
+
+Moving this existing coordinator to Brazil is not an available documented placement operation: Cloudflare's current [data-location contract](https://developers.cloudflare.com/durable-objects/reference/data-location/) says existing objects do not relocate and `sam` hints currently instantiate in Eastern North America. The R2-first durability and strong-read contracts remain unchanged; no namespace replacement or weakened consistency was used to create an artificial latency gain. These platform constraints and the unclassified historical 503 keep the overall performance objective open.

@@ -289,3 +289,26 @@ Separate strong-consistency BM25 loads each completed 192 requests over the unch
 | 16          | 338.89 / 413.60          | 344.66 / 951.04        | 46.28 / 31.29                      |
 
 The experimental native `strong_snapshot` interval included 203–507 ms in the first four measured responses, dominating their I/O intervals. The local 100,000-document benchmark also paid fresh-root decoding: strong rare/selective/common/filtered p50 was 5.84/19.14/23.94/21.93 ms. This deployment did not benefit from exchanging coordinator access for a fresh R2 GET per query. Runtime `877a403` reverts that path; strong queries again use the coordinator, with no additional R2 GET or snapshot cache. The concurrent revision regression remains in the suite. No consistency contract was relaxed to compensate for latency.
+
+## Conditional manifest reads and bounded ANN caching
+
+Runtime `4c7e246` tried bodyless conditional R2 GETs against a bounded 4 MiB decoded manifest-version cache. Every query validated the ETag with R2; the local full gate passed. Despite avoiding unchanged-body transfer, a native strong BM25 load over 100,000 documents still regressed. Baseline and experimental runs each completed 192 correct requests: concurrency 1/4/16 p50 changed from 176.58/181.36/244.30 to 270.06/275.09/335.60 ms, p95 from 198.29/221.25/349.52 to 428.78/988.30/722.06 ms, throughput from 5.58/20.82/53.37 to 3.32/9.36/30.94 requests/s. Runtime `e39fa4c` reverted the experiment. Strong manifest acquisition remains with the coordinator.
+
+Runtime `81755b2` instead caches only ANN candidates with native Cache API for one second. The key includes the canonical epoch, sequence and outbox, physical bucket and query/filter configuration. Every hit still reconciles revisions, vector presence and residual filters against the live strong R2 view before materializing documents. Empty responses and failures are not cached. The workerd regression checks provider call counts, expiry and mutation invalidation. The final suite passes 105 Worker/tooling and 17 Rust tests.
+
+A native before/after comparison used the same 96-vector, 32-segment corpus, with five warmups and twenty measured requests per case. Both runs completed 200 requests; all rows, scores, attributes and revisions agreed. The workload repeats each query rapidly and measures TTL reuse, not unique-query latency or fully cold ANN service.
+
+| Native case        | Before p50 / p95 ms | Cache p50 / p95 ms | Measured hits / 20 |
+| ------------------ | ------------------- | ------------------ | ------------------ |
+| Vector 1           | 261.59 / 283.34     | 191.39 / 287.65    | 16                 |
+| Vector 10          | 255.68 / 280.79     | 186.41 / 260.97    | 17                 |
+| Vector 50          | 284.15 / 368.38     | 207.43 / 308.02    | 16                 |
+| Vector filtered 10 | 260.12 / 286.51     | 180.51 / 289.33    | 16                 |
+| Hybrid 1           | 256.27 / 269.96     | 183.14 / 280.85    | 16                 |
+| Hybrid 10          | 271.74 / 388.37     | 190.54 / 282.24    | 16                 |
+| Hybrid 50          | 319.41 / 549.08     | 232.52 / 332.93    | 16                 |
+| Hybrid filtered 10 | 266.97 / 291.71     | 191.78 / 285.02    | 16                 |
+
+Median latency decreased across the repeated-query cases, while several p95 values rose slightly. Within the experimental samples, unfiltered vector-10 cache hits had median 185.80 ms and misses 260.97 ms; hybrid-10 hits had median 188.82 ms and misses 270.53 ms. Each miss subset has only three or four observations and is not an independent causal comparison. Cache hits avoid the provider call; expiry, unique inputs and canonical changes still pay that call and cache-adapter work. Vector visibility remains eventual, with up to one additional second of cached candidate visibility. These results do not establish general Turbopuffer parity or removal of the remote strong-read hop.
+
+A separate owned native namespace confirmed actual cache reuse, then deleted the top candidate and reset the namespace. The sequence-2 query returned only the surviving revision-1 document; sequence 3 returned no rows after reset. The first bounded observation window did not satisfy its combined visibility/cache-hit assertion; persisted metadata showed two committed documents and an empty outbox. The probe resumed on that same namespace without repeating the seed and then completed. Its first resumed cold request recorded 1,120 ms in the ANN/cache interval and 1,644 ms at the gateway, reinforcing that this cache does not solve cold service latency.

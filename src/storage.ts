@@ -14,6 +14,8 @@ import {
   SegmentHeader,
   SegmentRange,
   TermCatalog,
+  TermSummaries,
+  EligibleMinimum,
   TermCatalogBatch,
   OverviewBatch,
   TermProjectionProps,
@@ -256,19 +258,27 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
       for (const [index, input] of ranges.entries()) {
         const identity = `${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}\0${filters}`;
         const hit = hits.find((entry) => entry.index === index);
-        const selected: { bytes: Uint8Array | undefined } = { bytes: hit?.bytes };
-        if (selected.bytes === undefined) {
-          selected.bytes = yield* withDirectory(input.key, input.headerBytes, (directory) =>
-            Effect.sync(() => directory.overview(filters)),
+        const selected = { bytes: hit?.bytes, catalog: hit?.catalog };
+        if (selected.bytes === undefined || selected.catalog === undefined) {
+          const projection = yield* withDirectory(input.key, input.headerBytes, (directory) =>
+            Effect.gen(function* () {
+              const dictionary = yield* Effect.try(() => directory.summary(terms)).pipe(
+                Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(TermSummaries))),
+              );
+              const minimum = yield* Effect.try(() => directory.minimum(filters)).pipe(
+                Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(EligibleMinimum))),
+              );
+              const bytes = yield* Effect.try(() => directory.overview(filters));
+              return { bytes, catalog: { dictionary, minimum } };
+            }),
           );
+          selected.bytes = projection.bytes;
+          selected.catalog = projection.catalog;
           reads.overviewBuilds += 1;
         } else reads.overviewMemoryHits += 1;
         const bytes = selected.bytes;
-        const catalog = yield* Effect.try(() => segment_overview_project(bytes, terms)).pipe(
-          Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(TermCatalog))),
-        );
         rememberOverview(identity, bytes);
-        catalogs.push(catalog);
+        catalogs.push(selected.catalog);
         admission.bytes += bytes.byteLength;
         if (admission.bytes > 3 * 1024 * 1024) {
           admission.enabled = false;

@@ -175,6 +175,21 @@ export const readTermProjection = Effect.fn("kannin.readTermProjection")(
   (key: string, headerBytes: number, terms: string, filters: string) =>
     Effect.gen(function* () {
       const identity = `${env.STORAGE_CACHE_SCOPE}:${key}/${headerBytes}\0${filters}`;
+      const memory = overviewBuffers.get(identity);
+      if (memory !== undefined) {
+        const projected = yield* Effect.try(() => segment_overview_project(memory, terms)).pipe(
+          Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(TermCatalog))),
+          Effect.orElseSucceed(() => undefined),
+        );
+        if (projected !== undefined) {
+          rememberOverview(identity, memory);
+          reads.overviewMemoryHits += 1;
+          return projected;
+        }
+        overviewBuffers.delete(identity);
+        overviewBudget.bytes -=
+          memory.byteLength + new TextEncoder().encode(identity).byteLength * 4 + 128;
+      }
       const cacheKey = new URL("https://overviews.internal/source-v1");
       cacheKey.searchParams.set("bucket", env.STORAGE_CACHE_SCOPE);
       cacheKey.searchParams.set("key", key);
@@ -183,39 +198,31 @@ export const readTermProjection = Effect.fn("kannin.readTermProjection")(
       const cache = yield* Effect.tryPromise(() => caches.open("raio-overviews-v1")).pipe(
         Effect.orElseSucceed(() => undefined),
       );
-      for (const tier of ["memory", "api"] as const) {
-        const candidate: { bytes: Uint8Array | undefined } = { bytes: undefined };
-        if (tier === "memory") candidate.bytes = overviewBuffers.get(identity);
-        else if (cache !== undefined) {
-          const cached = yield* Effect.tryPromise(() => cache.match(cacheKey)).pipe(
-            Effect.orElseSucceed(() => undefined),
-          );
-          if (cached !== undefined)
-            candidate.bytes = yield* Effect.tryPromise(
-              async () => new Uint8Array(await cached.arrayBuffer()),
-            ).pipe(Effect.orElseSucceed(() => undefined));
-        }
-        const bytes = candidate.bytes;
-        if (bytes === undefined) continue;
-        const projected = yield* Effect.try(() => segment_overview_project(bytes, terms)).pipe(
-          Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(TermCatalog))),
+      if (cache !== undefined) {
+        const cached = yield* Effect.tryPromise(() => cache.match(cacheKey)).pipe(
           Effect.orElseSucceed(() => undefined),
         );
-        if (projected !== undefined) {
-          rememberOverview(identity, bytes);
-          if (tier === "memory") reads.overviewMemoryHits += 1;
-          else reads.overviewCacheApiHits += 1;
-          return projected;
-        }
-        const invalid = overviewBuffers.get(identity);
-        if (invalid !== undefined)
-          overviewBudget.bytes -=
-            invalid.byteLength + new TextEncoder().encode(identity).byteLength * 4 + 128;
-        overviewBuffers.delete(identity);
-        if (cache !== undefined)
+        if (cached !== undefined) {
+          const candidate = yield* Effect.tryPromise(
+            async () => new Uint8Array(await cached.arrayBuffer()),
+          ).pipe(Effect.orElseSucceed(() => undefined));
+          if (candidate !== undefined) {
+            const projected = yield* Effect.try(() =>
+              segment_overview_project(candidate, terms),
+            ).pipe(
+              Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(TermCatalog))),
+              Effect.orElseSucceed(() => undefined),
+            );
+            if (projected !== undefined) {
+              rememberOverview(identity, candidate);
+              reads.overviewCacheApiHits += 1;
+              return projected;
+            }
+          }
           yield* Effect.tryPromise(() => cache.delete(cacheKey)).pipe(
             Effect.orElseSucceed(() => false),
           );
+        }
       }
       const bytes = yield* withDirectory(key, headerBytes, (directory) =>
         Effect.sync(() => directory.overview(filters)),

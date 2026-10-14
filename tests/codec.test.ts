@@ -7,6 +7,7 @@ import {
   tokenize,
   segment_bloom,
   segment_bloom_filter_many,
+  segment_term_bounds,
 } from "../dist/wasm/raio_engine";
 
 initSync({
@@ -52,4 +53,33 @@ test("WASM batched blooms preserve Unicode membership and reject broken offsets"
   expect(() =>
     segment_bloom_filter_many(packed, new Uint32Array([0, packed.length + 1]), "[]"),
   ).toThrow("Invalid bloom offsets");
+});
+
+test("WASM term bounds preserve order, empty eligibility and batch limits", () => {
+  const statistics = JSON.stringify({
+    documents: 100,
+    title_length: 100,
+    body_length: 1000,
+    frequencies: { alpha: 10 },
+  });
+  const dictionary = { alpha: { df: 10, bounds: [[1, 2, 1, 10]] } };
+  const actual = Array.from(
+    segment_term_bounds(
+      statistics,
+      JSON.stringify([
+        { dictionary, minimum: [0, 0] },
+        { dictionary, minimum: null },
+        { dictionary, minimum: [1, 10] },
+      ]),
+    ),
+  );
+  expect(actual[0]).toBeGreaterThan(0);
+  expect(actual[1]).toBe(0);
+  expect(actual[2]).toBe(actual[0]);
+  expect(() =>
+    segment_term_bounds(
+      statistics,
+      JSON.stringify(Array.from({ length: 65 }, () => ({ dictionary, minimum: null }))),
+    ),
+  ).toThrow("Term bound batch exceeds segment budget");
 });

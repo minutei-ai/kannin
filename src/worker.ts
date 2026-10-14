@@ -17,7 +17,7 @@ import {
   tokenize,
   segment_document_terms,
   segment_filter,
-  segment_term_bound,
+  segment_term_bounds,
 } from "../dist/wasm/raio_engine";
 import module from "raio:wasm";
 import type { Row } from "./protocol";
@@ -383,23 +383,40 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
     frequencies: Object.fromEntries(frequencies),
   };
   const encodedStatistics = Schema.encodeSync(Schema.fromJsonString(SearchStatistics))(statistics);
-  const prioritized = catalog
-    .map((entry) => ({
-      segment: entry.segment,
-      dictionary: entry.dictionary,
-      minimum: entry.minimum,
-      bound: segment_term_bound(
-        encodedStatistics,
-        Schema.encodeSync(Schema.fromJsonString(TermSummaries))(entry.dictionary),
-        Schema.encodeSync(Schema.fromJsonString(EligibleMinimum))(entry.minimum),
-      ),
-    }))
-    .sort((left, right) => {
-      if (left.bound !== right.bound) return right.bound - left.bound;
-      if (left.segment.minimumId < right.segment.minimumId) return -1;
-      if (left.segment.minimumId > right.segment.minimumId) return 1;
-      return 0;
-    });
+  const bounded = [];
+  for (const offset of Array.from(
+    { length: Math.ceil(catalog.length / 64) },
+    (_, index) => index * 64,
+  )) {
+    const window = catalog.slice(offset, offset + 64);
+    const encoded = Schema.encodeSync(Schema.fromJsonString(Schema.Array(TermCatalog)))(
+      window.map((entry) => ({ dictionary: entry.dictionary, minimum: entry.minimum })),
+    );
+    const bounds = Schema.decodeSync(Schema.Array(Schema.Finite))(
+      Array.from(segment_term_bounds(encodedStatistics, encoded)),
+    );
+    if (bounds.length !== window.length)
+      throw new Rejected({ status: 503, message: "Term bound batch omitted a segment" });
+    bounded.push(
+      ...window.map((entry, index) => {
+        const bound = bounds[index];
+        if (bound === undefined)
+          throw new Rejected({ status: 503, message: "Term bound batch omitted a segment" });
+        return {
+          segment: entry.segment,
+          dictionary: entry.dictionary,
+          minimum: entry.minimum,
+          bound,
+        };
+      }),
+    );
+  }
+  const prioritized = bounded.sort((left, right) => {
+    if (left.bound !== right.bound) return right.bound - left.bound;
+    if (left.segment.minimumId < right.segment.minimumId) return -1;
+    if (left.segment.minimumId > right.segment.minimumId) return 1;
+    return 0;
+  });
   const dictionaryEnded = Effect.runSync(Clock.currentTimeNanos);
   timings.append("server-timing", `text_directory;dur=${Number(dictionaryEnded - started) / 1e6}`);
   const ranked: Array<{

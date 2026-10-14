@@ -988,33 +988,42 @@ pub mod wasm {
             .fold(0.0, f64::max)
     }
 
+    #[derive(Deserialize)]
+    struct TermCatalog {
+        dictionary: BTreeMap<String, TermSummary>,
+        minimum: Option<(u32, u32)>,
+    }
+
     #[wasm_bindgen]
-    #[doc = "# Errors\nRejects invalid statistics, term metadata, or eligible minimum serialization."]
-    pub fn segment_term_bound(
-        statistics: &str,
-        terms: &str,
-        minimum: &str,
-    ) -> Result<f64, JsValue> {
+    #[doc = "# Errors\nRejects invalid statistics, catalogs or batches beyond 64 segments."]
+    pub fn segment_term_bounds(statistics: &str, catalogs: &str) -> Result<Vec<f64>, JsValue> {
         let statistics: Statistics = serde_json::from_str(statistics)
             .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
-        let terms: BTreeMap<String, TermSummary> =
-            serde_json::from_str(terms).map_err(|cause| JsValue::from_str(&cause.to_string()))?;
-        let minimum: Option<(u32, u32)> =
-            serde_json::from_str(minimum).map_err(|cause| JsValue::from_str(&cause.to_string()))?;
-        let Some(minimum) = minimum else {
-            return Ok(0.0);
-        };
-        Ok(terms
+        let catalogs: Vec<TermCatalog> = serde_json::from_str(catalogs)
+            .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        if catalogs.len() > 64 {
+            return Err(JsValue::from_str("Term bound batch exceeds segment budget"));
+        }
+        Ok(catalogs
             .iter()
-            .map(|(term, meta)| {
-                term_bound(
-                    meta,
-                    &statistics,
-                    statistics.frequencies.get(term).copied().unwrap_or(0),
-                    minimum,
-                )
+            .map(|catalog| {
+                let Some(minimum) = catalog.minimum else {
+                    return 0.0;
+                };
+                catalog
+                    .dictionary
+                    .iter()
+                    .map(|(term, meta)| {
+                        term_bound(
+                            meta,
+                            &statistics,
+                            statistics.frequencies.get(term).copied().unwrap_or(0),
+                            minimum,
+                        )
+                    })
+                    .sum()
             })
-            .sum())
+            .collect())
     }
 
     #[wasm_bindgen]

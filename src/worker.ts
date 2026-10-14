@@ -209,7 +209,7 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
               return { dictionary, minimum };
             }),
           ),
-        { concurrency: 4 },
+        { concurrency: 1 },
       ).pipe(
         Effect.flatMap(Schema.encodeEffect(TermCatalogBatch)),
         Effect.map((dictionary) =>

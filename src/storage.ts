@@ -235,7 +235,7 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
             }
             return catalogs;
           }),
-        { concurrency: 1 },
+        { concurrency: 4 },
       );
       return batches.flat();
     }),

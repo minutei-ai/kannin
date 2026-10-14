@@ -569,3 +569,30 @@ Native diagnostics reused the million-document corpus and the preceding section'
 All first-run observations regressed; all second-run observations improved. The cache/isolate/network state was uncontrolled, so the local serialization gain does not establish a causal native latency improvement.
 
 All 96 mixed-load responses retained exact strong rows/scores and the acknowledged sequence. Concurrency 1/4/16 measured p50 62.58/61.89/255.18 ms, p95 387.82/250.70/1,189.85 ms and throughput 8.30/28.21/21.20 requests/s. Relative to the preceding direct-projection load, concurrency-four tails improved substantially, while concurrency-sixteen median, tail and throughput regressed. The README reports this latest load. New-selector/filter misses still take seconds; first-use lease reliability, native peak memory and fully indexed Turbopuffer parity remain open.
+
+## Shared native snapshot acquisition
+
+Runtime `90632d8` shares only pending native snapshot acquisitions per physical bucket/namespace. The owning request consumes and decodes the R2 body and publishes the snapshot once. Other readers await the decoded result, then check their own sequence barrier and the observation age recorded before the original R2 read. The entry is removed after success, absence or failure. Completed acquisitions are not another persistent cache. Existing memory/Cache API age bounds remain unchanged.
+
+The first attempted implementation used `Effect.cached` across request fibers. Workerd canceled joined requests as hung; that implementation was removed before publication. Sharing a native acquisition Promise preserved request-owned I/O. A twelve-request local regression with mixed committed/future sequence barriers observed seven R2 acquisitions before and two after. Late requests may legitimately start another acquisition, so the regression asserts actual sharing and fewer acquisitions than requests rather than requiring one acquisition for the entire HTTP burst. Every request retained its individual 200/409 result. A second regression corrupts canonical data during overlapping reads, verifies 503 responses, repairs it and verifies immediate recovery. The complete gate passed 115 Worker/tooling tests and 18 Rust tests; deployment completed.
+
+`GET /health` now exposes isolate-local snapshot acquisition/join counters. Native requests can land in different isolates, so these counters are not global I/O counts. The native driver below measures latency and result equality, not aggregate R2 call reduction.
+
+Two native loads before deployment and two after used the same million-document corpus, 32 mixed queries per concurrency phase, and exact strong rows/scores plus acknowledged sequence checks. All 384 edge responses passed.
+
+| Run      | Concurrency | p50 ms |  p95 ms | Requests/s |
+| -------- | ----------: | -----: | ------: | ---------: |
+| Before 1 |           1 |  76.72 |  389.05 |       8.25 |
+| Before 1 |           4 |  76.30 |  381.26 |      32.50 |
+| Before 1 |          16 | 121.69 | 1006.07 |      25.67 |
+| Before 2 |           1 |  59.55 |  356.02 |       8.51 |
+| Before 2 |           4 |  83.15 |  362.35 |      26.52 |
+| Before 2 |          16 | 118.55 |  865.78 |      21.99 |
+| After 1  |           1 |  77.52 |  275.50 |       6.95 |
+| After 1  |           4 | 106.16 |  981.11 |      12.07 |
+| After 1  |          16 | 210.26 | 1162.10 |      23.73 |
+| After 2  |           1 |  81.81 |  499.24 |       7.09 |
+| After 2  |           4 |  78.94 |  271.84 |      28.20 |
+| After 2  |          16 | 111.19 |  951.71 |      22.02 |
+
+The local overlapping-read reduction is demonstrated. Native results remain mixed: the second concurrency-sixteen median improved against both baselines, but its tail exceeded the second baseline; concurrency-one median and throughput regressed. Uncontrolled cache/isolate/network state prevents a causal overall latency claim. The README reports the latest run and retains the preceding fresh-filter diagnostic separately. New-selector/filter misses, first-use lease reliability, native peak memory and fully indexed Turbopuffer parity remain open.

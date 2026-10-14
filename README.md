@@ -17,7 +17,7 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 |           4 |  63.13 | 432.11 |      25.82 |
 |          16 | 110.42 | 806.83 |      26.62 |
 
-Runtime `f1d5c6f`; latest of two complete post-deploy runs, 32 mixed queries per phase. All 192 edge responses matched strong rows and scores. Reusable overviews now compute exact filter minima from attribute groups; new selector/filter observations improved from **3.70–3.91 s** to **1.57–2.49 s** after warming. Isolate/cache/network state limits attribution. An earlier load failed the snapshot freshness guard; Cache API publication was moved off the read critical path and two subsequent loads passed. General first-use reliability and performance parity remain unverified.
+Runtime `7f6d00c`; 32 mixed queries per phase. All 96 edge responses matched strong rows and scores. Reusable attribute groups retain only required fields for narrow filters, validating all discarded values; wider filters use native full-map decoding. New selector/filter observations took **0.84–1.83 s**, with a filtered-case regression in the second round. Cache/isolate/network state limits attribution. An earlier load failed the snapshot freshness guard; subsequent loads passed after Cache API publication moved off the read critical path. First-use reliability and general performance parity remain unverified.
 
 The local million-document workload measured strong common/filtered p50 of **127/126 ms** across 2,000 uncompacted segments. These emulator results exclude native network latency. Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10** across 300 queries. Eight native vector/hybrid fixture cases also retained exact rows and scores.
 

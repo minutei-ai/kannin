@@ -638,3 +638,31 @@ Two subsequent native loads completed, each checking 96 edge responses against e
 The README reports the latest complete run. Native tails remain variable; two passing loads do not establish that every first-use/freshness failure is resolved. Native peak memory, cold reliability and fully indexed Turbopuffer parity remain open.
 
 Independent SciFact evaluation after the cutover retained nDCG@10 0.6730619695232347, recall@10 0.7956666666666666 and MRR@10 0.641808201058201 across 300 queries. Eight read-only native vector/hybrid cases retained the exact previously recorded rows and scores; this is fixture evidence, not a general provider recall claim. Both runtime CI jobs completed successfully.
+
+## Selective attribute projection
+
+Runtime `7f6d00c` retains only attribute fields referenced by up to eight distinct filter fields during group decoding. It still parses every value through native serde_json Value validation, including discarded values, preserving rejection of malformed JSON and invalid numeric/string values. Repeated conditions on a field remain in the original predicate array. Larger field sets delegate to native full-map/tuple decoding after the selective prototype regressed sixteen-field CPU. Cached source bytes, identities, budgets and exact minima are unchanged.
+
+Alternating WASM comparisons used 1,000 documents, the same compressed source, 10 warmup pairs and 30 measured pairs per filter shape. Every projected catalog/minimum matched the old implementation. The wide records had group/year plus 32 numeric attributes; the small records had group/year only.
+
+| Distinct filter fields | Wide before/after p50 ms | Two-attribute before/after p50 ms |
+| ---------------------: | -----------------------: | --------------------------------: |
+|                      0 |           11.735 / 7.000 |                     1.304 / 1.300 |
+|                      1 |           11.696 / 7.361 |                     1.020 / 1.021 |
+|                      4 |           11.931 / 9.294 |                     1.008 / 0.947 |
+|                      8 |          12.192 / 10.315 |                     1.027 / 0.980 |
+|                     16 |          13.065 / 13.150 |                     0.997 / 1.045 |
+
+This operation-level result demonstrates a benefit for wide attributes with narrow predicates. It does not demonstrate a benefit for every attribute/filter shape; the small sixteen-field case regressed slightly. The full gate passed 116 Worker/tooling tests and 18 Rust tests, including repeated-field conjunctions and invalid overflowing numbers/unpaired Unicode in discarded fields. Deployment completed.
+
+Native fresh-selector/filter diagnostics reused the unchanged million-document, two-attribute corpus and the previous absent-token/always-true-year method. Every row/score matched strong baselines and the saved prior-version responses. Existing immutable/process/regional caches remained eligible.
+
+| Query     | Before ms | First after ms | Second after ms |
+| --------- | --------: | -------------: | --------------: |
+| Selective |   1981.04 |        1274.08 |         1831.98 |
+| Common    |   1444.73 |         989.01 |          837.85 |
+| Filtered  |   1222.32 |        1025.87 |         1681.67 |
+
+All first-run observations improved; the second filtered observation regressed. Uncontrolled cache/isolate/network state prevents causal general latency attribution.
+
+All 96 native mixed-load edge responses retained exact strong rows/scores and the acknowledged sequence. Concurrency 1/4/16 measured p50 68.94/66.61/152.74 ms, p95 510.22/348.31/1,036.17 ms and throughput 7.25/34.20/28.28 requests/s. Relative to the preceding latest group/snapshot-publication run, concurrency-four tails and throughput improved, while concurrency-one tails and concurrency-sixteen tails regressed. The README reports this latest complete load. Native cold reliability, peak memory and fully indexed Turbopuffer parity remain open.

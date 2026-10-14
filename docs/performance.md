@@ -262,3 +262,30 @@ Runtime `09418f5` deployed successfully and its full CI passed. A new native cor
 | Hybrid filtered 10 | 273.39 / 285.31     | 272.30 / 293.87    |
 
 The local I/O reduction does not produce a consistent native latency improvement. Several p95 values regressed. A separate 192-request native BM25 load on the unchanged 100,000-document corpus also completed without errors: concurrency 1/4/16 p50 was 56.09/62.48/75.89 ms, p95 200.90/187.76/688.30 ms, throughput 11.52/38.49/50.95 requests/s. That load overlapped the first retrieval run and is not an isolated causal comparison. The broad performance objective remains open.
+
+## Rejected direct strong reads from R2
+
+Runtime `560abfd` tested uncached canonical manifest reads and query execution in the authenticated edge Worker, removing the strong-query coordinator hop. It used the native R2 binding's [global read-after-write guarantee](https://developers.cloudflare.com/r2/reference/consistency/), retained the sequence barrier, rejected missing acknowledged manifests and bounded selection plus evaluation to 30 seconds under the existing 24-hour segment quarantine. The full local gate passed with 106 Worker/tooling and 17 Rust tests. Concurrent queries observed complete revisions while writes advanced.
+
+Correctness passed, but native latency regressed. Baseline and experimental retrieval runs each completed 200 requests on the same 96-vector, 32-segment corpus, with five warmups and twenty measured requests per case; every row and score matched across runs. The runs did not overlap the separate BM25 loads.
+
+| Native case        | Coordinator p50 / p95 ms | Direct R2 p50 / p95 ms |
+| ------------------ | ------------------------ | ---------------------- |
+| Vector 1           | 259.96 / 295.13          | 468.52 / 756.20        |
+| Vector 10          | 257.58 / 274.82          | 465.11 / 691.71        |
+| Vector 50          | 285.79 / 501.19          | 489.85 / 681.75        |
+| Vector filtered 10 | 257.64 / 274.72          | 459.25 / 710.53        |
+| Hybrid 1           | 260.81 / 271.25          | 455.95 / 682.45        |
+| Hybrid 10          | 266.99 / 283.34          | 465.85 / 705.76        |
+| Hybrid 50          | 315.07 / 562.18          | 513.23 / 784.42        |
+| Hybrid filtered 10 | 263.60 / 277.00          | 464.23 / 735.45        |
+
+Separate strong-consistency BM25 loads each completed 192 requests over the unchanged 100,000-document corpus and checked every response against the strong baseline.
+
+| Concurrency | Coordinator p50 / p95 ms | Direct R2 p50 / p95 ms | Coordinator / direct R2 requests/s |
+| ----------- | ------------------------ | ---------------------- | ---------------------------------- |
+| 1           | 199.08 / 263.12          | 332.40 / 787.30        | 4.83 / 2.37                        |
+| 4           | 204.33 / 268.95          | 314.43 / 640.59        | 18.37 / 10.35                      |
+| 16          | 338.89 / 413.60          | 344.66 / 951.04        | 46.28 / 31.29                      |
+
+The experimental native `strong_snapshot` interval included 203–507 ms in the first four measured responses, dominating their I/O intervals. The local 100,000-document benchmark also paid fresh-root decoding: strong rare/selective/common/filtered p50 was 5.84/19.14/23.94/21.93 ms. This deployment did not benefit from exchanging coordinator access for a fresh R2 GET per query. Runtime `877a403` reverts that path; strong queries again use the coordinator, with no additional R2 GET or snapshot cache. The concurrent revision regression remains in the suite. No consistency contract was relaxed to compensate for latency.

@@ -245,3 +245,34 @@ test("warm namespace snapshots survive Cache API eviction only within their orig
   await Effect.runPromise(Effect.sleep("1100 millis"));
   expect((await request(worker, "warm-memory", "query", input)).status).toBe(503);
 });
+
+test("parallel strong queries observe complete immutable revisions while writes advance", async () => {
+  const namespace = "strong-parallel";
+  await request(worker, namespace, "write", write([document("a", "shared revisionone")]));
+  for (const revision of [2, 3, 4, 5]) {
+    const responses = await Promise.all([
+      request(worker, namespace, "write", write([document("a", `shared revision${revision}`)])),
+      ...Array.from({ length: 12 }, () => request(worker, namespace, "query", textQuery("shared"))),
+    ]);
+    const acknowledged = Schema.decodeUnknownSync(WriteResult)(await responses[0]?.json());
+    expect(acknowledged.sequence).toBe(revision);
+    for (const response of responses.slice(1)) {
+      expect(response.status).toBe(200);
+      const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+      expect([revision - 1, revision]).toContain(result.sequence);
+      expect(result.rows).toHaveLength(1);
+      expect(result.rows[0]?.revision).toBe(result.sequence);
+      expect(result.consistency).toBe("strong");
+    }
+    const fresh = Schema.decodeUnknownSync(QueryResult)(
+      await (
+        await request(worker, namespace, "query", {
+          ...textQuery("shared"),
+          minimumSequence: revision,
+        })
+      ).json(),
+    );
+    expect(fresh.sequence).toBe(revision);
+    expect(fresh.rows[0]?.text).toBe(`shared revision${revision}`);
+  }
+});

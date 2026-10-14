@@ -6,6 +6,7 @@ import {
   segment_document,
   segment_bloom,
   segment_bloom_filter_many,
+  segment_overview_project,
 } from "../dist/wasm/raio_engine";
 import type { DataRange, TermProjectionRange } from "./protocol";
 import {
@@ -27,7 +28,13 @@ const MAX_DECODED_BYTES = 40 * 1024 * 1024;
 const termCatalogs = new Map<string, { catalog: typeof TermCatalog.Type; bytes: number }>();
 const termBudget = { bytes: 0 };
 const MAX_TERM_CACHE_BYTES = 4 * 1024 * 1024;
+const overviewBuffers = new Map<string, Uint8Array>();
+const overviewBudget = { bytes: 0 };
+const MAX_OVERVIEW_BYTES = 4 * 1024 * 1024;
 const reads = {
+  overviewMemoryHits: 0,
+  overviewCacheApiHits: 0,
+  overviewBuilds: 0,
   termReads: 0,
   termRequests: 0,
   termBytes: 0,
@@ -144,6 +151,94 @@ export const withDirectory = Effect.fn("raio.withDirectory")(
       use,
       (directory) => Effect.sync(() => directory.free()),
     ),
+);
+
+function rememberOverview(identity: string, bytes: Uint8Array) {
+  const previous = overviewBuffers.get(identity);
+  const keyBytes = new TextEncoder().encode(identity).byteLength * 4 + 128;
+  if (previous !== undefined) overviewBudget.bytes -= previous.byteLength + keyBytes;
+  overviewBuffers.delete(identity);
+  const charge = bytes.byteLength + keyBytes;
+  if (charge > MAX_OVERVIEW_BYTES) return;
+  while (overviewBudget.bytes + charge > MAX_OVERVIEW_BYTES) {
+    const oldest = overviewBuffers.entries().next().value;
+    if (oldest === undefined) break;
+    overviewBuffers.delete(oldest[0]);
+    overviewBudget.bytes -=
+      oldest[1].byteLength + new TextEncoder().encode(oldest[0]).byteLength * 4 + 128;
+  }
+  overviewBuffers.set(identity, bytes);
+  overviewBudget.bytes += charge;
+}
+
+export const readTermProjection = Effect.fn("kannin.readTermProjection")(
+  (key: string, headerBytes: number, terms: string, filters: string) =>
+    Effect.gen(function* () {
+      const identity = `${env.STORAGE_CACHE_SCOPE}:${key}/${headerBytes}\0${filters}`;
+      const cacheKey = new URL("https://overviews.internal/source-v1");
+      cacheKey.searchParams.set("bucket", env.STORAGE_CACHE_SCOPE);
+      cacheKey.searchParams.set("key", key);
+      cacheKey.searchParams.set("headerBytes", String(headerBytes));
+      cacheKey.searchParams.set("filters", yield* Effect.tryPromise(() => sha256(filters)));
+      const cache = yield* Effect.tryPromise(() => caches.open("raio-overviews-v1")).pipe(
+        Effect.orElseSucceed(() => undefined),
+      );
+      for (const tier of ["memory", "api"] as const) {
+        const candidate: { bytes: Uint8Array | undefined } = { bytes: undefined };
+        if (tier === "memory") candidate.bytes = overviewBuffers.get(identity);
+        else if (cache !== undefined) {
+          const cached = yield* Effect.tryPromise(() => cache.match(cacheKey)).pipe(
+            Effect.orElseSucceed(() => undefined),
+          );
+          if (cached !== undefined)
+            candidate.bytes = yield* Effect.tryPromise(
+              async () => new Uint8Array(await cached.arrayBuffer()),
+            ).pipe(Effect.orElseSucceed(() => undefined));
+        }
+        const bytes = candidate.bytes;
+        if (bytes === undefined) continue;
+        const projected = yield* Effect.try(() => segment_overview_project(bytes, terms)).pipe(
+          Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(TermCatalog))),
+          Effect.orElseSucceed(() => undefined),
+        );
+        if (projected !== undefined) {
+          rememberOverview(identity, bytes);
+          if (tier === "memory") reads.overviewMemoryHits += 1;
+          else reads.overviewCacheApiHits += 1;
+          return projected;
+        }
+        const invalid = overviewBuffers.get(identity);
+        if (invalid !== undefined)
+          overviewBudget.bytes -=
+            invalid.byteLength + new TextEncoder().encode(identity).byteLength * 4 + 128;
+        overviewBuffers.delete(identity);
+        if (cache !== undefined)
+          yield* Effect.tryPromise(() => cache.delete(cacheKey)).pipe(
+            Effect.orElseSucceed(() => false),
+          );
+      }
+      const bytes = yield* withDirectory(key, headerBytes, (directory) =>
+        Effect.sync(() => directory.overview(filters)),
+      );
+      const projected = yield* Effect.try(() => segment_overview_project(bytes, terms)).pipe(
+        Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(TermCatalog))),
+      );
+      reads.overviewBuilds += 1;
+      rememberOverview(identity, bytes);
+      if (cache !== undefined)
+        yield* Effect.tryPromise(() =>
+          cache.put(
+            cacheKey,
+            new Response(bytes.slice(), {
+              headers: {
+                "cache-control": "public, max-age=31536000, immutable",
+                "content-type": "application/octet-stream",
+              },
+            }),
+          ),
+        ).pipe(Effect.orElseSucceed(() => undefined));
+      return projected;
+    }),
 );
 
 export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
@@ -322,6 +417,11 @@ export async function readDocument(
 
 export function clearImmutableCache(prefix: string) {
   const identity = `${env.STORAGE_CACHE_SCOPE}:${prefix}`;
+  for (const [key, bytes] of overviewBuffers)
+    if (key.startsWith(`${identity}/`)) {
+      overviewBuffers.delete(key);
+      overviewBudget.bytes -= bytes.byteLength + new TextEncoder().encode(key).byteLength * 4 + 128;
+    }
   for (const [key, entry] of termCatalogs)
     if (key.startsWith(`${identity}/`)) {
       termCatalogs.delete(key);
@@ -346,6 +446,7 @@ export function cacheUsage() {
     directoryCacheChargedBytes: decodedBudget.bytes,
     bloomCacheBytes: bloomBudget.bytes,
     termCacheBytes: termBudget.bytes,
+    overviewCacheBytes: overviewBudget.bytes,
     ...reads,
   };
 }

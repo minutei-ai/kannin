@@ -100,6 +100,26 @@ impl Header {
         Ok(bytes)
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn eligible_minimum(&self, filters: &[Filter]) -> Result<Option<(u32, u32)>, String> {
+        if filters.is_empty() {
+            return Ok(Some((0, 0)));
+        }
+        let allowed = self.allowed(filters, &[])?;
+        Ok(self
+            .documents
+            .iter()
+            .zip(&allowed)
+            .filter(|(_, allowed)| **allowed)
+            .fold(None, |minimum, (document, _)| match minimum {
+                Some((title, body)) => Some((
+                    u32::min(title, document.title_length),
+                    u32::min(body, document.body_length),
+                )),
+                None => Some((document.title_length, document.body_length)),
+            }))
+    }
+
     fn allowed(&self, filters: &[Filter], dead: &[u32]) -> Result<Vec<bool>, String> {
         let key = serde_json::to_string(filters).map_err(|cause| cause.to_string())?;
         let cached = self
@@ -953,8 +973,8 @@ pub fn bloom_filter_many<'a>(
 pub mod wasm {
     use super::{
         BlockMeta, BuiltSegment, Document, DocumentMeta, FILTER_CACHE_BYTES, Filter, Header,
-        Search, Statistics, TermMeta, bloom_build, bloom_filter_many, bm25, build, decode_page,
-        document_terms, matches, parse_header,
+        MAX_BYTES, Search, Statistics, TermMeta, append, bloom_build, bloom_filter_many, bm25,
+        build, decode_page, document_terms, matches, parse_header,
     };
     use serde::{Deserialize, Serialize};
     use std::collections::{BTreeMap, BTreeSet};
@@ -965,6 +985,33 @@ pub mod wasm {
     struct TermSummary {
         df: u32,
         bounds: Vec<(u32, u32, u32, u32)>,
+    }
+
+    impl From<&TermMeta> for TermSummary {
+        fn from(meta: &TermMeta) -> Self {
+            Self {
+                df: meta.df,
+                bounds: meta
+                    .blocks
+                    .iter()
+                    .map(|block| {
+                        (
+                            block.max_title_tf,
+                            block.max_body_tf,
+                            block.min_title_length,
+                            block.min_body_length,
+                        )
+                    })
+                    .collect(),
+            }
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Overview {
+        dictionary: BTreeMap<String, TermSummary>,
+        minimum: Option<(u32, u32)>,
     }
 
     fn term_bound(
@@ -1117,26 +1164,10 @@ pub mod wasm {
             let selected: BTreeMap<_, _> = terms
                 .iter()
                 .filter_map(|term| {
-                    self.header.terms.get(term).map(|meta| {
-                        (
-                            term,
-                            TermSummary {
-                                df: meta.df,
-                                bounds: meta
-                                    .blocks
-                                    .iter()
-                                    .map(|block| {
-                                        (
-                                            block.max_title_tf,
-                                            block.max_body_tf,
-                                            block.min_title_length,
-                                            block.min_body_length,
-                                        )
-                                    })
-                                    .collect(),
-                            },
-                        )
-                    })
+                    self.header
+                        .terms
+                        .get(term)
+                        .map(|meta| (term, TermSummary::from(meta)))
                 })
                 .collect();
             serde_json::to_string(&selected).map_err(|cause| JsValue::from_str(&cause.to_string()))
@@ -1146,27 +1177,37 @@ pub mod wasm {
         pub fn minimum(&self, filters: &str) -> Result<String, JsValue> {
             let filters: Vec<Filter> = serde_json::from_str(filters)
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
-            let minimum = if filters.is_empty() {
-                Some((0, 0))
-            } else {
-                let allowed = self
-                    .header
-                    .allowed(&filters, &[])
-                    .map_err(|cause| JsValue::from_str(&cause))?;
-                self.header
-                    .documents
-                    .iter()
-                    .zip(&allowed)
-                    .filter(|(_, allowed)| **allowed)
-                    .fold(None, |minimum, (document, _)| match minimum {
-                        Some((title, body)) => Some((
-                            u32::min(title, document.title_length),
-                            u32::min(body, document.body_length),
-                        )),
-                        None => Some((document.title_length, document.body_length)),
-                    })
-            };
+            let minimum = self
+                .header
+                .eligible_minimum(&filters)
+                .map_err(|cause| JsValue::from_str(&cause))?;
             serde_json::to_string(&minimum).map_err(|cause| JsValue::from_str(&cause.to_string()))
+        }
+
+        #[doc = "# Errors\nRejects invalid filters, attributes, summary serialization or size budgets."]
+        pub fn overview(&self, filters: &str) -> Result<Vec<u8>, JsValue> {
+            let filters: Vec<Filter> = serde_json::from_str(filters)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            let overview = Overview {
+                dictionary: self
+                    .header
+                    .terms
+                    .iter()
+                    .map(|(term, meta)| (term.clone(), TermSummary::from(meta)))
+                    .collect(),
+                minimum: self
+                    .header
+                    .eligible_minimum(&filters)
+                    .map_err(|cause| JsValue::from_str(&cause))?,
+            };
+            let json = serde_json::to_vec(&overview)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            if json.len() > MAX_BYTES {
+                return Err(JsValue::from_str("Overview exceeds decoded size budget"));
+            }
+            let mut bytes = Vec::new();
+            append(&mut bytes, &json).map_err(|cause| JsValue::from_str(&cause))?;
+            Ok(bytes)
         }
 
         #[doc = "# Errors\nRejects invalid ids or tombstones, row overflow, or result serialization errors."]
@@ -1245,6 +1286,33 @@ pub mod wasm {
     struct Located<'a> {
         row: u32,
         document: &'a DocumentMeta,
+    }
+
+    #[wasm_bindgen]
+    #[doc = "# Errors\nRejects corrupt overview framing, invalid terms, or projection serialization."]
+    pub fn segment_overview_project(bytes: &[u8], terms: &str) -> Result<String, JsValue> {
+        #[derive(Serialize)]
+        struct Projection<'a> {
+            dictionary: BTreeMap<&'a String, &'a TermSummary>,
+            minimum: Option<(u32, u32)>,
+        }
+        let decoded = decode_page(bytes).map_err(|cause| JsValue::from_str(&cause))?;
+        let overview: Overview = serde_json::from_slice(&decoded)
+            .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        let terms: Vec<String> =
+            serde_json::from_str(terms).map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        if terms.len() > 64 {
+            return Err(JsValue::from_str("Overview projection exceeds 64 terms"));
+        }
+        let selected: BTreeMap<_, _> = terms
+            .iter()
+            .filter_map(|term| overview.dictionary.get(term).map(|meta| (term, meta)))
+            .collect();
+        serde_json::to_string(&Projection {
+            dictionary: selected,
+            minimum: overview.minimum,
+        })
+        .map_err(|cause| JsValue::from_str(&cause.to_string()))
     }
 
     #[wasm_bindgen]

@@ -8,7 +8,17 @@ import {
   segment_bloom,
   segment_bloom_filter_many,
   segment_term_bounds,
+  segment_overview_project,
+  Segment,
+  Directory,
 } from "../dist/wasm/raio_engine";
+import {
+  StoredDocument,
+  Filter,
+  TermCatalog,
+  TermSummaries,
+  EligibleMinimum,
+} from "../src/protocol";
 
 initSync({
   module: new WebAssembly.Module(
@@ -34,6 +44,55 @@ test("WASM text tokenization agrees across normalization forms", () => {
 test("WASM codec enforces the log-size budget", () => {
   expect(() => pack("x".repeat(2 * 1024 * 1024 + 1))).toThrow("TooLarge");
   expect(() => unpack(new Uint8Array(15))).toThrow("InvalidHeader");
+});
+
+test("compressed overviews preserve term bounds and exact filter minima across selectors", () => {
+  const segment = new Segment(
+    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))([
+      { id: "a", revision: 1, title: "", text: "cafe rust", attributes: { group: 1 } },
+      {
+        id: "b",
+        revision: 1,
+        title: "title",
+        text: "rust rust cloudflare",
+        attributes: { group: 2 },
+      },
+    ]),
+  );
+  const directory = new Directory(segment.bytes());
+  for (const filters of [
+    [],
+    [{ field: "group", op: "eq", value: 2 }],
+    [{ field: "group", op: "eq", value: 3 }],
+  ]) {
+    const encodedFilters = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Filter)))(
+      Schema.decodeUnknownSync(Schema.Array(Filter))(filters),
+    );
+    const overview = directory.overview(encodedFilters);
+    for (const terms of [["rust"], ["cafe", "absent"], ["cloudflare", "rust"]]) {
+      const encodedTerms = JSON.stringify(terms);
+      expect(
+        Schema.decodeSync(Schema.fromJsonString(TermCatalog))(
+          segment_overview_project(overview, encodedTerms),
+        ),
+      ).toEqual({
+        dictionary: Schema.decodeSync(Schema.fromJsonString(TermSummaries))(
+          directory.summary(encodedTerms),
+        ),
+        minimum: Schema.decodeSync(Schema.fromJsonString(EligibleMinimum))(
+          directory.minimum(encodedFilters),
+        ),
+      });
+    }
+    const corrupted = overview.slice();
+    corrupted[4] = (corrupted[4] ?? 0) ^ 1;
+    expect(() => segment_overview_project(corrupted, '["rust"]')).toThrow();
+    expect(() =>
+      segment_overview_project(overview, JSON.stringify(Array.from({ length: 65 }, () => "rust"))),
+    ).toThrow("64 terms");
+  }
+  directory.free();
+  segment.free();
 });
 
 test("WASM batched blooms preserve Unicode membership and reject broken offsets", () => {

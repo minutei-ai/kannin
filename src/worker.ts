@@ -42,8 +42,6 @@ import {
   SegmentTerms,
   TermCatalog,
   TermCatalogBatch,
-  TermSummaries,
-  EligibleMinimum,
   LocatedDocument,
   RankingInput,
   SearchStatistics,
@@ -70,6 +68,7 @@ import {
   range,
   withDirectory,
   readTermCatalogs,
+  readTermProjection,
   buildSegment,
   bloom,
   bloomCandidates,
@@ -197,18 +196,7 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
     const response = await Effect.runPromise(
       Effect.forEach(
         props.value.ranges,
-        (input) =>
-          withDirectory(input.key, input.headerBytes, (directory) =>
-            Effect.gen(function* () {
-              const dictionary = yield* Schema.decodeEffect(Schema.fromJsonString(TermSummaries))(
-                directory.summary(encodedTerms),
-              );
-              const minimum = yield* Schema.decodeEffect(Schema.fromJsonString(EligibleMinimum))(
-                directory.minimum(encodedFilters),
-              );
-              return { dictionary, minimum };
-            }),
-          ),
+        (input) => readTermProjection(input.key, input.headerBytes, encodedTerms, encodedFilters),
         { concurrency: 1 },
       ).pipe(
         Effect.flatMap(Schema.encodeEffect(TermCatalogBatch)),

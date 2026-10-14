@@ -1,5 +1,7 @@
 import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
+import { Response } from "miniflare";
+import { createHash } from "node:crypto";
 import { Root, QueryResult, Metadata, Health } from "../src/protocol";
 import { document, request, startWorker, textQuery, write } from "./harness";
 
@@ -149,6 +151,81 @@ test("term projection batches preserve global frequencies and filter eligibility
   );
   expect(after.termRequests - acquired.termRequests).toBe(3);
   expect(after.termReads - acquired.termReads).toBe(33);
+});
+
+test("compressed overviews serve new selectors from memory and Cache API after process eviction", async () => {
+  const namespace = "overview-selectors";
+  for (const index of Array.from({ length: 17 }, (_, ordinal) => ordinal))
+    await request(
+      worker,
+      namespace,
+      "write",
+      write([document(String(index).padStart(2, "0"), "alpha beta gamma")]),
+    );
+  const first = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", textQuery("alpha beta"))).json(),
+  );
+  const before = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  const second = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", textQuery("beta gamma"))).json(),
+  );
+  expect(second.rows).toEqual(first.rows);
+  const memory = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(memory.overviewMemoryHits - before.overviewMemoryHits).toBe(17);
+  expect(memory.overviewBuilds - before.overviewBuilds).toBe(0);
+  expect(memory.overviewCacheBytes).toBeLessThanOrEqual(4 * 1024 * 1024);
+  await request(worker, namespace, "rebuild", {});
+  const third = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", textQuery("gamma alpha"))).json(),
+  );
+  expect(third.rows).toEqual(first.rows);
+  const shared = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(shared.overviewCacheApiHits - memory.overviewCacheApiHits).toBe(17);
+  expect(shared.overviewBuilds - memory.overviewBuilds).toBe(0);
+});
+
+test("corrupted compressed overview cache falls back to verified immutable source data", async () => {
+  const namespace = "overview-corruption";
+  await request(worker, namespace, "write", write([document("a", "alpha beta")]));
+  expect((await request(worker, namespace, "query", textQuery("alpha"))).status).toBe(200);
+  const bucket = await worker.getR2Bucket("STORAGE");
+  const object = await bucket.get(`namespaces/${namespace}/root.json`);
+  if (object === null) throw new Error("Missing manifest");
+  const manifest = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
+  const segment = manifest.segments[0];
+  if (segment === undefined) throw new Error("Missing segment");
+  const cache = await (await worker.getCaches()).open("raio-overviews-v1");
+  const key = new URL("https://overviews.internal/source-v1");
+  key.searchParams.set("bucket", "raio-test");
+  key.searchParams.set("key", segment.key);
+  key.searchParams.set("headerBytes", String(segment.headerBytes));
+  key.searchParams.set("filters", createHash("sha256").update("[]").digest("hex"));
+  await cache.put(
+    key,
+    new Response(new Uint8Array(1), {
+      headers: { "cache-control": "public, max-age=60" },
+    }),
+  );
+  await request(worker, namespace, "rebuild", {});
+  const before = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  const recovered = await request(worker, namespace, "query", textQuery("beta"));
+  expect(recovered.status).toBe(200);
+  expect(
+    Schema.decodeUnknownSync(QueryResult)(await recovered.json()).rows.map((row) => row.id),
+  ).toEqual(["a"]);
+  const after = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(after.overviewBuilds - before.overviewBuilds).toBe(1);
+  expect(after.overviewCacheApiHits - before.overviewCacheApiHits).toBe(0);
 });
 
 for (const match of ["all", "phrase"] as const)

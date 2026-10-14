@@ -25,6 +25,8 @@ import {
 } from "./protocol";
 
 const buffers = new Map<string, Uint8Array>();
+const pendingRanges = new Map<string, Promise<Uint8Array>>();
+const MAX_PENDING_RANGES = 64;
 const budget = { bytes: 0 };
 const MAX_CACHE_BYTES = 12 * 1024 * 1024;
 const directories = new Map<string, { directory: Directory; bytes: number }>();
@@ -88,27 +90,44 @@ export async function range(key: string, offset: number, length: number) {
     buffers.set(cacheKey, cached);
     return cached;
   }
-  const input = Schema.encodeSync(SegmentRange)({ key, offset, length });
-  const url = new URL("https://segments.internal/range");
-  url.searchParams.set("key", input.key);
-  url.searchParams.set("offset", String(input.offset));
-  url.searchParams.set("length", String(input.length));
-  const props = Schema.encodeSync(SegmentCacheProps)({ bucket: env.STORAGE_CACHE_SCOPE });
-  const response = await exports.Segments({ props }).fetch(url);
-  const status = response.headers.get("cf-cache-status");
-  if (status === "HIT") reads.workerCacheHits += 1;
-  else if (status === "MISS") reads.workerCacheMisses += 1;
-  if (status !== "HIT" && response.headers.get("x-raio-cache") === "api-hit")
-    reads.cacheApiHits += 1;
-  reads.rangeReads += 1;
-  if (!response.ok)
-    throw new Rejected({ status: 503, message: "Committed R2 segment unavailable" });
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  reads.rangeBytes += bytes.byteLength;
-  if (bytes.byteLength !== length)
-    throw new Rejected({ status: 503, message: "R2 range returned a truncated segment" });
-  remember(cacheKey, bytes);
-  return bytes;
+  const pending = pendingRanges.get(cacheKey);
+  if (pending !== undefined) return pending;
+  const acquisition = (async () => {
+    const input = Schema.encodeSync(SegmentRange)({ key, offset, length });
+    const url = new URL("https://segments.internal/range");
+    url.searchParams.set("key", input.key);
+    url.searchParams.set("offset", String(input.offset));
+    url.searchParams.set("length", String(input.length));
+    const props = Schema.encodeSync(SegmentCacheProps)({ bucket: env.STORAGE_CACHE_SCOPE });
+    const response = await exports.Segments({ props }).fetch(url);
+    const status = response.headers.get("cf-cache-status");
+    if (status === "HIT") reads.workerCacheHits += 1;
+    else if (status === "MISS") reads.workerCacheMisses += 1;
+    if (status !== "HIT" && response.headers.get("x-raio-cache") === "api-hit")
+      reads.cacheApiHits += 1;
+    reads.rangeReads += 1;
+    if (!response.ok)
+      throw new Rejected({ status: 503, message: "Committed R2 segment unavailable" });
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    reads.rangeBytes += bytes.byteLength;
+    if (bytes.byteLength !== length)
+      throw new Rejected({ status: 503, message: "R2 range returned a truncated segment" });
+    remember(cacheKey, bytes);
+    return bytes;
+  })();
+  if (pendingRanges.size >= MAX_PENDING_RANGES) return acquisition;
+  const shared = acquisition.then(
+    (bytes) => {
+      pendingRanges.delete(cacheKey);
+      return bytes;
+    },
+    (cause: unknown) => {
+      pendingRanges.delete(cacheKey);
+      return Promise.reject(cause);
+    },
+  );
+  pendingRanges.set(cacheKey, shared);
+  return shared;
 }
 
 async function acquireDirectory(key: string, headerBytes: number) {

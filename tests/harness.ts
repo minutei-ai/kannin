@@ -3,7 +3,11 @@ import { join } from "node:path";
 import type { Write, Attributes } from "../src/protocol";
 
 const root = join(import.meta.dir, "..");
-export async function startWorker(persistence?: string, consumeQueues = false) {
+export async function startWorker(
+  persistence?: string,
+  consumeQueues = false,
+  artifactRoot = join(root, "dist/worker"),
+) {
   const bundle = await Bun.build({
     entrypoints: [join(root, "tests/vector-backend.ts")],
     target: "browser",
@@ -38,12 +42,12 @@ export async function startWorker(persistence?: string, consumeQueues = false) {
             modules: {
               "worker.js": {
                 type: "esm" as const,
-                contents: await Bun.file(join(root, "dist/worker/worker.js")).text(),
+                contents: await Bun.file(join(artifactRoot, "worker.js")).text(),
               },
               "raio_engine_bg.wasm": {
                 type: "wasm" as const,
                 contents: new Uint8Array(
-                  await Bun.file(join(root, "dist/worker/raio_engine_bg.wasm")).arrayBuffer(),
+                  await Bun.file(join(artifactRoot, "raio_engine_bg.wasm")).arrayBuffer(),
                 ),
               },
             },

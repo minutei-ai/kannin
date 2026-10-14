@@ -1332,3 +1332,19 @@ The million-document before/after/repeated load retained all 288 strong-baseline
 | 1           | 74.01 / 122.12        | 100.87 / 470.88        | 75.19 / 146.19                  |
 | 4           | 78.60 / 1087.62       | 89.48 / 1142.58        | 67.92 / 273.19                  |
 | 16          | 324.58 / 1160.45      | 146.43 / 1294.95       | 173.10 / 1378.46                |
+
+### Sharing pending immutable range bodies
+
+Native Workers Cache collapses cache acquisition, but separate process calls to the range boundary could still each consume the same returned body. A direct cold workerd fixture demonstrated 32 simultaneous callers of one 1 MiB interval consuming 32 bodies/32 MiB. The range boundary now shares only its pending native acquisition by physical bucket, immutable key, offset and length. The owning call consumes and validates the body before resolving bytes. Success/failure remove the promise; the map tracks at most 64 acquisitions and bypasses tracking at capacity. Existing immutable LRU behavior remains unchanged.
+
+Fifteen alternating pairs at one and 32 consumers included three warmups and twelve measured samples per variant. Every caller returned the expected length. At 32 consumers, response-body acquisitions fell from 32 to 1 and consumed bytes from 33,554,432 to 1,048,576; median complete local request time fell from 51.63 to 3.04 ms. At one consumer, both retained one body and medians were 4.29 and 3.46 ms. These are local boundary timings. Consumed response bytes do not establish R2 origin transfer or native billed CPU, because native cache collapsing may already avoid duplicate origin fetches.
+
+The full gate passed 25 Rust and 130 Bun/workerd tests. A separate workerd fixture checks that 32 callers receive one decoded byte-buffer identity, and that eight callers of a missing object share one failed acquisition before a canonical retry succeeds. Existing concurrent query, directory lifetime, immutable cache isolation and ranking checks passed. The fixture runs in its own generated temporary bundle and never adds a public application route.
+
+Native Alchemy deployment and its Vectorize metadata migration succeeded. Baseline, first candidate and repeated candidate loads retained 288 exact-result/score/sequence comparisons on the million-document corpus at concurrency 1/4/16. The repeated candidate improved concurrency 4 median/p95 but worsened concurrency 1 median/p95 and concurrency 16 median. Cache/isolate/network conditions were uncontrolled. This proves native concurrent query behavior, not the isolated 32-consumer timing, native peak heap or a general latency improvement.
+
+| Concurrency | Baseline p50 / p95 ms | Candidate p50 / p95 ms | Repeated candidate p50 / p95 ms |
+| ----------- | --------------------- | ---------------------- | ------------------------------- |
+| 1           | 103.44 / 409.22       | 95.92 / 526.06         | 115.88 / 687.58                 |
+| 4           | 114.34 / 912.33       | 100.35 / 853.64        | 90.82 / 427.38                  |
+| 16          | 169.13 / 1184.05      | 166.43 / 1231.61       | 193.69 / 1116.75                |

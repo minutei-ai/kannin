@@ -265,7 +265,19 @@ export const EligibleMinimum = Schema.Union([
     Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 4294967295 })),
   ]),
 ]);
-export const TermCatalog = Schema.Struct({ dictionary: SegmentTerms, minimum: EligibleMinimum });
+export const TermSummary = Schema.Struct({
+  df: SegmentTerm.fields.df,
+  bounds: Schema.Array(
+    Schema.Tuple([
+      SegmentBlock.fields.max_title_tf,
+      SegmentBlock.fields.max_body_tf,
+      SegmentBlock.fields.min_title_length,
+      SegmentBlock.fields.min_body_length,
+    ]),
+  ),
+});
+export const TermSummaries = Schema.Record(Schema.String, TermSummary);
+export const TermCatalog = Schema.Struct({ dictionary: TermSummaries, minimum: EligibleMinimum });
 export const SegmentHeader = Schema.Struct({
   version: Schema.Literal(1),
   documents: Schema.NonEmptyArray(SegmentDocument),

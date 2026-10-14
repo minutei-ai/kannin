@@ -5,7 +5,7 @@ import {
   Directory,
   segment_document,
   segment_bloom,
-  segment_bloom_filter,
+  segment_bloom_filter_many,
 } from "../dist/wasm/raio_engine";
 import type { DataRange } from "./protocol";
 import {
@@ -44,7 +44,6 @@ const bloomBuffers = new Map<string, Uint8Array>();
 const bloomBudget = { bytes: 0 };
 const strings = Schema.fromJsonString(Schema.Array(Schema.String));
 const encodeStrings = Schema.encodeSync(strings);
-const decodeStrings = Schema.decodeSync(strings);
 
 function remember(key: string, bytes: Uint8Array) {
   const previous = buffers.get(key);
@@ -157,7 +156,7 @@ export const readTerms = Effect.fn("kannin.readTerms")(
         termCatalogs.set(identity, cached);
         return cached.catalog;
       }
-      const url = new URL("https://terms.internal/catalog-v2");
+      const url = new URL("https://terms.internal/catalog-v3");
       url.searchParams.set("key", key);
       url.searchParams.set("headerBytes", String(headerBytes));
       const response = yield* Effect.tryPromise({
@@ -217,23 +216,47 @@ export function bloom(values: ReadonlyArray<string>) {
   return btoa(Array.from(bytes, (byte) => String.fromCharCode(byte)).join(""));
 }
 
-export function bloomCandidates(encoded: string, values: ReadonlyArray<string>) {
-  const cached = bloomBuffers.get(encoded);
-  if (cached !== undefined) {
-    bloomBuffers.delete(encoded);
-    bloomBuffers.set(encoded, cached);
-    return decodeStrings(segment_bloom_filter(cached, encodeStrings(values)));
+export function bloomCandidates(encoded: ReadonlyArray<string>, values: ReadonlyArray<string>) {
+  const input = encodeStrings(values);
+  const selected = [];
+  for (const offset of Array.from(
+    { length: Math.ceil(encoded.length / 64) },
+    (_, index) => index * 64,
+  )) {
+    const bitsets = encoded.slice(offset, offset + 64).map((value) => {
+      const cached = bloomBuffers.get(value);
+      if (cached !== undefined) {
+        bloomBuffers.delete(value);
+        bloomBuffers.set(value, cached);
+        return cached;
+      }
+      const bytes = Uint8Array.from(atob(value), (character) => character.charCodeAt(0));
+      bloomBuffers.set(value, bytes);
+      bloomBudget.bytes += bytes.byteLength;
+      while (bloomBudget.bytes > 4 * 1024 * 1024) {
+        const oldest = bloomBuffers.entries().next().value;
+        if (oldest === undefined) break;
+        bloomBuffers.delete(oldest[0]);
+        bloomBudget.bytes -= oldest[1].byteLength;
+      }
+      return bytes;
+    });
+    const packed = new Uint8Array(bitsets.reduce((total, bytes) => total + bytes.byteLength, 0));
+    const offsets = new Uint32Array(bitsets.length + 1);
+    const layout = { offset: 0 };
+    for (const [index, bytes] of bitsets.entries()) {
+      offsets[index] = layout.offset;
+      packed.set(bytes, layout.offset);
+      layout.offset += bytes.byteLength;
+    }
+    offsets[bitsets.length] = layout.offset;
+    selected.push(
+      ...Schema.decodeSync(Schema.fromJsonString(Schema.Array(Schema.Array(Schema.String))))(
+        segment_bloom_filter_many(packed, offsets, input),
+      ),
+    );
   }
-  const bytes = Uint8Array.from(atob(encoded), (character) => character.charCodeAt(0));
-  bloomBuffers.set(encoded, bytes);
-  bloomBudget.bytes += bytes.byteLength;
-  while (bloomBudget.bytes > 4 * 1024 * 1024) {
-    const oldest = bloomBuffers.entries().next().value;
-    if (oldest === undefined) break;
-    bloomBuffers.delete(oldest[0]);
-    bloomBudget.bytes -= oldest[1].byteLength;
-  }
-  return decodeStrings(segment_bloom_filter(bytes, encodeStrings(values)));
+  return selected;
 }
 
 export async function readDocument(

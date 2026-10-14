@@ -41,6 +41,7 @@ import {
   SegmentHits,
   SegmentTerms,
   TermCatalog,
+  TermSummaries,
   EligibleMinimum,
   LocatedDocument,
   RankingInput,
@@ -175,7 +176,7 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
       await sha256(`${encodedTerms}\0${this.ctx.props.filters}`),
     );
     const cache = await Effect.runPromise(
-      Effect.tryPromise(() => caches.open("raio-terms-v2")).pipe(
+      Effect.tryPromise(() => caches.open("raio-terms-v3")).pipe(
         Effect.orElseSucceed(() => undefined),
       ),
     );
@@ -193,8 +194,8 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
     const response = await Effect.runPromise(
       withDirectory(input.key, input.headerBytes, (directory) =>
         Effect.gen(function* () {
-          const dictionary = yield* Schema.decodeEffect(Schema.fromJsonString(SegmentTerms))(
-            directory.terms(encodedTerms),
+          const dictionary = yield* Schema.decodeEffect(Schema.fromJsonString(TermSummaries))(
+            directory.summary(encodedTerms),
           );
           const minimum = yield* Schema.decodeEffect(Schema.fromJsonString(EligibleMinimum))(
             directory.minimum(encodedFilters),
@@ -284,25 +285,38 @@ const readBody = Effect.fn("raio.readBody")(function* (request: Pick<Request, "h
 
 async function locate(ids: ReadonlyArray<string>, root: typeof Root.Type) {
   const found = new Map<string, typeof Located.Type>();
-  for (const segment of root.segments.toReversed()) {
-    const candidates = bloomCandidates(
-      segment.documentBloom,
-      ids.filter((id) => !found.has(id)),
+  const ordered = root.segments.toReversed();
+  for (const offset of Array.from(
+    { length: Math.ceil(ordered.length / 64) },
+    (_, index) => index * 64,
+  )) {
+    const segments = ordered.slice(offset, offset + 64);
+    const remaining = ids.filter((id) => !found.has(id));
+    if (remaining.length === 0) break;
+    const matches = bloomCandidates(
+      segments.map((segment) => segment.documentBloom),
+      remaining,
     );
-    if (candidates.length === 0) continue;
-    const rows = await Effect.runPromise(
-      withDirectory(segment.key, segment.headerBytes, (decoded) =>
-        Effect.gen(function* () {
-          const lookup = yield* Schema.encodeEffect(strings)(candidates);
-          const dead = yield* Schema.encodeEffect(integers)(segment.dead);
-          return yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Array(LocatedDocument)))(
-            decoded.lookup(lookup, dead),
-          );
-        }),
-      ),
-    );
-    for (const row of rows) found.set(row.document.id, { ...row, segment });
-    if (found.size === ids.length) break;
+    for (const [index, segment] of segments.entries()) {
+      const selected = matches[index];
+      if (selected === undefined)
+        throw new Rejected({ status: 503, message: "Bloom batch omitted a segment" });
+      const candidates = selected.filter((id) => !found.has(id));
+      if (candidates.length === 0) continue;
+      const rows = await Effect.runPromise(
+        withDirectory(segment.key, segment.headerBytes, (decoded) =>
+          Effect.gen(function* () {
+            const lookup = yield* Schema.encodeEffect(strings)(candidates);
+            const dead = yield* Schema.encodeEffect(integers)(segment.dead);
+            return yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Array(LocatedDocument)))(
+              decoded.lookup(lookup, dead),
+            );
+          }),
+        ),
+      );
+      for (const row of rows) found.set(row.document.id, { ...row, segment });
+      if (found.size === ids.length) break;
+    }
   }
   return found;
 }
@@ -319,10 +333,16 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
   if (terms.length > 64 || (input.match === "phrase" && words.length > 64))
     throw new Rejected({ status: 400, message: "Query exceeds 64 normalized terms" });
   if (terms.length === 0 || root.documents === 0) return [];
-  const candidates = root.segments.map((segment) => ({
-    segment,
-    terms: bloomCandidates(segment.termBloom, terms),
-  }));
+  const bloomMatches = bloomCandidates(
+    root.segments.map((segment) => segment.termBloom),
+    terms,
+  );
+  const candidates = root.segments.map((segment, index) => {
+    const selected = bloomMatches[index];
+    if (selected === undefined)
+      throw new Rejected({ status: 503, message: "Bloom batch omitted a segment" });
+    return { segment, terms: selected };
+  });
   if (
     (input.match === "all" || input.match === "phrase") &&
     !candidates.some((candidate) => candidate.terms.length === terms.length)
@@ -370,7 +390,7 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
       minimum: entry.minimum,
       bound: segment_term_bound(
         encodedStatistics,
-        Schema.encodeSync(Schema.fromJsonString(SegmentTerms))(entry.dictionary),
+        Schema.encodeSync(Schema.fromJsonString(TermSummaries))(entry.dictionary),
         Schema.encodeSync(Schema.fromJsonString(EligibleMinimum))(entry.minimum),
       ),
     }))
@@ -423,7 +443,10 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
           Effect.sync(() => decoded.ranker(ranking)),
           (ranker) =>
             Effect.gen(function* () {
-              const requested = Object.entries(dictionary);
+              const postingDirectory = yield* Schema.decodeEffect(
+                Schema.fromJsonString(SegmentTerms),
+              )(decoded.terms(projectionTerms));
+              const requested = Object.entries(postingDirectory);
               for (const offset of Array.from(
                 { length: Math.ceil(requested.length / 4) },
                 (_, index) => index * 4,

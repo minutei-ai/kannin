@@ -876,8 +876,17 @@ pub fn bloom_contains(bytes: &[u8], value: &str) -> Result<bool, String> {
     if bytes.len() > MAX_BYTES {
         return Err("Bloom exceeds size budget".into());
     }
-    let a = bloom_hash(value, 0xcbf2_9ce4_8422_2325);
-    let b = bloom_hash(value, 0x8422_2325_cbf2_9ce4) | 1;
+    bloom_contains_hashes(
+        bytes,
+        bloom_hash(value, 0xcbf2_9ce4_8422_2325),
+        bloom_hash(value, 0x8422_2325_cbf2_9ce4) | 1,
+    )
+}
+
+fn bloom_contains_hashes(bytes: &[u8], a: u64, b: u64) -> Result<bool, String> {
+    if bytes.is_empty() {
+        return Ok(false);
+    }
     for index in 0u64..7 {
         let bit = usize::try_from(
             a.wrapping_add(index.wrapping_mul(b))
@@ -891,11 +900,60 @@ pub fn bloom_contains(bytes: &[u8], value: &str) -> Result<bool, String> {
     Ok(true)
 }
 
+#[doc = "# Errors\nRejects oversized batches or invalid offset framing."]
+pub fn bloom_filter_many<'a>(
+    bytes: &[u8],
+    offsets: &[u32],
+    values: &'a [String],
+) -> Result<Vec<Vec<&'a str>>, String> {
+    if bytes.len() > MAX_BYTES || offsets.len() > 65 {
+        return Err("Bloom batch exceeds size budget".into());
+    }
+    if offsets.first() != Some(&0)
+        || offsets
+            .last()
+            .copied()
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|cause| cause.to_string())?
+            != Some(bytes.len())
+    {
+        return Err("Invalid bloom offsets".into());
+    }
+    let hashes: Vec<_> = values
+        .iter()
+        .map(|value| {
+            (
+                value.as_str(),
+                bloom_hash(value, 0xcbf2_9ce4_8422_2325),
+                bloom_hash(value, 0x8422_2325_cbf2_9ce4) | 1,
+            )
+        })
+        .collect();
+    offsets
+        .windows(2)
+        .map(|span| {
+            let start = usize::try_from(span[0]).map_err(|cause| cause.to_string())?;
+            let end = usize::try_from(span[1]).map_err(|cause| cause.to_string())?;
+            let bloom = bytes
+                .get(start..end)
+                .ok_or_else(|| "Invalid bloom offsets".to_owned())?;
+            let mut selected = Vec::new();
+            for &(value, a, b) in &hashes {
+                if bloom_contains_hashes(bloom, a, b)? {
+                    selected.push(value);
+                }
+            }
+            Ok(selected)
+        })
+        .collect()
+}
+
 #[cfg(target_arch = "wasm32")]
 pub mod wasm {
     use super::{
         BlockMeta, BuiltSegment, Document, DocumentMeta, FILTER_CACHE_BYTES, Filter, Header,
-        Search, Statistics, TermMeta, bloom_build, bloom_contains, bm25, build, decode_page,
+        Search, Statistics, TermMeta, bloom_build, bloom_filter_many, bm25, build, decode_page,
         document_terms, matches, parse_header,
     };
     use serde::{Deserialize, Serialize};
@@ -903,15 +961,26 @@ pub mod wasm {
     use std::rc::Rc;
     use wasm_bindgen::prelude::*;
 
-    fn term_bound(meta: &TermMeta, statistics: &Statistics, df: u64, minimum: (u32, u32)) -> f64 {
-        meta.blocks
+    #[derive(Serialize, Deserialize)]
+    struct TermSummary {
+        df: u32,
+        bounds: Vec<(u32, u32, u32, u32)>,
+    }
+
+    fn term_bound(
+        meta: &TermSummary,
+        statistics: &Statistics,
+        df: u64,
+        minimum: (u32, u32),
+    ) -> f64 {
+        meta.bounds
             .iter()
-            .map(|block| {
+            .map(|&(title_tf, body_tf, title_length, body_length)| {
                 bm25(
-                    block.max_title_tf,
-                    block.max_body_tf,
-                    block.min_title_length.max(minimum.0),
-                    block.min_body_length.max(minimum.1),
+                    title_tf,
+                    body_tf,
+                    title_length.max(minimum.0),
+                    body_length.max(minimum.1),
                     statistics,
                     df,
                 )
@@ -928,7 +997,7 @@ pub mod wasm {
     ) -> Result<f64, JsValue> {
         let statistics: Statistics = serde_json::from_str(statistics)
             .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
-        let terms: BTreeMap<String, TermMeta> =
+        let terms: BTreeMap<String, TermSummary> =
             serde_json::from_str(terms).map_err(|cause| JsValue::from_str(&cause.to_string()))?;
         let minimum: Option<(u32, u32)> =
             serde_json::from_str(minimum).map_err(|cause| JsValue::from_str(&cause.to_string()))?;
@@ -1030,6 +1099,38 @@ pub mod wasm {
                 .filter_map(|term| self.header.terms.get(term).map(|meta| (term, meta)))
                 .collect();
             serde_json::to_string(&selected).map_err(|e| JsValue::from_str(&e.to_string()))
+        }
+
+        #[doc = "# Errors\nRejects invalid term JSON or summary serialization."]
+        pub fn summary(&self, terms: &str) -> Result<String, JsValue> {
+            let terms: Vec<String> = serde_json::from_str(terms)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            let selected: BTreeMap<_, _> = terms
+                .iter()
+                .filter_map(|term| {
+                    self.header.terms.get(term).map(|meta| {
+                        (
+                            term,
+                            TermSummary {
+                                df: meta.df,
+                                bounds: meta
+                                    .blocks
+                                    .iter()
+                                    .map(|block| {
+                                        (
+                                            block.max_title_tf,
+                                            block.max_body_tf,
+                                            block.min_title_length,
+                                            block.min_body_length,
+                                        )
+                                    })
+                                    .collect(),
+                            },
+                        )
+                    })
+                })
+                .collect();
+            serde_json::to_string(&selected).map_err(|cause| JsValue::from_str(&cause.to_string()))
         }
 
         #[doc = "# Errors\nRejects invalid filters, attributes, or minimum serialization."]
@@ -1175,15 +1276,15 @@ pub mod wasm {
 
     #[wasm_bindgen]
     #[doc = "# Errors\nRejects invalid values, bloom budgets, or result serialization errors."]
-    pub fn segment_bloom_filter(bytes: &[u8], values: &str) -> Result<String, JsValue> {
+    pub fn segment_bloom_filter_many(
+        bytes: &[u8],
+        offsets: &[u32],
+        values: &str,
+    ) -> Result<String, JsValue> {
         let values: Vec<String> =
             serde_json::from_str(values).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let mut selected = Vec::new();
-        for value in &values {
-            if bloom_contains(bytes, value).map_err(|cause| JsValue::from_str(&cause))? {
-                selected.push(value);
-            }
-        }
+        let selected = bloom_filter_many(bytes, offsets, &values)
+            .map_err(|cause| JsValue::from_str(&cause))?;
         serde_json::to_string(&selected).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 

@@ -304,3 +304,37 @@ fn bloom_filters_have_no_false_negatives_and_bounded_false_positives()
 
     Ok(())
 }
+
+#[test]
+fn batched_blooms_match_independent_membership_and_reject_bad_framing()
+-> Result<(), Box<dyn std::error::Error>> {
+    let values: Vec<_> = (0..500).map(|index| format!("ação-{index}")).collect();
+    let mut bytes = Vec::new();
+    let mut offsets = vec![0];
+    let mut blooms = Vec::new();
+    for group in 0..64 {
+        let entries: Vec<_> = (group..group + 500)
+            .map(|index| format!("ação-{index}"))
+            .collect();
+        let bloom = segment::bloom_build(&entries)?;
+        bytes.extend_from_slice(&bloom);
+        offsets.push(u32::try_from(bytes.len())?);
+        blooms.push(bloom);
+    }
+    let actual = segment::bloom_filter_many(&bytes, &offsets, &values)?;
+    for (selected, bloom) in actual.iter().zip(&blooms) {
+        let mut expected = Vec::new();
+        for value in &values {
+            if segment::bloom_contains(bloom, value)? {
+                expected.push(value.as_str());
+            }
+        }
+        assert_eq!(selected, &expected);
+    }
+    assert!(segment::bloom_filter_many(&bytes, &[0, 2, 1], &values).is_err());
+    assert!(segment::bloom_filter_many(&bytes, &[1], &values).is_err());
+    assert!(segment::bloom_filter_many(&bytes, &[0, u32::MAX], &values).is_err());
+    assert!(segment::bloom_filter_many(&[], &[], &values).is_err());
+    assert!(segment::bloom_filter_many(&[], &[0], &values)?.is_empty());
+    Ok(())
+}

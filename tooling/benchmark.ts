@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { cpus } from "node:os";
 import { Schema } from "effect";
-import { QueryResult, Health } from "../src/protocol";
+import { QueryResult, Health, Row } from "../src/protocol";
 import { request, startWorker, textQuery, write } from "../tests/harness";
 import { corpus } from "./corpus";
 
@@ -32,6 +32,7 @@ for (const offset of Array.from({ length: Math.ceil(size / 500) }, (_, ordinal) 
 }
 const ingestMs = performance.now() - ingestion;
 const reports = [];
+const baselines = new Map<string, string>();
 const queries = [
   ["rare", textQuery("unique42")],
   ["selective", textQuery("group42")],
@@ -54,7 +55,15 @@ for (const consistency of ["strong", "edge-eventual"] as const)
       if (result.rows.length === 0) throw new Error("Empty benchmark result");
       if (result.consistency !== consistency)
         throw new Error("Benchmark consistency differs from requested contract");
-      samples.push(performance.now() - start);
+      const elapsed = performance.now() - start;
+      if (result.sequence !== Math.ceil(size / 500))
+        throw new Error("Benchmark sequence differs from acknowledged ingestion");
+      const encodedRows = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Row)))(result.rows);
+      const expected = baselines.get(name);
+      if (expected === undefined) baselines.set(name, encodedRows);
+      else if (expected !== encodedRows)
+        throw new Error("Benchmark ranking changed across requests or consistency modes");
+      samples.push(elapsed);
     }
     const ordered = [...samples].sort((a, b) => a - b);
     reports.push({
@@ -80,6 +89,8 @@ console.log(
       wasmSha256,
       documents: size,
       corpusSha256: corpusHash.digest("hex"),
+      resultCheck:
+        "identical rows and scores across requests and consistency modes; acknowledged sequence verified",
       ingestMs,
       documentsPerSecond: (size / ingestMs) * 1000,
       reports,

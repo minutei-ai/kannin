@@ -258,6 +258,24 @@ fn encode_postings(postings: &[Posting]) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+fn decode_positions(data: &[u8], offset: &mut usize) -> Result<Vec<u32>, String> {
+    let length = get_int(data, offset)? as usize;
+    if length > data.len() - *offset {
+        return Err("Invalid position count".into());
+    }
+    let mut positions = Vec::with_capacity(length);
+    let mut position = 0u32;
+    for index in 0..length {
+        let delta = get_int(data, offset)?;
+        if index > 0 && delta == 0 {
+            return Err("Duplicate token position".into());
+        }
+        position = position.checked_add(delta).ok_or("Position overflow")?;
+        positions.push(position);
+    }
+    Ok(positions)
+}
+
 #[doc = "# Errors\nRejects invalid pages, overflowing or truncated varints, excessive rows, duplicate positions, and trailing bytes."]
 pub fn decode_postings(bytes: &[u8]) -> Result<Vec<Posting>, String> {
     let data = decode_page(bytes)?;
@@ -274,26 +292,8 @@ pub fn decode_postings(bytes: &[u8]) -> Result<Vec<Posting>, String> {
             return Err("Duplicate posting row".into());
         }
         row = row.checked_add(delta).ok_or("Row overflow")?;
-        let mut fields = Vec::new();
-        for _ in 0..2 {
-            let length = get_int(&data, &mut offset)? as usize;
-            if length > data.len() - offset {
-                return Err("Invalid position count".into());
-            }
-            let mut positions = Vec::with_capacity(length);
-            let mut position = 0u32;
-            for index in 0..length {
-                let delta = get_int(&data, &mut offset)?;
-                if index > 0 && delta == 0 {
-                    return Err("Duplicate token position".into());
-                }
-                position = position.checked_add(delta).ok_or("Position overflow")?;
-                positions.push(position);
-            }
-            fields.push(positions);
-        }
-        let body = fields.pop().ok_or("Missing positional field")?;
-        let title = fields.pop().ok_or("Missing positional field")?;
+        let title = decode_positions(&data, &mut offset)?;
+        let body = decode_positions(&data, &mut offset)?;
         if body.is_empty() && title.is_empty() {
             return Err("Empty posting".into());
         }
@@ -2081,6 +2081,45 @@ mod scoring_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod posting_decode_tests {
+    use super::{append, decode_postings};
+
+    #[test]
+    fn positional_fields_keep_order_and_reject_malformed_varints()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut valid = Vec::new();
+        append(&mut valid, &[1, 0, 2, 0, 2, 1, 3])?;
+        let rows = decode_postings(&valid)?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, [0, 2]);
+        assert_eq!(rows[0].body, [3]);
+        for (data, expected) in [
+            (vec![1, 0, 2, 0, 0, 0], "Duplicate token position"),
+            (vec![1, 0, 0, 2, 0, 0], "Duplicate token position"),
+            (vec![1, 0, 0, 0], "Empty posting"),
+            (vec![1, 0, 0, 3, 1], "Invalid position count"),
+            (vec![1, 0, 0, 1, 128], "Truncated varint"),
+            (
+                vec![1, 0, 0, 1, 255, 255, 255, 255, 16],
+                "Overflowing varint",
+            ),
+            (
+                vec![1, 0, 0, 2, 255, 255, 255, 255, 15, 1],
+                "Position overflow",
+            ),
+            (vec![1, 0, 0, 1, 0, 7], "Trailing posting bytes"),
+            (vec![2, 0, 0, 1, 0, 0, 0, 1, 0], "Duplicate posting row"),
+            (vec![129, 1], "Posting block exceeds 128 rows"),
+        ] {
+            let mut page = Vec::new();
+            append(&mut page, &data)?;
+            assert_eq!(decode_postings(&page).err().as_deref(), Some(expected));
+        }
+        Ok(())
     }
 }
 

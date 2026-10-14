@@ -1354,3 +1354,21 @@ Native Alchemy deployment and its Vectorize metadata migration succeeded. Baseli
 A temporary candidate checked up to four private individual-page Cache API entries before acquiring a cold merged document span. Complete hits decoded/CRC-checked pages in result order; partial hits and cache errors fell back to the existing merged acquisition. Memory-resident pages and merged buffers bypassed the probe. Canonical R2 format and query contracts were unaffected.
 
 A local workerd comparison used four cache states with 40 documents and eleven alternating pairs per state, excluding three warmups. All 88 complete query results preserved rows and scores. With every individual page present, range acquisitions fell from 5 to 2 and medians from 23.11 to 21.81 ms. Empty-cache medians worsened from 29.80 to 38.06 ms, partial-cache medians from 19.94 to 30.46 ms and an already cached merged span from 9.91 to 25.26 ms; these controls retained the same acquired ranges/bytes. Direct lookup overhead outweighed the narrow benefit. The prototype's 25 Rust and 130 Bun/workerd tests passed, but it was removed before any native deployment. Production retains direct merged acquisition and the existing individual memory-cache fallback. The measurements do not establish native Cache API namespace visibility or origin-transfer savings.
+
+### Removing a temporary allocation from posting decoding
+
+Rust previously allocated a temporary vector of positional vectors for every posting, then popped body/title fields. The decoder now reads title and body directly through one checked positional-field decoder. Posting order, score arithmetic, CRC/decoded-length validation and the persisted segment format are unchanged.
+
+A local Bun/WASM comparison measured projection, ranker creation, decoding and finishing on 10,000-document fixtures. Twelve cases covered unfiltered/clustered/interleaved/tombstoned data and any/all/phrase. Fifteen alternating pairs ran sixteen complete pipelines each, with three warmups excluded from timing. The first comparison and isolated repetition preserved all 11,520 serialized row/score outputs. In the repetition, unfiltered medians improved 3.7–6.3%, clustered filters 6.1–6.7%, interleaved filters 4.5–4.9% and tombstones 2.9–3.3%. These are local pipeline timings, not native CPU or client latency measurements.
+
+The full gate passed 26 Rust and 130 Bun/workerd tests. A new decoder test frames malformed positional data with a valid CRC and checks duplicate title/body positions, empty postings, invalid counts, truncated/overflowing varints, cumulative position overflow, trailing bytes, duplicate rows and excessive row count. Existing exhaustive ranking, phrases, tombstones and concurrent cache tests passed.
+
+Native Alchemy deployment and its Vectorize metadata migration succeeded. The million-document before/after/repeated load preserved all 288 exact-result/score/sequence comparisons. Client latency remains mixed: the first candidate improved concurrency 1/16 medians but worsened all p95 values, while the repetition worsened concurrency 1/4 medians and improved concurrency 16 median. Cache/isolate/network conditions were uncontrolled. The local allocation/pipeline result does not establish native billed CPU, peak memory or a traffic-wide latency gain.
+
+| Concurrency | Baseline p50 / p95 ms | Candidate p50 / p95 ms | Repeated candidate p50 / p95 ms |
+| ----------- | --------------------- | ---------------------- | ------------------------------- |
+| 1           | 72.59 / 299.87        | 68.88 / 380.68         | 99.22 / 734.14                  |
+| 4           | 76.14 / 801.14        | 84.18 / 1320.56        | 110.96 / 464.95                 |
+| 16          | 185.91 / 1145.02      | 116.86 / 2250.96       | 177.22 / 1087.18                |
+
+A separate post-deploy all/phrase load retained another 96 exact-result comparisons at concurrency 1/4/16. Its p50 values were 117.33/115.00/179.04 ms and p95 values 206.09/1191.83/1401.90 ms. This validates native phrase/intersection behavior after the decoder change, without a paired pre-change timing baseline.

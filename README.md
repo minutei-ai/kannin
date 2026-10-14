@@ -13,9 +13,9 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Concurrency | p50 ms |  p95 ms | Requests/s |
 | ----------: | -----: | ------: | ---------: |
-|           1 | 115.88 |  687.58 |       4.46 |
-|           4 |  90.82 |  427.38 |      21.20 |
-|          16 | 193.69 | 1116.75 |      19.84 |
+|           1 |  99.22 |  734.14 |       5.14 |
+|           4 | 110.96 |  464.95 |      19.48 |
+|          16 | 177.22 | 1087.18 |      19.89 |
 
 Latest complete 32-request phases use rare, selective, common and filtered text queries; all **96 responses** matched strong rows/scores and sequence. Baseline and two candidate runs retained **288 exact comparisons**. Adjacent result pages now share bounded reads in any ranking order: the native fixture reduced text/vector/hybrid acquisitions from **12/11/18 to 5/4/6**, preserving scores and provider order. Controlled local reverse-ranked materialization fell from **42.17 to 22.74 ms**. Pending-only sharing additionally reduced a 32-consumer local range fixture from **32 bodies to one**; this does not establish native origin-transfer or CPU savings. Cache/isolate/network placement was uncontrolled and native client latency remained mixed. Earlier Rust and cache measurements, including regressions and controls, are linked below. Peak memory and general Turbopuffer parity remain unverified.
 

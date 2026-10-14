@@ -179,3 +179,17 @@ A filtered top-k regression first read nineteen ranges after directory eviction 
 The 100,000-document local run measured strong p50/p95 3.55/4.94, 16.70/25.76, 21.40/28.57 and 19.21/27.30 ms for rare/selective/common/filtered queries. Edge values were 3.15/3.44, 18.25/26.85, 22.37/30.03 and 20.18/27.54 ms. Ingestion measured 23.61 seconds, approximately 4,235 documents/s. Warm medians vary modestly from the preceding run; the deterministic range reduction concerns directory eviction, not a general warm latency claim. Worker SHA-256 is `79abfa72fa91b767e76d1cd7a6f72d4d25de782e9a36e08a775f0f4238c51528`; WASM SHA-256 is `7a6fabfcd0a8473a920af63d5afe6121a94437845f851f7c6d2cf4a69d7d3556`. Corpus SHA-256 remains `e23ae431deaee2436ee6674a7834e57663739b6c5bd723b7c9137c4ab123dbfb`.
 
 A fresh native pre-change run completed all 192 strong-baseline comparisons. Concurrency 1/4/16 measured p50 89.90/153.63/178.44 ms, p95 398.42/1472.63/1333.52 ms and throughput 5.91/9.09/25.75 requests/s. These are a fresh comparison baseline, distinct from historical runs and their cache state.
+
+Runtime `341e41c` deployed successfully and its CI passed. The first native load after deployment returned HTTP 503 during concurrency 1 and aborted; its old diagnostic did not capture the body, so the failure remains unclassified. Eight subsequent strong/edge diagnostic reads passed, and twelve conjunctive comparisons retained the original rows and scores. The load driver now consumes error bodies and records bounded wire details, query, server timing and request trace id on non-success responses. This improves future diagnosis without hiding or retrying failed samples.
+
+A second native load completed all 192 strong-baseline comparisons without HTTP errors.
+
+| Concurrency | Before p50 / p95 ms | After p50 / p95 ms | Before / after requests per second |
+| ----------- | ------------------- | ------------------ | ---------------------------------- |
+| 1           | 89.90 / 398.42      | 159.18 / 223.05    | 5.91 / 5.56                        |
+| 4           | 153.63 / 1472.63    | 162.46 / 297.35    | 9.09 / 18.99                       |
+| 16          | 178.44 / 1333.52    | 162.00 / 815.20    | 25.75 / 46.07                      |
+
+The concurrency-1 median became slower. Separate sequential runs, deployment and cache warming limit timing attribution, and the completed second run does not classify or prove resolution of the first 503. Ranking acquisition intervals decreased: `text_rank` maxima changed from 1442/2160/1421 ms to 44/271/498 ms. Dictionary maxima were 110/109/146 ms after the change. Native clocks measure elapsed I/O intervals here, not isolated CPU. An immediate filtered strong query observed native projection/range HIT counters with about 2.17 MiB of decoded directory charge; the counters are process scoped and include preceding work.
+
+SciFact's 300 judgments retained nDCG@10 0.67306, recall@10 0.79567 and MRR@10 0.64181. Local checks passed 100 Worker/tooling tests and 17 Rust tests, including strict lint and compiler rejection probes. General latency guarantees, the unclassified intermittent 503 and broad vector/hybrid throughput remain open.

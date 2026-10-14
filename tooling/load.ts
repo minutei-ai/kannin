@@ -3,6 +3,11 @@ import { Metadata, NamespaceName, Query, QueryResult, Row } from "../src/protoco
 
 class LoadFailure extends Schema.TaggedError<LoadFailure>()("LoadFailure", {
   message: Schema.String,
+  status: Schema.optional(Schema.Int),
+  body: Schema.optional(Schema.String),
+  query: Schema.optional(Query),
+  serverTiming: Schema.optional(Schema.Union([Schema.String, Schema.Null])),
+  ray: Schema.optional(Schema.Union([Schema.String, Schema.Null])),
 }) {}
 
 const url = new URL(Effect.runSync(Config.String("RAIO_URL")));
@@ -70,10 +75,17 @@ for (const concurrency of [1, 4, 16]) {
               body: encoded,
             }),
           );
+          const body = yield* Effect.tryPromise(() => response.text());
           if (!response.ok)
-            return yield* new LoadFailure({ message: `Load query failed: ${response.status}` });
-          const body = yield* Effect.tryPromise(() => response.json());
-          const result = yield* Schema.decodeUnknownEffect(QueryResult)(body);
+            return yield* new LoadFailure({
+              message: `Load query failed: ${response.status}`,
+              status: response.status,
+              body: body.slice(0, 1024),
+              query,
+              serverTiming: response.headers.get("server-timing"),
+              ray: response.headers.get("cf-ray"),
+            });
+          const result = yield* Schema.decodeEffect(Schema.fromJsonString(QueryResult))(body);
           const rows = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Array(Row)))(
             result.rows,
           );

@@ -35,7 +35,7 @@ Conjunctive segment pruning reduced local warm p50 from **14.11 to 6.83 ms** for
 
 These deployed measurements are from `faa310e`, before the latest warm-snapshot optimization, with the same five-warmup/50-sample methodology. Strong reads paid the coordinator hop outside Brazil. A separate mixed-query load run reached **45.4 requests/s at concurrency 16**, with **p95 1,090.5 ms**; all 384 responses matched strong baselines. Cold requests reached **3.4 seconds**. These results establish bounded measurements, not general Turbopuffer parity or million-document scale.
 
-Native projection and priority runs each passed **192 mixed-query checks**; twelve conjunctive comparisons also preserved results. Catalog HITs survived a Worker deployment. The latest concurrency-1 p50/p95 was **56 / 298 ms**; concurrency-16 p95 still reached **2.26 seconds**. Cold ranking acquisition and broad scaling remain unresolved.
+The filtered-projection run passed **192 mixed-query checks**, with concurrency-1 p50/p95 **159 / 223 ms** and concurrency-16 p95 **815 ms**, reaching **46.1 requests/s**. The first post-deploy load aborted on an unclassified 503; a completed repeat does not prove that failure resolved. Broad vector/hybrid throughput and general latency guarantees remain open.
 
 [Full deployed evidence](docs/performance.md) · [local methodology and contract comparison](docs/turbopuffer-contracts.md) · [SciFact ranking quality](docs/quality.md)
 

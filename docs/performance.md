@@ -596,3 +596,45 @@ Two native loads before deployment and two after used the same million-document 
 | After 2  |          16 | 111.19 |  951.71 |      22.02 |
 
 The local overlapping-read reduction is demonstrated. Native results remain mixed: the second concurrency-sixteen median improved against both baselines, but its tail exceeded the second baseline; concurrency-one median and throughput regressed. Uncontrolled cache/isolate/network state prevents a causal overall latency claim. The README reports the latest run and retains the preceding fresh-filter diagnostic separately. New-selector/filter misses, first-use lease reliability, native peak memory and fully indexed Turbopuffer parity remain open.
+
+## Reusable exact eligibility groups
+
+Runtime `ae75f45` replaced filter-specific compressed overviews with one immutable source per physical bucket/segment/header length. Documents with identical serialized attributes share component-wise title/body minima. Evaluating the real filter over groups gives the same physical minimum as scanning documents, including null for no matches and the original zero floor for an empty predicate. Physical frequencies and bounds remain unchanged; fresh live statistics/tombstones remain query-local. The private source format is now `raio-overview-batches-v2` / `batch-v2`, with no old-format reads. Canonical R2 files and projected catalog responses did not change.
+
+Group tuples serialize borrowed attribute JSON objects directly. A rejected prototype serialized attribute objects inside JSON string keys, adding another parse/escape layer and regressing high-cardinality CPU. The tuple representation removed that regression. Failure to build a disposable overview skips its admission and returns the directly validated catalog; existing four-MiB LRU, three-MiB batch admission and sixteen-MiB decoded-page limits remain enforced.
+
+Alternating old/new WASM comparisons used 5,000 documents and ten changing filters, checking every catalog/minimum against the original directory. Repeated attributes used 10 warmup pairs and 30 measured pairs; unique attributes used 5 warmup pairs and 15 measured pairs.
+
+| Attribute shape     | Old/new compressed bytes | Before/after p50 ms | Before/after p95 ms |
+| ------------------- | -----------------------: | ------------------: | ------------------: |
+| Repeated groups     |            19081 / 21392 |       81.25 / 36.65 |       86.70 / 38.45 |
+| Unique per document |            19081 / 46548 |       92.09 / 77.50 |      102.86 / 84.36 |
+
+These timings cover ten projections, including per-filter source construction in the old path and one reusable source construction in the new path. They do not imply the same percentage for complete queries. High cardinality grows payload size and can reduce LRU admission. The full gate passed 116 Worker/tooling tests and 18 Rust tests. Regression coverage includes conjunctions, every filter operator, missing/null/boolean attributes, groups with different document lengths, malformed groups/root fields, empty eligibility, corruption and cross-filter recovery after process eviction. The seventeen-segment cache regression recovered all sources through two Cache API lookups without rebuilding when the predicate changed.
+
+Native fresh-filter diagnostics used the unchanged million-document corpus and the preceding absent-token/always-true negative-year-predicate method. The first post-deploy source-cache round had a selective regression; following rounds reused the new source format. Every row/score matched strong baselines and the saved preceding-version responses.
+
+| Query     | Before ms | First v2 run ms | Second v2 run ms | After snapshot publication fix ms |
+| --------- | --------: | --------------: | ---------------: | --------------------------------: |
+| Selective |   3907.67 |         5432.69 |          2177.71 |                           2487.41 |
+| Common    |   3699.68 |         3605.19 |          1000.43 |                           1566.20 |
+| Filtered  |   3750.69 |         2579.26 |          1386.67 |                           1750.99 |
+
+All final observations improved relative to the preceding implementation, but immutable range, process and regional caches remained eligible. These are not fully cold namespace measurements or a causal global latency guarantee.
+
+The first v2 mixed load aborted on a native 503 `Snapshot freshness budget exceeded`, with gateway duration 1,629 ms. That failed run produced no complete percentile report and is not counted as a passing load. Runtime `f1d5c6f` then moved the derived Cache API snapshot write to the owning request's native waitUntil. Snapshot selection still enforces the observation time recorded before R2 acquisition and each caller's minimumSequence; no freshness bound was relaxed. The complete local gate passed again and deployment completed.
+
+Two subsequent native loads completed, each checking 96 edge responses against exact strong rows/scores and the acknowledged sequence.
+
+| Run         | Concurrency | p50 ms |  p95 ms | Requests/s |
+| ----------- | ----------: | -----: | ------: | ---------: |
+| After fix 1 |           1 |  65.23 |  411.25 |       8.03 |
+| After fix 1 |           4 |  79.33 |  833.56 |      19.16 |
+| After fix 1 |          16 |  98.89 | 1392.46 |      22.89 |
+| After fix 2 |           1 |  58.13 |  273.65 |       8.30 |
+| After fix 2 |           4 |  67.71 |  506.18 |      20.80 |
+| After fix 2 |          16 | 147.75 |  825.32 |      28.04 |
+
+The README reports the latest complete run. Native tails remain variable; two passing loads do not establish that every first-use/freshness failure is resolved. Native peak memory, cold reliability and fully indexed Turbopuffer parity remain open.
+
+Independent SciFact evaluation after the cutover retained nDCG@10 0.6730619695232347, recall@10 0.7956666666666666 and MRR@10 0.641808201058201 across 300 queries. Eight read-only native vector/hybrid cases retained the exact previously recorded rows and scores; this is fixture evidence, not a general provider recall claim. Both runtime CI jobs completed successfully.

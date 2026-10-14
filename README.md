@@ -17,7 +17,7 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 |           4 |  63.13 | 432.11 |      25.82 |
 |          16 | 110.42 | 806.83 |      26.62 |
 
-Runtime `90632d8`; latest of two post-deploy runs, with 32 mixed-query requests per phase. All 192 post-deploy edge responses matched strong rows and scores. Pending native snapshot acquisitions are shared, with freshness and sequence checked for every reader. Cold overview misses project catalogs directly from the validated directory; compressed overviews now serialize borrowed entries without copying the full dictionary. The preceding overview diagnostics forced new selector/filter misses and took **3.09–4.31 seconds**; their first post-deploy round regressed and their second improved all three observations. Cache state and network variation limit attribution. Mixed-load tails still regress between runs, and an earlier edge request hit its 30-second lease; successful later runs do not prove that first-use failure resolved.
+Runtime `f1d5c6f`; latest of two complete post-deploy runs, 32 mixed queries per phase. All 192 edge responses matched strong rows and scores. Reusable overviews now compute exact filter minima from attribute groups; new selector/filter observations improved from **3.70–3.91 s** to **1.57–2.49 s** after warming. Isolate/cache/network state limits attribution. An earlier load failed the snapshot freshness guard; Cache API publication was moved off the read critical path and two subsequent loads passed. General first-use reliability and performance parity remain unverified.
 
 The local million-document workload measured strong common/filtered p50 of **127/126 ms** across 2,000 uncompacted segments. These emulator results exclude native network latency. Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10** across 300 queries. Eight native vector/hybrid fixture cases also retained exact rows and scores.
 
@@ -36,7 +36,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **115 Worker/tooling tests and 18 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **116 Worker/tooling tests and 18 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

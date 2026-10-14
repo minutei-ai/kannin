@@ -7,13 +7,14 @@ import {
   segment_bloom,
   segment_bloom_filter_many,
 } from "../dist/wasm/raio_engine";
-import type { DataRange, TermProjectionRange } from "./protocol";
+import type { DataRange, HeaderRange } from "./protocol";
 import {
   StoredDocument,
   SegmentHeader,
   SegmentRange,
   TermCatalog,
-  TermCatalogBatch,
+  TermSummaries,
+  EligibleMinimum,
   SegmentCacheProps,
   Rejected,
 } from "./protocol";
@@ -94,7 +95,7 @@ export async function range(key: string, offset: number, length: number) {
   return bytes;
 }
 
-async function acquireDirectory(key: string, headerBytes: number) {
+async function acquireDirectory(key: string, headerBytes: number, suppliedBytes?: Uint8Array) {
   const identity = `${env.STORAGE_CACHE_SCOPE}:${key}`;
   const cached = directories.get(identity);
   if (cached !== undefined) {
@@ -103,7 +104,11 @@ async function acquireDirectory(key: string, headerBytes: number) {
     directories.set(identity, cached);
     return cached.directory.retain();
   }
-  const bytes = await range(key, 0, headerBytes);
+  const selected = { bytes: suppliedBytes };
+  if (selected.bytes === undefined) selected.bytes = await range(key, 0, headerBytes);
+  const bytes = selected.bytes;
+  if (bytes.byteLength !== headerBytes)
+    throw new Rejected({ status: 503, message: "R2 header returned a truncated segment" });
   const concurrent = directories.get(identity);
   if (concurrent !== undefined) return concurrent.directory.retain();
   const decoded = new Directory(bytes);
@@ -122,6 +127,8 @@ async function acquireDirectory(key: string, headerBytes: number) {
     decodedBudget.bytes -= oldest[1].bytes;
     oldest[1].directory.free();
   }
+  if (suppliedBytes !== undefined)
+    remember(`${env.STORAGE_CACHE_SCOPE}:${key}/0/${headerBytes}`, bytes);
   directories.set(identity, entry);
   decodedBudget.bytes += entry.bytes;
   return decoded.retain();
@@ -132,10 +139,11 @@ export const withDirectory = Effect.fn("raio.withDirectory")(
     key: string,
     headerBytes: number,
     use: (directory: Directory) => Effect.Effect<A, E, R>,
+    suppliedBytes?: Uint8Array,
   ) =>
     Effect.acquireUseRelease(
       Effect.tryPromise({
-        try: () => acquireDirectory(key, headerBytes),
+        try: () => acquireDirectory(key, headerBytes, suppliedBytes),
         catch: (cause) => {
           if (Schema.is(Rejected)(cause)) return cause;
           return new Cause.UnknownError(cause);
@@ -147,11 +155,20 @@ export const withDirectory = Effect.fn("raio.withDirectory")(
 );
 
 export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
-  (ranges: ReadonlyArray<typeof TermProjectionRange.Type>, terms: string, filters: string) =>
+  (ranges: ReadonlyArray<typeof HeaderRange.Type>, terms: string, filters: string) =>
     Effect.gen(function* () {
-      const windows = Array.from({ length: Math.ceil(ranges.length / 16) }, (_, index) =>
-        ranges.slice(index * 16, index * 16 + 16),
-      );
+      const windows: Array<Array<typeof HeaderRange.Type>> = [];
+      for (const input of ranges) {
+        const window = windows.at(-1);
+        if (
+          window === undefined ||
+          window.length === 16 ||
+          window.reduce((total, entry) => total + entry.headerBytes, 0) + input.headerBytes >
+            4 * 1024 * 1024
+        )
+          windows.push([input]);
+        else window.push(input);
+      }
       const batches = yield* Effect.forEach(
         windows,
         (window) =>
@@ -173,12 +190,11 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
             }
             const props = {
               bucket: env.STORAGE_CACHE_SCOPE,
-              terms,
-              filters,
               ranges: window.map((input) => ({ key: input.key, headerBytes: input.headerBytes })),
             };
             const response = yield* Effect.tryPromise({
-              try: () => exports.Terms({ props }).fetch("https://terms.internal/catalog-v4"),
+              try: () =>
+                exports.HeaderBatches({ props }).fetch("https://headers.internal/headers-v1"),
               catch: (cause) => {
                 if (Schema.is(Rejected)(cause)) return cause;
                 return new Cause.UnknownError(cause);
@@ -188,30 +204,39 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
             reads.termRequests += 1;
             const status = response.headers.get("cf-cache-status");
             if (status === "HIT") reads.termWorkerCacheHits += window.length;
-            if (status !== "HIT" && response.headers.get("x-raio-cache") === "terms-api-hit")
+            if (status !== "HIT" && response.headers.get("x-raio-cache") === "headers-api-hit")
               reads.termCacheApiHits += window.length;
-            const text = yield* Effect.tryPromise(() => response.text());
             if (!response.ok)
+              return yield* new Rejected({ status: 503, message: "Immutable headers unavailable" });
+            const packed = new Uint8Array(yield* Effect.tryPromise(() => response.arrayBuffer()));
+            const expectedBytes = window.reduce((total, input) => total + input.headerBytes, 0);
+            if (packed.byteLength !== expectedBytes)
               return yield* new Rejected({
                 status: 503,
-                message: "Immutable term catalog unavailable",
+                message: "Header batch returned truncated ranges",
               });
-            const catalogs = yield* Schema.decodeEffect(Schema.fromJsonString(TermCatalogBatch))(
-              text,
-            );
-            if (catalogs.length !== window.length)
-              return yield* new Rejected({
-                status: 503,
-                message: "Term projection batch omitted a segment",
-              });
-            reads.termBytes += new TextEncoder().encode(text).byteLength;
-            for (const [index, catalog] of catalogs.entries()) {
-              const input = window[index];
-              if (input === undefined)
-                return yield* new Rejected({
-                  status: 503,
-                  message: "Term projection batch added a segment",
-                });
+            reads.termBytes += packed.byteLength;
+            const catalogs = [];
+            const cursor = { offset: 0 };
+            for (const input of window) {
+              const header = packed.slice(cursor.offset, cursor.offset + input.headerBytes);
+              cursor.offset += input.headerBytes;
+              const catalog = yield* withDirectory(
+                input.key,
+                input.headerBytes,
+                (directory) =>
+                  Effect.gen(function* () {
+                    const dictionary = yield* Schema.decodeEffect(
+                      Schema.fromJsonString(TermSummaries),
+                    )(directory.summary(terms));
+                    const minimum = yield* Schema.decodeEffect(
+                      Schema.fromJsonString(EligibleMinimum),
+                    )(directory.minimum(filters));
+                    return { dictionary, minimum };
+                  }),
+                header,
+              );
+              catalogs.push(catalog);
               const identity = `${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}/${terms}\0${filters}`;
               const encoded = yield* Schema.encodeEffect(Schema.fromJsonString(TermCatalog))(
                 catalog,

@@ -1,6 +1,8 @@
 import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
-import { Root, QueryResult, Metadata, Health } from "../src/protocol";
+import { Response } from "miniflare";
+import { createHash } from "node:crypto";
+import { Root, QueryResult, Metadata, Health, HeaderBatchProps } from "../src/protocol";
 import { document, request, startWorker, textQuery, write } from "./harness";
 
 const worker = await startWorker();
@@ -57,7 +59,7 @@ test("cached old segments cannot resurrect updated or deleted documents", async 
 });
 
 test("the authenticated gateway never exposes immutable cache entrypoints", async () => {
-  for (const path of ["/range", "/catalog-v4"]) {
+  for (const path of ["/range", "/headers-v1"]) {
     const url = new URL(path, await worker.ready);
     const anonymous = await fetch(url);
     expect(anonymous.status).toBe(401);
@@ -149,6 +151,36 @@ test("term projection batches preserve global frequencies and filter eligibility
   );
   expect(after.termRequests - acquired.termRequests).toBe(3);
   expect(after.termReads - acquired.termReads).toBe(33);
+  expect(after.termCacheApiHits - acquired.termCacheApiHits).toBe(33);
+});
+
+test("truncated cached header frames fail closed and recover after eviction", async () => {
+  const namespace = "truncated-header-frame";
+  await request(worker, namespace, "write", write([document("a", "integrity bytes")]));
+  const bucket = await worker.getR2Bucket("STORAGE");
+  const object = await bucket.get(`namespaces/${namespace}/root.json`);
+  if (object === null) throw new Error("Missing manifest");
+  const manifest = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
+  const ranges = manifest.segments.map((segment) => ({
+    key: segment.key,
+    headerBytes: segment.headerBytes,
+  }));
+  const encoded = Schema.encodeSync(Schema.fromJsonString(HeaderBatchProps.fields.ranges))(ranges);
+  const cache = await (await worker.getCaches()).open("raio-headers-v1");
+  const key = new URL("https://raio-headers.internal/headers-v1");
+  key.searchParams.set("bucket", "raio-test");
+  key.searchParams.set("ranges", createHash("sha256").update(encoded).digest("hex"));
+  await cache.put(
+    key,
+    new Response(new Uint8Array(1), { headers: { "cache-control": "public, max-age=60" } }),
+  );
+  expect((await request(worker, namespace, "query", textQuery("integrity"))).status).toBe(503);
+  expect(await cache.delete(key)).toBe(true);
+  const recovered = await request(worker, namespace, "query", textQuery("integrity"));
+  expect(recovered.status).toBe(200);
+  expect(
+    Schema.decodeUnknownSync(QueryResult)(await recovered.json()).rows.map((row) => row.id),
+  ).toEqual(["a"]);
 });
 
 for (const match of ["all", "phrase"] as const)
@@ -235,7 +267,7 @@ test("conjunctive pruning uses live frequencies after deleting the only shared-t
   expect(after.directoryCacheHits - before.directoryCacheHits).toBe(1);
 });
 
-test("immutable query catalogs survive directory eviction without reloading irrelevant headers", async () => {
+test("cached header batches restore catalogs without new header range reads", async () => {
   const namespace = "projected-catalog";
   for (const index of Array.from({ length: 29 }, (_, ordinal) => ordinal))
     await request(
@@ -261,10 +293,12 @@ test("immutable query catalogs survive directory eviction without reloading irre
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(4);
+  expect(after.rangeReads - before.rangeReads).toBe(3);
+  expect(after.termRequests - before.termRequests).toBe(2);
+  expect(after.termCacheApiHits - before.termCacheApiHits).toBe(30);
 });
 
-test("cached term bounds prune uncompetitive segments after directory eviction", async () => {
+test("cached header batches preserve bound pruning after process-cache eviction", async () => {
   const namespace = "projected-bounds";
   for (const index of Array.from({ length: 16 }, (_, ordinal) => ordinal))
     await request(
@@ -293,7 +327,9 @@ test("cached term bounds prune uncompetitive segments after directory eviction",
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(4);
+  expect(after.rangeReads - before.rangeReads).toBe(3);
+  expect(after.termRequests - before.termRequests).toBe(1);
+  expect(after.termCacheApiHits - before.termCacheApiHits).toBe(16);
 });
 
 test("term projections keep phrase order, filter eligibility and revisions query scoped", async () => {
@@ -388,7 +424,7 @@ test("segment priority finds the equal-score winner before reading lower-priorit
   expect(after.rangeReads - before.rangeReads).toBe(19);
 });
 
-test("filtered score projections prune headers after directory eviction", async () => {
+test("cached header batches preserve filtered pruning after process-cache eviction", async () => {
   const namespace = "filtered-projection";
   for (const index of Array.from({ length: 16 }, (_, ordinal) => ordinal))
     await request(
@@ -416,7 +452,9 @@ test("filtered score projections prune headers after directory eviction", async 
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(4);
+  expect(after.rangeReads - before.rangeReads).toBe(3);
+  expect(after.termRequests - before.termRequests).toBe(1);
+  expect(after.termCacheApiHits - before.termCacheApiHits).toBe(16);
 });
 
 test("ineligible segments still contribute namespace-wide frequencies", async () => {

@@ -634,6 +634,38 @@ impl Ord for Hit {
     }
 }
 
+struct BlockBounds<'a> {
+    blocks: Vec<(&'a BlockMeta, f64)>,
+    binary_search: bool,
+}
+
+impl<'a> BlockBounds<'a> {
+    fn new(blocks: Vec<(&'a BlockMeta, f64)>) -> Self {
+        let binary_search = blocks.len() >= 8
+            && blocks.iter().all(|(block, _)| block.first <= block.last)
+            && blocks
+                .windows(2)
+                .all(|pair| pair[0].0.last < pair[1].0.first);
+        Self {
+            blocks,
+            binary_search,
+        }
+    }
+
+    fn containing(&self, row: u32) -> Option<&(&'a BlockMeta, f64)> {
+        if self.binary_search {
+            let index = self.blocks.partition_point(|(block, _)| block.last < row);
+            return self
+                .blocks
+                .get(index)
+                .filter(|(block, _)| block.first <= row);
+        }
+        self.blocks
+            .iter()
+            .find(|(block, _)| block.first <= row && block.last >= row)
+    }
+}
+
 pub struct Search {
     pub header: Rc<Header>,
     pub statistics: Statistics,
@@ -733,32 +765,30 @@ impl Search {
         false
     }
 
-    fn block_bounds(
-        &self,
-        terms: &[&String],
-        scorers: &[TermScorer],
-    ) -> Vec<Vec<(&BlockMeta, f64)>> {
+    fn block_bounds(&self, terms: &[&String], scorers: &[TermScorer]) -> Vec<BlockBounds<'_>> {
         terms
             .iter()
             .enumerate()
             .map(|(index, term)| {
-                self.header
-                    .terms
-                    .get(term.as_str())
-                    .into_iter()
-                    .flat_map(|meta| meta.blocks.iter())
-                    .map(|block| {
-                        (
-                            block,
-                            scorers[index].score(
-                                block.max_title_tf,
-                                block.max_body_tf,
-                                block.min_title_length,
-                                block.min_body_length,
-                            ),
-                        )
-                    })
-                    .collect()
+                BlockBounds::new(
+                    self.header
+                        .terms
+                        .get(term.as_str())
+                        .into_iter()
+                        .flat_map(|meta| meta.blocks.iter())
+                        .map(|block| {
+                            (
+                                block,
+                                scorers[index].score(
+                                    block.max_title_tf,
+                                    block.max_body_tf,
+                                    block.min_title_length,
+                                    block.min_body_length,
+                                ),
+                            )
+                        })
+                        .collect(),
+                )
             })
             .collect()
     }
@@ -766,7 +796,7 @@ impl Search {
     fn skippable_block_end(
         lists: &[&[Posting]],
         cursors: &[usize],
-        bounds: &[Vec<(&BlockMeta, f64)>],
+        bounds: &[BlockBounds<'_>],
         cutoff: &Hit,
         row: u32,
     ) -> Option<u32> {
@@ -774,9 +804,7 @@ impl Search {
         let mut bound = 0.0;
         for (index, list) in lists.iter().enumerate() {
             if let Some(posting) = list.get(cursors[index])
-                && let Some((block, score)) = bounds[index]
-                    .iter()
-                    .find(|(block, _)| block.first <= posting.row && block.last >= posting.row)
+                && let Some((block, score)) = bounds[index].containing(posting.row)
             {
                 end = end.min(block.last);
                 bound += score;
@@ -1966,5 +1994,58 @@ mod page_buffer_tests {
             assert!(decode_page(&bad_adler).is_err());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod block_lookup_tests {
+    use super::{BlockBounds, BlockMeta, Range};
+
+    #[test]
+    fn lookup_preserves_first_match_for_gaps_overlap_and_unordered_ranges() {
+        for ranges in [
+            (0..24).map(|index| (index * 3, index * 3 + 1)).collect(),
+            vec![(0, 4), (8, 12), (20, 24)],
+            vec![(20, 24), (0, 4), (8, 12)],
+            vec![(0, 12), (8, 20), (20, 24)],
+            vec![(12, 8), (0, 4), (20, 24)],
+            vec![],
+        ] {
+            let blocks: Vec<_> = ranges
+                .iter()
+                .map(|&(first, last)| BlockMeta {
+                    first,
+                    last,
+                    count: 1,
+                    max_title_tf: 1,
+                    max_body_tf: 1,
+                    min_title_length: 1,
+                    min_body_length: 1,
+                    data: Range {
+                        offset: 0,
+                        length: 0,
+                    },
+                })
+                .collect();
+            let bounds = BlockBounds::new(
+                blocks
+                    .iter()
+                    .enumerate()
+                    .map(|(index, block)| {
+                        (block, f64::from(u32::try_from(index).unwrap_or(u32::MAX)))
+                    })
+                    .collect(),
+            );
+            for row in (0..=30).chain([u32::MAX]) {
+                let expected = blocks
+                    .iter()
+                    .position(|block| block.first <= row && block.last >= row);
+                let actual = bounds.containing(row).map(|(_, score)| *score);
+                assert_eq!(
+                    actual,
+                    expected.map(|index| f64::from(u32::try_from(index).unwrap_or(u32::MAX)))
+                );
+            }
+        }
     }
 }

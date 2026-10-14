@@ -1149,3 +1149,22 @@ A separate temporary Rust project resolved [xorf 0.13.0](https://github.com/ayaz
 | 10000 | unique    |                20000 |             12820 |                                  39 |
 
 For 5,000/10,000 keys this prototype reduced filter bytes by 33–36%, with 0.38–0.49% observed false positives. These native-Rust synthetic membership results are not a WASM timing proof, a projected deployed-manifest size guarantee, or a demonstrated end-to-end latency gain. The existing Bloom format, capacity, readers, canonical R2 objects and product dependencies remain unchanged. Safe corrupt-descriptor handling, actual corpus false-positive acquisition cost, bounded construction, and a single explicit migration must be resolved before changing a persisted filter representation. All prototypes and reports remain outside the public tree.
+
+## Checked compact-filter codec prototype
+
+The temporary BinaryFuse8 prototype now frames its native descriptor and fingerprint buffer with magic, key count and CRC. The first corruption regression exposed an unprotected key-count header; CRC coverage was corrected to include that header as well as the payload. Reads check minimum/maximum frame size, empty-filter framing, CRC, exact descriptor length, nonzero power-of-two segment length, its matching mask, positive segment-aligned count length, checked total fingerprint length and equality with the actual buffer. These geometry checks bound the native reader's three indices before creating its borrowed filter handle. The library's raw descriptor constructor does not provide this validation itself.
+
+Four native release tests passed, including 10,000 arbitrary descriptor mutations with recomputed CRC, empty/single/small/large sets, truncation and corrupt framing. Actual WASM execution in Bun/V8 rejected all 804 truncations of the 500-key frame and eight invalid geometries with valid CRC, processed 10,000 arbitrary descriptors without a runtime trap, preserved all 500 inserted memberships, and remained usable afterward. This is bounded test coverage, not a proof over every possible malformed input or deployed workerd evidence.
+
+A fair local WASM comparison calls the existing batched Bloom reader and the compact batched reader with the same 10,000 absent string probes. Both parse the input JSON, hash the strings and encode selected values; the compact reader validates framing/CRC once per batch. Ten warmup pairs precede one hundred alternating measured pairs. Frame bytes include the compact codec's sixteen-byte envelope, in addition to the native descriptor/fingerprints.
+
+|  Keys | Prefix    | Bloom bytes | Compact frame bytes | Bloom p50 ms | Compact p50 ms | Bloom p95 ms | Compact p95 ms |
+| ----: | :-------- | ----------: | ------------------: | -----------: | -------------: | -----------: | -------------: |
+|   500 | document- |        1000 |                 804 |       1.4170 |         1.1031 |       1.6644 |         1.3432 |
+|   500 | unique    |        1000 |                 804 |       1.3601 |         1.0418 |       2.0437 |         1.5314 |
+|  5000 | document- |       10000 |                6692 |       1.4644 |         1.1504 |       1.8143 |         1.2981 |
+|  5000 | unique    |       10000 |                6692 |       1.3765 |         1.0549 |       2.3328 |         1.4652 |
+| 10000 | document- |       20000 |               12836 |       1.4264 |         1.1330 |       1.5343 |         1.1926 |
+| 10000 | unique    |       20000 |               12836 |       1.3687 |         1.0672 |       2.3999 |         1.7878 |
+
+The prototype improved local batched-query medians by 20–24% and retained the previously observed false-positive tradeoff. No inserted membership was lost. The product's Bloom implementation, dependencies, root format, readers and deployed data remain unchanged. The codec and all scratch tests/builds remain outside the tracked tree. A product adoption still requires a bounded constructor, batched multi-filter reader validation, an explicit one-step migration of canonical roots and pinned rebuild snapshots, native corpus acquisition-cost comparison, and independent live performance evidence. A smaller/faster synthetic membership filter does not by itself establish faster full search.

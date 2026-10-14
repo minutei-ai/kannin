@@ -13,11 +13,11 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Concurrency | p50 ms |  p95 ms | Requests/s |
 | ----------: | -----: | ------: | ---------: |
-|           1 | 101.04 | 1183.56 |       3.67 |
-|           4 |  95.41 |  764.86 |      16.61 |
-|          16 | 149.87 |  877.11 |      25.76 |
+|           1 | 113.07 |  659.43 |       5.01 |
+|           4 | 122.76 |  981.85 |      11.39 |
+|          16 | 272.29 | 1518.85 |      17.40 |
 
-Runtime `7f6d00c`; latest 32-request phase measurements after restoring native Workers Cache for `Terms`. All 96 edge responses matched strong rows and scores. Disabling that tier regressed new-selector diagnostics and was rejected; the restored observations took **0.77–2.22 s**. Reusable overviews preserve exact filter minima and validate discarded attributes. Cache/isolate/network state limits attribution, and mixed-load tails remain variable. An earlier snapshot freshness failure remains recorded; later passing runs do not establish general first-use reliability or Turbopuffer parity.
+Runtime `5291fda`; latest complete 32-request phase measurements after reverting the binary overview experiment. All 96 edge responses matched strong rows and scores. The binary prototype halved local projection CPU but regressed native fresh-selector observations, so the validated JSON source format remains active. Restored selector/filter observations took **0.85–1.54 s**. Native cache/isolate/network variation and mixed-load tail regressions limit attribution. First-use reliability, peak memory and general Turbopuffer parity remain unverified.
 
 The local million-document workload measured strong common/filtered p50 of **127/126 ms** across 2,000 uncompacted segments. These emulator results exclude native network latency. Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10** across 300 queries. Eight native vector/hybrid fixture cases also retained exact rows and scores.
 

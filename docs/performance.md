@@ -698,3 +698,32 @@ Three mixed loads completed, each with 32 requests per concurrency phase and exa
 | Enabled restored |          16 | 149.87 |  877.11 |      25.76 |
 
 The restored concurrency-sixteen median and throughput improved, but concurrency-one and four throughput regressed. The README reports the latest restored run. The experiment did not produce a consistent whole-workload benefit, so no application change was retained. Native first-use reliability, peak memory and fully indexed Turbopuffer parity remain open.
+
+## Rejected binary overview dictionary
+
+Experimental runtime `476a2e1` encoded cached dictionaries as ordered UTF-8 keys and little-endian frequency/bound integers, retaining group JSON. It removed term-key allocations during unrequested entry traversal and validated magic, counts, lengths, ordering, UTF-8, summary ranges and CRC. Its private namespace was v3; canonical R2 formats and projected catalog JSON did not change. The full gate passed 116 Worker/tooling and 18 Rust tests, including malformed payloads with recomputed CRC. Runtime `5291fda` reverted the experiment after native regressions; final deployment uses the previous v2 JSON sources, with no v3 compatibility reads.
+
+Alternating local old/new WASM comparisons used 5,000 documents, 50 warmup pairs and 100 measured pairs. Every projected catalog/minimum matched the prior implementation. On the initial fixture, no/one/two-filter projection p50 changed from 2.977/3.078/3.109 ms to 1.366/1.475/1.493 ms; compressed source size changed from 19,615 to 19,660 bytes. On the actual benchmark text/attributes, p50 changed from 5.574/5.772/5.778 ms to 2.432/2.607/2.680 ms; bytes changed from 17,647 to 18,000. These demonstrate an operation-level CPU gain, not native-query acceleration or a payload-size gain.
+
+Native fresh-selector/always-true-year diagnostics used the unchanged million-document corpus. Every response matched strong rows/scores and saved prior-version results. The experimental v3 source namespace began without the existing v2 entries; process, regional and immutable caches were otherwise uncontrolled.
+
+| Query     | JSON before ms | Binary first ms | Binary repeat ms | JSON restored ms |
+| --------- | -------------: | --------------: | ---------------: | ---------------: |
+| Selective |         925.85 |         4818.99 |          2902.12 |          1535.61 |
+| Common    |         875.66 |         4239.73 |          1779.59 |          1538.34 |
+| Filtered  |         712.94 |         2532.65 |          2008.63 |           848.01 |
+
+Both binary rounds regressed all cases against the preceding JSON run. All restored observations improved against both binary rounds, although they remained slower than the initial baseline. Cache reset and network/isolate variation prevent a clean causal attribution. The measurements provided no sufficient native benefit to retain the new format.
+
+A 96-response load completed for each experimental and restored runtime, preserving exact strong rows/scores and sequence barriers.
+
+| Configuration | Concurrency | p50 ms |  p95 ms | Requests/s |
+| ------------- | ----------: | -----: | ------: | ---------: |
+| Binary        |           1 |  65.84 |  424.26 |       7.83 |
+| Binary        |           4 | 110.36 |  893.60 |      12.63 |
+| Binary        |          16 | 132.00 | 1742.91 |      18.28 |
+| JSON restored |           1 | 113.07 |  659.43 |       5.01 |
+| JSON restored |           4 | 122.76 |  981.85 |      11.39 |
+| JSON restored |          16 | 272.29 | 1518.85 |      17.40 |
+
+The restored mixed load still regressed medians/throughput; reverting the experiment does not prove resolution of the wider workload variability. The README reports the latest restored run. The restoration passed the full 134-test gate and deployment completed. Native cold reliability, peak memory and fully indexed Turbopuffer parity remain open.

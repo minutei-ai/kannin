@@ -946,3 +946,37 @@ The unchanged million-document corpus completed four 96-response native loads: o
 | Original restored |          16 | 129.12 | 1247.37 |      16.59 |
 
 Both experimental loads regressed throughput in every phase against the original run; the first concurrency-one server trace spent 955 ms in the rank phase, which also includes acquisition and is not a pure decode timer. Restored throughput improved against both experimental runs in every phase, although it remained below the original reference. Cache/isolate/network conditions were uncontrolled, so this does not independently prove the small Rust change caused the full regression. The native evidence did not justify retaining it. The original decoder source and deployment were restored, preserving the prior candidate-buffer and block-bound optimizations. The README reports the restored measurement; no application change from this experiment remains.
+
+## Rejected exact declared Rust page output buffer
+
+An uncommitted experiment replaced miniz_oxide's dynamically doubling Vec decompressor with its native fixed-slice API. It was rejected after mixed native observations and the previous decoder restored. Pages already declare a decoded length; that value is checked against the same sixteen-MiB ceiling before allocating the output. The API retains zlib Adler-32 validation (`ignore_adler32=false`), and the reader still checks actual output length and CRC. No compressed or decoded wire format changes. Native tests include empty pages, declared shorter/longer/over-budget lengths, incorrect CRC/Adler and truncated streams.
+
+The integrated gate passed 117 Worker/tooling and 21 Rust tests; 1,296 differential WASM query pairs preserved exact rows and scores. A first alternating benchmark overlapped other checks and had noisy tails; the reported isolated repeat used five warmup pairs and sixty measured pairs per fixture. It times Ranker.add calls, including input transfer, decompression, decoding and list/header validation; acquisition and finish are excluded.
+
+| Documents | Density | Blocks | Before p50 ms | After p50 ms | Before p95 ms | After p95 ms |
+| --------: | ------: | -----: | ------------: | -----------: | ------------: | -----------: |
+|       500 |       1 |     12 |         0.316 |        0.295 |         0.483 |        0.473 |
+|       500 |      12 |     12 |         0.463 |        0.406 |         0.493 |        0.438 |
+|     10000 |       1 |    237 |         5.619 |        5.215 |         6.528 |        6.113 |
+|     10000 |      12 |    237 |         9.383 |        8.180 |        11.149 |        9.980 |
+
+The isolated local p50 gain was 7–13%, with improved p95 in all four fixtures. This is a local operation measurement, not a Cloudflare whole-query guarantee or measured peak-memory proof.
+
+The unchanged million-document corpus completed four 96-response native loads: before, experimental first, experimental repeat and restored repeat. All 384 completed edge responses matched strong rows/scores and sequence barriers. The first restored load aborted with HTTP 503 (`Snapshot freshness budget exceeded`, gateway 1,066 ms) and produced no complete report; it is not counted as passing.
+
+| Configuration           | Concurrency | p50 ms |  p95 ms | Requests/s |
+| ----------------------- | ----------: | -----: | ------: | ---------: |
+| Before                  |           1 |  96.19 |  586.63 |       5.68 |
+| Before                  |           4 |  75.85 |  684.29 |      19.91 |
+| Before                  |          16 |  95.82 |  727.70 |      20.35 |
+| Fixed buffer first      |           1 | 140.76 | 1200.45 |       2.85 |
+| Fixed buffer first      |           4 | 115.92 | 1436.66 |      10.45 |
+| Fixed buffer first      |          16 | 584.44 | 1545.53 |      18.39 |
+| Fixed buffer repeated   |           1 |  80.04 |  263.47 |       8.23 |
+| Fixed buffer repeated   |           4 |  90.25 |  955.25 |      10.92 |
+| Fixed buffer repeated   |          16 | 393.43 | 1247.39 |      17.71 |
+| Dynamic restored repeat |           1 |  68.30 |  511.32 |       5.65 |
+| Dynamic restored repeat |           4 | 126.15 |  810.40 |      12.96 |
+| Dynamic restored repeat |          16 | 112.45 | 1242.01 |      22.16 |
+
+The fixed-buffer repeat improved the public-concurrency-one phase, but regressed concurrency-four/sixteen against the reference. Restoring the previous decoder improved concurrency-four/sixteen throughput against both experimental runs, while restored concurrency-one remained mixed. Cache/isolate/network placement was uncontrolled, so these are not isolated native CPU measurements. They provided insufficient whole-workload evidence to retain the change. The algorithm and deployment were restored; the new page-integrity regression was retained and the restored full gate passed all 138 tests. Snapshot first-use reliability and a native kernel comparison isolated from R2/cache acquisition remain open.

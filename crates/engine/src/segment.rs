@@ -1933,3 +1933,38 @@ mod candidate_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod page_buffer_tests {
+    use super::{MAX_BYTES, append, decode_page};
+
+    #[test]
+    fn declared_output_length_and_integrity_remain_strict() -> Result<(), Box<dyn std::error::Error>>
+    {
+        for data in [Vec::new(), vec![7; 1], vec![11; 65_537]] {
+            let mut payload = Vec::new();
+            append(&mut payload, &data)?;
+            assert_eq!(decode_page(&payload)?, data);
+            let mut wrong_crc = payload.clone();
+            wrong_crc[4] ^= 1;
+            assert!(decode_page(&wrong_crc).is_err());
+            for length in [0, 1, 65_536, 65_538, MAX_BYTES + 1] {
+                if length == data.len() {
+                    continue;
+                }
+                let mut corrupt = payload.clone();
+                corrupt[..4].copy_from_slice(&u32::try_from(length)?.to_le_bytes());
+                assert!(decode_page(&corrupt).is_err());
+            }
+            for removed in 1..=5 {
+                assert!(decode_page(&payload[..payload.len() - removed]).is_err());
+            }
+            let mut bad_adler = payload.clone();
+            if let Some(last) = bad_adler.last_mut() {
+                *last ^= 1;
+            }
+            assert!(decode_page(&bad_adler).is_err());
+        }
+        Ok(())
+    }
+}

@@ -231,3 +231,19 @@ Runtime `2ffcafc` deployed successfully. The native post-change run completed th
 The native run became slower in most cases despite fewer document reads and lower local adapter cost. Provider/network variation and deployment/cache state are uncontrolled. These results establish correct native behavior, not a native latency win. Post-change index interval medians were 115–131 ms; reconciliation/document medians were zero in the native I/O clock, which does not isolate CPU. Gateway medians added about 127 ms beyond the coordinator in unfiltered vector cases.
 
 Moving this existing coordinator to Brazil is not an available documented placement operation: Cloudflare's current [data-location contract](https://developers.cloudflare.com/durable-objects/reference/data-location/) says existing objects do not relocate and `sam` hints currently instantiate in Eastern North America. The R2-first durability and strong-read contracts remain unchanged; no namespace replacement or weakened consistency was used to create an artificial latency gain. These platform constraints and the unclassified historical 503 keep the overall performance objective open.
+
+## Bounded vector candidate windows
+
+Previously, vector top-1 materialized one page but still located every one of up to fifty provider candidates. Reconciliation now advances through ordered windows, sized to the remaining top-k with a minimum of four. It stops only after enough live eligible matches are found or the complete provider list is exhausted. All provider metadata is decoded first; epoch/revision/vector-presence and residual filters still apply before top-k.
+
+A native workerd regression with twenty vectors in twenty immutable segments first read 21 ranges after directory-memory eviction and now reads five. A separate regression advances through stale revisions and non-indexed residual predicates, returning the same three live candidates before and after compaction.
+
+A controlled local experiment used fifty vectors in fifty segments and the real native workerd/R2/DO path with a deterministic ANN fixture. Each query explicitly discards the process's immutable caches; Cache API remains warm. Five warmups precede twenty measured requests for each top-k. The baseline bundle was compiled from the preceding public commit `e65f983` with the same resolved dependencies and unchanged WASM engine, outside the tracked repository. Every before/after row and score agreed.
+
+| Top-k | Before p50 / p95 ms | After p50 / p95 ms | Before / after range reads |
+| ----- | ------------------- | ------------------ | -------------------------- |
+| 1     | 63.67 / 70.40       | 10.51 / 12.40      | 51 / 5                     |
+| 10    | 74.15 / 88.78       | 28.21 / 32.60      | 60 / 20                    |
+| 50    | 112.41 / 124.60     | 115.69 / 132.44    | 100 / 100                  |
+
+The full top-50 requires all candidate locations and pages; its timing regressed modestly in this run. These measurements isolate process-cache eviction in the local adapter, not a fully cold Cloudflare ANN service. Large native corpus throughput and consistent latency still require proof.

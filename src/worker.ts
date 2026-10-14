@@ -584,35 +584,45 @@ async function vectorQuery(
     match,
     metadata: Schema.decodeUnknownSync(candidate)(match.metadata),
   }));
-  const current = await locate(
-    metadata.map((item) => item.metadata.id),
-    root,
-  );
-  const eligible = await Effect.runPromise(
-    Effect.forEach(
-      metadata,
-      (item) =>
-        Effect.gen(function* () {
-          const location = current.get(item.metadata.id);
-          if (
-            location === undefined ||
-            location.document.revision !== item.metadata.revision ||
-            !location.document.vector
-          )
-            return Option.none();
-          const expected = yield* Effect.tryPromise(() =>
-            vectorId(root.vectorEpoch, item.metadata.id, item.metadata.revision),
-          );
-          if (item.match.id !== expected) return Option.none();
-          const attributes = yield* Schema.encodeEffect(Schema.fromJsonString(Attributes))(
-            location.document.attributes,
-          );
-          if (!segment_filter(attributes, encodedFilters)) return Option.none();
-          return Option.some({ location, score: item.match.score });
-        }),
-      { concurrency: 4 },
-    ).pipe(Effect.map(EffectArray.getSomes)),
-  );
+  const eligible = [];
+  const cursor = { offset: 0 };
+  while (cursor.offset < metadata.length && eligible.length < input.topK) {
+    const window = metadata.slice(
+      cursor.offset,
+      cursor.offset + Math.max(4, input.topK - eligible.length),
+    );
+    cursor.offset += window.length;
+    const current = await locate(
+      window.map((item) => item.metadata.id),
+      root,
+    );
+    const validated = await Effect.runPromise(
+      Effect.forEach(
+        window,
+        (item) =>
+          Effect.gen(function* () {
+            const location = current.get(item.metadata.id);
+            if (
+              location === undefined ||
+              location.document.revision !== item.metadata.revision ||
+              !location.document.vector
+            )
+              return Option.none();
+            const expected = yield* Effect.tryPromise(() =>
+              vectorId(root.vectorEpoch, item.metadata.id, item.metadata.revision),
+            );
+            if (item.match.id !== expected) return Option.none();
+            const attributes = yield* Schema.encodeEffect(Schema.fromJsonString(Attributes))(
+              location.document.attributes,
+            );
+            if (!segment_filter(attributes, encodedFilters)) return Option.none();
+            return Option.some({ location, score: item.match.score });
+          }),
+        { concurrency: 4 },
+      ).pipe(Effect.map(EffectArray.getSomes)),
+    );
+    eligible.push(...validated);
+  }
   const reconciled = Effect.runSync(Clock.currentTimeNanos);
   timings.append("server-timing", `vector_reconcile;dur=${Number(reconciled - indexEnded) / 1e6}`);
   const rows = await Effect.runPromise(

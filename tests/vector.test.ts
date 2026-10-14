@@ -481,3 +481,68 @@ test("vector top-k materializes only the requested live document pages", async (
   );
   expect(after.rangeReads - before.rangeReads).toBe(1);
 });
+
+test("small vector top-k avoids locating every candidate segment", async () => {
+  const namespace = "vector-scattered";
+  for (const index of Array.from({ length: 20 }, (_, ordinal) => ordinal))
+    await request(worker, namespace, "write", {
+      requestId: `page-${index}`,
+      upserts: [
+        { id: String(index).padStart(4, "0"), text: "lexical", attributes: {}, vector: vector(1) },
+      ],
+      deletes: [],
+    });
+  await request(worker, namespace, "vector-sync", {});
+  await request(worker, namespace, "vector-sync", {});
+  await request(worker, namespace, "rebuild", {});
+  const before = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  const result = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", { ...vectorQuery(), topK: 1 })).json(),
+  );
+  expect(result.rows.map((row) => row.id)).toEqual(["0000"]);
+  const after = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(after.rangeReads - before.rangeReads).toBe(5);
+});
+
+test("candidate windows continue through stale revisions and residual filters before top-k", async () => {
+  const namespace = "vector-window-residual";
+  await request(worker, namespace, "write", {
+    requestId: "seed",
+    upserts: Array.from({ length: 20 }, (_, index) => ({
+      id: String(index).padStart(4, "0"),
+      text: "lexical",
+      attributes: { eligible: index >= 12 },
+      vector: vector(1),
+    })),
+    deletes: [],
+  });
+  await request(worker, namespace, "vector-sync", {});
+  await request(worker, namespace, "write", {
+    requestId: "retire",
+    upserts: Array.from({ length: 8 }, (_, index) => ({
+      id: String(index).padStart(4, "0"),
+      text: "replacement",
+      attributes: { eligible: true },
+    })),
+    deletes: [],
+  });
+  const input = {
+    ...vectorQuery(),
+    topK: 3,
+    filters: [{ field: "eligible", op: "eq", value: true }],
+  };
+  const found = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", input)).json(),
+  );
+  expect(found.rows.map((row) => row.id)).toEqual(["0012", "0013", "0014"]);
+  expect(found.rows.every((row) => row.revision === 1)).toBe(true);
+  await request(worker, namespace, "compact", {});
+  const compacted = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", input)).json(),
+  );
+  expect(compacted.rows).toEqual(found.rows);
+});

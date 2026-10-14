@@ -100,6 +100,11 @@ test("overview projection validates unrequested values and rejects malformed roo
   for (const json of [
     '{"dictionary":{"unused":{"df":"bad","bounds":[]}},"minimum":null}',
     '{"dictionary":{"unused":{"df":1,"bounds":[[0,1,0,-1]]}},"minimum":null}',
+    '{"dictionary":{"unused":{"df":1,"bounds":[[0,1,0]]}},"minimum":null}',
+    '{"dictionary":{"unused":{"df":1,"bounds":[[0,1,0,1,0]]}},"minimum":null}',
+    '{"dictionary":{"unused":{"df":1,"bounds":[[0,1,0,4294967296]]}},"minimum":null}',
+    '{"dictionary":{"unused":{"df":1}},"minimum":null}',
+    '{"dictionary":{"unused":{"df":1,"bounds":[],"bounds":[]}},"minimum":null}',
     '{"dictionary":{},"dictionary":{},"minimum":null}',
     '{"dictionary":{},"minimum":null,"minimum":null}',
     '{"dictionary":{},"minimum":null,"unknown":true}',

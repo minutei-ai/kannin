@@ -1018,6 +1018,33 @@ pub mod wasm {
         requested: &'a BTreeSet<String>,
     }
 
+    struct DiscardedBounds;
+
+    impl<'de> serde::de::Visitor<'de> for DiscardedBounds {
+        type Value = ();
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an array of four unsigned integer bounds")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut sequence: A) -> Result<(), A::Error> {
+            while sequence.next_element::<(u32, u32, u32, u32)>()?.is_some() {}
+            Ok(())
+        }
+    }
+
+    fn discard_bounds<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_seq(DiscardedBounds)
+    }
+
+    #[derive(Deserialize)]
+    struct DiscardedSummary {
+        #[serde(rename = "df")]
+        _df: u32,
+        #[serde(rename = "bounds", deserialize_with = "discard_bounds")]
+        _bounds: (),
+    }
+
     impl<'de> serde::de::DeserializeSeed<'de> for SelectedTerms<'_> {
         type Value = BTreeMap<String, TermSummary>;
 
@@ -1042,9 +1069,11 @@ pub mod wasm {
         ) -> Result<Self::Value, A::Error> {
             let mut selected = BTreeMap::new();
             while let Some(term) = map.next_key::<String>()? {
-                let summary = map.next_value::<TermSummary>()?;
                 if self.requested.contains(&term) {
+                    let summary = map.next_value::<TermSummary>()?;
                     selected.insert(term, summary);
+                } else {
+                    map.next_value::<DiscardedSummary>()?;
                 }
             }
             Ok(selected)

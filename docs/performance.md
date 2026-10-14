@@ -813,3 +813,60 @@ Both eight-read runs improved the public-concurrency-sixteen median and throughp
 | Filtered  |           1070.43 |           520.20 |
 
 All six diagnostic responses matched strong rows/scores. Directory time changed from 1,058/388/632 ms to 743/504/285 ms; the common-query regression and snapshot variation limit attribution. Deployment completed before both after measurements.
+
+## Partial immutable catalog reuse
+
+The catalog reader previously abandoned the memory-hit scan at the first miss and fetched every range in a partially cached batch. It now retains all immutable hits, fetches only missing ranges, and merges the response by original position before global live frequency aggregation. Held query-local catalogs survive LRU eviction by concurrent batch admission. Physical bucket, immutable object/header, terms and filter identity remain unchanged. Native response/count validation and the bounded batch/concurrency budgets remain in force.
+
+A workerd regression prepares 15 immutable single-document segments and queries them, then adds the sixteenth segment. The old binary requested all 16 catalogs; the new reader requests one and reports 15 memory hits. This is a 93.75% reduction in requested catalog projections for that incremental-write case, not a whole-query latency claim. The test also checks the new global score, then replaces a document and deletes another, checking exact live IDs and an independent BM25 score. It failed on the old reader (`expected 1, received 16`) and passed with the change. The full gate passed 117 Worker/tooling and 19 Rust tests.
+
+Native deployment completed and the unchanged million-document read-only corpus passed two complete 96-response loads, one before and one after. Every edge response matched strong rows/scores and the sequence barrier. This workload does not write between queries and therefore does not isolate the incremental-write benefit. Isolate/cache/network placement was uncontrolled.
+
+| Runtime | Concurrency | p50 ms |  p95 ms | Requests/s |
+| ------- | ----------: | -----: | ------: | ---------: |
+| before  |           1 |  69.19 |  318.07 |       8.53 |
+| before  |           4 |  85.07 |  716.51 |      14.78 |
+| before  |          16 | 157.21 | 1147.17 |      24.55 |
+| after   |           1 |  72.64 |  569.17 |       5.94 |
+| after   |           4 |  72.63 |  946.23 |      19.54 |
+| after   |          16 | 140.51 | 1018.69 |      21.28 |
+
+The after run improved concurrency-four throughput and concurrency-sixteen median/p95, while concurrency-one and sixteen throughput regressed. Native whole-query effects remain mixed. The retained change removes reproducible unnecessary immutable catalog projections after writes; no general latency or Turbopuffer parity claim follows from it.
+
+## Reused Rust candidate buffers and early exclusion
+
+The Rust ranker reuses one posting-selection vector per finish operation instead of allocating a BTreeMap for every candidate. Phrase token positions are mapped once into the sorted term slots, preserving repeated terms and field-specific positional matching. Query terms are sorted/deduplicated in their small vector instead of an intermediate BTreeSet. Rows excluded by filters or tombstones advance their posting cursors without calculating a score. Term accumulation order, live global statistics, exact block-bound guards and deterministic ties remain unchanged; canonical R2 formats and cache identities do not change.
+
+The integrated full gate passed 117 Worker/tooling and 20 Rust tests. A new native regression checks repeated-token phrase order and excluded candidate state. A deterministic differential test compared 1,296 old/new WASM query pairs on 256 varied documents: Unicode normalization, eight filter selections, empty/absent terms, repeated phrases, top-k 1/10/100, and tombstones with recomputed live statistics. Every serialized row, ID and score matched exactly.
+
+Alternating local WASM measurements use ten warmup pairs and 100 measured pairs per case, timing Ranker.finish only. Directory/ranker acquisition and posting decompression are excluded. Both binaries rank identical segments with top-k ten, four tombstones and an optional group equality filter.
+
+| Documents | Match  | Filter | Before p50 ms | After p50 ms |
+| --------: | ------ | ------ | ------------: | -----------: |
+|       500 | any    | False  |         0.389 |        0.309 |
+|       500 | any    | True   |         0.347 |        0.187 |
+|       500 | all    | False  |         0.204 |        0.178 |
+|       500 | all    | True   |         0.170 |        0.096 |
+|       500 | phrase | False  |         0.162 |        0.083 |
+|       500 | phrase | True   |         0.081 |        0.018 |
+|     10000 | any    | False  |         4.586 |        4.043 |
+|     10000 | any    | True   |         4.250 |        2.927 |
+|     10000 | all    | False  |         4.718 |        4.183 |
+|     10000 | all    | True   |         4.262 |        2.922 |
+|     10000 | phrase | False  |         2.548 |        1.330 |
+|     10000 | phrase | True   |         1.313 |        0.267 |
+
+These local kernel gains do not establish whole-query or Turbopuffer parity. An initial copy-only full gate was blocked by sandbox EPERM while Miniflare opened its local server; after workspace restrictions were lifted, the integrated full gate completed successfully.
+
+Native deployment completed on the unchanged million-document corpus. The first post-deploy edge load aborted with HTTP 503 (`Snapshot freshness budget exceeded`, gateway 1,336 ms); it produced no complete report and is not counted as a passing load. The pre-deploy reference and a subsequent post-deploy repetition each completed 96 responses, preserving exact strong rows/scores and sequence barriers. The failed attempt remains evidence that first-use snapshot reliability is unresolved.
+
+| Runtime        | Concurrency | p50 ms |  p95 ms | Requests/s |
+| -------------- | ----------: | -----: | ------: | ---------: |
+| Before         |           1 |  75.79 |  717.15 |       4.47 |
+| Before         |           4 |  91.77 |  958.00 |      12.51 |
+| Before         |          16 | 461.53 | 1745.21 |      18.28 |
+| After repeated |           1 |  67.66 |  267.92 |       8.17 |
+| After repeated |           4 |  77.70 |  845.48 |      15.54 |
+| After repeated |          16 | 141.35 | 1195.39 |      19.38 |
+
+The completed repeat improved median, p95 and throughput in all three phases against this reference; uncontrolled isolate/cache/network conditions prevent attributing that whole-query difference solely to Rust. Local alternating binary measurements support a kernel gain of 11–46% for any/all and 48–80% for these phrase fixtures. The change does not fix snapshot acquisition failures or prove Turbopuffer parity.

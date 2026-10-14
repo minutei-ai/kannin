@@ -153,6 +153,42 @@ test("term projection batches preserve global frequencies and filter eligibility
   expect(after.termReads - acquired.termReads).toBe(129);
 });
 
+test("incremental writes retain partial immutable term catalogs and recompute live scores", async () => {
+  const namespace = "partial-catalogs";
+  for (const index of Array.from({ length: 15 }, (_, ordinal) => ordinal))
+    await request(
+      worker,
+      namespace,
+      "write",
+      write([document(String(index).padStart(3, "0"), "shared")]),
+    );
+  const first = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", textQuery("shared"))).json(),
+  );
+  await request(worker, namespace, "write", write([document("015", "shared")]));
+  const before = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  const second = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", textQuery("shared"))).json(),
+  );
+  const after = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(after.termReads - before.termReads).toBe(1);
+  expect(after.termMemoryHits - before.termMemoryHits).toBe(15);
+  expect(second.rows.map((row) => row.id)).toEqual(first.rows.map((row) => row.id));
+  for (const row of second.rows) expect(row.score).toBeCloseTo(Math.log1p(0.5 / 16.5), 12);
+  await request(worker, namespace, "write", write([document("001", "other")], ["000"]));
+  const changed = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", textQuery("shared"))).json(),
+  );
+  expect(changed.rows.map((row) => row.id)).toEqual(
+    Array.from({ length: 10 }, (_, index) => String(index + 2).padStart(3, "0")),
+  );
+  for (const row of changed.rows) expect(row.score).toBeCloseTo(Math.log1p(1.5 / 14.5), 12);
+});
+
 test("compressed overviews serve new selectors and filters after process eviction", async () => {
   const namespace = "overview-selectors";
   for (const index of Array.from({ length: 17 }, (_, ordinal) => ordinal))

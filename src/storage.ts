@@ -323,25 +323,28 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
         (window) =>
           Effect.gen(function* () {
             const hits = [];
-            for (const input of window) {
+            for (const [index, input] of window.entries()) {
               const identity = `${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}/${terms}\0${filters}`;
               const entry = termCatalogs.get(identity);
-              if (entry === undefined) break;
-              hits.push({ identity, entry });
+              if (entry === undefined) continue;
+              hits.push({ index, identity, entry });
             }
-            if (hits.length === window.length) {
-              reads.termMemoryHits += hits.length;
-              for (const hit of hits) {
-                termCatalogs.delete(hit.identity);
-                termCatalogs.set(hit.identity, hit.entry);
-              }
-              return hits.map((hit) => hit.entry.catalog);
+            reads.termMemoryHits += hits.length;
+            for (const hit of hits) {
+              termCatalogs.delete(hit.identity);
+              termCatalogs.set(hit.identity, hit.entry);
             }
+            if (hits.length === window.length) return hits.map((hit) => hit.entry.catalog);
+            const selected = new Map(hits.map((hit) => [hit.index, hit.entry.catalog] as const));
+            const missing = Array.from(window.entries()).filter(([index]) => !selected.has(index));
             const props = {
               bucket: env.STORAGE_CACHE_SCOPE,
               terms,
               filters,
-              ranges: window.map((input) => ({ key: input.key, headerBytes: input.headerBytes })),
+              ranges: missing.map(([, input]) => ({
+                key: input.key,
+                headerBytes: input.headerBytes,
+              })),
             };
             const response = yield* Effect.tryPromise({
               try: () => exports.Terms({ props }).fetch("https://terms.internal/catalog-v4"),
@@ -350,12 +353,12 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
                 return new Cause.UnknownError(cause);
               },
             });
-            reads.termReads += window.length;
+            reads.termReads += missing.length;
             reads.termRequests += 1;
             const status = response.headers.get("cf-cache-status");
-            if (status === "HIT") reads.termWorkerCacheHits += window.length;
+            if (status === "HIT") reads.termWorkerCacheHits += missing.length;
             if (status !== "HIT" && response.headers.get("x-raio-cache") === "terms-api-hit")
-              reads.termCacheApiHits += window.length;
+              reads.termCacheApiHits += missing.length;
             const text = yield* Effect.tryPromise(() => response.text());
             if (!response.ok)
               return yield* new Rejected({
@@ -365,19 +368,21 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
             const catalogs = yield* Schema.decodeEffect(Schema.fromJsonString(TermCatalogBatch))(
               text,
             );
-            if (catalogs.length !== window.length)
+            if (catalogs.length !== missing.length)
               return yield* new Rejected({
                 status: 503,
                 message: "Term projection batch omitted a segment",
               });
             reads.termBytes += new TextEncoder().encode(text).byteLength;
             for (const [index, catalog] of catalogs.entries()) {
-              const input = window[index];
-              if (input === undefined)
+              const entry = missing[index];
+              if (entry === undefined)
                 return yield* new Rejected({
                   status: 503,
                   message: "Term projection batch added a segment",
                 });
+              const [position, input] = entry;
+              selected.set(position, catalog);
               const identity = `${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}/${terms}\0${filters}`;
               const encoded = yield* Schema.encodeEffect(Schema.fromJsonString(TermCatalog))(
                 catalog,
@@ -399,7 +404,14 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
               termCatalogs.set(identity, { catalog, bytes });
               termBudget.bytes += bytes;
             }
-            return catalogs;
+            return yield* Effect.forEach(window, (_, index) => {
+              const catalog = selected.get(index);
+              if (catalog === undefined)
+                return Effect.fail(
+                  new Rejected({ status: 503, message: "Term projection omitted a segment" }),
+                );
+              return Effect.succeed(catalog);
+            });
           }),
         { concurrency: 8 },
       );

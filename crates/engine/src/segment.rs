@@ -710,15 +710,15 @@ impl Search {
         Ok(())
     }
 
-    fn phrase(postings: &[Option<&Posting>]) -> bool {
-        let Some(first) = postings.first().copied().flatten() else {
+    fn phrase(postings: &[Option<&Posting>], order: &[usize]) -> bool {
+        let Some(first) = order.first().and_then(|index| postings[*index]) else {
             return false;
         };
         for title in [true, false] {
             let starts = if title { &first.title } else { &first.body };
             for start in starts {
-                if postings.iter().enumerate().all(|(offset, p)| {
-                    p.is_some_and(|p| {
+                if order.iter().enumerate().all(|(offset, index)| {
+                    postings[*index].is_some_and(|p| {
                         let positions = if title { &p.title } else { &p.body };
                         u32::try_from(offset)
                             .ok()
@@ -775,12 +775,9 @@ impl Search {
 
     #[doc = "# Errors\nRejects posting frequencies that cannot fit the wire format."]
     pub fn finish(&self) -> Result<Vec<Hit>, String> {
-        let terms: Vec<_> = self
-            .words
-            .iter()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
+        let mut terms: Vec<_> = self.words.iter().collect();
+        terms.sort_unstable();
+        terms.dedup();
         let lists: Vec<_> = terms
             .iter()
             .map(|term| {
@@ -805,6 +802,15 @@ impl Search {
                 )
             })
             .collect();
+        let phrase_order: Vec<_> = if self.mode == "phrase" {
+            self.words
+                .iter()
+                .map(|word| terms.partition_point(|term| *term < word))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut selected = vec![None; lists.len()];
         let mut cursors = vec![0usize; lists.len()];
         let mut heap: BinaryHeap<Hit> = BinaryHeap::new();
         while let Some(row) = lists
@@ -824,7 +830,17 @@ impl Search {
                 }
                 continue;
             }
-            let mut selected = BTreeMap::new();
+            if !self.allowed[row as usize] {
+                for (index, list) in lists.iter().enumerate() {
+                    cursors[index] += usize::from(
+                        list.get(cursors[index])
+                            .is_some_and(|posting| posting.row == row),
+                    );
+                }
+                continue;
+            }
+            selected.fill(None);
+            let mut matched = 0;
             let mut score = 0.0;
             for (index, list) in lists.iter().enumerate() {
                 if let Some(posting) = list.get(cursors[index]).filter(|p| p.row == row) {
@@ -835,23 +851,15 @@ impl Search {
                         meta.title_length,
                         meta.body_length,
                     );
-                    selected.insert(terms[index].as_str(), posting);
+                    selected[index] = Some(posting);
+                    matched += 1;
                     cursors[index] += 1;
                 }
             }
-            if !self.allowed[row as usize] || (self.mode != "any" && selected.len() != terms.len())
-            {
+            if self.mode != "any" && matched != terms.len() {
                 continue;
             }
-            if self.mode == "phrase"
-                && !Self::phrase(
-                    &self
-                        .words
-                        .iter()
-                        .map(|word| selected.get(word.as_str()).copied())
-                        .collect::<Vec<_>>(),
-                )
-            {
+            if self.mode == "phrase" && !Self::phrase(&selected, &phrase_order) {
                 continue;
             }
             if score <= 0.0 {
@@ -1846,5 +1854,63 @@ mod scoring_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod candidate_tests {
+    use super::{Document, Search, Statistics, build};
+    use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::rc::Rc;
+
+    #[test]
+    fn reusable_candidates_preserve_phrase_order_and_exclusions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let documents: Vec<Document> = serde_json::from_value(json!([
+            {"id":"a","text":"beta alpha beta","attributes":{}},
+            {"id":"b","text":"alpha beta alpha","attributes":{}},
+            {"id":"c","text":"alpha beta","attributes":{}},
+            {"id":"d","text":"beta beta alpha","attributes":{}}
+        ]))?;
+        let built = build(documents)?;
+        let base = 16 + serde_json::to_vec(&built.header)?.len();
+        let header = Rc::new(built.header);
+        for (text, dead, expected) in [
+            ("alpha beta alpha", vec![], vec![1]),
+            ("beta alpha beta", vec![], vec![0]),
+            ("alpha alpha", vec![], vec![]),
+            ("alpha beta alpha", vec![1], vec![]),
+        ] {
+            let statistics = Statistics {
+                documents: 4,
+                title_length: 0,
+                body_length: 11,
+                frequencies: BTreeMap::from([("alpha".into(), 4), ("beta".into(), 4)]),
+            };
+            let mut search =
+                Search::new(header.clone(), statistics, text, "phrase", 10, &dead, &[])?;
+            for (term, meta) in &header.terms {
+                if !search.words.contains(term) {
+                    continue;
+                }
+                for block in &meta.blocks {
+                    let start = base + block.data.offset as usize;
+                    search.add(
+                        term,
+                        &built.bytes[start..start + block.data.length as usize],
+                    )?;
+                }
+            }
+            assert_eq!(
+                search
+                    .finish()?
+                    .iter()
+                    .map(|hit| hit.row)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        Ok(())
     }
 }

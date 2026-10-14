@@ -13,11 +13,11 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Concurrency | p50 ms |  p95 ms | Requests/s |
 | ----------: | -----: | ------: | ---------: |
-|           1 | 104.59 | 1014.42 |       3.72 |
-|           4 |  98.03 |  873.32 |      12.34 |
-|          16 | 183.64 |  968.68 |      25.51 |
+|           1 |  67.66 |  267.92 |       8.17 |
+|           4 |  77.70 |  845.48 |      15.54 |
+|          16 | 141.35 | 1195.39 |      19.38 |
 
-Latest complete 32-request phase measurements with eight concurrent 16-segment catalog reads. All 96 edge responses matched strong rows and scores. Both native after runs improved concurrency-sixteen median and throughput; the repeat regressed throughput at concurrency one/four. Preparing BM25 constants once per term reduced local Rust/WASM ranking p50 by **25–45%**, with identical results and scores. First-use reliability, peak memory and general Turbopuffer parity remain unverified.
+Latest complete 32-request phase measurements after Rust candidate-buffer reuse and early filter/tombstone exclusion. All 96 edge responses matched strong rows and scores. A preceding post-deploy attempt failed with a snapshot freshness 503; the successful repeat does not resolve first-use reliability. Local alternating WASM ranking measurements improved p50 by **11–46% for any/all** and **48–80% for phrase fixtures**, preserving exact scores. Partial catalog reuse requests only missing immutable ranges after writes. Peak memory and general Turbopuffer parity remain unverified.
 
 The local million-document workload measured strong common/filtered p50 of **127/126 ms** across 2,000 uncompacted segments. These emulator results exclude native network latency. Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10** across 300 queries. Eight native vector/hybrid fixture cases also retained exact rows and scores.
 

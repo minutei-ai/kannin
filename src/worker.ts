@@ -416,6 +416,16 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
     id: string;
     score: number;
   }> = [];
+  const rankMetrics = {
+    prepare: 0n,
+    acquire: 0n,
+    decode: 0n,
+    score: 0n,
+    spans: 0,
+    blocks: 0,
+    bytes: 0,
+    segments: 0,
+  };
   for (const { segment, dictionary, minimum, bound } of prioritized) {
     if (minimum === null) continue;
     if (Object.keys(dictionary).length === 0) continue;
@@ -445,12 +455,14 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
       filters: input.filters,
       statistics,
     });
+    const prepareStarted = Effect.runSync(Clock.currentTimeNanos);
     const result = await Effect.runPromise(
       withDirectory(segment.key, segment.headerBytes, (decoded) =>
         Effect.acquireUseRelease(
           Effect.sync(() => decoded.ranker(ranking)),
           (ranker) =>
             Effect.gen(function* () {
+              rankMetrics.prepare += (yield* Clock.currentTimeNanos) - prepareStarted;
               const requested = yield* Schema.decodeEffect(Schema.fromJsonString(PostingSpans))(
                 ranker.posting_spans(),
               );
@@ -459,6 +471,7 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
                 (_, index) => index * 4,
               )) {
                 const window = requested.slice(offset, offset + 4);
+                const acquireStarted = yield* Clock.currentTimeNanos;
                 const loaded = yield* Effect.forEach(
                   window,
                   (metadata) =>
@@ -504,6 +517,17 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
                     }),
                   { concurrency: 4 },
                 );
+                const acquired = yield* Clock.currentTimeNanos;
+                rankMetrics.acquire += acquired - acquireStarted;
+                rankMetrics.spans += loaded.length;
+                rankMetrics.bytes += loaded.reduce(
+                  (total, posting) => total + posting.bytes.byteLength,
+                  0,
+                );
+                rankMetrics.blocks += loaded.reduce(
+                  (total, posting) => total + posting.metadata.blocks.length,
+                  0,
+                );
                 for (const posting of loaded)
                   for (const block of posting.metadata.blocks) {
                     const start = block.data.offset - posting.offset;
@@ -512,10 +536,15 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
                       posting.bytes.subarray(start, start + block.data.length),
                     );
                   }
+                rankMetrics.decode += (yield* Clock.currentTimeNanos) - acquired;
               }
-              return yield* Schema.decodeEffect(Schema.fromJsonString(SegmentHits))(
+              const scoreStarted = yield* Clock.currentTimeNanos;
+              const hits = yield* Schema.decodeEffect(Schema.fromJsonString(SegmentHits))(
                 ranker.finish(),
               );
+              rankMetrics.score += (yield* Clock.currentTimeNanos) - scoreStarted;
+              rankMetrics.segments += 1;
+              return hits;
             }),
           (ranker) => Effect.sync(() => ranker.free()),
         ),
@@ -532,6 +561,19 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
   }
   const rankingEnded = Effect.runSync(Clock.currentTimeNanos);
   timings.append("server-timing", `text_rank;dur=${Number(rankingEnded - dictionaryEnded) / 1e6}`);
+  timings.append("server-timing", `text_rank_prepare;dur=${Number(rankMetrics.prepare) / 1e6}`);
+  timings.append(
+    "server-timing",
+    `text_posting_acquire;dur=${Number(rankMetrics.acquire) / 1e6};desc="spans=${rankMetrics.spans} bytes=${rankMetrics.bytes}"`,
+  );
+  timings.append(
+    "server-timing",
+    `text_posting_decode;dur=${Number(rankMetrics.decode) / 1e6};desc="blocks=${rankMetrics.blocks}"`,
+  );
+  timings.append(
+    "server-timing",
+    `text_score;dur=${Number(rankMetrics.score) / 1e6};desc="segments=${rankMetrics.segments}"`,
+  );
   const hits = ranked.slice(0, input.topK);
   const windows = EffectArray.chunksOf(hits, 4).flatMap((window) => {
     const first = window[0];

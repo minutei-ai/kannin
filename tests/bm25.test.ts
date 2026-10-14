@@ -5,6 +5,47 @@ import { document, request, startWorker, textQuery, write } from "./harness";
 
 const worker = await startWorker();
 afterAll(() => worker.dispose());
+
+test("posting timing counts remain request-local across concurrent edge queries", async () => {
+  const namespace = "posting-timing";
+  await request(
+    worker,
+    namespace,
+    "write",
+    write(Array.from({ length: 8 }, (_, index) => document(String(index), "alpha beta"))),
+  );
+  const responses = await Promise.all(
+    Array.from({ length: 12 }, async (_, index) => {
+      const text = "alpha";
+      const terms = { value: 1, text };
+      if (index % 2 === 1) {
+        terms.value = 2;
+        terms.text = "alpha beta";
+      }
+      const response = await request(worker, namespace, "query", {
+        ...textQuery(terms.text),
+        consistency: "edge-eventual",
+        minimumSequence: 1,
+      });
+      expect(response.status).toBe(200);
+      const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+      expect(result.rows.map((row) => row.id)).toEqual(
+        Array.from({ length: 8 }, (_value, row) => String(row)),
+      );
+      const timing = response.headers.get("server-timing");
+      expect(timing).toContain(`desc="spans=${terms.value} bytes=`);
+      expect(timing).toContain(`desc="blocks=${terms.value}"`);
+      expect(timing).toContain('desc="segments=1"');
+      expect(timing).toContain("text_rank_prepare;dur=");
+      expect(timing).toContain("text_posting_acquire;dur=");
+      expect(timing).toContain("text_posting_decode;dur=");
+      expect(timing).toContain("text_score;dur=");
+      return response.status;
+    }),
+  );
+  expect(responses).toHaveLength(12);
+});
+
 async function search(namespace: string, input: ReturnType<typeof textQuery> & { match?: string }) {
   const response = await request(worker, namespace, "query", input);
   expect(response.status).toBe(200);

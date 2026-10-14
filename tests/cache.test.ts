@@ -109,7 +109,7 @@ test("concurrent cold edge queries share immutable range acquisition", async () 
 
 test("term projection batches preserve global frequencies and filter eligibility at their boundary", async () => {
   const namespace = "batch-term-projections";
-  for (const index of Array.from({ length: 33 }, (_, ordinal) => ordinal))
+  for (const index of Array.from({ length: 129 }, (_, ordinal) => ordinal))
     await request(
       worker,
       namespace,
@@ -130,8 +130,8 @@ test("term projection batches preserve global frequencies and filter eligibility
   const acquired = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(acquired.termRequests - before.termRequests).toBe(3);
-  expect(acquired.termReads - before.termReads).toBe(33);
+  expect(acquired.termRequests - before.termRequests).toBe(9);
+  expect(acquired.termReads - before.termReads).toBe(129);
   const filtered = Schema.decodeUnknownSync(QueryResult)(
     await (
       await request(
@@ -149,8 +149,8 @@ test("term projection batches preserve global frequencies and filter eligibility
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.termRequests - acquired.termRequests).toBe(3);
-  expect(after.termReads - acquired.termReads).toBe(33);
+  expect(after.termRequests - acquired.termRequests).toBe(9);
+  expect(after.termReads - acquired.termReads).toBe(129);
 });
 
 test("compressed overviews serve new selectors and filters after process eviction", async () => {

@@ -785,3 +785,31 @@ The common query regressed in both rounds; directory time was 5,537 ms first and
 The experiment was rejected and the 16-segment source restored. Fewer internal calls alone did not prove lower native latency. Larger source batches can increase cold work per entrypoint and cache retention pressure; this is an inference from the timings, not independently measured CPU or memory proof.
 
 Restored deployment completed. The three fresh-selector checks again matched strong rows/scores, taking 1,640/1,366/998 ms for selective/common/filtered queries; common-query latency improved against both 64-segment rounds. Directory timings remained 648–949 ms, so the wider directory bottleneck is unresolved.
+
+## Eight concurrent immutable catalog reads
+
+The catalog reader now processes up to eight 16-segment batches concurrently, preserving native ordered `Effect.forEach` results and manifest-order live frequency aggregation. Posting/document concurrency, batch schemas, canonical R2 formats, cache identities and admission budgets remain unchanged. The boundary regression spans 129 segments (nine batches), checking complete and partial batches, exact request counts, filtered scores and live frequency preservation. The full gate passed 116 Worker/tooling and 19 Rust tests.
+
+The unchanged million-document native corpus was measured before/after deployment. Each phase has 32 edge responses compared exactly against strong rows/scores and sequence barriers; 288 responses passed across the three complete runs. Before/first-after loads overlapped the three fresh-selector diagnostics; the repeated after load ran without those diagnostics. Regional/isolate caches and network conditions were uncontrolled.
+
+| Catalog concurrency | Public concurrency | p50 ms |  p95 ms | Requests/s |
+| ------------------- | -----------------: | -----: | ------: | ---------: |
+| 4 before            |                  1 |  94.50 |  507.22 |       5.05 |
+| 4 before            |                  4 | 101.90 |  749.17 |      14.19 |
+| 4 before            |                 16 | 343.35 | 1165.62 |      20.16 |
+| 8 first             |                  1 |  75.09 |  433.14 |       6.17 |
+| 8 first             |                  4 |  73.24 |  908.78 |      22.49 |
+| 8 first             |                 16 |  87.22 | 1270.57 |      23.11 |
+| 8 repeated          |                  1 | 104.59 | 1014.42 |       3.72 |
+| 8 repeated          |                  4 |  98.03 |  873.32 |      12.34 |
+| 8 repeated          |                 16 | 183.64 |  968.68 |      25.51 |
+
+Both eight-read runs improved the public-concurrency-sixteen median and throughput against the reference. The repeated p95 also improved. Public concurrency one/four regressed throughput in the repeat, so the observations do not establish a universal improvement. The bounded increase was retained for its measured high-concurrency benefit; low-load tails, peak memory and general Turbopuffer parity remain open.
+
+| Query     | 4 reads before ms | 8 reads after ms |
+| --------- | ----------------: | ---------------: |
+| Selective |           2409.28 |          1556.20 |
+| Common    |           1000.40 |          1245.74 |
+| Filtered  |           1070.43 |           520.20 |
+
+All six diagnostic responses matched strong rows/scores. Directory time changed from 1,058/388/632 ms to 743/504/285 ms; the common-query regression and snapshot variation limit attribution. Deployment completed before both after measurements.

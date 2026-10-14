@@ -733,12 +733,40 @@ impl Search {
         false
     }
 
-    fn skippable_block_end(
+    fn block_bounds(
         &self,
         terms: &[&String],
+        scorers: &[TermScorer],
+    ) -> Vec<Vec<(&BlockMeta, f64)>> {
+        terms
+            .iter()
+            .enumerate()
+            .map(|(index, term)| {
+                self.header
+                    .terms
+                    .get(term.as_str())
+                    .into_iter()
+                    .flat_map(|meta| meta.blocks.iter())
+                    .map(|block| {
+                        (
+                            block,
+                            scorers[index].score(
+                                block.max_title_tf,
+                                block.max_body_tf,
+                                block.min_title_length,
+                                block.min_body_length,
+                            ),
+                        )
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn skippable_block_end(
         lists: &[&[Posting]],
         cursors: &[usize],
-        scorers: &[TermScorer],
+        bounds: &[Vec<(&BlockMeta, f64)>],
         cutoff: &Hit,
         row: u32,
     ) -> Option<u32> {
@@ -746,23 +774,12 @@ impl Search {
         let mut bound = 0.0;
         for (index, list) in lists.iter().enumerate() {
             if let Some(posting) = list.get(cursors[index])
-                && let Some(block) = self
-                    .header
-                    .terms
-                    .get(terms[index].as_str())
-                    .and_then(|term| {
-                        term.blocks
-                            .iter()
-                            .find(|block| block.first <= posting.row && block.last >= posting.row)
-                    })
+                && let Some((block, score)) = bounds[index]
+                    .iter()
+                    .find(|(block, _)| block.first <= posting.row && block.last >= posting.row)
             {
                 end = end.min(block.last);
-                bound += scorers[index].score(
-                    block.max_title_tf,
-                    block.max_body_tf,
-                    block.min_title_length,
-                    block.min_body_length,
-                );
+                bound += score;
             }
         }
         if bound + 1e-12 < cutoff.score
@@ -794,14 +811,11 @@ impl Search {
             .map(|term| {
                 TermScorer::new(
                     &self.statistics,
-                    self.statistics
-                        .frequencies
-                        .get(term.as_str())
-                        .copied()
-                        .unwrap_or(0),
+                    self.statistics.frequencies.get(*term).copied().unwrap_or(0),
                 )
             })
             .collect();
+        let mut bounds = None;
         let phrase_order: Vec<_> = if self.mode == "phrase" {
             self.words
                 .iter()
@@ -821,8 +835,13 @@ impl Search {
         {
             if heap.len() == self.top_k
                 && let Some(cutoff) = heap.peek()
-                && let Some(end) =
-                    self.skippable_block_end(&terms, &lists, &cursors, &scorers, cutoff, row)
+                && let Some(end) = Self::skippable_block_end(
+                    &lists,
+                    &cursors,
+                    bounds.get_or_insert_with(|| self.block_bounds(&terms, &scorers)),
+                    cutoff,
+                    row,
+                )
             {
                 for (index, list) in lists.iter().enumerate() {
                     cursors[index] +=

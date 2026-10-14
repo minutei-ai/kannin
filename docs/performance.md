@@ -870,3 +870,45 @@ Native deployment completed on the unchanged million-document corpus. The first 
 | After repeated |          16 | 141.35 | 1195.39 |      19.38 |
 
 The completed repeat improved median, p95 and throughput in all three phases against this reference; uncontrolled isolate/cache/network conditions prevent attributing that whole-query difference solely to Rust. Local alternating binary measurements support a kernel gain of 11–46% for any/all and 48–80% for these phrase fixtures. The change does not fix snapshot acquisition failures or prove Turbopuffer parity.
+
+## Query-local prepared Rust block bounds
+
+The ranker previously looked up term metadata and recalculated the same block BM25 bound at every candidate after filling top-k. It now prepares an ordered vector of block references and exact bounds once per finish operation, only when a full top-k first makes pruning possible. Existing linear first-match block selection, term summation order, floating-point guard and tie behavior remain unchanged. No block ordering assumption or persisted/cache format changes were introduced. Local lifetime and lazy acquisition avoid retaining query statistics globally and avoid preparing unused bounds for queries without enough hits.
+
+The eager prototype reduced any/all CPU on larger segments but regressed several 16-document fixtures; it was replaced before deployment by demand-driven preparation. Alternating original/final WASM measurements used ten warmup pairs and 100 measured pairs, top-k ten, four tombstones and optional equality filters. They time finish only, excluding decompression and acquisition. All result rows and scores match.
+
+| Documents | Match  | Filter | Before p50 ms | After p50 ms |
+| --------: | ------ | ------ | ------------: | -----------: |
+|        16 | any    | False  |        0.0171 |       0.0180 |
+|        16 | any    | True   |        0.0049 |       0.0049 |
+|        16 | all    | False  |        0.0129 |       0.0128 |
+|        16 | all    | True   |        0.0041 |       0.0042 |
+|        16 | phrase | False  |        0.0073 |       0.0072 |
+|        16 | phrase | True   |        0.0033 |       0.0032 |
+|       500 | any    | False  |        0.1843 |       0.1060 |
+|       500 | any    | True   |        0.0947 |       0.0332 |
+|       500 | all    | False  |        0.1761 |       0.1014 |
+|       500 | all    | True   |        0.0942 |       0.0330 |
+|       500 | phrase | False  |        0.0881 |       0.0904 |
+|       500 | phrase | True   |        0.0177 |       0.0177 |
+|     10000 | any    | False  |        4.1202 |       2.6759 |
+|     10000 | any    | True   |        3.0110 |       1.5648 |
+|     10000 | all    | False  |        4.0896 |       2.6667 |
+|     10000 | all    | True   |        2.9293 |       1.5486 |
+|     10000 | phrase | False  |        1.6695 |       1.6189 |
+|     10000 | phrase | True   |        0.2875 |       0.2778 |
+
+Small-query and phrase results were close to baseline, with occasional microsecond regressions. Any/all on 500/10,000-document fixtures gained substantially; this is an operation-level improvement, not a universal whole-query guarantee. The full local gate passed 117 Worker/tooling and 20 Rust tests; all 1,296 differential query pairs preserved exact rows/scores, including empty/missing terms, Unicode, repeated phrases, filters, live frequencies, tombstones and top-k 1/10/100.
+
+Native deployment completed on the unchanged million-document corpus. The first post-deploy load aborted with HTTP 503 (`Snapshot freshness budget exceeded`, gateway 1,358 ms) and produced no complete report; it is not a passing load. The pre-deploy reference and one subsequent repetition each completed 96 responses with exact strong rows/scores and sequence barriers. Snapshot first-use reliability remains unresolved.
+
+| Runtime        | Concurrency | p50 ms |  p95 ms | Requests/s |
+| -------------- | ----------: | -----: | ------: | ---------: |
+| Before         |           1 | 101.56 |  511.02 |       5.30 |
+| Before         |           4 | 106.67 |  873.49 |      14.63 |
+| Before         |          16 | 241.06 | 1477.99 |      15.09 |
+| After repeated |           1 |  71.74 |  332.81 |       8.13 |
+| After repeated |           4 |  68.60 |  571.81 |      16.80 |
+| After repeated |          16 | 155.17 | 1179.61 |      19.79 |
+
+The complete repeat improved median, p95 and throughput in all phases against this reference, but uncontrolled cache/isolate/network conditions prevent attributing that change solely to Rust. Kernel measurements support the local larger-segment any/all gain; the aborted snapshot request prevents a universal reliability or Turbopuffer parity claim.

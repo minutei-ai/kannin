@@ -1130,3 +1130,22 @@ The unchanged million-document corpus completed original, first candidate and re
 | Intersection repeated |          16 | 344.41 | 1216.54 |      15.49 |
 
 Whole-query observations were mixed: concurrency-four medians improved in both candidate runs, concurrency-one tails improved, but concurrency-sixteen median latency regressed. Native CPU evidence establishes the targeted traversal gain independently of this acquisition/network noise; it does not establish a uniform whole-search gain. A separate general rare/selective/common/filter load completed 96 exact responses at the same sequence, for 384 verified whole-query responses across four complete loads. Its latest values are in the README. Native peak-memory proof, exercised expired-acquisition recovery and fully indexed Turbopuffer parity remain outstanding.
+
+## Manifest acquisition size and compact-filter exploration
+
+The native million-document corpus has 200 segments and a 5,448,863-byte Schema-encoded manifest at sequence 2,000. The authenticated metadata response now includes `segments` and `manifestEncodedBytes`, computed from its current view. The local compaction regression checks eight segments becoming one, a smaller encoded view with the same sequence, and equality between reported UTF-8 bytes and the actual canonical R2 object's size. The default gate passed 22 Rust and 118 Worker/tooling tests. This is diagnostic evidence of a substantial acquisition payload, not isolated attribution of whole-query tails to that payload.
+
+A temporary local probe folded the existing sixteen-bit-per-key Bloom into half as many bytes by OR-ing corresponding halves. The existing native membership reader accepted those bitsets, and all inserted keys remained positive in six fixtures. Each fixture used ten thousand absent probes. Original false positives ranged from three to eight; folded counts ranged from 96 to 161. Simple halving therefore substantially increases potential false-positive directory acquisition, and was not applied to canonical manifests.
+
+A separate temporary Rust project resolved [xorf 0.13.0](https://github.com/ayazhafiz/xorf) with only its binary-fuse feature, using the same 64-bit input hash and a BinaryFuse8 filter. It compiled on native and wasm32-unknown-unknown targets. All inserted keys remained positive in the six fixtures. Serialized size includes the native descriptor and fingerprint bytes; the table reports absent-probe results from this synthetic local experiment.
+
+|  Keys | Prefix    | Existing Bloom bytes | Binary Fuse bytes | Binary Fuse false positives / 10000 |
+| ----: | :-------- | -------------------: | ----------------: | ----------------------------------: |
+|   500 | document- |                 1000 |               788 |                                  38 |
+|   500 | unique    |                 1000 |               788 |                                  41 |
+|  5000 | document- |                10000 |              6676 |                                  40 |
+|  5000 | unique    |                10000 |              6676 |                                  47 |
+| 10000 | document- |                20000 |             12820 |                                  49 |
+| 10000 | unique    |                20000 |             12820 |                                  39 |
+
+For 5,000/10,000 keys this prototype reduced filter bytes by 33–36%, with 0.38–0.49% observed false positives. These native-Rust synthetic membership results are not a WASM timing proof, a projected deployed-manifest size guarantee, or a demonstrated end-to-end latency gain. The existing Bloom format, capacity, readers, canonical R2 objects and product dependencies remain unchanged. Safe corrupt-descriptor handling, actual corpus false-positive acquisition cost, bounded construction, and a single explicit migration must be resolved before changing a persisted filter representation. All prototypes and reports remain outside the public tree.

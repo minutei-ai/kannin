@@ -55,7 +55,7 @@ R2 public custom-domain CDN caching, Smart Tiered Cache for public buckets, and 
 
 References: [Workers Cache](https://developers.cloudflare.com/workers/cache/), [Cache API](https://developers.cloudflare.com/workers/runtime-apis/cache/), [R2 consistency](https://developers.cloudflare.com/r2/reference/consistency/).
 
-Native cache smoke evidence recorded both Workers Cache hits and Cache API hits after clearing the volatile range/directory caches. The authenticated metadata endpoint exposes process-scoped cache counters; these distinguish native cache fills from memory reuse and are not a billing meter. The local gate and executable negative lint probes are documented in the README. SciFact ranking judgments have independent verification in [retrieval quality](quality.md); general performance parity remains unverified.
+Native cache smoke evidence recorded both Workers Cache hits and Cache API hits after clearing the volatile range/directory caches. The authenticated metadata endpoint exposes segment count and the UTF-8 size of the currently Schema-encoded manifest view, plus process-scoped cache counters. Encoded size equals the canonical compact object written by the engine; an empty, uncommitted namespace can have a virtual manifest with no stored object. These are operational diagnostics, not a billing meter. Computing encoded size occurs only on metadata reads, not on ordinary query acquisition. The local gate and executable negative lint probes are documented in the README. SciFact ranking judgments have independent verification in [retrieval quality](quality.md); general performance parity remains unverified.
 
 ## Vector metadata lifecycle
 

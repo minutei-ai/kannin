@@ -226,6 +226,8 @@ export const CacheMetrics = Schema.Struct({
 export const Metadata = Schema.Struct({
   sequence: Schema.Int,
   documents: Schema.Int,
+  segments: Schema.Int,
+  manifestEncodedBytes: Schema.Int,
   vectorOutbox: Schema.Int,
   cache: CacheMetrics,
 });

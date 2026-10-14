@@ -1531,6 +1531,8 @@ export class SearchNamespace extends DurableObject<Env> {
               yield* Schema.encodeEffect(Metadata)({
                 sequence: manifest.sequence,
                 documents: manifest.documents,
+                segments: manifest.segments.length,
+                manifestEncodedBytes: new TextEncoder().encode(encodeRoot(manifest)).byteLength,
                 vectorOutbox: manifest.vectorJobs.length,
                 cache: cacheUsage(),
               }),

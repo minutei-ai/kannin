@@ -20,12 +20,26 @@ test("R2 compaction preserves global scores, attributes and document revisions",
       write([document(String(index), `rust ${"padding ".repeat(index)}`, { number: index })]),
     );
   const before = await query("compact");
+  const initial = Schema.decodeUnknownSync(Metadata)(
+    await (await request(worker, "compact", "metadata")).json(),
+  );
+  expect(initial.segments).toBe(8);
   const result = await request(worker, "compact", "compact", {});
   expect(result.status).toBe(200);
   const body = await result.json();
   expect(body).toMatchObject({ compacted: 8, segments: 1, documents: 8 });
   const after = await query("compact");
   expect(after).toEqual(before);
+  const compacted = Schema.decodeUnknownSync(Metadata)(
+    await (await request(worker, "compact", "metadata")).json(),
+  );
+  expect(compacted.segments).toBe(1);
+  expect(compacted.manifestEncodedBytes).toBeLessThan(initial.manifestEncodedBytes);
+  const root = await (
+    await worker.getR2Bucket("STORAGE", "raio")
+  ).get("namespaces/compact/root.json");
+  expect(root?.size).toBe(compacted.manifestEncodedBytes);
+  expect(compacted.sequence).toBe(initial.sequence);
   await worker.unsafeEvictDurableObject("raio", "SearchNamespace", { name: "compact" });
   expect(await query("compact")).toEqual(before);
 });

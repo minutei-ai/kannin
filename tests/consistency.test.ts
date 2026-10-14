@@ -1,7 +1,14 @@
 import { afterAll, expect, test } from "bun:test";
 import { Response } from "miniflare";
 import { Clock, Effect, Schema } from "effect";
-import { Health, QueryResult, Root, Snapshot, WriteResult } from "../src/protocol";
+import {
+  Health,
+  QueryResult,
+  Root,
+  Snapshot,
+  SnapshotCacheHeaders,
+  WriteResult,
+} from "../src/protocol";
 import { document, request, startWorker, textQuery, write } from "./harness";
 
 const worker = await startWorker();
@@ -61,7 +68,7 @@ test("failed shared snapshot acquisitions release their entry and allow canonica
   expect(result.rows.map((row) => row.id)).toEqual(["a"]);
 });
 
-async function seedSnapshot(namespace: string, observedAt: number) {
+async function seedSnapshot(namespace: string, observedAt: number, advertisedAt = observedAt) {
   const bucket = await worker.getR2Bucket("STORAGE");
   const object = await bucket.get(`namespaces/${namespace}/root.json`);
   if (object === null) throw new Error("Missing manifest");
@@ -72,7 +79,14 @@ async function seedSnapshot(namespace: string, observedAt: number) {
   await cache.put(
     key,
     new Response(Schema.encodeSync(Schema.fromJsonString(Snapshot))({ observedAt, manifest }), {
-      headers: { "cache-control": "public, max-age=60", "content-type": "application/json" },
+      headers: {
+        "cache-control": "public, max-age=60",
+        "content-type": "application/json",
+        ...Schema.encodeSync(SnapshotCacheHeaders)({
+          "x-raio-observed-at": advertisedAt,
+          "x-raio-sequence": manifest.sequence,
+        }),
+      },
     }),
   );
 }
@@ -113,6 +127,9 @@ test("minimumSequence bypasses a cached manifest after update and deletion", asy
     await (await request(worker, "edge-barrier", "query", textQuery("old"))).json(),
   );
   expect(strong.rows).toEqual([]);
+  const before = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
   const edge = Schema.decodeUnknownSync(QueryResult)(
     await (
       await request(worker, "edge-barrier", "query", {
@@ -122,6 +139,11 @@ test("minimumSequence bypasses a cached manifest after update and deletion", asy
       })
     ).json(),
   );
+  const after = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(after.snapshotCacheDecodes - before.snapshotCacheDecodes).toBe(0);
+  expect(after.snapshotCacheRejected - before.snapshotCacheRejected).toBe(1);
   expect(edge.sequence).toBe(updated.sequence);
   expect(edge.rows.map((row) => row.id)).toEqual(["a"]);
   const deleted = Schema.decodeUnknownSync(WriteResult)(
@@ -146,6 +168,9 @@ test("an expired or future-dated snapshot is rejected even if Cache API retains 
     await request(worker, namespace, "write", write([document("a", "old text")]));
     await seedSnapshot(namespace, Effect.runSync(Clock.currentTimeMillis) + offset);
     await request(worker, namespace, "write", write([document("a", "new text")]));
+    const before = Schema.decodeUnknownSync(Health)(
+      await (await fetch(new URL("/health", await worker.ready))).json(),
+    );
     const edge = Schema.decodeUnknownSync(QueryResult)(
       await (
         await request(worker, namespace, "query", {
@@ -156,7 +181,35 @@ test("an expired or future-dated snapshot is rejected even if Cache API retains 
     );
     expect(edge.rows.map((row) => row.id)).toEqual(["a"]);
     expect(edge.sequence).toBe(2);
+    const after = Schema.decodeUnknownSync(Health)(
+      await (await fetch(new URL("/health", await worker.ready))).json(),
+    );
+    expect(after.snapshotCacheDecodes - before.snapshotCacheDecodes).toBe(0);
+    expect(after.snapshotCacheRejected - before.snapshotCacheRejected).toBe(1);
   }
+});
+
+test("fresh cache headers cannot make an expired snapshot body eligible", async () => {
+  const namespace = "edge-header-body-age";
+  await request(worker, namespace, "write", write([document("a", "old text")]));
+  const now = Effect.runSync(Clock.currentTimeMillis);
+  await seedSnapshot(namespace, now - 2000, now);
+  await request(worker, namespace, "write", write([document("a", "new text")]));
+  const before = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  const response = await request(worker, namespace, "query", {
+    ...textQuery("new"),
+    consistency: "edge-eventual",
+  });
+  expect(response.status).toBe(200);
+  const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+  expect(result.sequence).toBe(2);
+  expect(result.rows.map((row) => row.id)).toEqual(["a"]);
+  const after = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(after.snapshotCacheDecodes - before.snapshotCacheDecodes).toBe(1);
 });
 
 test("future sequence barriers fail for both modes without waiting for Vectorize", async () => {

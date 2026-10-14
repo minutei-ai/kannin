@@ -128,6 +128,13 @@ export const Snapshot = Schema.Struct({
   observedAt: Schema.Finite,
   manifest: Root,
 });
+export const SnapshotCacheHeaders = Schema.Struct({
+  "x-raio-observed-at": Schema.NumberFromString.check(Schema.isFinite()),
+  "x-raio-sequence": Schema.NumberFromString.check(
+    Schema.isInt(),
+    Schema.isGreaterThanOrEqualTo(0),
+  ),
+});
 export const VectorRebuildSnapshot = Schema.Struct({ root: Root, fields: VectorFilterFields });
 export const VectorRebuild = Schema.Struct({
   snapshot: Schema.optional(Schema.String.check(Schema.isPattern(/^[a-f0-9-]{36}$/))),
@@ -234,6 +241,8 @@ export const Metadata = Schema.Struct({
 export const Health = Schema.Struct({
   snapshotR2Reads: Schema.Int,
   snapshotSharedReads: Schema.Int,
+  snapshotCacheDecodes: Schema.Int,
+  snapshotCacheRejected: Schema.Int,
   name: Schema.Literal("kannin"),
   version: Schema.Literal("0.1.0"),
   engine: Schema.Literal("rust-wasm-r2"),

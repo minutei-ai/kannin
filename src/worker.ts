@@ -37,6 +37,7 @@ import {
   Rejected,
   Root,
   Snapshot,
+  SnapshotCacheHeaders,
   SegmentDocument,
   SegmentHits,
   SegmentTerms,
@@ -1696,7 +1697,12 @@ function rememberSnapshot(key: string, snapshot: typeof Snapshot.Type, encoded: 
   }
 }
 
-const snapshotMetrics = { snapshotR2Reads: 0, snapshotSharedReads: 0 };
+const snapshotMetrics = {
+  snapshotR2Reads: 0,
+  snapshotSharedReads: 0,
+  snapshotCacheDecodes: 0,
+  snapshotCacheRejected: 0,
+};
 async function acquireSnapshot(
   ctx: ExecutionContext,
   env: Env,
@@ -1721,6 +1727,10 @@ async function acquireSnapshot(
             headers: {
               "cache-control": "public, max-age=2, must-revalidate",
               "content-type": "application/json",
+              ...Schema.encodeSync(SnapshotCacheHeaders)({
+                "x-raio-observed-at": observedAt,
+                "x-raio-sequence": manifest.sequence,
+              }),
             },
           }),
         )
@@ -1768,6 +1778,7 @@ const edgeSnapshot = Effect.fn("raio.edgeSnapshot")(function* (
   env: Env,
   namespace: string,
   minimumSequence: number,
+  timings: Headers,
 ) {
   const cacheKey = new URL(`https://raio-cache.internal/snapshots/${namespace}`);
   cacheKey.searchParams.set("bucket", env.STORAGE_CACHE_SCOPE);
@@ -1795,15 +1806,33 @@ const edgeSnapshot = Effect.fn("raio.edgeSnapshot")(function* (
         Effect.orElseSucceed(() => undefined),
       );
       if (cached !== undefined) {
-        const encoded = yield* Effect.tryPromise(() => cached.text()).pipe(
-          Effect.orElseSucceed(() => undefined),
-        );
-        if (encoded !== undefined) {
-          const decoded = yield* Schema.decodeEffect(Schema.fromJsonString(Snapshot))(encoded).pipe(
+        const metadata = Schema.decodeUnknownExit(SnapshotCacheHeaders)({
+          "x-raio-observed-at": cached.headers.get("x-raio-observed-at"),
+          "x-raio-sequence": cached.headers.get("x-raio-sequence"),
+        });
+        const cacheSelectedAt = yield* Clock.currentTimeMillis;
+        if (
+          metadata._tag === "Success" &&
+          cacheSelectedAt >= metadata.value["x-raio-observed-at"] &&
+          cacheSelectedAt - metadata.value["x-raio-observed-at"] < 1000 &&
+          metadata.value["x-raio-sequence"] >= minimumSequence
+        ) {
+          const encoded = yield* Effect.tryPromise(() => cached.text()).pipe(
             Effect.orElseSucceed(() => undefined),
           );
-          selection.snapshot = decoded;
-          if (decoded !== undefined) rememberSnapshot(cacheKey.href, decoded, encoded);
+          if (encoded !== undefined) {
+            snapshotMetrics.snapshotCacheDecodes += 1;
+            const decoded = yield* Schema.decodeEffect(Schema.fromJsonString(Snapshot))(
+              encoded,
+            ).pipe(Effect.orElseSucceed(() => undefined));
+            selection.snapshot = decoded;
+            if (decoded !== undefined) rememberSnapshot(cacheKey.href, decoded, encoded);
+          }
+        } else {
+          snapshotMetrics.snapshotCacheRejected += 1;
+          timings.append("server-timing", "edge_snapshot_cache_rejected");
+          const body = cached.body;
+          if (body !== null) yield* Effect.tryPromise(() => body.cancel()).pipe(Effect.ignore);
         }
       }
     }
@@ -1921,7 +1950,13 @@ export default {
                 message: "Edge consistency is supported for text queries only",
               });
             const snapshotStarted = yield* Clock.currentTimeNanos;
-            const manifest = yield* edgeSnapshot(ctx, env, namespace, input.minimumSequence ?? 0);
+            const manifest = yield* edgeSnapshot(
+              ctx,
+              env,
+              namespace,
+              input.minimumSequence ?? 0,
+              snapshotTimings,
+            );
             const snapshotEnded = yield* Clock.currentTimeNanos;
             if (manifest !== undefined) {
               const evaluated = yield* Effect.tryPromise({

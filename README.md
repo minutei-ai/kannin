@@ -17,7 +17,7 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 |           4 |  63.13 | 432.11 |      25.82 |
 |          16 | 110.42 | 806.83 |      26.62 |
 
-Runtime `1572b02`; latest of two post-deploy runs, with 32 mixed-query requests per phase. All 192 post-deploy edge responses matched strong rows and scores. Valid in-memory snapshots now bypass Cache API acquisition. Compressed segment overviews reuse immutable metadata across query selectors; repeated new selectors still took **1.28–2.74 seconds**. Cache state and network variation limit attribution. Repeated native runs show mixed improvements and regressions, and an earlier edge request hit its 30-second lease; successful later runs do not prove that first-use failure resolved.
+Runtime `7f4bc5b`; 32 mixed-query requests per phase. All 96 edge responses matched strong rows and scores. Cold overview misses now project catalogs directly from the validated directory while building reusable compressed metadata. New selector/filter combinations that forced overview misses took **2.97–4.36 seconds**, improving all three measured cases versus the preceding runtime. Cache state and network variation limit attribution. Mixed-load tails still regress between runs, and an earlier edge request hit its 30-second lease; successful later runs do not prove that first-use failure resolved.
 
 The local million-document workload measured strong common/filtered p50 of **127/126 ms** across 2,000 uncompacted segments. These emulator results exclude native network latency. Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10** across 300 queries. Eight native vector/hybrid fixture cases also retained exact rows and scores.
 

@@ -533,3 +533,21 @@ Two native loads immediately before deployment and two after used the same milli
 | After 2  |          16 | 110.42 |  806.83 |      26.62 |
 
 The second post-deploy run improved all medians relative to both preceding baseline runs, while the first post-deploy run regressed several phases. Concurrency-sixteen p95 remained above the first baseline. Isolate, cache and network state were uncontrolled; these measurements do not establish a causal overall speedup. The README reports the latest run, with both runs retained here. New-selector latency, first-use lease reliability, native peak memory and fully indexed Turbopuffer parity remain open.
+
+## Direct projection on overview misses
+
+Runtime `7f4bc5b` obtains selected summaries and filter minima directly from the verified Rust directory when a compressed overview is missing. It still builds that overview for future selectors, but avoids immediately decompressing and scanning the full dictionary again. Partial memory hits reuse the catalog already decoded during the memory probe. Persisted formats, cache identities, admission budgets and global live ranking statistics are unchanged.
+
+An alternating local WASM microbenchmark used the same 5,000-document segment and three terms, 50 warmup pairs and 100 measured pairs. Each path built an overview; the baseline then projected it, while the new path used directory summary/minimum APIs. Every result matched the expected catalog. p50 fell from 5.718 to 3.037 ms and p95 from 5.956 to 3.190 ms. This measures that operation, not complete-query latency. The full local gate passed 113 Worker/tooling tests and 18 Rust tests; deployment completed.
+
+Native diagnostics used the unchanged million-document corpus. Each query appended an absent random token and an independently generated negative year lower bound, which all benchmark documents satisfy. The fresh filter identity forced a compressed-overview miss while preserving the original strong result. Existing immutable range/directory caches remained eligible; this was not a wholly cold namespace. Before/after row scores were also compared directly across report files.
+
+| Query     | Before ms | After ms | Second fresh-filter run ms |
+| --------- | --------: | -------: | -------------------------: |
+| Selective |   4496.76 |  4357.80 |                    4304.40 |
+| Common    |   3959.79 |  3131.45 |                    2997.55 |
+| Filtered  |   3480.38 |  2971.81 |                    3114.29 |
+
+All six post-deploy diagnostics returned exact baseline rows and scores. All three observations improved in both runs, but single observations with uncontrolled cache/isolate/network state cannot establish a causal general latency percentage.
+
+A separate 96-request mixed load retained exact strong rows/scores and acknowledged sequence. Concurrency 1/4/16 measured p50 62.63/65.99/176.19 ms, p95 527.87/960.33/912.96 ms and throughput 8.24/14.43/25.07 requests/s. Relative to the preceding latest snapshot run, concurrency-four p95 and concurrency-sixteen medians regressed. The README reports this latest load; previous measurements remain above. New-selector/filter misses still take seconds, and first-use lease reliability, native peak memory and fully indexed Turbopuffer parity remain open.

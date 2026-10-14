@@ -159,7 +159,7 @@ const report = await (async () => {
     };
     if (name === "filtered") parameters.filters = ["group", "Eq", 42];
     const settled = { probes: 0, ready: false };
-    for (const attempt of Array.from({ length: 12 }, (_, index) => index)) {
+    for (const attempt of Array.from({ length: 360 }, (_, index) => index)) {
       const probe = await comparator.query(parameters);
       const remaining = probe.performance?.exhaustive_search_count;
       if (remaining === undefined)
@@ -173,7 +173,7 @@ const report = await (async () => {
       console.error(
         JSON.stringify({ case: name, index: state.index, exhaustiveSearchCount: remaining }),
       );
-      if (attempt < 11) await Effect.runPromise(Effect.sleep("2 seconds"));
+      if (attempt < 359) await Effect.runPromise(Effect.sleep("5 seconds"));
     }
     if (!settled.ready)
       throw new Error(

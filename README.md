@@ -43,6 +43,8 @@ Native ANN candidate caching reduced repeated vector-10 p50 from **256 to 186 ms
 
 The local **1,000,000-document** follow-up uses 2,000 uncompacted segments. Compact term projections reduced strong common/filtered p50 from **2,108/2,020 to 127/126 ms** with the same 4 MiB catalog budget. All measured new-run rows and scores agreed across strong and edge modes. Ingestion took 22.45 minutes; edge selective latency regressed. [Full results and limits](docs/performance.md#million-document-local-workload).
 
+Native ingestion now also confirms **1,000,000 documents**. Six warm strong diagnostic queries per case measured selective/common medians of **211/226 ms**, while individual initial requests took **7.64/5.36 seconds**. The full comparator run remains unverified because query metrics reported unindexed documents after metadata readiness. [Native evidence and limitations](docs/performance.md#native-million-document-diagnostics).
+
 ## Run
 
 Requires Bun, Rust 1.96 with `wasm32-unknown-unknown`, and `wasm-bindgen-cli` 0.2.129.

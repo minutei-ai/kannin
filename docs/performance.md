@@ -365,3 +365,13 @@ The native before/after loads reused the unchanged 100,000-document corpus. Each
 | 16          | 73.60 / 444.26      | 60.80 / 465.50     | 105.77 / 121.47           |
 
 All measured medians decreased, but two p95 values increased and concurrency-4 throughput was effectively unchanged. Provider/network variation, deployment and cache state remain uncontrolled; these results support a bounded improvement, not general parity or attribution of the whole latency change to this batch operation. Native million-document proof, selective edge tails, cold service latency and ingestion range work remain open.
+
+## Native million-document diagnostics
+
+The deployed runtime at `19d3e0f` completed the deterministic million-document corpus. A subsequent persisted metadata audit confirmed 1,000,000 live documents, sequence 2,000 and zero vector outbox entries. This establishes native ingestion completion. The resumed ingestion included replaying acknowledged batch receipts, so its elapsed time is not a fresh million-document ingestion rate.
+
+Three initial strong queries returned HTTP 200: rare took 1,345.93 ms, selective took 7,643.60 ms and common took 5,356.06 ms. Server timings attributed 6,574 ms of the selective request and 4,560 ms of the common request to term-directory acquisition. These are individual diagnostic observations after ingestion, not controlled cold-cache percentiles.
+
+Six alternating repetitions per selective/common case returned identical rows and scores to their respective initial response. Selective median was 210.58 ms, with a range of 184.01–425.69 ms; common median was 225.58 ms, with a range of 207.48–238.51 ms. This small diagnostic sample isolates a substantial initial acquisition cost; it does not establish concurrent throughput, percentile tails or Turbopuffer parity. The Cloudflare clock's reported zero-duration warm stages do not isolate their CPU time.
+
+The first full comparison aborted before collecting latency samples: Turbopuffer metadata reported `up-to-date`, while twelve query probes still reported 47,500 unindexed documents. The temporary comparator's deletion was confirmed. A fresh comparator is being evaluated against the existing Kannin corpus; query-level readiness now permits up to 360 probes spaced five seconds apart, without relaxing the zero-unindexed-document requirement. The initial observations above warmed Kannin before this repeated comparison, so its first query must not be described as a cold-cache measurement. Full comparison results remain unverified.

@@ -8,6 +8,37 @@ import { document, request, startWorker, textQuery, write } from "./harness";
 const worker = await startWorker();
 afterAll(() => worker.dispose());
 
+test("reverse-ranked adjacent pages share reads without changing rank order", async () => {
+  const namespace = "reverse-result-pages";
+  await request(
+    worker,
+    namespace,
+    "write",
+    write(
+      Array.from({ length: 80 }, (_, index) =>
+        document(String(index).padStart(4, "0"), "equal ".repeat(index + 1)),
+      ),
+    ),
+  );
+  const before = Schema.decodeUnknownSync(Metadata)(
+    await (await request(worker, namespace, "metadata")).json(),
+  );
+  const initial = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", textQuery("equal", 10))).json(),
+  );
+  expect(initial.rows.map((row) => row.id)).toEqual(
+    Array.from({ length: 10 }, (_, index) => String(79 - index).padStart(4, "0")),
+  );
+  const after = Schema.decodeUnknownSync(Metadata)(
+    await (await request(worker, namespace, "metadata")).json(),
+  );
+  expect(after.cache.rangeReads - before.cache.rangeReads).toBeLessThanOrEqual(5);
+  const smaller = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", textQuery("equal", 1))).json(),
+  );
+  expect(smaller.rows).toEqual(initial.rows.slice(0, 1));
+});
+
 test("contiguous top-k pages share bounded reads and retain individual memory cache hits", async () => {
   const namespace = "contiguous-result-pages";
   await request(

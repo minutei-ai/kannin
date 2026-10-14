@@ -11,15 +11,15 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 **1,000,000 documents · deployed Cloudflare · client in Brazil · edge reads with acknowledged sequence barrier**
 
-| Concurrency | p50 ms | p95 ms | Requests/s |
-| ----------: | -----: | -----: | ---------: |
-|           1 |  81.10 | 249.57 |       8.28 |
-|           4 | 108.13 | 917.43 |      14.92 |
-|          16 | 236.20 | 999.20 |      25.08 |
+| Concurrency | p50 ms |  p95 ms | Requests/s |
+| ----------: | -----: | ------: | ---------: |
+|           1 |  75.19 |  146.19 |      11.15 |
+|           4 |  67.92 |  273.19 |      18.63 |
+|          16 | 173.10 | 1378.46 |      18.83 |
 
-Latest complete 32-request phases use rare, selective, common and filtered text queries; all **96 responses** matched strong rows/scores and sequence. The latest eligible-posting comparison preserved **288 responses** across baseline and two candidate runs. On clustered filters, the local 10,000-document projection/decode/ranking pipeline decoded **6 rather than 158 blocks** and improved its median by **96%**; this is a local pipeline result. Local Rust/WASM any ranking medians improved **40–45% without filters** and **63–70% with filters** on 10,000-document fixtures, preserving exact scores; whole-query latency remained mixed. Reusing encoded manifest bytes reduced controlled local warm revalidation median from **22.36 to 13.57 ms**. Another **96 all/phrase responses** matched after the cursor deployment. Rust intersection traversal reduced native median CPU by **97–98% for sparse all/phrase fixtures** and **84% for dense filtered all**. Native catalog diagnostics transferred **101 KB initially, then 7 KB per new filter**, with zero acquisitions on the next cycle. Cache/isolate/network placement was uncontrolled. Snapshot coordinator recovery preserves the one-second age budget and future-sequence HTTP 409; expired-acquisition recovery was not exercised in these completed loads. Peak memory and general Turbopuffer parity remain unverified.
+Latest complete 32-request phases use rare, selective, common and filtered text queries; all **96 responses** matched strong rows/scores and sequence. Baseline and two candidate runs retained **288 exact comparisons**. Adjacent result pages now share bounded reads in any ranking order: the native fixture reduced text/vector/hybrid acquisitions from **12/11/18 to 5/4/6**, preserving scores and provider order. Controlled local reverse-ranked materialization fell from **42.17 to 22.74 ms**. Cache/isolate/network placement was uncontrolled and native client latency remained mixed. Earlier Rust and cache measurements, including regressions and controls, are linked below. Peak memory and general Turbopuffer parity remain unverified.
 
-The local million-document workload measured strong common/filtered p50 of **127/126 ms** across 2,000 uncompacted segments. These emulator results exclude native network latency. Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10** across 300 queries. Eight native vector/hybrid fixture cases also retained exact rows and scores.
+The local million-document workload measured strong common/filtered p50 of **127/126 ms** across 2,000 uncompacted segments. These emulator results exclude native network latency. Earlier independent SciFact evaluation measured **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10** across 300 queries. Eight native vector/hybrid fixture cases also retained exact rows and scores.
 
 A separate operational Turbopuffer comparison measured **59–81 ms p50**, while the comparator still processed 15,000 unindexed documents. Fully indexed comparison and general parity remain unverified.
 

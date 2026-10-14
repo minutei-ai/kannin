@@ -551,10 +551,11 @@ export const readDocuments = Effect.fn("raio.readDocuments")(function* (
 ) {
   if (pages.length > 4)
     return yield* new Rejected({ status: 503, message: "Document batch exceeds four pages" });
-  const first = pages[0];
+  const ordered = pages.toSorted((left, right) => left.offset - right.offset);
+  const first = ordered[0];
   if (first === undefined) return [];
   const span = { end: first.offset, contiguous: true, cached: false };
-  for (const page of pages) {
+  for (const page of ordered) {
     const offset = headerBytes + page.offset;
     if (offset < headerBytes || offset + page.length > totalBytes || page.length < 8)
       return yield* new Rejected({ status: 503, message: "Invalid segment document range" });

@@ -482,6 +482,40 @@ test("vector top-k materializes only the requested live document pages", async (
   expect(after.rangeReads - before.rangeReads).toBe(1);
 });
 
+test("vector materialization batches adjacent pages in provider score order", async () => {
+  const namespace = "vector-reverse-pages";
+  await request(worker, namespace, "write", {
+    requestId: "pages",
+    upserts: Array.from({ length: 20 }, (_, index) => ({
+      id: String(index).padStart(4, "0"),
+      text: "lexical",
+      attributes: {},
+      vector: vector(1, 20 - index),
+    })),
+    deletes: [],
+  });
+  await request(worker, namespace, "vector-sync", {});
+  const before = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  const result = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", vectorQuery())).json(),
+  );
+  expect(result.rows.map((row) => row.id)).toEqual(
+    Array.from({ length: 10 }, (_, index) => String(19 - index).padStart(4, "0")),
+  );
+  expect(
+    result.rows.every((row, index) => {
+      const previous = result.rows[index - 1];
+      return previous === undefined || previous.score > row.score;
+    }),
+  ).toBe(true);
+  const after = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(after.rangeReads - before.rangeReads).toBe(3);
+});
+
 test("small vector top-k avoids locating every candidate segment", async () => {
   const namespace = "vector-scattered";
   for (const index of Array.from({ length: 20 }, (_, ordinal) => ordinal))

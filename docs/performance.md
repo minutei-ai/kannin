@@ -1314,3 +1314,21 @@ The million-document before/after/repeated load retained 288 exact-result compar
 | 1           | 81.22 / 167.03        | 71.05 / 480.54         | 81.10 / 249.57                  |
 | 4           | 98.29 / 848.86        | 76.19 / 1274.24        | 108.13 / 917.43                 |
 | 16          | 397.77 / 1635.68      | 182.45 / 1261.73       | 236.20 / 999.20                 |
+
+### Materializing adjacent pages in ranking order
+
+The bounded document reader now sorts at most four page references to determine physical contiguity, then decodes and returns documents in the original requested order. Text batches accept consecutive physical rows in any ranking order. Vector materialization uses the same bounded reader while preserving provider order and scores. Sparse/mixed-segment windows remain individual acquisitions; partly cached or oversized spans retain the existing fallback. One query-local semaphore bounds materialization to four I/O operations.
+
+A local workerd comparison covered contiguous, sparse and reverse-ranked fixtures with 80 documents. Thirteen alternating pairs per shape included three warmups and ten measured samples; all 78 complete query results matched rows and scores exactly. The isolated repetition retained 5 reads/12,158 bytes for contiguous results and 12 reads/12,158 bytes for sparse results. Reverse ranking fell from 12 to 5 reads while retaining 12,401 bytes; median query time fell from 42.17 to 22.74 ms (46.1%). Contiguous medians were 24.84 to 23.98 ms and sparse medians 44.25 to 44.79 ms. These are controlled local timings, not native population percentiles.
+
+The full gate passed 25 Rust and 128 Bun/workerd tests. New workerd tests verify reverse text order, single-result cache reuse and vector provider score order while materializing ten vector results in three page reads. Existing sparse, partial-cache, eviction, corrupt-page, stale-vector and residual-filter checks passed.
+
+Native Alchemy deployment and the Vectorize metadata migration succeeded. An owned 80-document fixture established actual Vectorize visibility, then cleared only its process caches before each pre/post-deploy query. Text, vector and hybrid responses preserved rows, scores and canonical sequence exactly. Native range acquisitions fell from 12 to 5 for text (12,672 bytes both), 11 to 4 for vector (12,356 bytes both), and 18 to 6 for hybrid (24,418 to 23,806 bytes). Single-query client times were 275.76 to 470.30 ms, 332.18 to 1,024.31 ms and 201.80 to 206.26 ms respectively. These small measurements confirm acquisition and correctness, while explicitly failing to demonstrate lower client latency. The fixture's documents were deleted, vector deletion submission drained, and metadata confirmed zero live documents and zero pending vector jobs. This does not independently prove asynchronous provider deletion visibility or remove retained canonical history.
+
+The million-document before/after/repeated load retained all 288 strong-baseline result/score/sequence comparisons. Client latency remains mixed: the first candidate worsened concurrency 1/4 medians, the repetition improved concurrency 4/16 medians, and concurrency 16 p95 worsened in both candidate runs. Cache/isolate/network conditions were uncontrolled. Acquisition reduction and the controlled local reverse-order result do not establish a traffic-wide latency improvement or Turbopuffer parity.
+
+| Concurrency | Baseline p50 / p95 ms | Candidate p50 / p95 ms | Repeated candidate p50 / p95 ms |
+| ----------- | --------------------- | ---------------------- | ------------------------------- |
+| 1           | 74.01 / 122.12        | 100.87 / 470.88        | 75.19 / 146.19                  |
+| 4           | 78.60 / 1087.62       | 89.48 / 1142.58        | 67.92 / 273.19                  |
+| 16          | 324.58 / 1160.45      | 146.43 / 1294.95       | 173.10 / 1378.46                |

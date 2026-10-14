@@ -536,14 +536,16 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
   const windows = EffectArray.chunksOf(hits, 4).flatMap((window) => {
     const first = window[0];
     if (first === undefined) return [];
+    const physicalRows = window.map((hit) => hit.row).toSorted((left, right) => left - right);
+    const firstRow = physicalRows[0];
     if (
       window.every(
-        (hit, index) =>
+        (hit) =>
           hit.segment.key === first.segment.key &&
           hit.segment.headerBytes === first.segment.headerBytes &&
-          hit.segment.bytes === first.segment.bytes &&
-          hit.row === first.row + index,
-      )
+          hit.segment.bytes === first.segment.bytes,
+      ) &&
+      physicalRows.every((row, index) => firstRow !== undefined && row === firstRow + index)
     )
       return [window];
     return window.map((hit) => [hit]);
@@ -731,36 +733,65 @@ async function vectorQuery(
   }
   const reconciled = Effect.runSync(Clock.currentTimeNanos);
   timings.append("server-timing", `vector_reconcile;dur=${Number(reconciled - indexEnded) / 1e6}`);
-  const rows = await Effect.runPromise(
-    Effect.forEach(
-      eligible.slice(0, input.topK),
-      (item) =>
-        Effect.gen(function* () {
-          const document = yield* Effect.tryPromise({
-            try: () =>
-              readDocument(
-                item.location.segment.key,
-                item.location.segment.headerBytes,
-                item.location.document.data,
-                item.location.segment.bytes,
-              ),
-            catch: (cause) => {
-              if (Schema.is(Rejected)(cause)) return cause;
-              return new Cause.UnknownError(cause);
-            },
-          });
-          return {
-            id: document.id,
-            title: document.title ?? "",
-            text: document.text,
-            attributes: document.attributes,
-            revision: document.revision,
-            score: item.score,
-          };
-        }),
-      { concurrency: 4 },
-    ),
+  const windows = EffectArray.chunksOf(eligible.slice(0, input.topK), 4).flatMap((window) => {
+    const first = window[0];
+    if (first === undefined) return [];
+    const physicalRows = window
+      .map((item) => item.location.row)
+      .toSorted((left, right) => left - right);
+    const firstRow = physicalRows[0];
+    if (
+      window.every(
+        (item) =>
+          item.location.segment.key === first.location.segment.key &&
+          item.location.segment.headerBytes === first.location.segment.headerBytes &&
+          item.location.segment.bytes === first.location.segment.bytes,
+      ) &&
+      physicalRows.every((row, index) => firstRow !== undefined && row === firstRow + index)
+    )
+      return [window];
+    return window.map((item) => [item]);
+  });
+  const batches = await Effect.runPromise(
+    Effect.gen(function* () {
+      const permits = yield* Semaphore.make(4);
+      return yield* Effect.forEach(
+        windows,
+        (window) =>
+          Effect.gen(function* () {
+            const first = window[0];
+            if (first === undefined) return [];
+            const documents = yield* readDocuments(
+              first.location.segment.key,
+              first.location.segment.headerBytes,
+              window.map((item) => item.location.document.data),
+              first.location.segment.bytes,
+              permits,
+            );
+            return yield* Effect.forEach(documents, (document, index) =>
+              Effect.gen(function* () {
+                const item = window[index];
+                if (item === undefined)
+                  return yield* new Rejected({
+                    status: 503,
+                    message: "Vector document batch omitted its candidate",
+                  });
+                return {
+                  id: document.id,
+                  title: document.title ?? "",
+                  text: document.text,
+                  attributes: document.attributes,
+                  revision: document.revision,
+                  score: item.score,
+                };
+              }),
+            );
+          }),
+        { concurrency: 4 },
+      );
+    }),
   );
+  const rows = batches.flat();
   const materialized = Effect.runSync(Clock.currentTimeNanos);
   timings.append(
     "server-timing",

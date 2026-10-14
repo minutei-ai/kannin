@@ -47,6 +47,8 @@ Native ingestion now also confirms **1,000,000 documents**. Six warm strong diag
 
 A separate native operational comparison measured strong p50 **169–192 ms**, edge p50 **91–126 ms** and edge p95 **465–746 ms**. Turbopuffer measured p50 **59–81 ms** while processing 15,000 unindexed documents. Every Kannin strong/edge pair agreed, but an earlier edge request timed out at 30 seconds. [Complete methodology and remaining failures](docs/performance.md#operational-comparison-with-unindexed-comparator-writes).
 
+The latest deployed change admits larger edge snapshots within a **24 MiB charged memory budget**. A native warm repetition at concurrency 1/4/16 measured p50 **89/82/114 ms**, with p95 **615/499/1,146 ms**. The first post-deploy run had worse tails; all 288 before/after edge responses agreed with strong baselines. [All runs and memory limits](docs/performance.md#large-edge-snapshot-budget).
+
 ## Run
 
 Requires Bun, Rust 1.96 with `wasm32-unknown-unknown`, and `wasm-bindgen-cli` 0.2.129.

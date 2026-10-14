@@ -1,7 +1,7 @@
 import { afterAll, expect, test } from "bun:test";
 import { Response } from "miniflare";
 import { Clock, Effect, Schema } from "effect";
-import { QueryResult, Root, Snapshot, WriteResult } from "../src/protocol";
+import { ErrorBody, QueryResult, Root, Snapshot, WriteResult } from "../src/protocol";
 import { document, request, startWorker, textQuery, write } from "./harness";
 
 const worker = await startWorker();
@@ -202,7 +202,7 @@ test("a still-valid older snapshot serves immediately while native background wo
   expect(state.refreshed).toBe(true);
 });
 
-test("query timings stay request scoped and preserve coordinator and gateway measurements", async () => {
+test("query timings stay request scoped and preserve snapshot and gateway measurements", async () => {
   await request(worker, "timing", "write", write([document("a", "measured rust search")]));
   const responses = await Promise.all(
     ["strong", "edge-eventual", "edge-eventual"].map((consistency) =>
@@ -220,7 +220,8 @@ test("query timings stay request scoped and preserve coordinator and gateway mea
       ).toHaveLength(1);
     expect(response.headers.get("cache-control")).toBe("private, no-store");
   }
-  expect(responses[0]?.headers.get("server-timing")).toContain("raio;dur=");
+  expect(responses[0]?.headers.get("server-timing")).toContain("strong_snapshot;dur=");
+  expect(responses[0]?.headers.get("server-timing")).not.toContain("raio;dur=");
   for (const response of responses.slice(1)) {
     expect(response.headers.get("server-timing")).toContain("edge_snapshot;dur=");
     expect(response.headers.get("server-timing")).not.toContain("raio;dur=");
@@ -244,4 +245,59 @@ test("warm namespace snapshots survive Cache API eviction only within their orig
   ).toEqual(["a"]);
   await Effect.runPromise(Effect.sleep("1100 millis"));
   expect((await request(worker, "warm-memory", "query", input)).status).toBe(503);
+});
+
+test("strong reads bypass warm coordinator state and reject corrupted canonical manifests", async () => {
+  await request(worker, "strong-canonical", "write", write([document("a", "canonical")]));
+  const first = await request(worker, "strong-canonical", "query", textQuery("canonical"));
+  expect(first.status).toBe(200);
+  expect(first.headers.get("server-timing")).toContain("strong_snapshot;dur=");
+  expect(first.headers.get("server-timing")).not.toContain("raio;dur=");
+  const bucket = await worker.getR2Bucket("STORAGE");
+  await bucket.put("namespaces/strong-canonical/root.json", "corrupted");
+  expect((await request(worker, "strong-canonical", "query", textQuery("canonical"))).status).toBe(
+    503,
+  );
+});
+
+test("parallel strong queries observe complete immutable revisions while writes advance", async () => {
+  const namespace = "strong-parallel";
+  await request(worker, namespace, "write", write([document("a", "shared revisionone")]));
+  for (const revision of [2, 3, 4, 5]) {
+    const responses = await Promise.all([
+      request(worker, namespace, "write", write([document("a", `shared revision${revision}`)])),
+      ...Array.from({ length: 12 }, () => request(worker, namespace, "query", textQuery("shared"))),
+    ]);
+    const acknowledged = Schema.decodeUnknownSync(WriteResult)(await responses[0]?.json());
+    expect(acknowledged.sequence).toBe(revision);
+    for (const response of responses.slice(1)) {
+      expect(response.status).toBe(200);
+      const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+      expect([revision - 1, revision]).toContain(result.sequence);
+      expect(result.rows).toHaveLength(1);
+      expect(result.rows[0]?.revision).toBe(result.sequence);
+      expect(result.consistency).toBe("strong");
+    }
+    const fresh = Schema.decodeUnknownSync(QueryResult)(
+      await (
+        await request(worker, namespace, "query", {
+          ...textQuery("shared"),
+          minimumSequence: revision,
+        })
+      ).json(),
+    );
+    expect(fresh.sequence).toBe(revision);
+    expect(fresh.rows[0]?.text).toBe(`shared revision${revision}`);
+  }
+});
+
+test("a missing canonical manifest fails closed even while the coordinator remains warm", async () => {
+  await request(worker, "strong-missing", "write", write([document("a", "acknowledged")]));
+  const bucket = await worker.getR2Bucket("STORAGE");
+  await bucket.delete("namespaces/strong-missing/root.json");
+  const response = await request(worker, "strong-missing", "query", textQuery("acknowledged"));
+  expect(response.status).toBe(503);
+  expect(Schema.decodeUnknownSync(ErrorBody)(await response.json())).toEqual({
+    error: "R2 manifest missing for an acknowledged namespace",
+  });
 });

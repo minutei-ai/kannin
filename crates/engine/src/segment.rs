@@ -1014,6 +1014,104 @@ pub mod wasm {
         minimum: Option<(u32, u32)>,
     }
 
+    struct SelectedTerms<'a> {
+        requested: &'a BTreeSet<String>,
+    }
+
+    impl<'de> serde::de::DeserializeSeed<'de> for SelectedTerms<'_> {
+        type Value = BTreeMap<String, TermSummary>;
+
+        fn deserialize<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_map(self)
+        }
+    }
+
+    impl<'de> serde::de::Visitor<'de> for SelectedTerms<'_> {
+        type Value = BTreeMap<String, TermSummary>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a term summary dictionary")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut selected = BTreeMap::new();
+            while let Some(term) = map.next_key::<String>()? {
+                let summary = map.next_value::<TermSummary>()?;
+                if self.requested.contains(&term) {
+                    selected.insert(term, summary);
+                }
+            }
+            Ok(selected)
+        }
+    }
+
+    #[derive(Deserialize)]
+    #[serde(field_identifier, rename_all = "lowercase")]
+    enum OverviewField {
+        Dictionary,
+        Minimum,
+    }
+
+    struct SelectedOverview<'a> {
+        requested: &'a BTreeSet<String>,
+    }
+
+    impl<'de> serde::de::DeserializeSeed<'de> for SelectedOverview<'_> {
+        type Value = Overview;
+
+        fn deserialize<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_map(self)
+        }
+    }
+
+    impl<'de> serde::de::Visitor<'de> for SelectedOverview<'_> {
+        type Value = Overview;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a segment overview")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut dictionary = None;
+            let mut minimum = None;
+            while let Some(field) = map.next_key::<OverviewField>()? {
+                match field {
+                    OverviewField::Dictionary => {
+                        if dictionary.is_some() {
+                            return Err(serde::de::Error::duplicate_field("dictionary"));
+                        }
+                        dictionary = Some(map.next_value_seed(SelectedTerms {
+                            requested: self.requested,
+                        })?);
+                    }
+                    OverviewField::Minimum => {
+                        if minimum.is_some() {
+                            return Err(serde::de::Error::duplicate_field("minimum"));
+                        }
+                        minimum = Some(map.next_value::<Option<(u32, u32)>>()?);
+                    }
+                }
+            }
+            Ok(Overview {
+                dictionary: dictionary
+                    .ok_or_else(|| serde::de::Error::missing_field("dictionary"))?,
+                minimum: minimum.unwrap_or(None),
+            })
+        }
+    }
+
     fn term_bound(
         meta: &TermSummary,
         statistics: &Statistics,
@@ -1291,28 +1389,25 @@ pub mod wasm {
     #[wasm_bindgen]
     #[doc = "# Errors\nRejects corrupt overview framing, invalid terms, or projection serialization."]
     pub fn segment_overview_project(bytes: &[u8], terms: &str) -> Result<String, JsValue> {
-        #[derive(Serialize)]
-        struct Projection<'a> {
-            dictionary: BTreeMap<&'a String, &'a TermSummary>,
-            minimum: Option<(u32, u32)>,
-        }
-        let decoded = decode_page(bytes).map_err(|cause| JsValue::from_str(&cause))?;
-        let overview: Overview = serde_json::from_slice(&decoded)
-            .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        use serde::de::DeserializeSeed;
+
         let terms: Vec<String> =
             serde_json::from_str(terms).map_err(|cause| JsValue::from_str(&cause.to_string()))?;
         if terms.len() > 64 {
             return Err(JsValue::from_str("Overview projection exceeds 64 terms"));
         }
-        let selected: BTreeMap<_, _> = terms
-            .iter()
-            .filter_map(|term| overview.dictionary.get(term).map(|meta| (term, meta)))
-            .collect();
-        serde_json::to_string(&Projection {
-            dictionary: selected,
-            minimum: overview.minimum,
-        })
-        .map_err(|cause| JsValue::from_str(&cause.to_string()))
+        let requested = terms.into_iter().collect();
+        let decoded = decode_page(bytes).map_err(|cause| JsValue::from_str(&cause))?;
+        let mut deserializer = serde_json::Deserializer::from_slice(&decoded);
+        let projected = SelectedOverview {
+            requested: &requested,
+        }
+        .deserialize(&mut deserializer)
+        .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        deserializer
+            .end()
+            .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        serde_json::to_string(&projected).map_err(|cause| JsValue::from_str(&cause.to_string()))
     }
 
     #[wasm_bindgen]

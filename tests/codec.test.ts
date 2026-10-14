@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { Schema } from "effect";
+import { crc32, deflateSync } from "node:zlib";
 import {
   initSync,
   pack,
@@ -93,6 +94,26 @@ test("compressed overviews preserve term bounds and exact filter minima across s
   }
   directory.free();
   segment.free();
+});
+
+test("overview projection validates unrequested values and rejects malformed root fields", () => {
+  for (const json of [
+    '{"dictionary":{"unused":{"df":"bad","bounds":[]}},"minimum":null}',
+    '{"dictionary":{"unused":{"df":1,"bounds":[[0,1,0,-1]]}},"minimum":null}',
+    '{"dictionary":{},"dictionary":{},"minimum":null}',
+    '{"dictionary":{},"minimum":null,"minimum":null}',
+    '{"dictionary":{},"minimum":null,"unknown":true}',
+    '{"dictionary":{},"minimum":null} trailing',
+  ]) {
+    const data = new TextEncoder().encode(json);
+    const compressed = deflateSync(data);
+    const bytes = new Uint8Array(8 + compressed.byteLength);
+    const frame = new DataView(bytes.buffer);
+    frame.setUint32(0, data.byteLength, true);
+    frame.setUint32(4, crc32(data), true);
+    bytes.set(compressed, 8);
+    expect(() => segment_overview_project(bytes, '["wanted"]')).toThrow();
+  }
 });
 
 test("WASM batched blooms preserve Unicode membership and reject broken offsets", () => {

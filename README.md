@@ -33,13 +33,15 @@ Conjunctive segment pruning reduced local warm p50 from **14.11 to 6.83 ms** for
 | Common    | 181.6 / 196.7 |   68.7 / 95.7 |
 | Filtered  | 177.4 / 189.7 |  68.2 / 102.1 |
 
-These deployed measurements are from `faa310e`, before the latest warm-snapshot optimization, with the same five-warmup/50-sample methodology. Strong reads paid the coordinator hop outside Brazil. A separate mixed-query load run reached **45.4 requests/s at concurrency 16**, with **p95 1,090.5 ms**; all 384 responses matched strong baselines. Cold requests reached **3.4 seconds**. These results establish bounded measurements, not general Turbopuffer parity or million-document scale.
+These deployed measurements are from `faa310e`, before the latest warm-snapshot optimization, with the same five-warmup/50-sample methodology. Strong reads paid the coordinator hop outside Brazil. A separate mixed-query load run reached **45.4 requests/s at concurrency 16**, with **p95 1,090.5 ms**; all 384 responses matched strong baselines. Cold requests reached **3.4 seconds**. These results establish bounded measurements, not general Turbopuffer parity or native million-document scale.
 
 The filtered-projection run passed **192 mixed-query checks**, with concurrency-1 p50/p95 **159 / 223 ms** and concurrency-16 p95 **815 ms**, reaching **46.1 requests/s**. The first post-deploy load aborted on an unclassified 503; a completed repeat does not prove that failure resolved. Broad vector/hybrid throughput and general latency guarantees remain open.
 
-Native vector/hybrid validation passed 200 before/after comparisons on a controlled 100-vector corpus. Latest medians were **288–326 ms**; this run was slower than its baseline despite reduced page reads. [Retrieval measurements and platform limits](docs/performance.md#vector-document-materialization-and-hybrid-execution).
+Native ANN candidate caching reduced repeated vector-10 p50 from **256 to 186 ms** and hybrid-10 from **272 to 191 ms** on a controlled 96-vector corpus. The one-second cache preserved all 200 before/after results; misses and cold service latency remain. [Methodology and limits](docs/performance.md#conditional-manifest-reads-and-bounded-ann-caching).
 
 [Full deployed evidence](docs/performance.md) · [local methodology and contract comparison](docs/turbopuffer-contracts.md) · [SciFact ranking quality](docs/quality.md)
+
+The local **1,000,000-document** follow-up uses 2,000 uncompacted segments. Compact term projections reduced strong common/filtered p50 from **2,108/2,020 to 127/126 ms** with the same 4 MiB catalog budget. All measured new-run rows and scores agreed across strong and edge modes. Ingestion took 22.45 minutes; edge selective latency regressed. [Full results and limits](docs/performance.md#million-document-local-workload).
 
 ## Run
 
@@ -52,7 +54,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **105 Worker/tooling tests and 17 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **106 Worker/tooling tests and 18 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

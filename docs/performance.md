@@ -15,7 +15,7 @@ Sequential ingestion in batches of 500 took 46.74 seconds for Kannin and 7.12 se
 
 Corpus SHA-256: `2b6257d0fce1b430f1a4b91b6cca9af481da8aa820142cc94ca628cb5cee03f2`. Worker SHA-256: `0ddb644ba06cdef53e877a398fcb4a6dcebbc9d323039f677e4ca901c9d5925c`. WASM SHA-256: `a4d1fdf2a4a397dc4978dede178269c71e49954a15eb347ed15ac367d0813254`. Bun 1.4.3; Rust 1.96; Effect 4.0.4; Alchemy 2.0.0-beta.83. The executable corpus and comparison live in `tooling/corpus.ts` and `tooling/compare.ts`.
 
-Before proactive refresh, edge p95 ranged from 269 to 378 ms because expired snapshots blocked on R2. Refreshing still-valid snapshots in native background work reduced that penalty without extending the age limit. Ingestion throughput, 1,000,000-document scale, concurrency, broader ranking judgments, vector recall and cost remain delivery gates. The public SciFact evaluation is recorded separately in quality.md.
+Before proactive refresh, edge p95 ranged from 269 to 378 ms because expired snapshots blocked on R2. Refreshing still-valid snapshots in native background work reduced that penalty without extending the age limit. Native ingestion throughput, native 1,000,000-document scale, concurrency, broader ranking judgments, vector recall and cost remain delivery gates. The public SciFact evaluation is recorded separately in quality.md.
 
 ## 100,000-document follow-up
 
@@ -312,3 +312,38 @@ A native before/after comparison used the same 96-vector, 32-segment corpus, wit
 Median latency decreased across the repeated-query cases, while several p95 values rose slightly. Within the experimental samples, unfiltered vector-10 cache hits had median 185.80 ms and misses 260.97 ms; hybrid-10 hits had median 188.82 ms and misses 270.53 ms. Each miss subset has only three or four observations and is not an independent causal comparison. Cache hits avoid the provider call; expiry, unique inputs and canonical changes still pay that call and cache-adapter work. Vector visibility remains eventual, with up to one additional second of cached candidate visibility. These results do not establish general Turbopuffer parity or removal of the remote strong-read hop.
 
 A separate owned native namespace confirmed actual cache reuse, then deleted the top candidate and reset the namespace. The sequence-2 query returned only the surviving revision-1 document; sequence 3 returned no rows after reset. The first bounded observation window did not satisfy its combined visibility/cache-hit assertion; persisted metadata showed two committed documents and an empty outbox. The probe resumed on that same namespace without repeating the seed and then completed. Its first resumed cold request recorded 1,120 ms in the ANN/cache interval and 1,644 ms at the gateway, reinforcing that this cache does not solve cold service latency.
+
+## Million-document local workload
+
+Runtime `34fa7de` batches Bloom probes and caches compact exact block-score projections under private `catalog-v3` / `raio-terms-v3` identities. Canonical R2 segment, root, log and receipt formats remain unchanged. The full local gate passes 106 Worker/tooling and 18 Rust tests. SciFact nDCG@10, recall@10 and MRR@10 remain exactly 0.6730619695232347, 0.7956666666666666 and 0.641808201058201.
+
+The isolated WASM experiment probes 1,000 bitsets against 500 IDs, with five warmups and twenty measured iterations. Before p50/p95 was 62.70/86.29 ms; batches of at most 64 measured 16.69/18.22 ms, with identical candidate lists. This baseline pre-encodes the input IDs, so it excludes additional old caller serialization work. A separate old/new WASM comparison on one 500-document segment reduced the two-term dictionary from 1,239 to 140 bytes while retaining bit-identical score bounds for unfiltered, eligible and empty-filter cases. No claim attributes the full-engine improvement solely to either isolated experiment.
+
+Both complete local runs ingested the same one million documents in 500-document batches. Background queue consumption is disabled in this benchmark, leaving 2,000 uncompacted segments. Each query/mode has five warmups and fifty measured requests. The new driver additionally checks the acknowledged sequence and identical rows/scores across every measured request and both consistency modes, outside the latency interval. The baseline driver checked nonempty results and requested consistency; it did not retain large-corpus row snapshots for a cross-version row comparison. Exact-ranking regressions, isolated old/new bounds and independent SciFact evaluation provide separate correctness evidence.
+
+| Query     | Mode          | Before p50 / p95 ms | After p50 / p95 ms |
+| --------- | ------------- | ------------------- | ------------------ |
+| rare      | strong        | 15.62 / 24.95       | 5.98 / 8.94        |
+| selective | strong        | 119.29 / 183.02     | 107.84 / 171.54    |
+| common    | strong        | 2,108.04 / 2,355.76 | 126.86 / 240.24    |
+| filtered  | strong        | 2,020.38 / 2,343.25 | 125.82 / 245.20    |
+| rare      | edge eventual | 28.39 / 52.21       | 25.30 / 49.20      |
+| selective | edge eventual | 148.45 / 234.28     | 205.51 / 436.75    |
+| common    | edge eventual | 2,037.85 / 2,230.52 | 238.81 / 365.12    |
+| filtered  | edge eventual | 2,005.69 / 2,211.08 | 146.65 / 219.10    |
+
+Ingestion changed from 1,541.07 to 1,346.82 seconds, or 648.90 to 742.49 documents/s. Selective edge latency regressed; the fresh/snapshot acquisition and large manifest costs remain in that path. Separate runs, emulator scheduling, cache state and host load limit causal attribution. These are local workerd measurements, not native million-document latency or Turbopuffer parity. The emulator process contains R2, Cache API and queue emulation; its RSS is not the Worker isolate's memory usage.
+
+The catalog L1 charge stayed within the same 4 MiB budget: 4,192,276 → 4,193,844 bytes. Projection acquisitions fell from 444,002 to 12,002 and acquired projection bytes from 426,308,418 to 1,476,148. These counters measure the private projection path, including Cache API hits, rather than raw R2 operations. Immutable range acquisitions and bytes stayed identical at 287,801 and 54,534,565,213; most were served from Cache API. Directory charge stayed at 41,873,899 bytes and WASM linear memory changed from 34,668,544 to 34,340,864 bytes. The unchanged range work still dominates large ingestion; this optimization does not remove that cost or establish a complete isolate memory bound.
+
+Corpus SHA-256: `8bd38242bd5eaad8d4b69bc4e21d8d29000e59dd659018489d42758b88911bcd`. Before Worker/WASM hashes: `6557dc37438e011f9247391bc37b79a1df664a5f2f8620adfee6d1b321ae03d8` / `7a6fabfcd0a8473a920af63d5afe6121a94437845f851f7c6d2cf4a69d7d3556`. After: `eaeb9f38126bf59512759395918be9f0c0948b03d8852549b43de5d5a5888456` / `19ed91b57716a49c23938b6baccbdd061a29dd147bd6c4f43a21af924ec3c44b`. Reproduce with `RAIO_BENCH_DOCUMENTS=1000000 bun tooling/benchmark.ts` after the native build.
+
+Native validation on the existing 100,000-document corpus completed 192 requests before deployment, 192 immediately after and 192 in a warm repeat, all matching their strong baselines. This smaller corpus did not demonstrate a native latency win.
+
+| Concurrency | Before p50 / p95 ms | Post-deploy p50 / p95 ms | Warm repeat p50 / p95 ms |
+| ----------- | ------------------- | ------------------------ | ------------------------ |
+| 1           | 53.05 / 84.54       | 68.36 / 367.83           | 62.03 / 125.42           |
+| 4           | 58.74 / 149.84      | 68.64 / 308.64           | 75.36 / 231.53           |
+| 16          | 70.04 / 476.57      | 87.64 / 402.16           | 76.84 / 448.84           |
+
+A separate native vector/hybrid run completed all 200 requests on the existing 96-vector corpus with exactly the same rows and scores as the preceding ANN-cache run. Vector-10 and hybrid-10 p50/p95 were 185.67/260.89 and 189.59/270.98 ms. Native large-corpus throughput, selective edge tails, ingestion range work and cold service latency remain open.

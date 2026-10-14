@@ -223,6 +223,41 @@ test("WASM batched blooms preserve Unicode membership and reject broken offsets"
   ).toThrow("Invalid bloom offsets");
 });
 
+test("WASM Bloom batches read persisted filters across repeated sizes and empty spans", () => {
+  const filters = [
+    [134, 2, 0, 193, 80, 32, 48, 8],
+    [64, 46, 0, 130, 129, 0, 56, 4],
+    [24, 9, 228, 16, 209, 71, 195, 11, 102, 152],
+    [],
+    [134, 2, 0, 193, 80, 32, 48, 8],
+    [64, 46, 0, 130, 129, 0, 56, 4],
+    [24, 9, 228, 16, 209, 71, 195, 11, 102, 152],
+  ];
+  const packed = new Uint8Array(filters.flat());
+  const offsets = new Uint32Array([0, 8, 16, 26, 26, 34, 42, 52]);
+  const selected = Schema.decodeSync(
+    Schema.fromJsonString(Schema.Array(Schema.Array(Schema.String))),
+  )(
+    segment_bloom_filter_many(
+      packed,
+      offsets,
+      JSON.stringify(["ação", "日本語", "rust", "café", "a", "b", "c", "d", "e", "missing"]),
+    ),
+  );
+  expect(selected).toEqual([
+    ["ação", "日本語"],
+    ["rust", "café"],
+    ["a", "b", "c", "d", "e"],
+    [],
+    ["ação", "日本語"],
+    ["rust", "café"],
+    ["a", "b", "c", "d", "e"],
+  ]);
+  expect(Array.from(segment_bloom(JSON.stringify(["ação", "日本語"])))).toEqual([
+    134, 2, 0, 193, 80, 32, 48, 8,
+  ]);
+});
+
 test("WASM term bounds preserve order, empty eligibility and batch limits", () => {
   const statistics = JSON.stringify({
     documents: 100,

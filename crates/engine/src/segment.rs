@@ -987,10 +987,18 @@ pub fn document_terms(document: &Document) -> Vec<String> {
         .collect()
 }
 
-fn bloom_hash(text: &str, seed: u64) -> u64 {
-    text.as_bytes().iter().fold(seed, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
-    })
+fn bloom_hashes(text: &str) -> (u64, u64) {
+    let (first, second) = text.as_bytes().iter().fold(
+        (0xcbf2_9ce4_8422_2325u64, 0x8422_2325_cbf2_9ce4u64),
+        |(first, second), byte| {
+            let value = u64::from(*byte);
+            (
+                (first ^ value).wrapping_mul(0x0100_0000_01b3),
+                (second ^ value).wrapping_mul(0x0100_0000_01b3),
+            )
+        },
+    );
+    (first, second | 1)
 }
 
 #[doc = "# Errors\nRejects values beyond the bloom size budget or an unrepresentable bit index."]
@@ -1000,8 +1008,7 @@ pub fn bloom_build(values: &[String]) -> Result<Vec<u8>, String> {
     }
     let mut bytes = vec![0u8; (values.len() * 2).max(8)];
     for value in values {
-        let a = bloom_hash(value, 0xcbf2_9ce4_8422_2325);
-        let b = bloom_hash(value, 0x8422_2325_cbf2_9ce4) | 1;
+        let (a, b) = bloom_hashes(value);
         for index in 0u64..7 {
             let bit = usize::try_from(
                 a.wrapping_add(index.wrapping_mul(b))
@@ -1022,11 +1029,8 @@ pub fn bloom_contains(bytes: &[u8], value: &str) -> Result<bool, String> {
     if bytes.len() > MAX_BYTES {
         return Err("Bloom exceeds size budget".into());
     }
-    bloom_contains_hashes(
-        bytes,
-        bloom_hash(value, 0xcbf2_9ce4_8422_2325),
-        bloom_hash(value, 0x8422_2325_cbf2_9ce4) | 1,
-    )
+    let (a, b) = bloom_hashes(value);
+    bloom_contains_hashes(bytes, a, b)
 }
 
 fn bloom_contains_hashes(bytes: &[u8], a: u64, b: u64) -> Result<bool, String> {
@@ -1069,25 +1073,63 @@ pub fn bloom_filter_many<'a>(
     let hashes: Vec<_> = values
         .iter()
         .map(|value| {
-            (
-                value.as_str(),
-                bloom_hash(value, 0xcbf2_9ce4_8422_2325),
-                bloom_hash(value, 0x8422_2325_cbf2_9ce4) | 1,
-            )
+            let (a, b) = bloom_hashes(value);
+            (value.as_str(), a, b)
         })
         .collect();
+    let mut cached_positions: Option<(usize, Vec<[usize; 7]>)> = None;
     offsets
         .windows(2)
-        .map(|span| {
+        .enumerate()
+        .map(|(index, span)| {
             let start = usize::try_from(span[0]).map_err(|cause| cause.to_string())?;
             let end = usize::try_from(span[1]).map_err(|cause| cause.to_string())?;
             let bloom = bytes
                 .get(start..end)
                 .ok_or_else(|| "Invalid bloom offsets".to_owned())?;
+            let reusable = offsets
+                .get(index + 2)
+                .is_some_and(|next| next.checked_sub(span[1]) == span[1].checked_sub(span[0]));
+            if !bloom.is_empty()
+                && reusable
+                && cached_positions
+                    .as_ref()
+                    .is_none_or(|(length, _)| *length != bloom.len())
+            {
+                let bits = u64::try_from(bloom.len()).map_err(|cause| cause.to_string())? * 8;
+                let positions = hashes
+                    .iter()
+                    .map(|&(_, a, b)| {
+                        let mut positions = [0; 7];
+                        for (index, position) in positions.iter_mut().enumerate() {
+                            let index = u64::try_from(index).map_err(|cause| cause.to_string())?;
+                            *position =
+                                usize::try_from(a.wrapping_add(index.wrapping_mul(b)) % bits)
+                                    .map_err(|cause| cause.to_string())?;
+                        }
+                        Ok::<_, String>(positions)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                cached_positions = Some((bloom.len(), positions));
+            }
             let mut selected = Vec::new();
-            for &(value, a, b) in &hashes {
-                if bloom_contains_hashes(bloom, a, b)? {
-                    selected.push(value);
+            if let Some((_, positions)) = cached_positions
+                .as_ref()
+                .filter(|(length, _)| *length == bloom.len())
+            {
+                for (&(value, _, _), positions) in hashes.iter().zip(positions) {
+                    if positions
+                        .iter()
+                        .all(|bit| bloom[bit / 8] & (1 << (bit % 8)) != 0)
+                    {
+                        selected.push(value);
+                    }
+                }
+            } else {
+                for &(value, a, b) in &hashes {
+                    if bloom_contains_hashes(bloom, a, b)? {
+                        selected.push(value);
+                    }
                 }
             }
             Ok(selected)

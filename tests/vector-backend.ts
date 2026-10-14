@@ -2,7 +2,7 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 
 const vectors = new Map<string, VectorizeVector>();
 const pending: VectorizeVector[] = [];
-const control = { fail: false, deferred: false, upsertCalls: 0 };
+const control = { fail: false, deferred: false, upsertCalls: 0, queryCalls: 0 };
 
 function metadataMatches(vector: VectorizeVector, filters: VectorizeVectorMetadataFilter) {
   return Object.entries(filters).every(([field, condition]) => {
@@ -57,6 +57,7 @@ export class VectorBackend extends WorkerEntrypoint {
   }
 
   async query(values: number[], options: VectorizeQueryOptions) {
+    control.queryCalls += 1;
     if (control.fail) throw new Error("Injected Vectorize failure");
     if (options.returnMetadata === "all" && (options.topK ?? 5) > 50)
       throw new Error("Vectorize topK with all metadata is limited to 50");
@@ -106,6 +107,7 @@ export default {
       vectors: vectors.size,
       pending: pending.length,
       upsertCalls: control.upsertCalls,
+      queryCalls: control.queryCalls,
     });
   },
 };

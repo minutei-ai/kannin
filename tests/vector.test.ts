@@ -1,5 +1,5 @@
 import { afterAll, expect, test } from "bun:test";
-import { Schema } from "effect";
+import { Effect, Schema } from "effect";
 import {
   QueryResult,
   Metadata,
@@ -545,4 +545,46 @@ test("candidate windows continue through stale revisions and residual filters be
     await (await request(worker, namespace, "query", input)).json(),
   );
   expect(compacted.rows).toEqual(found.rows);
+});
+
+test("bounded ANN cache avoids provider calls and expires without caching document authority", async () => {
+  const namespace = "ann-cache";
+  await request(worker, namespace, "write", {
+    requestId: "seed",
+    upserts: [{ id: "a", text: "lexical", attributes: {}, vector: vector(1) }],
+    deletes: [],
+  });
+  await request(worker, namespace, "vector-sync", {});
+  const service = await worker.getWorker("vectors");
+  const controlSchema = Schema.Struct({ queryCalls: Schema.Int });
+  const before = Schema.decodeUnknownSync(controlSchema)(
+    await (await service.fetch("http://fixture/healthy")).json(),
+  );
+  const first = await request(worker, namespace, "query", vectorQuery());
+  expect(first.headers.get("server-timing")).toContain('vector_cache;desc="miss"');
+  const next = await request(worker, namespace, "query", vectorQuery());
+  expect(next.headers.get("server-timing")).toContain('vector_cache;desc="hit"');
+  expect(Schema.decodeUnknownSync(QueryResult)(await next.json()).rows).toEqual(
+    Schema.decodeUnknownSync(QueryResult)(await first.json()).rows,
+  );
+  const reused = Schema.decodeUnknownSync(controlSchema)(
+    await (await service.fetch("http://fixture/healthy")).json(),
+  );
+  expect(reused.queryCalls).toBe(before.queryCalls + 1);
+  await Effect.runPromise(Effect.sleep("1100 millis"));
+  const expired = await request(worker, namespace, "query", vectorQuery());
+  expect(expired.headers.get("server-timing")).toContain('vector_cache;desc="miss"');
+  const renewed = Schema.decodeUnknownSync(controlSchema)(
+    await (await service.fetch("http://fixture/healthy")).json(),
+  );
+  expect(renewed.queryCalls).toBe(before.queryCalls + 2);
+  await request(worker, namespace, "write", {
+    requestId: "replace",
+    upserts: [{ id: "a", text: "new", attributes: {}, vector: vector(0.6, 0.8) }],
+    deletes: [],
+  });
+  await request(worker, namespace, "vector-sync", {});
+  const updated = await request(worker, namespace, "query", vectorQuery());
+  expect(updated.headers.get("server-timing")).toContain('vector_cache;desc="miss"');
+  expect(Schema.decodeUnknownSync(QueryResult)(await updated.json()).rows[0]?.text).toBe("new");
 });

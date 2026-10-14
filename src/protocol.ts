@@ -322,3 +322,19 @@ export class Rejected extends Schema.TaggedError<Rejected>()("Rejected", {
   status: Schema.Int,
   message: Schema.String,
 }) {}
+
+export const VectorSelection = Schema.Struct({
+  epoch: Root.fields.vectorEpoch,
+  sequence: Root.fields.sequence,
+  pending: Root.fields.vectorJobs,
+  vector: Vector,
+  filters: Schema.Array(Filter),
+  fields: VectorFilterFields,
+});
+export const VectorCandidates = Schema.Array(
+  Schema.Struct({
+    id: Schema.String,
+    score: Schema.Finite,
+    metadata: Schema.Struct({ id: Id, revision: Schema.Int }),
+  }),
+).check(Schema.isMaxLength(50));

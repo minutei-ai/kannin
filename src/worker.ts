@@ -50,6 +50,8 @@ import {
   VectorMessage,
   VectorSyncResult,
   VectorFilterFields,
+  VectorSelection,
+  VectorCandidates,
   VectorRebuild,
   VectorRebuildSnapshot,
   VectorRebuildResult,
@@ -576,14 +578,57 @@ async function vectorQuery(
   };
   if (Object.keys(prefilter).length > 0) options.filter = prefilter;
   const indexStarted = Effect.runSync(Clock.currentTimeNanos);
-  const result = await env.VECTORS.query([...input.vector], options);
+  const selector = Schema.encodeSync(Schema.fromJsonString(VectorSelection))({
+    epoch: root.vectorEpoch,
+    sequence: root.sequence,
+    pending: root.vectorJobs,
+    vector: input.vector,
+    filters: input.filters,
+    fields,
+  });
+  const cacheKey = new URL(`https://raio-cache.internal/vectors-v1/${await sha256(selector)}`);
+  cacheKey.searchParams.set("bucket", env.STORAGE_CACHE_SCOPE);
+  const cache = await Effect.runPromise(
+    Effect.tryPromise(() => caches.open("kannin-vectors-v1")).pipe(
+      Effect.orElseSucceed(() => undefined),
+    ),
+  );
+  const candidates: { value: typeof VectorCandidates.Type | undefined } = { value: undefined };
+  if (cache !== undefined) {
+    const cached = await Effect.runPromise(
+      Effect.tryPromise(() => cache.match(cacheKey)).pipe(Effect.orElseSucceed(() => undefined)),
+    );
+    if (cached !== undefined) {
+      const decoded = await Effect.runPromise(
+        Effect.tryPromise(() => cached.text()).pipe(
+          Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(VectorCandidates))),
+          Effect.orElseSucceed(() => undefined),
+        ),
+      );
+      candidates.value = decoded;
+    }
+  }
+  if (candidates.value === undefined) {
+    const result = await env.VECTORS.query([...input.vector], options);
+    candidates.value = Schema.decodeUnknownSync(VectorCandidates)(result.matches);
+    timings.append("server-timing", 'vector_cache;desc="miss"');
+    if (cache !== undefined && candidates.value.length > 0) {
+      const encoded = Schema.encodeSync(Schema.fromJsonString(VectorCandidates))(candidates.value);
+      await Effect.runPromise(
+        Effect.tryPromise(() =>
+          cache.put(
+            cacheKey,
+            new Response(encoded, {
+              headers: { "cache-control": "public, max-age=1", "content-type": "application/json" },
+            }),
+          ),
+        ).pipe(Effect.ignore),
+      );
+    }
+  } else timings.append("server-timing", 'vector_cache;desc="hit"');
   const indexEnded = Effect.runSync(Clock.currentTimeNanos);
   timings.append("server-timing", `vector_index;dur=${Number(indexEnded - indexStarted) / 1e6}`);
-  const candidate = Schema.Struct({ id: Schema.String, revision: Schema.Int });
-  const metadata = result.matches.map((match) => ({
-    match,
-    metadata: Schema.decodeUnknownSync(candidate)(match.metadata),
-  }));
+  const metadata = candidates.value.map((match) => ({ match, metadata: match.metadata }));
   const eligible = [];
   const cursor = { offset: 0 };
   while (cursor.offset < metadata.length && eligible.length < input.topK) {

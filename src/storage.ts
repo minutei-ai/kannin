@@ -15,6 +15,8 @@ import {
   SegmentRange,
   TermCatalog,
   TermCatalogBatch,
+  OverviewBatch,
+  TermProjectionProps,
   SegmentCacheProps,
   Rejected,
 } from "./protocol";
@@ -34,6 +36,7 @@ const MAX_OVERVIEW_BYTES = 4 * 1024 * 1024;
 const reads = {
   overviewMemoryHits: 0,
   overviewCacheApiHits: 0,
+  overviewCacheApiLookups: 0,
   overviewBuilds: 0,
   termReads: 0,
   termRequests: 0,
@@ -171,51 +174,74 @@ function rememberOverview(identity: string, bytes: Uint8Array) {
   overviewBudget.bytes += charge;
 }
 
-export const readTermProjection = Effect.fn("kannin.readTermProjection")(
-  (key: string, headerBytes: number, terms: string, filters: string) =>
+export const readTermProjections = Effect.fn("kannin.readTermProjections")(
+  (ranges: ReadonlyArray<typeof TermProjectionRange.Type>, terms: string, filters: string) =>
     Effect.gen(function* () {
-      const identity = `${env.STORAGE_CACHE_SCOPE}:${key}/${headerBytes}\0${filters}`;
-      const memory = overviewBuffers.get(identity);
-      if (memory !== undefined) {
-        const projected = yield* Effect.try(() => segment_overview_project(memory, terms)).pipe(
+      const hits = [];
+      for (const [index, input] of ranges.entries()) {
+        const identity = `${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}\0${filters}`;
+        const bytes = overviewBuffers.get(identity);
+        if (bytes === undefined) continue;
+        const catalog = yield* Effect.try(() => segment_overview_project(bytes, terms)).pipe(
           Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(TermCatalog))),
           Effect.orElseSucceed(() => undefined),
         );
-        if (projected !== undefined) {
-          rememberOverview(identity, memory);
-          reads.overviewMemoryHits += 1;
-          return projected;
+        if (catalog === undefined) {
+          overviewBuffers.delete(identity);
+          overviewBudget.bytes -=
+            bytes.byteLength + new TextEncoder().encode(identity).byteLength * 4 + 128;
+          continue;
         }
-        overviewBuffers.delete(identity);
-        overviewBudget.bytes -=
-          memory.byteLength + new TextEncoder().encode(identity).byteLength * 4 + 128;
+        hits.push({ index, identity, bytes, catalog });
       }
-      const cacheKey = new URL("https://overviews.internal/source-v1");
+      if (hits.length === ranges.length) {
+        for (const hit of hits) rememberOverview(hit.identity, hit.bytes);
+        reads.overviewMemoryHits += hits.length;
+        return hits.map((hit) => hit.catalog);
+      }
+      const cacheKey = new URL("https://overviews.internal/batch-v1");
       cacheKey.searchParams.set("bucket", env.STORAGE_CACHE_SCOPE);
-      cacheKey.searchParams.set("key", key);
-      cacheKey.searchParams.set("headerBytes", String(headerBytes));
+      const encodedRanges = yield* Schema.encodeEffect(
+        Schema.fromJsonString(TermProjectionProps.fields.ranges),
+      )(ranges);
+      cacheKey.searchParams.set("ranges", yield* Effect.tryPromise(() => sha256(encodedRanges)));
       cacheKey.searchParams.set("filters", yield* Effect.tryPromise(() => sha256(filters)));
-      const cache = yield* Effect.tryPromise(() => caches.open("raio-overviews-v1")).pipe(
+      const cache = yield* Effect.tryPromise(() => caches.open("raio-overview-batches-v1")).pipe(
         Effect.orElseSucceed(() => undefined),
       );
       if (cache !== undefined) {
+        reads.overviewCacheApiLookups += 1;
         const cached = yield* Effect.tryPromise(() => cache.match(cacheKey)).pipe(
           Effect.orElseSucceed(() => undefined),
         );
         if (cached !== undefined) {
-          const candidate = yield* Effect.tryPromise(
-            async () => new Uint8Array(await cached.arrayBuffer()),
-          ).pipe(Effect.orElseSucceed(() => undefined));
-          if (candidate !== undefined) {
-            const projected = yield* Effect.try(() =>
-              segment_overview_project(candidate, terms),
-            ).pipe(
-              Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(TermCatalog))),
-              Effect.orElseSucceed(() => undefined),
-            );
+          const candidate = yield* Effect.tryPromise(() => cached.text()).pipe(
+            Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(OverviewBatch))),
+            Effect.orElseSucceed(() => undefined),
+          );
+          if (candidate !== undefined && candidate.length === ranges.length) {
+            const projected = yield* Effect.forEach(
+              candidate,
+              (bytes) =>
+                Effect.try(() => segment_overview_project(bytes, terms)).pipe(
+                  Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(TermCatalog))),
+                ),
+              { concurrency: 1 },
+            ).pipe(Effect.orElseSucceed(() => undefined));
             if (projected !== undefined) {
-              rememberOverview(identity, candidate);
-              reads.overviewCacheApiHits += 1;
+              for (const [index, bytes] of candidate.entries()) {
+                const input = ranges[index];
+                if (input === undefined)
+                  return yield* new Rejected({
+                    status: 503,
+                    message: "Overview batch added a segment",
+                  });
+                rememberOverview(
+                  `${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}\0${filters}`,
+                  bytes,
+                );
+              }
+              reads.overviewCacheApiHits += candidate.length;
               return projected;
             }
           }
@@ -224,27 +250,47 @@ export const readTermProjection = Effect.fn("kannin.readTermProjection")(
           );
         }
       }
-      const bytes = yield* withDirectory(key, headerBytes, (directory) =>
-        Effect.sync(() => directory.overview(filters)),
-      );
-      const projected = yield* Effect.try(() => segment_overview_project(bytes, terms)).pipe(
-        Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(TermCatalog))),
-      );
-      reads.overviewBuilds += 1;
-      rememberOverview(identity, bytes);
-      if (cache !== undefined)
+      const catalogs = [];
+      const sources = [];
+      const admission = { bytes: 0, enabled: true };
+      for (const [index, input] of ranges.entries()) {
+        const identity = `${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}\0${filters}`;
+        const hit = hits.find((entry) => entry.index === index);
+        const selected: { bytes: Uint8Array | undefined } = { bytes: hit?.bytes };
+        if (selected.bytes === undefined) {
+          selected.bytes = yield* withDirectory(input.key, input.headerBytes, (directory) =>
+            Effect.sync(() => directory.overview(filters)),
+          );
+          reads.overviewBuilds += 1;
+        } else reads.overviewMemoryHits += 1;
+        const bytes = selected.bytes;
+        const catalog = yield* Effect.try(() => segment_overview_project(bytes, terms)).pipe(
+          Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(TermCatalog))),
+        );
+        rememberOverview(identity, bytes);
+        catalogs.push(catalog);
+        admission.bytes += bytes.byteLength;
+        if (admission.bytes > 3 * 1024 * 1024) {
+          admission.enabled = false;
+          sources.length = 0;
+        }
+        if (admission.enabled) sources.push(bytes);
+      }
+      if (cache !== undefined && admission.enabled) {
+        const encoded = yield* Schema.encodeEffect(Schema.fromJsonString(OverviewBatch))(sources);
         yield* Effect.tryPromise(() =>
           cache.put(
             cacheKey,
-            new Response(bytes.slice(), {
+            new Response(encoded, {
               headers: {
                 "cache-control": "public, max-age=31536000, immutable",
-                "content-type": "application/octet-stream",
+                "content-type": "application/json",
               },
             }),
           ),
         ).pipe(Effect.orElseSucceed(() => undefined));
-      return projected;
+      }
+      return catalogs;
     }),
 );
 

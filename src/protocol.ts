@@ -207,6 +207,7 @@ export const CacheMetrics = Schema.Struct({
   overviewCacheBytes: Schema.Int,
   overviewMemoryHits: Schema.Int,
   overviewCacheApiHits: Schema.Int,
+  overviewCacheApiLookups: Schema.Int,
   overviewBuilds: Schema.Int,
   termReads: Schema.Int,
   termRequests: Schema.Int,
@@ -284,6 +285,15 @@ export const TermSummary = Schema.Struct({
 export const TermSummaries = Schema.Record(Schema.String, TermSummary);
 export const TermCatalog = Schema.Struct({ dictionary: TermSummaries, minimum: EligibleMinimum });
 export const TermCatalogBatch = Schema.Array(TermCatalog).check(Schema.isBetweenLength(1, 16));
+export const OverviewBatch = Schema.Array(Schema.Uint8ArrayFromBase64)
+  .check(Schema.isBetweenLength(1, 16))
+  .check(
+    Schema.makeFilter(
+      (sources) =>
+        sources.reduce((total, bytes) => total + bytes.byteLength, 0) <= 3 * 1024 * 1024 ||
+        "Overview batch exceeds three MiB",
+    ),
+  );
 export const SegmentHeader = Schema.Struct({
   version: Schema.Literal(1),
   documents: Schema.NonEmptyArray(SegmentDocument),

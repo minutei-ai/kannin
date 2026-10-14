@@ -2,7 +2,7 @@ import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
 import { Response } from "miniflare";
 import { createHash } from "node:crypto";
-import { Root, QueryResult, Metadata, Health } from "../src/protocol";
+import { Root, QueryResult, Metadata, Health, TermProjectionProps } from "../src/protocol";
 import { document, request, startWorker, textQuery, write } from "./harness";
 
 const worker = await startWorker();
@@ -188,6 +188,7 @@ test("compressed overviews serve new selectors from memory and Cache API after p
   );
   expect(shared.overviewCacheApiHits - memory.overviewCacheApiHits).toBe(17);
   expect(shared.overviewBuilds - memory.overviewBuilds).toBe(0);
+  expect(shared.overviewCacheApiLookups - memory.overviewCacheApiLookups).toBe(2);
 });
 
 test("corrupted compressed overview cache falls back to verified immutable source data", async () => {
@@ -200,15 +201,17 @@ test("corrupted compressed overview cache falls back to verified immutable sourc
   const manifest = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
   const segment = manifest.segments[0];
   if (segment === undefined) throw new Error("Missing segment");
-  const cache = await (await worker.getCaches()).open("raio-overviews-v1");
-  const key = new URL("https://overviews.internal/source-v1");
+  const cache = await (await worker.getCaches()).open("raio-overview-batches-v1");
+  const key = new URL("https://overviews.internal/batch-v1");
   key.searchParams.set("bucket", "raio-test");
-  key.searchParams.set("key", segment.key);
-  key.searchParams.set("headerBytes", String(segment.headerBytes));
+  const ranges = Schema.encodeSync(Schema.fromJsonString(TermProjectionProps.fields.ranges))([
+    { key: segment.key, headerBytes: segment.headerBytes },
+  ]);
+  key.searchParams.set("ranges", createHash("sha256").update(ranges).digest("hex"));
   key.searchParams.set("filters", createHash("sha256").update("[]").digest("hex"));
   await cache.put(
     key,
-    new Response(new Uint8Array(1), {
+    new Response('["AA=="]', {
       headers: { "cache-control": "public, max-age=60" },
     }),
   );

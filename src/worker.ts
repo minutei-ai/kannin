@@ -68,7 +68,7 @@ import {
   range,
   withDirectory,
   readTermCatalogs,
-  readTermProjection,
+  readTermProjections,
   buildSegment,
   bloom,
   bloomCandidates,
@@ -194,11 +194,7 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
       }
     }
     const response = await Effect.runPromise(
-      Effect.forEach(
-        props.value.ranges,
-        (input) => readTermProjection(input.key, input.headerBytes, encodedTerms, encodedFilters),
-        { concurrency: 1 },
-      ).pipe(
+      readTermProjections(props.value.ranges, encodedTerms, encodedFilters).pipe(
         Effect.flatMap(Schema.encodeEffect(TermCatalogBatch)),
         Effect.map((dictionary) =>
           Response.json(dictionary, {

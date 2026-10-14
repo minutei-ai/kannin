@@ -761,3 +761,27 @@ The lower local kernel cost is supported by alternating binary measurements. Nat
 Fresh native selector/filter diagnostics returned exact strong rows/scores in 1,056/949/1,247 ms for selective/common/filtered queries. Server timings attribute 567–914 ms to directory work, 207–224 ms to snapshots, and 0–11 ms to ranking; these observations leave directory/snapshot acquisition as the dominant measured next targets.
 
 The post-change local SciFact evaluation completed 5,183 documents and 300 queries: nDCG@10 0.673061970, Recall@10 0.795666667, MRR@10 0.641808201. Every evaluated query result matched the previous report. Source CI passed.
+
+## Rejected 64-segment projection batches
+
+An uncommitted native experiment expanded only the term/overview batch budget from 16 to 64, retaining four concurrent requests, exact global frequencies, immutable identities and the three-MiB overview admission limit. Its full local gate passed 116 Worker/tooling and 19 Rust tests. Boundary regressions used 65 segments and verified a full batch, partial tail, filters, scores and cache restoration after memory eviction. Canonical R2 formats did not change.
+
+Fresh-selector diagnostics on the unchanged million-document corpus preserved exact strong results in every case. Ordered batch cache keys changed with batching, so the first experimental run began without the old batch entries; isolate and regional cache placement remained uncontrolled.
+
+| Query     | 16 before ms | 64 first ms | 64 repeat ms |
+| --------- | -----------: | ----------: | -----------: |
+| Selective |      1796.38 |     5950.22 |       813.58 |
+| Common    |      1083.50 |     5889.23 |      4111.63 |
+| Filtered  |      1034.90 |      841.13 |      1408.48 |
+
+The common query regressed in both rounds; directory time was 5,537 ms first and 3,627 ms repeated, compared with 383 ms before. Selective improvement on the repeat did not establish a whole-workload benefit. The 96-response experimental load preserved exact rows/scores and sequence barriers but reduced throughput across all phases against the preceding 16-segment runtime measurement.
+
+| Concurrency | 64 p50 ms | 64 p95 ms | 64 requests/s |
+| ----------: | --------: | --------: | ------------: |
+|           1 |     68.83 |    966.57 |          2.34 |
+|           4 |     84.20 |   1104.71 |          8.97 |
+|          16 |    359.33 |   1546.04 |         16.31 |
+
+The experiment was rejected and the 16-segment source restored. Fewer internal calls alone did not prove lower native latency. Larger source batches can increase cold work per entrypoint and cache retention pressure; this is an inference from the timings, not independently measured CPU or memory proof.
+
+Restored deployment completed. The three fresh-selector checks again matched strong rows/scores, taking 1,640/1,366/998 ms for selective/common/filtered queries; common-query latency improved against both 64-segment rounds. Directory timings remained 648–949 ms, so the wider directory bottleneck is unresolved.

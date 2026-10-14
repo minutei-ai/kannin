@@ -5,6 +5,14 @@ import type { Filter } from "../src/protocol";
 import { Query, QueryResult, Write, Metadata } from "../src/protocol";
 import { corpus } from "./corpus";
 
+class ComparisonFailure extends Schema.TaggedError<ComparisonFailure>()("ComparisonFailure", {
+  phase: Schema.Literals(["metadata", "strong", "edge", "final-metadata"]),
+  status: Schema.Int,
+  body: Schema.String,
+  ray: Schema.Union([Schema.String, Schema.Null]),
+  serverTiming: Schema.Union([Schema.String, Schema.Null]),
+}) {}
+
 const url = new URL(Effect.runSync(Config.String("RAIO_URL")));
 const raioToken = Effect.runSync(Config.Redacted("RAIO_API_TOKEN"));
 const turboToken = Effect.runSync(Config.Redacted("TURBOPUFFER_API_KEY"));
@@ -108,6 +116,14 @@ const report = await (async () => {
   const metadataResponse = await fetch(new URL(`/v1/namespaces/${namespace}/metadata`, url), {
     headers,
   });
+  if (!metadataResponse.ok)
+    throw new ComparisonFailure({
+      phase: "metadata",
+      status: metadataResponse.status,
+      body: (await metadataResponse.text()).slice(0, 1024),
+      ray: metadataResponse.headers.get("cf-ray"),
+      serverTiming: metadataResponse.headers.get("server-timing"),
+    });
   const metadata = Schema.decodeUnknownSync(Metadata)(await metadataResponse.json());
   if (metadata.documents !== size) throw new Error("Raio document count mismatch");
   const indexing = { polls: 0, ready: false, waitedMs: 0 };
@@ -176,6 +192,14 @@ const report = await (async () => {
         headers,
         body: Schema.encodeSync(Schema.fromJsonString(Query))(query),
       });
+      if (!response.ok)
+        throw new ComparisonFailure({
+          phase: "strong",
+          status: response.status,
+          body: (await response.text()).slice(0, 1024),
+          ray: response.headers.get("cf-ray"),
+          serverTiming: response.headers.get("server-timing"),
+        });
       const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
       const raioMs = performance.now() - first;
       if (result.rows.length === 0) throw new Error("Empty Raio result");
@@ -191,6 +215,14 @@ const report = await (async () => {
           minimumSequence: metadata.sequence,
         }),
       });
+      if (!edgeResponse.ok)
+        throw new ComparisonFailure({
+          phase: "edge",
+          status: edgeResponse.status,
+          body: (await edgeResponse.text()).slice(0, 1024),
+          ray: edgeResponse.headers.get("cf-ray"),
+          serverTiming: edgeResponse.headers.get("server-timing"),
+        });
       const edge = Schema.decodeUnknownSync(QueryResult)(await edgeResponse.json());
       const edgeMs = performance.now() - edgeStarted;
       if (
@@ -236,6 +268,14 @@ const report = await (async () => {
   const final = await fetch(new URL(`/v1/namespaces/${namespace}/metadata`, url), {
     headers,
   });
+  if (!final.ok)
+    throw new ComparisonFailure({
+      phase: "final-metadata",
+      status: final.status,
+      body: (await final.text()).slice(0, 1024),
+      ray: final.headers.get("cf-ray"),
+      serverTiming: final.headers.get("server-timing"),
+    });
   const finalMetadata = Schema.decodeUnknownSync(Metadata)(await final.json());
   return {
     runtime: "deployed-cloudflare-vs-turbopuffer",

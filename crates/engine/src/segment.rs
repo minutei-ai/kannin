@@ -830,6 +830,7 @@ pub struct Search {
     pub top_k: usize,
     pub allowed: Vec<bool>,
     lists: PostingLists,
+    last_decoded_rows: BTreeMap<String, Option<u32>>,
 }
 
 #[derive(Serialize)]
@@ -907,6 +908,7 @@ impl Search {
             mode: mode.into(),
             top_k,
             allowed,
+            last_decoded_rows: BTreeMap::new(),
             lists: if mode == "phrase" {
                 PostingLists::Positions(BTreeMap::new())
             } else {
@@ -924,15 +926,19 @@ impl Search {
             PostingLists::Positions(lists) => {
                 let postings = decode_postings(bytes)?;
                 let list = lists.entry(term.into()).or_default();
+                let previous = self.last_decoded_rows.entry(term.into()).or_default();
                 for posting in postings {
                     validate_posting(
                         &self.header,
                         posting.row,
                         posting.title.last().copied(),
                         posting.body.last().copied(),
-                        list.last().map(|previous| previous.row),
+                        *previous,
                     )?;
-                    list.push(posting);
+                    *previous = Some(posting.row);
+                    if self.allowed[posting.row as usize] {
+                        list.push(posting);
+                    }
                 }
             }
             PostingLists::Frequencies(lists) => {
@@ -948,15 +954,13 @@ impl Search {
                     )
                 })?;
                 let list = lists.entry(term.into()).or_default();
+                let previous = self.last_decoded_rows.entry(term.into()).or_default();
                 for (posting, title, body) in postings {
-                    validate_posting(
-                        &self.header,
-                        posting.row,
-                        title,
-                        body,
-                        list.last().map(|previous| previous.row),
-                    )?;
-                    list.push(posting);
+                    validate_posting(&self.header, posting.row, title, body, *previous)?;
+                    *previous = Some(posting.row);
+                    if self.allowed[posting.row as usize] {
+                        list.push(posting);
+                    }
                 }
             }
         }
@@ -2385,6 +2389,121 @@ mod frequency_tests {
                 search.add("alpha", &page).err().as_deref(),
                 Some("Invalid token position")
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn excluded_rows_do_not_hide_corruption_or_disordered_blocks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let built = build(serde_json::from_value(json!([
+            {"id":"a","text":"alpha","attributes":{}},
+            {"id":"b","text":"alpha","attributes":{}},
+            {"id":"c","text":"alpha","attributes":{}}
+        ]))?)?;
+        let mut later = Vec::new();
+        append(&mut later, &[1, 2, 0, 1, 0])?;
+        let mut earlier = Vec::new();
+        append(&mut earlier, &[1, 1, 0, 1, 0])?;
+        let mut invalid = Vec::new();
+        append(&mut invalid, &[1, 2, 0, 1, 1])?;
+        for mode in ["any", "all", "phrase"] {
+            let mut search = Search::new(
+                built.header.clone(),
+                Statistics {
+                    documents: 3,
+                    title_length: 0,
+                    body_length: 3,
+                    frequencies: BTreeMap::from([("alpha".into(), 3)]),
+                },
+                "alpha",
+                mode,
+                10,
+                &[0, 1, 2],
+                &[],
+            )?;
+            search.add("alpha", &later)?;
+            assert!(search.finish()?.is_empty());
+            assert_eq!(search.last_decoded_rows.get("alpha"), Some(&Some(2)));
+            match &search.lists {
+                PostingLists::Positions(lists) => assert!(lists.values().all(Vec::is_empty)),
+                PostingLists::Frequencies(lists) => assert!(lists.values().all(Vec::is_empty)),
+            }
+            assert_eq!(
+                search.add("alpha", &earlier).err().as_deref(),
+                Some("Posting blocks out of order")
+            );
+            assert_eq!(
+                search.add("alpha", &invalid).err().as_deref(),
+                Some("Invalid token position")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retained_eligible_rows_match_a_full_list_reference_in_every_mode()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let docs: Vec<Document> = (0..256)
+            .map(|index| Document {
+                id: format!("{index:05}"),
+                revision: 0,
+                title: String::new(),
+                text: "alpha beta alpha".into(),
+                attributes: BTreeMap::from([("group".into(), json!(index % 8))]),
+                vector: None,
+            })
+            .collect();
+        let built = build(docs)?;
+        let base = 16 + serde_json::to_vec(&built.header)?.len();
+        let header = Rc::new(built.header);
+        for mode in ["any", "all", "phrase"] {
+            let mut searches = Vec::new();
+            for full in [false, true] {
+                let mut search = Search::new(
+                    header.clone(),
+                    Statistics {
+                        documents: 253,
+                        title_length: 0,
+                        body_length: 759,
+                        frequencies: BTreeMap::from([("alpha".into(), 253), ("beta".into(), 253)]),
+                    },
+                    "alpha beta",
+                    mode,
+                    100,
+                    &[0, 8, 16],
+                    &[Filter {
+                        field: "group".into(),
+                        op: "eq".into(),
+                        value: json!(0),
+                    }],
+                )?;
+                let allowed = search.allowed.clone();
+                if full {
+                    search.allowed.fill(true);
+                }
+                for (term, metadata) in &header.terms {
+                    for block in &metadata.blocks {
+                        let start = base + block.data.offset as usize;
+                        search.add(
+                            term,
+                            &built.bytes[start..start + block.data.length as usize],
+                        )?;
+                    }
+                }
+                search.allowed = allowed;
+                searches.push(search);
+            }
+            assert_eq!(searches[0].finish()?, searches[1].finish()?);
+            let sizes: Vec<_> = searches
+                .iter()
+                .map(|search| match &search.lists {
+                    PostingLists::Positions(lists) => lists.values().map(Vec::len).sum::<usize>(),
+                    PostingLists::Frequencies(lists) => lists.values().map(Vec::len).sum::<usize>(),
+                })
+                .collect();
+            assert_eq!(sizes, [58, 512]);
+            assert_eq!(searches[0].last_decoded_rows, searches[1].last_decoded_rows);
         }
         Ok(())
     }

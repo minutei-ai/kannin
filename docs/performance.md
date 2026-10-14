@@ -1390,3 +1390,23 @@ The full local gate passed 28 Rust and 130 Bun/workerd tests. Native Alchemy dep
 | 16          | 222.59 / 1116.62      | 316.44 / 1345.81       | 359.61 / 1186.33                |
 
 The original SciFact archive matched its recorded SHA-256. Both the prior positional engine and the compact engine ran all 300 judged queries over 5,183 documents through local workerd/R2. Complete report bytes, per-query identifiers and metrics were identical. Independent metric recomputation agreed within 1e-12: NDCG@10 0.6730619695232347, Recall@10 0.7956666666666666 and MRR@10 0.641808201058201. This is a local scientific-retrieval regression gate, not native ranking-quality or vector-recall proof.
+
+### Discarding excluded postings after validation
+
+The ranker now validates every decoded posting before retaining only rows allowed by filters/tombstones. It separately tracks the last decoded row per requested term, so an excluded final row cannot hide an overlapping or reversed next block. CRC, varints, document-position bounds and ordering checks still apply to discarded data. Full term catalogs continue to supply global document frequencies and conservative bounds. Physical acquisition and persisted formats are unchanged.
+
+Two local Bun/WASM comparisons each covered twelve 10,000-document cases with unfiltered/clustered/interleaved/tombstoned any/all/phrase. Fifteen alternating pairs ran sixteen pipelines each, with three warmups excluded from timing; all 11,520 serialized row/score outputs matched. In the isolated repetition, interleaved any/all/phrase medians improved 7.5/2.6/6.7%; clustered any/all improved 6.9/2.3%; tombstoned any/all improved 4.0/4.8%. Unfiltered any changed +0.7%, all -0.8%, and phrase -12.1%; the first run's unfiltered phrase change was -6.1%, showing timing variability. These are local pipeline measurements, not native CPU or broad latency guarantees.
+
+The full gate passed 30 Rust and 130 Bun/workerd tests. A direct all-mode comparison retained 58 eligible postings versus a 512-posting full-list reference, preserving every score and the last-decoded-row map. Separate tests verify that an entirely excluded block still establishes order for the next block and still rejects out-of-document positions. This demonstrates reduced list retention in that fixture, not total Worker peak memory.
+
+Native Alchemy deployment and its Vectorize metadata migration succeeded. The million-document baseline/first-candidate/repeated-candidate load retained all 288 exact-result/score/sequence comparisons. A post-deploy all/phrase load retained another 96 results, with p50 92.17/122.73/340.42 ms and p95 274.40/677.76/2237.78 ms at concurrency 1/4/16. Native client tails worsened in the ordinary candidate loads, despite smaller retained lists and controlled local improvements. Cache/isolate/network conditions were uncontrolled; this is not a native latency improvement claim.
+
+| Concurrency | Baseline p50 / p95 ms | Candidate p50 / p95 ms | Repeated candidate p50 / p95 ms |
+| ----------- | --------------------- | ---------------------- | ------------------------------- |
+| 1           | 75.92 / 327.77        | 75.36 / 435.47         | 71.34 / 127.84                  |
+| 4           | 214.67 / 1306.71      | 72.48 / 1801.39        | 85.32 / 968.52                  |
+| 16          | 296.74 / 1278.82      | 319.72 / 3615.63       | 303.44 / 2523.25                |
+
+Worst concurrency-16 candidate requests reported text_rank intervals around 2.7–3.6 seconds. That phase includes posting acquisition and elapsed asynchronous scheduling; it is not a pure Rust CPU measurement. Native clocks freeze during uninterrupted CPU work, so zero-valued median phases cannot establish absence of work. These observations leave acquisition/tail attribution unresolved.
+
+The complete 300-query SciFact evaluation was repeated over the verified original dataset. Its full report was byte-identical to the preceding compact-frequency evaluation, retaining every returned identifier and metric. This preserves the local retrieval-quality gate; native quality, peak Worker memory and Turbopuffer parity remain unproven.

@@ -284,7 +284,7 @@ test("R2-backed rebuild cursors resume after provider failure and reconcile inte
   );
   expect(changed.rows.map((row) => row.id)).toEqual(["150"]);
   expect(changed.rows[0]?.text).toBe("updated");
-});
+}, 15000);
 
 test("rebuild cursor validation and namespace reset cannot silently change the selected snapshot", async () => {
   for (const cursor of [

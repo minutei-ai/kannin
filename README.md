@@ -9,47 +9,21 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 ## Performance
 
-**100,000 documents · local workerd · warm queries · milliseconds (p50 / p95)**
+**1,000,000 documents · deployed Cloudflare · client in Brazil · edge reads with acknowledged sequence barrier**
 
-| Query     |        Strong | Edge eventual |
-| --------- | ------------: | ------------: |
-| Rare      |   3.55 / 4.94 |   3.15 / 3.44 |
-| Selective | 16.70 / 25.76 | 18.25 / 26.85 |
-| Common    | 21.40 / 28.57 | 22.37 / 30.03 |
-| Filtered  | 19.21 / 27.30 | 20.18 / 27.54 |
+| Concurrency | p50 ms | p95 ms | Requests/s |
+| ----------: | -----: | -----: | ---------: |
+|           1 |  80.83 | 682.73 |       6.40 |
+|           4 |  83.75 | 772.23 |      13.55 |
+|          16 | 142.43 | 860.56 |      24.17 |
 
-Local ingestion: **100,000 documents in 23.61 seconds**, approximately **4,235 documents/s**, in batches of 500. Intel Xeon E5-2680 v4, Bun 1.4.3. Each case/mode has five warmups and 50 measured requests, including HTTP and response decoding. Both modes share one process; no query-result cache. Local timings exclude Cloudflare regional network latency.
+Runtime `a8df7ed`; 32 mixed-query requests per phase. All 96 edge responses matched strong rows and scores. Compressed segment overviews reuse immutable metadata across query selectors; repeated new selectors still took **1.79–3.19 seconds**. Cache state and network variation limit attribution. Concurrency-four tails slightly regressed, and an earlier edge request hit its 30-second lease; successful later runs do not prove that first-use failure resolved.
 
-Immutable query catalogs now let cached queries recover global BM25 frequencies without reloading every segment header. After directory eviction, local regressions reduced range reads **33 → 4** for conjunctive queries and **19 → 4** for both unfiltered and filtered score pruning. [Cache design and measurements](docs/performance.md#immutable-term-projections).
+The local million-document workload measured strong common/filtered p50 of **127/126 ms** across 2,000 uncompacted segments. These emulator results exclude native network latency. Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10** across 300 queries. Eight native vector/hybrid fixture cases also retained exact rows and scores.
 
-Conjunctive segment pruning reduced local warm p50 from **14.11 to 6.83 ms** for `all` and **13.91 to 5.88 ms** for phrase queries in a separate 15,000-document, 30-segment workload. Impossible Bloom intersections avoid directory reads; exact live term frequencies avoid unnecessary postings. [Methodology and limits](docs/performance.md#conjunctive-query-pruning).
+A separate operational Turbopuffer comparison measured **59–81 ms p50**, while the comparator still processed 15,000 unindexed documents. Fully indexed comparison and general parity remain unverified.
 
-**100,000 documents · deployed Cloudflare · client in Brazil · milliseconds (p50 / p95)**
-
-| Query     |        Strong | Edge eventual |
-| --------- | ------------: | ------------: |
-| Rare      | 165.3 / 194.8 |   53.4 / 77.2 |
-| Selective | 172.0 / 187.2 |   63.8 / 87.1 |
-| Common    | 181.6 / 196.7 |   68.7 / 95.7 |
-| Filtered  | 177.4 / 189.7 |  68.2 / 102.1 |
-
-These deployed measurements are from `faa310e`, before the latest warm-snapshot optimization, with the same five-warmup/50-sample methodology. Strong reads paid the coordinator hop outside Brazil. A separate mixed-query load run reached **45.4 requests/s at concurrency 16**, with **p95 1,090.5 ms**; all 384 responses matched strong baselines. Cold requests reached **3.4 seconds**. These results establish bounded measurements, not general Turbopuffer parity or native million-document scale.
-
-The filtered-projection run passed **192 mixed-query checks**, with concurrency-1 p50/p95 **159 / 223 ms** and concurrency-16 p95 **815 ms**, reaching **46.1 requests/s**. The first post-deploy load aborted on an unclassified 503; a completed repeat does not prove that failure resolved. Broad vector/hybrid throughput and general latency guarantees remain open.
-
-Native ANN candidate caching reduced repeated vector-10 p50 from **256 to 186 ms** and hybrid-10 from **272 to 191 ms** on a controlled 96-vector corpus. The one-second cache preserved all 200 before/after results; misses and cold service latency remain. [Methodology and limits](docs/performance.md#conditional-manifest-reads-and-bounded-ann-caching).
-
-[Full deployed evidence](docs/performance.md) · [local methodology and contract comparison](docs/turbopuffer-contracts.md) · [SciFact ranking quality](docs/quality.md)
-
-The local **1,000,000-document** follow-up uses 2,000 uncompacted segments. Compact term projections reduced strong common/filtered p50 from **2,108/2,020 to 127/126 ms** with the same 4 MiB catalog budget. All measured new-run rows and scores agreed across strong and edge modes. Ingestion took 22.45 minutes; edge selective latency regressed. [Full results and limits](docs/performance.md#million-document-local-workload).
-
-Native ingestion now also confirms **1,000,000 documents**. Six warm strong diagnostic queries per case measured selective/common medians of **211/226 ms**, while individual initial requests took **7.64/5.36 seconds**. The full comparator run remains unverified because query metrics reported unindexed documents after metadata readiness. [Native evidence and limitations](docs/performance.md#native-million-document-diagnostics).
-
-A separate native operational comparison measured strong p50 **169–192 ms**, edge p50 **91–126 ms** and edge p95 **465–746 ms**. Turbopuffer measured p50 **59–81 ms** while processing 15,000 unindexed documents. Every Kannin strong/edge pair agreed, but an earlier edge request timed out at 30 seconds. [Complete methodology and remaining failures](docs/performance.md#operational-comparison-with-unindexed-comparator-writes).
-
-The latest deployed change admits larger edge snapshots within a **24 MiB charged memory budget**. A native warm repetition at concurrency 1/4/16 measured p50 **89/82/114 ms**, with p95 **615/499/1,146 ms**. The first post-deploy run had worse tails; all 288 before/after edge responses agreed with strong baselines. [All runs and memory limits](docs/performance.md#large-edge-snapshot-budget).
-
-Native projections now batch up to sixteen segments per call. The latest mixed-query load measured p50 **80/91/196 ms** at concurrency 1/4/16, with exact strong/edge agreement; its initial p95 reached **3.52 seconds**. New projection selectors still took **4.35–4.61 seconds** in individual diagnostics. A full-header cache experiment was reverted after worse total latency. [Retained behavior and all measurements](docs/performance.md#batched-native-query-projections).
+[Native and local measurements, regressions and methodology](docs/performance.md) · [contract comparison](docs/turbopuffer-contracts.md) · [ranking quality](docs/quality.md)
 
 ## Run
 

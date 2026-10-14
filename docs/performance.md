@@ -1274,3 +1274,23 @@ Baseline, first candidate and repeated candidate runs completed 288 exact-result
 | 16          | 308.16 / 1775.63   | 310.77 / 1745.65    | 242.35 / 1159.89             |
 
 The candidate runs observed ten request-local unchanged-ETag markers. The measurements preserve exact ranking and demonstrate the new native cache path, but remain mixed for median latency and do not establish Turbopuffer parity or a traffic-wide speedup.
+
+### Monotonic block-bound cursors in Rust
+
+After filling text top-k, the scorer previously scanned a term's block-bound list from its beginning for each candidate. The scorer now retains one query-local bound cursor per term and searches its remaining suffix only when the posting row leaves the current block. Segment parsing validates strictly ordered, nonoverlapping block row intervals. Score arithmetic, term accumulation order, pruning tolerance and tie order are unchanged; the segment wire format remains version 1.
+
+A local Bun/WASM differential comparison covered 54 fixtures: 128/2,048/10,000 documents, three posting-density patterns, any/all/phrase and filters on/off. Fifteen alternating pairs ran 64 finishes each, excluding three warmup pairs for timing. All 103,680 repeated ranking results matched the previous engine's serialized rows and scores exactly. A further 18-fixture repetition at 10,000 documents ran after the local test gate finished and preserved another 34,560 results.
+
+In that repetition, unfiltered any medians fell by 39.9–44.5% and filtered any by 63.5–69.8%. Dense all and phrase medians fell by 37.4–46.0%; sparse nonempty intersections improved by 28.2–31.4%. Nearly empty filtered intersection controls changed by -3.6% to +5.2%, below one microsecond in absolute median difference. One disjoint phrase control changed by +1.2% (0.3523 to 0.3565 ms). These are isolated local ranking timings, not native CPU or client-query percentiles. A binary-search-only precursor regressed sparse any and was replaced before deployment. In the broader run, single-block fixtures changed by -1.2% to +7.2%, with median change +1.5%; 2,048-document fixtures had median change -7.1%. That broader run overlapped the local check and is weaker timing evidence than the isolated repetition.
+
+The full gate passed 23 Rust and 126 Bun/workerd tests. A new corrupt-header test recomputes the CRC after reordering or overlapping block intervals and verifies explicit rejection. Existing exhaustive scoring, exact tie, phrase, tombstone and concurrent workerd coverage passed.
+
+Native Alchemy deployment and its Vectorize metadata migration succeeded. The million-document before/after/repeated load retained all 288 exact-result comparisons, including scores and sequence. Client latency remains mixed: the first candidate improved medians at all three concurrencies but worsened p95 at concurrency 4/16; the repetition improved concurrency 1/4 medians and worsened concurrency 16 median. Cache warmth, isolate placement and network conditions were uncontrolled. These runs do not prove a general end-to-end speedup or Turbopuffer parity.
+
+| Concurrency | Baseline p50 / p95 ms | Candidate p50 / p95 ms | Repeated candidate p50 / p95 ms |
+| ----------- | --------------------- | ---------------------- | ------------------------------- |
+| 1           | 134.59 / 429.60       | 99.52 / 437.53         | 66.07 / 147.49                  |
+| 4           | 94.21 / 334.02        | 84.38 / 1081.87        | 71.82 / 827.70                  |
+| 16          | 214.79 / 962.64       | 182.96 / 2037.30       | 294.33 / 958.46                 |
+
+A separate post-deploy all/phrase load completed 96 further exact-result comparisons at concurrency 1/4/16. Its p50 values were 84.17/105.53/428.99 ms and p95 values 226.13/978.30/1441.83 ms. This validates native intersection/phrase behavior after the cursor change; it has no paired pre-change timing baseline.

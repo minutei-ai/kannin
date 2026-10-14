@@ -476,6 +476,13 @@ pub fn parse_header(bytes: &[u8]) -> Result<(Header, usize), String> {
         if term.df > u32::try_from(header.documents.len()).map_err(|cause| cause.to_string())? {
             return Err("Invalid term document frequency".into());
         }
+        if term
+            .blocks
+            .windows(2)
+            .any(|pair| pair[0].last >= pair[1].first)
+        {
+            return Err("Posting block rows are not strictly ordered".into());
+        }
         for block in &term.blocks {
             if block.last
                 >= u32::try_from(header.documents.len()).map_err(|cause| cause.to_string())?
@@ -855,19 +862,28 @@ impl Search {
         lists: &[&[Posting]],
         cursors: &[usize],
         bounds: &[Vec<(&BlockMeta, f64)>],
+        bound_cursors: &mut [usize],
         cutoff: &Hit,
         row: u32,
     ) -> Option<u32> {
         let mut end = u32::MAX;
         let mut bound = 0.0;
         for (index, list) in lists.iter().enumerate() {
-            if let Some(posting) = list.get(cursors[index])
-                && let Some((block, score)) = bounds[index]
-                    .iter()
-                    .find(|(block, _)| block.first <= posting.row && block.last >= posting.row)
-            {
-                end = end.min(block.last);
-                bound += score;
+            if let Some(posting) = list.get(cursors[index]) {
+                if bounds[index]
+                    .get(bound_cursors[index])
+                    .is_some_and(|(block, _)| block.last < posting.row)
+                {
+                    bound_cursors[index] += bounds[index][bound_cursors[index]..]
+                        .partition_point(|(block, _)| block.last < posting.row);
+                }
+                if let Some((block, score)) = bounds[index]
+                    .get(bound_cursors[index])
+                    .filter(|(block, _)| block.first <= posting.row)
+                {
+                    end = end.min(block.last);
+                    bound += score;
+                }
             }
         }
         if bound + 1e-12 < cutoff.score
@@ -904,6 +920,7 @@ impl Search {
             })
             .collect();
         let mut bounds = None;
+        let mut bound_cursors = vec![0; terms.len()];
         let phrase_order: Vec<_> = if self.mode == "phrase" {
             self.words
                 .iter()
@@ -922,6 +939,7 @@ impl Search {
                     &positions.lists,
                     &positions.cursors,
                     bounds.get_or_insert_with(|| self.block_bounds(&terms, &scorers)),
+                    &mut bound_cursors,
                     cutoff,
                     row,
                 )

@@ -287,6 +287,36 @@ fn equal_score_blocks_preserve_exact_top_k_ties() -> Result<(), Box<dyn std::err
 }
 
 #[test]
+fn posting_directory_rejects_reordered_and_overlapping_rows()
+-> Result<(), Box<dyn std::error::Error>> {
+    let docs = (0..512)
+        .map(|index| document(format!("{index:05}"), "alpha beta"))
+        .collect();
+    let built = segment::build(docs)?;
+    for overlap in [false, true] {
+        let mut header: serde_json::Value = serde_json::to_value(&built.header)?;
+        let blocks = header["terms"]["alpha"]["blocks"]
+            .as_array_mut()
+            .ok_or("Missing blocks")?;
+        if overlap {
+            blocks[1]["first"] = blocks[0]["last"].clone();
+        } else {
+            blocks.swap(0, 1);
+        }
+        let json = serde_json::to_vec(&header)?;
+        let mut bytes = b"RAIOSEG1".to_vec();
+        bytes.extend_from_slice(&u32::try_from(json.len())?.to_le_bytes());
+        bytes.extend_from_slice(&crc32fast::hash(&json).to_le_bytes());
+        bytes.extend_from_slice(&json);
+        assert_eq!(
+            segment::parse_header(&bytes).err().as_deref(),
+            Some("Posting block rows are not strictly ordered")
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn bloom_filters_have_no_false_negatives_and_bounded_false_positives()
 -> Result<(), Box<dyn std::error::Error>> {
     let values: Vec<_> = (0..1000).map(|index| format!("document-{index}")).collect();

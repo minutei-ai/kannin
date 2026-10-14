@@ -999,3 +999,41 @@ Each case alternated request order across 23 pairs, excluded three warmup pairs 
 |     10000 |      12 | rank      |               20 |                20 |           2.750000 |            2.625000 |           4.687500 |            3.062500 |
 
 All 369 producer invocations completed with exact matching results and native `ok` outcomes. Five fixture preparations were discarded, including one additional preparation in the large low-density rank control, leaving 19 candidate samples there. Decoding medians improved by 3–10% in three cases, but regressed by 8% for 10,000 high-density documents. The unchanged rank control also varied between versions, demonstrating residual scheduling noise. The combined evidence does not establish a consistent native gain; the original dynamic decompressor remains deployed. No production source, corpus, cache configuration or search resource changed during this follow-up. Synthetic receipts were exported before removing the two temporary Workers and bucket. This CPU measurement does not establish whole-query latency, peak memory or Turbopuffer parity.
+
+## Rejected binary lookup of Rust pruning blocks
+
+The pruning loop previously searched each term's block bounds from the beginning for every candidate row. The candidate checks the prepared bounds once and uses binary lookup for at least eight non-overlapping, ordered blocks. Short, overlapping, inverted or unordered block ranges retain the original first-match linear search. Bound scores, term accumulation order, epsilon, tie-breaking, filters, tombstones, phrase order and wire/cache formats remain unchanged. A regression compares selected bounds with the original linear rule over gaps, overlaps, unordered/inverted ranges, empty lists and the binary path.
+
+A local alternating WASM comparison preserved all 1,296 query results/scores across any/all/phrase modes, eight filters, three top-k budgets and live statistics/tombstones. Larger 10,000-document any/all cases improved median finish time by 17–25%; the filtered phrase case improved 3%. Small cases varied by microseconds. The local timing overlapped validation on a heavily loaded shared machine, so native CPU evidence is reported separately.
+
+The temporary native CPU harness described above was rebuilt with the current baseline and candidate. This round measured rank-only requests: 23 alternating pairs per fixture, three excluded warmup pairs, 128 repetitions for 500 documents and 16 for 10,000. Every repetition checked exact rows/scores. The producer acquired no R2/cache data. Native invocation CPU includes validation and output serialization and is divided by repetitions. Isolate lifecycle and hardware scheduling remain uncontrolled.
+
+| Documents | Density | Baseline samples | Candidate samples | Baseline p50 ms/op | Candidate p50 ms/op | Baseline p95 ms/op | Candidate p95 ms/op |
+| --------: | ------: | ---------------: | ----------------: | -----------------: | ------------------: | -----------------: | ------------------: |
+|       500 |       1 |               20 |                20 |           0.164062 |            0.140625 |           0.242188 |            0.351562 |
+|       500 |      12 |               20 |                20 |           0.156250 |            0.156250 |           0.218750 |            0.273438 |
+|     10000 |       1 |               19 |                20 |           4.437500 |            3.625000 |           5.187500 |            5.625000 |
+|     10000 |      12 |               20 |                20 |           4.500000 |            3.375000 |           5.375000 |            4.187500 |
+
+All 185 invocations completed with matching results and native `ok` outcomes. Fresh fixture preparation is excluded; an additional preparation left 19 baseline samples for the large low-density case. Larger-segment median CPU improved 18–25%; p95 improved in the dense case and regressed in the low-density case. The candidate did not establish improved whole-query latency, peak-memory or Turbopuffer parity. The temporary two Workers and bucket were removed after receipt export.
+
+Local lint, typechecking, native/WASM Clippy and all 22 Rust tests passed. Two full default-timeout gates failed with workerd test timeouts: one R2 listing test in the first run, then vector rebuild and long-history reload tests in the second. The shared machine had load averages above 100. All 117 Worker/tooling tests passed with the identical assertions and a 30-second per-test timeout; repository timeout configuration was unchanged. A subsequent local full gate passed with the default timeout after machine load subsided; the independent CI gate also passed ([run 38578665699](https://github.com/minutei-ai/kannin/actions/runs/38578665699)).
+
+The unchanged million-document corpus then completed four 96-response loads: original, candidate first, candidate repeated and original restored. All 384 edge responses matched strong rows/scores and sequence barriers, with the corpus remaining at one million documents and sequence 2,000. No corpus writes occurred. Each phase used 32 requests, four text cases, no separate warmup and uncontrolled cache/isolate/network conditions.
+
+| Configuration      | Concurrency | p50 ms |  p95 ms | Requests/s |
+| :----------------- | ----------: | -----: | ------: | ---------: |
+| Original           |           1 |  78.05 |  680.28 |       4.96 |
+| Original           |           4 |  72.08 | 1086.42 |      13.79 |
+| Original           |          16 | 128.97 | 2045.28 |      15.58 |
+| Candidate first    |           1 | 123.27 | 1061.58 |       3.02 |
+| Candidate first    |           4 |  94.19 | 1194.87 |      12.97 |
+| Candidate first    |          16 | 156.45 | 1753.02 |      13.84 |
+| Candidate repeated |           1 |  96.94 |  824.23 |       4.35 |
+| Candidate repeated |           4 |  89.61 |  867.13 |      13.65 |
+| Candidate repeated |          16 | 221.34 |  870.20 |      16.07 |
+| Original restored  |           1 |  81.51 |  538.25 |       6.33 |
+| Original restored  |           4 |  80.70 |  971.67 |      12.98 |
+| Original restored  |          16 | 138.42 | 1215.32 |      17.96 |
+
+Both candidate runs regressed median latency in every phase against the reference. Candidate throughput regressed in all first-run phases; its repeat remained below the reference at concurrency one/four and improved slightly at sixteen. Restoration reduced medians in all phases against both candidate runs, while tail latency/throughput remained mixed. These uncontrolled loads do not prove the binary lookup caused the regression, but they did not justify promoting it as a whole-search improvement. Production was restored to the previous Rust source; the candidate and its passing CI remain in `perf/rust-block-lookup` for reproducibility. The README reports the restored load. Native CPU gain alone does not establish end-to-end speed or Turbopuffer parity.

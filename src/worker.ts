@@ -1689,7 +1689,7 @@ export class SearchNamespace extends DurableObject<Env> {
 
 const warmSnapshots = new Map<string, { snapshot: typeof Snapshot.Type; bytes: number }>();
 const warmSnapshotBudget = { bytes: 0 };
-const MAX_WARM_SNAPSHOT_BYTES = 4 * 1024 * 1024;
+const MAX_WARM_SNAPSHOT_BYTES = 24 * 1024 * 1024;
 
 function rememberSnapshot(key: string, snapshot: typeof Snapshot.Type, encoded: string) {
   const prior = warmSnapshots.get(key);

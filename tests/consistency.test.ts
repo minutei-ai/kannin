@@ -246,6 +246,37 @@ test("warm namespace snapshots survive Cache API eviction only within their orig
   expect((await request(worker, "warm-memory", "query", input)).status).toBe(503);
 });
 
+test("large warm snapshots retain the same age limit after Cache API eviction", async () => {
+  const namespace = "large-warm-memory";
+  await request(worker, namespace, "write", write([document("a", "warm namespace")]));
+  const bucket = await worker.getR2Bucket("STORAGE");
+  const object = await bucket.get(`namespaces/${namespace}/root.json`);
+  if (object === null) throw new Error("Missing manifest");
+  const manifest = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
+  await bucket.put(
+    `namespaces/${namespace}/root.json`,
+    Schema.encodeSync(Schema.fromJsonString(Root))({
+      ...manifest,
+      segments: manifest.segments.map((segment) =>
+        Object.assign({}, segment, { documentBloom: btoa("\xff".repeat(900000)) }),
+      ),
+    }),
+  );
+  const input = { ...textQuery("warm"), consistency: "edge-eventual", minimumSequence: 1 };
+  expect((await request(worker, namespace, "query", input)).status).toBe(200);
+  const cache = await (await worker.getCaches()).open("raio-snapshots-v1");
+  const key = new URL(`https://raio-cache.internal/snapshots/${namespace}?bucket=raio-test`);
+  expect(await cache.delete(key)).toBe(true);
+  await bucket.put(`namespaces/${namespace}/root.json`, "corrupted canonical root");
+  const cached = await request(worker, namespace, "query", input);
+  expect(cached.status).toBe(200);
+  expect(
+    Schema.decodeUnknownSync(QueryResult)(await cached.json()).rows.map((row) => row.id),
+  ).toEqual(["a"]);
+  await Effect.runPromise(Effect.sleep("1100 millis"));
+  expect((await request(worker, namespace, "query", input)).status).toBe(503);
+});
+
 test("parallel strong queries observe complete immutable revisions while writes advance", async () => {
   const namespace = "strong-parallel";
   await request(worker, namespace, "write", write([document("a", "shared revisionone")]));

@@ -1088,3 +1088,45 @@ The change is retained for demonstrated transfer reduction and dictionary/minimu
 |          16 | 468.70 | 1289.97 |      19.50 |
 
 Source and deployment include snapshot coordinator recovery. First-use expiration recovery was not exercised in these completed loads; native peak-memory proof and fully indexed Turbopuffer parity remain unverified.
+
+## Rust intersection candidates for all and phrase modes
+
+The previous loop traversed the union of posting lists and scored partial matches before rejecting rows missing a required term. The retained cursor owner now drives all/phrase traversal from the shortest list, advances other lists directly toward that candidate with exponential search plus a bounded binary partition, and stops when any required list is exhausted. Excluded driver rows are skipped before alignment. Full physical coverage has a direct row/index path; it resynchronizes cursors only after exclusions create divergence. Any traversal, block score bounds, term accumulation order, tie-breaking and positional phrase semantics remain unchanged. No wire/cache formats or infrastructure bindings change.
+
+The initial plain binary seeks regressed alternating disjoint lists, especially with filters; adaptive seeks and early exclusions removed that regression. An initial full-coverage implementation rewrote every cursor on every candidate and regressed dense unfiltered queries; synchronizing only after divergence removed that overhead. Native Clippy rejected an oversized finish function; cursor navigation now owns its actual traversal state and policy, without suppressions. Local alternating finish measurements used ten warmup pairs and one hundred measured pairs for 16/500/10,000 documents, dense/sparse/disjoint postings, any/all/phrase modes and filtered/unfiltered cases. Large sparse all/phrase medians improved 96–97%; disjoint cases improved 77–95%; dense filtered cases improved 78–80%, while dense unfiltered medians stayed close to the reference. Every fixture preserved finished rows/scores. A separate 1,296-query differential preserved exact rows/scores over filters, top-k, tombstones, live statistics and repeated words.
+
+The independent Rust regression derives all-term membership and contiguous phrase positions from input title/body tokens, then checks exact scores/order against the unaffected any-mode exhaustive result over the entire small fixture. It covers both fields, repeated alpha, disjoint terms, filters, tombstones and top-k 1/10/100. The default gate passed 22 Rust and 118 Worker/tooling tests.
+
+A temporary native Worker ran both WASM versions against identical synthetic bytes. Each of eleven cases used 23 alternating pairs with 128 finish repetitions per invocation; three warmup pairs and every fixture-preparation request were excluded. All 506 invocations finished with exact matching results and native `ok` outcomes. Twelve fixture preparations occurred, all outside measured samples; each variant has twenty measured samples per case. One fixture is retained at a time. Tail Worker CPU receipts include invocation validation/serialization overhead and are divided by repetitions; the producer performs no R2/cache acquisition. One-ms receipt granularity limits interpretation of the smallest per-operation values. Isolate lifecycle and scheduling remain uncontrolled.
+
+| Distribution | Mode   | Filter | Before p50 ms/op | After p50 ms/op | Before p95 ms/op | After p95 ms/op |
+| :----------- | :----- | :----- | ---------------: | --------------: | ---------------: | --------------: |
+| Dense        | any    | False  |         2.554688 |        2.625000 |         3.875000 |        4.328125 |
+| Dense        | all    | False  |         2.484375 |        2.390625 |         4.117188 |        4.140625 |
+| Dense        | all    | True   |         1.804688 |        0.296875 |         2.945312 |        0.359375 |
+| Sparse       | all    | False  |         1.632812 |        0.039062 |         2.453125 |        0.101562 |
+| Sparse       | all    | True   |         0.335938 |        0.007812 |         0.742188 |        0.265625 |
+| Sparse       | phrase | False  |         1.468750 |        0.039062 |         1.921875 |        0.046875 |
+| Sparse       | phrase | True   |         0.312500 |        0.007812 |         0.367188 |        0.031250 |
+| Disjoint     | all    | False  |         0.476562 |        0.109375 |         1.039062 |        0.218750 |
+| Disjoint     | all    | True   |         0.210938 |        0.015625 |         0.398438 |        0.039062 |
+| Disjoint     | phrase | False  |         0.500000 |        0.171875 |         0.851562 |        0.250000 |
+| Disjoint     | phrase | True   |         0.210938 |        0.015625 |         0.398438 |        0.078125 |
+
+Native sparse all/phrase median CPU improved 97–98%, dense filtered all improved 84%, and disjoint all/phrase improved 66–93%. The any-mode control median increased 2.8% with a noisier tail, while dense unfiltered all improved 3.8%; neither is a universal latency claim. Receipts were exported before removing the two temporary Workers and bucket.
+
+The unchanged million-document corpus completed original, first candidate and repeated candidate loads with rare compound all, common all, filtered all and common phrase queries. Every phase used 32 edge requests. All 288 responses matched strong rows/scores and sequence 2,000; none used coordinator recovery. No separate warmup was used and cache/isolate/network conditions were uncontrolled.
+
+| Configuration         | Concurrency | p50 ms |  p95 ms | Requests/s |
+| :-------------------- | ----------: | -----: | ------: | ---------: |
+| Original              |           1 |  83.32 | 1062.91 |       3.74 |
+| Original              |           4 | 110.25 |  822.48 |      16.57 |
+| Original              |          16 | 165.86 | 1244.78 |      16.85 |
+| Intersection first    |           1 |  80.39 |  311.43 |       7.69 |
+| Intersection first    |           4 |  98.29 | 1289.86 |      10.76 |
+| Intersection first    |          16 | 196.87 | 1250.30 |      20.21 |
+| Intersection repeated |           1 |  83.39 |  391.98 |       4.60 |
+| Intersection repeated |           4 |  89.65 |  935.60 |      12.80 |
+| Intersection repeated |          16 | 344.41 | 1216.54 |      15.49 |
+
+Whole-query observations were mixed: concurrency-four medians improved in both candidate runs, concurrency-one tails improved, but concurrency-sixteen median latency regressed. Native CPU evidence establishes the targeted traversal gain independently of this acquisition/network noise; it does not establish a uniform whole-search gain. A separate general rare/selective/common/filter load completed 96 exact responses at the same sequence, for 384 verified whole-query responses across four complete loads. Its latest values are in the README. Native peak-memory proof, exercised expired-acquisition recovery and fully indexed Turbopuffer parity remain outstanding.

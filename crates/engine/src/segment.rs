@@ -634,6 +634,94 @@ impl Ord for Hit {
     }
 }
 
+struct PostingCursors<'a> {
+    lists: Vec<&'a [Posting]>,
+    cursors: Vec<usize>,
+    allowed: &'a [bool],
+    driver: Option<usize>,
+    dense: bool,
+}
+
+impl<'a> PostingCursors<'a> {
+    fn new(lists: Vec<&'a [Posting]>, allowed: &'a [bool], intersect: bool) -> Self {
+        let driver = if intersect {
+            lists
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, list)| list.len())
+                .map(|(index, _)| index)
+        } else {
+            None
+        };
+        let dense = intersect && lists.iter().all(|list| list.len() == allowed.len());
+        Self {
+            cursors: vec![0; lists.len()],
+            lists,
+            allowed,
+            driver,
+            dense,
+        }
+    }
+
+    fn advance_before(list: &[Posting], target: u32) -> usize {
+        if list.first().is_none_or(|posting| posting.row >= target) {
+            return 0;
+        }
+        let mut end = 1usize;
+        while end < list.len() && list[end].row < target {
+            end = end.saturating_mul(2);
+        }
+        let start = end / 2;
+        let stop = end.saturating_add(1).min(list.len());
+        start + list[start..stop].partition_point(|posting| posting.row < target)
+    }
+
+    fn row(&mut self) -> Option<u32> {
+        let Some(driver) = self.driver else {
+            return self
+                .lists
+                .iter()
+                .enumerate()
+                .filter_map(|(index, list)| {
+                    list.get(self.cursors[index]).map(|posting| posting.row)
+                })
+                .min();
+        };
+        let mut diverged = false;
+        'candidates: loop {
+            let row = self.lists[driver].get(self.cursors[driver])?.row;
+            if !self.allowed[row as usize] {
+                self.cursors[driver] += 1;
+                diverged = true;
+                continue;
+            }
+            if self.dense {
+                if diverged {
+                    self.cursors.fill(row as usize);
+                }
+                return Some(row);
+            }
+            for (index, list) in self.lists.iter().enumerate() {
+                if list
+                    .get(self.cursors[index])
+                    .is_some_and(|posting| posting.row < row)
+                {
+                    self.cursors[index] += Self::advance_before(&list[self.cursors[index]..], row);
+                }
+                let posting = list.get(self.cursors[index])?;
+                if posting.row > row {
+                    self.cursors[driver] += Self::advance_before(
+                        &self.lists[driver][self.cursors[driver]..],
+                        posting.row,
+                    );
+                    continue 'candidates;
+                }
+            }
+            return Some(row);
+        }
+    }
+}
+
 pub struct Search {
     pub header: Rc<Header>,
     pub statistics: Statistics,
@@ -825,34 +913,29 @@ impl Search {
             Vec::new()
         };
         let mut selected = vec![None; lists.len()];
-        let mut cursors = vec![0usize; lists.len()];
+        let mut positions = PostingCursors::new(lists, &self.allowed, self.mode != "any");
         let mut heap: BinaryHeap<Hit> = BinaryHeap::new();
-        while let Some(row) = lists
-            .iter()
-            .enumerate()
-            .filter_map(|(i, list)| list.get(cursors[i]).map(|p| p.row))
-            .min()
-        {
+        while let Some(row) = positions.row() {
             if heap.len() == self.top_k
                 && let Some(cutoff) = heap.peek()
                 && let Some(end) = Self::skippable_block_end(
-                    &lists,
-                    &cursors,
+                    &positions.lists,
+                    &positions.cursors,
                     bounds.get_or_insert_with(|| self.block_bounds(&terms, &scorers)),
                     cutoff,
                     row,
                 )
             {
-                for (index, list) in lists.iter().enumerate() {
-                    cursors[index] +=
-                        list[cursors[index]..].partition_point(|posting| posting.row <= end);
+                for (index, list) in positions.lists.iter().enumerate() {
+                    positions.cursors[index] += list[positions.cursors[index]..]
+                        .partition_point(|posting| posting.row <= end);
                 }
                 continue;
             }
             if !self.allowed[row as usize] {
-                for (index, list) in lists.iter().enumerate() {
-                    cursors[index] += usize::from(
-                        list.get(cursors[index])
+                for (index, list) in positions.lists.iter().enumerate() {
+                    positions.cursors[index] += usize::from(
+                        list.get(positions.cursors[index])
                             .is_some_and(|posting| posting.row == row),
                     );
                 }
@@ -861,8 +944,8 @@ impl Search {
             selected.fill(None);
             let mut matched = 0;
             let mut score = 0.0;
-            for (index, list) in lists.iter().enumerate() {
-                if let Some(posting) = list.get(cursors[index]).filter(|p| p.row == row) {
+            for (index, list) in positions.lists.iter().enumerate() {
+                if let Some(posting) = list.get(positions.cursors[index]).filter(|p| p.row == row) {
                     let meta = &self.header.documents[row as usize];
                     score += scorers[index].score(
                         u32::try_from(posting.title.len()).map_err(|cause| cause.to_string())?,
@@ -872,7 +955,7 @@ impl Search {
                     );
                     selected[index] = Some(posting);
                     matched += 1;
-                    cursors[index] += 1;
+                    positions.cursors[index] += 1;
                 }
             }
             if self.mode != "any" && matched != terms.len() {

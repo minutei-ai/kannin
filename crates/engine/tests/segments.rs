@@ -338,3 +338,92 @@ fn batched_blooms_match_independent_membership_and_reject_bad_framing()
     assert!(segment::bloom_filter_many(&[], &[0], &values)?.is_empty());
     Ok(())
 }
+
+#[test]
+fn intersections_match_exhaustive_membership_and_phrase_positions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let docs: Vec<_> = (0..64)
+        .map(|index| {
+            let body = match index % 7 {
+                0 => "alpha beta gamma alpha",
+                1 => "alpha gamma",
+                2 => "beta gamma",
+                3 => "alpha beta gamma",
+                4 => "beta alpha beta gamma alpha",
+                5 => "gamma alpha",
+                _ => "gamma alpha beta gamma alpha",
+            };
+            let mut doc = document(format!("{index:03}"), body);
+            if index % 7 == 5 {
+                doc.title = "alpha beta".into();
+            }
+            doc.attributes
+                .insert("group".into(), serde_json::json!(index % 4));
+            doc
+        })
+        .collect();
+    for dead in [vec![], vec![0, 7, 14, 21]] {
+        for filters in [
+            vec![],
+            vec![Filter {
+                field: "group".into(),
+                op: "eq".into(),
+                value: serde_json::json!(1),
+            }],
+        ] {
+            let all = search(
+                docs.clone(),
+                "alpha beta gamma alpha",
+                "any",
+                &dead,
+                &filters,
+                100,
+            )?;
+            for mode in ["all", "phrase"] {
+                let expected: Vec<_> = all
+                    .iter()
+                    .filter(|(id, _)| {
+                        docs.iter().find(|doc| doc.id == *id).is_some_and(|doc| {
+                            let title: Vec<_> = doc.title.split_whitespace().collect();
+                            let body: Vec<_> = doc.text.split_whitespace().collect();
+                            if mode == "all" {
+                                return ["alpha", "beta", "gamma"]
+                                    .iter()
+                                    .all(|term| title.contains(term) || body.contains(term));
+                            }
+                            [title, body].iter().any(|tokens| {
+                                tokens
+                                    .windows(4)
+                                    .any(|window| window == ["alpha", "beta", "gamma", "alpha"])
+                            })
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                for k in [1, 10, 100] {
+                    let actual = search(
+                        docs.clone(),
+                        "alpha beta gamma alpha",
+                        mode,
+                        &dead,
+                        &filters,
+                        k,
+                    )?;
+                    assert_eq!(actual, expected.iter().take(k).cloned().collect::<Vec<_>>());
+                }
+            }
+        }
+    }
+    assert!(
+        search(
+            vec![document("a", "alpha"), document("b", "beta")],
+            "alpha beta",
+            "all",
+            &[],
+            &[],
+            10
+        )?
+        .is_empty()
+    );
+    Ok(())
+}

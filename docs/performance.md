@@ -375,3 +375,18 @@ Three initial strong queries returned HTTP 200: rare took 1,345.93 ms, selective
 Six alternating repetitions per selective/common case returned identical rows and scores to their respective initial response. Selective median was 210.58 ms, with a range of 184.01–425.69 ms; common median was 225.58 ms, with a range of 207.48–238.51 ms. This small diagnostic sample isolates a substantial initial acquisition cost; it does not establish concurrent throughput, percentile tails or Turbopuffer parity. The Cloudflare clock's reported zero-duration warm stages do not isolate their CPU time.
 
 The first full comparison aborted before collecting latency samples: Turbopuffer metadata reported `up-to-date`, while twelve query probes still reported 47,500 unindexed documents. The temporary comparator's deletion was confirmed. A fresh comparator is being evaluated against the existing Kannin corpus; query-level readiness now permits up to 360 probes spaced five seconds apart, without relaxing the zero-unindexed-document requirement. The initial observations above warmed Kannin before this repeated comparison, so its first query must not be described as a cold-cache measurement. Full comparison results remain unverified.
+
+### Operational comparison with unindexed comparator writes
+
+A separate read-only diagnostic reused that fresh comparator while the strict readiness run continued waiting. Turbopuffer strong queries included all writes, and every measured response reported 15,000 unindexed documents. This is an operational observation of partially indexed search, not a fully indexed comparison. It used the same corpus SHA-256 as the local million-document workload, Cloudflare ingress `GRU`, Turbopuffer `aws-sa-east-1`, concurrency one, five warmups and fifty measured requests per case and mode. Background readiness probes also queried the comparator; that extra traffic and earlier cache warming limit attribution.
+
+| Query     | Strong p50 / p95 ms | Edge p50 / p95 ms | Turbopuffer p50 / p95 ms |
+| --------- | ------------------: | ----------------: | -----------------------: |
+| rare      |     169.37 / 194.01 |    90.73 / 514.35 |            59.69 / 61.22 |
+| selective |     174.22 / 194.85 |    98.10 / 509.17 |            58.91 / 60.53 |
+| common    |     192.07 / 205.84 |   126.12 / 746.27 |            81.49 / 82.99 |
+| filtered  |     187.02 / 201.40 |   109.44 / 464.95 |            77.37 / 78.34 |
+
+All 224 strong/edge pairs, including initial requests and warmups, returned identical rows and scores with the acknowledged sequence barrier. Turbopuffer results were nonempty; this driver does not assert cross-engine score or tie-order equality. Final metadata still reported one million documents and sequence 2,000. These observations do not establish concurrent throughput or general parity.
+
+The first operational attempt aborted on selective edge with HTTP 504 after its 30-second snapshot lease expired. Subsequent diagnostic edge requests succeeded in 2,416.88 ms for selective and 6,181.57 ms for common, matching strong rows and scores. The later successful run above also observed initial filtered strong/edge requests of 5,844.11/5,272.55 ms. Warming does not resolve the earlier timeout: initial acquisition cost and edge tails remain optimization requirements. The comparator lifecycle and deletion remain owned by the still-running strict comparison.

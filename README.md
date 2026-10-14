@@ -45,6 +45,8 @@ The local **1,000,000-document** follow-up uses 2,000 uncompacted segments. Comp
 
 Native ingestion now also confirms **1,000,000 documents**. Six warm strong diagnostic queries per case measured selective/common medians of **211/226 ms**, while individual initial requests took **7.64/5.36 seconds**. The full comparator run remains unverified because query metrics reported unindexed documents after metadata readiness. [Native evidence and limitations](docs/performance.md#native-million-document-diagnostics).
 
+A separate native operational comparison measured strong p50 **169–192 ms**, edge p50 **91–126 ms** and edge p95 **465–746 ms**. Turbopuffer measured p50 **59–81 ms** while processing 15,000 unindexed documents. Every Kannin strong/edge pair agreed, but an earlier edge request timed out at 30 seconds. [Complete methodology and remaining failures](docs/performance.md#operational-comparison-with-unindexed-comparator-writes).
+
 ## Run
 
 Requires Bun, Rust 1.96 with `wasm32-unknown-unknown`, and `wasm-bindgen-cli` 0.2.129.

@@ -1372,3 +1372,21 @@ Native Alchemy deployment and its Vectorize metadata migration succeeded. The mi
 | 16          | 185.91 / 1145.02      | 116.86 / 2250.96       | 177.22 / 1087.18                |
 
 A separate post-deploy all/phrase load retained another 96 exact-result comparisons at concurrency 1/4/16. Its p50 values were 117.33/115.00/179.04 ms and p95 values 206.09/1191.83/1401.90 ms. This validates native phrase/intersection behavior after the decoder change, without a paired pre-change timing baseline.
+
+### Compact frequency lists for any/all
+
+Any/all queries previously retained every token-position vector after decoding, although scoring needed only title/body frequencies. Rust now stores a 12-byte row/title-count/body-count record per posting for these modes. Phrase queries retain their complete positional representation. A shared checked decoder still scans every positional varint, rejects malformed counts/duplicates/overflow/trailing bytes and validates last positions against header document lengths. CRC and decompression limits remain unchanged. The cursor/scoring implementation is monomorphized for both representations, without dynamic dispatch or score-arithmetic changes. The persisted segment/HTTP formats are unchanged; the Rust `Search.lists` implementation field is now private.
+
+Two local Bun/WASM comparisons each covered twelve 10,000-document cases: unfiltered/clustered/interleaved/tombstoned data and any/all/phrase. Fifteen alternating pairs ran sixteen projection/decode/ranking pipelines each, excluding three warmups from timing. All 11,520 serialized row/score outputs matched. In the isolated repetition, unfiltered any/all medians improved 19.8–22.9% and interleaved any/all 22.1–22.4%. Clustered any/all improved 4.2–4.6%, tombstoned any/all 2.1–3.1%, and phrase controls 1.2–3.8%. These are local pipeline timings, not native CPU or traffic-wide latency measurements.
+
+The full gate covers low/high token frequency, filters, tombstones and exact score equality against positional lists. Retained list/vector capacity is less than half the positional reference in the low-frequency fixture and less than one tenth in the high-frequency fixture. This counts Rust container capacities, excluding allocator overhead, directories, JavaScript values and other caches; it is not a Worker peak-memory proof. Malformed posting fixtures run through both decoder variants and preserve their declared errors. Position/doc-length mismatch rejection is checked in all three match modes.
+
+The full local gate passed 28 Rust and 130 Bun/workerd tests. Native Alchemy deployment and its Vectorize metadata migration succeeded. Baseline, first candidate and repeated candidate loads preserved 288 exact-result/score/sequence comparisons on the million-document corpus. A separate post-deploy all/phrase load retained another 96 results, with p50 83.77/123.00/351.23 ms at concurrency 1/4/16. Client latency remains mixed: the first candidate worsened all medians, while the repetition improved concurrency 1/4 medians and worsened concurrency 16 median. Cache/isolate/network conditions were uncontrolled. The local throughput/capacity result does not establish native CPU savings, Worker peak heap or Turbopuffer parity.
+
+| Concurrency | Baseline p50 / p95 ms | Candidate p50 / p95 ms | Repeated candidate p50 / p95 ms |
+| ----------- | --------------------- | ---------------------- | ------------------------------- |
+| 1           | 74.44 / 295.67        | 77.61 / 250.15         | 68.70 / 176.05                  |
+| 4           | 78.49 / 859.15        | 85.36 / 1036.65        | 74.58 / 463.37                  |
+| 16          | 222.59 / 1116.62      | 316.44 / 1345.81       | 359.61 / 1186.33                |
+
+The original SciFact archive matched its recorded SHA-256. Both the prior positional engine and the compact engine ran all 300 judged queries over 5,183 documents through local workerd/R2. Complete report bytes, per-query identifiers and metrics were identical. Independent metric recomputation agreed within 1e-12: NDCG@10 0.6730619695232347, Recall@10 0.7956666666666666 and MRR@10 0.641808201058201. This is a local scientific-retrieval regression gate, not native ranking-quality or vector-recall proof.

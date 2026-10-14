@@ -258,12 +258,26 @@ fn encode_postings(postings: &[Posting]) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn decode_positions(data: &[u8], offset: &mut usize) -> Result<Vec<u32>, String> {
-    let length = get_int(data, offset)? as usize;
+struct DecodedPositions {
+    count: u32,
+    last: Option<u32>,
+    values: Vec<u32>,
+}
+
+fn decode_positions<const POSITIONAL: bool>(
+    data: &[u8],
+    offset: &mut usize,
+) -> Result<DecodedPositions, String> {
+    let count = get_int(data, offset)?;
+    let length = count as usize;
     if length > data.len() - *offset {
         return Err("Invalid position count".into());
     }
-    let mut positions = Vec::with_capacity(length);
+    let mut values = if POSITIONAL {
+        Vec::with_capacity(length)
+    } else {
+        Vec::new()
+    };
     let mut position = 0u32;
     for index in 0..length {
         let delta = get_int(data, offset)?;
@@ -271,13 +285,22 @@ fn decode_positions(data: &[u8], offset: &mut usize) -> Result<Vec<u32>, String>
             return Err("Duplicate token position".into());
         }
         position = position.checked_add(delta).ok_or("Position overflow")?;
-        positions.push(position);
+        if POSITIONAL {
+            values.push(position);
+        }
     }
-    Ok(positions)
+    let last = if count == 0 { None } else { Some(position) };
+    Ok(DecodedPositions {
+        count,
+        last,
+        values,
+    })
 }
 
-#[doc = "# Errors\nRejects invalid pages, overflowing or truncated varints, excessive rows, duplicate positions, and trailing bytes."]
-pub fn decode_postings(bytes: &[u8]) -> Result<Vec<Posting>, String> {
+fn decode_posting_rows<const POSITIONAL: bool, T>(
+    bytes: &[u8],
+    make: impl Fn(u32, DecodedPositions, DecodedPositions) -> T,
+) -> Result<Vec<T>, String> {
     let data = decode_page(bytes)?;
     let mut offset = 0;
     let count = get_int(&data, &mut offset)? as usize;
@@ -292,17 +315,89 @@ pub fn decode_postings(bytes: &[u8]) -> Result<Vec<Posting>, String> {
             return Err("Duplicate posting row".into());
         }
         row = row.checked_add(delta).ok_or("Row overflow")?;
-        let title = decode_positions(&data, &mut offset)?;
-        let body = decode_positions(&data, &mut offset)?;
-        if body.is_empty() && title.is_empty() {
+        let title = decode_positions::<POSITIONAL>(&data, &mut offset)?;
+        let body = decode_positions::<POSITIONAL>(&data, &mut offset)?;
+        if body.count == 0 && title.count == 0 {
             return Err("Empty posting".into());
         }
-        rows.push(Posting { row, title, body });
+        rows.push(make(row, title, body));
     }
     if offset != data.len() {
         return Err("Trailing posting bytes".into());
     }
     Ok(rows)
+}
+
+#[doc = "# Errors\nRejects invalid pages, overflowing or truncated varints, excessive rows, duplicate positions, and trailing bytes."]
+pub fn decode_postings(bytes: &[u8]) -> Result<Vec<Posting>, String> {
+    decode_posting_rows::<true, _>(bytes, |row, title, body| Posting {
+        row,
+        title: title.values,
+        body: body.values,
+    })
+}
+
+struct FrequencyPosting {
+    row: u32,
+    title: u32,
+    body: u32,
+}
+
+enum PostingLists {
+    Positions(BTreeMap<String, Vec<Posting>>),
+    Frequencies(BTreeMap<String, Vec<FrequencyPosting>>),
+}
+
+trait PostingRow {
+    fn row(&self) -> u32;
+    fn counts(&self) -> [usize; 2];
+    fn positions(&self) -> [&[u32]; 2];
+}
+
+impl PostingRow for Posting {
+    fn row(&self) -> u32 {
+        self.row
+    }
+    fn counts(&self) -> [usize; 2] {
+        [self.title.len(), self.body.len()]
+    }
+    fn positions(&self) -> [&[u32]; 2] {
+        [&self.title, &self.body]
+    }
+}
+
+impl PostingRow for FrequencyPosting {
+    fn row(&self) -> u32 {
+        self.row
+    }
+    fn counts(&self) -> [usize; 2] {
+        [self.title as usize, self.body as usize]
+    }
+    fn positions(&self) -> [&[u32]; 2] {
+        [&[], &[]]
+    }
+}
+
+fn validate_posting(
+    header: &Header,
+    row: u32,
+    title: Option<u32>,
+    body: Option<u32>,
+    previous: Option<u32>,
+) -> Result<(), String> {
+    let doc = header
+        .documents
+        .get(row as usize)
+        .ok_or("Invalid posting row")?;
+    if title.is_some_and(|position| position >= doc.title_length)
+        || body.is_some_and(|position| position >= doc.body_length)
+    {
+        return Err("Invalid token position".into());
+    }
+    if previous.is_some_and(|previous| previous >= row) {
+        return Err("Posting blocks out of order".into());
+    }
+    Ok(())
 }
 
 fn encode_terms(
@@ -641,16 +736,16 @@ impl Ord for Hit {
     }
 }
 
-struct PostingCursors<'a> {
-    lists: Vec<&'a [Posting]>,
+struct PostingCursors<'a, T: PostingRow> {
+    lists: Vec<&'a [T]>,
     cursors: Vec<usize>,
     allowed: &'a [bool],
     driver: Option<usize>,
     dense: bool,
 }
 
-impl<'a> PostingCursors<'a> {
-    fn new(lists: Vec<&'a [Posting]>, allowed: &'a [bool], intersect: bool) -> Self {
+impl<'a, T: PostingRow> PostingCursors<'a, T> {
+    fn new(lists: Vec<&'a [T]>, allowed: &'a [bool], intersect: bool) -> Self {
         let driver = if intersect {
             lists
                 .iter()
@@ -670,17 +765,17 @@ impl<'a> PostingCursors<'a> {
         }
     }
 
-    fn advance_before(list: &[Posting], target: u32) -> usize {
-        if list.first().is_none_or(|posting| posting.row >= target) {
+    fn advance_before(list: &[T], target: u32) -> usize {
+        if list.first().is_none_or(|posting| posting.row() >= target) {
             return 0;
         }
         let mut end = 1usize;
-        while end < list.len() && list[end].row < target {
+        while end < list.len() && list[end].row() < target {
             end = end.saturating_mul(2);
         }
         let start = end / 2;
         let stop = end.saturating_add(1).min(list.len());
-        start + list[start..stop].partition_point(|posting| posting.row < target)
+        start + list[start..stop].partition_point(|posting| posting.row() < target)
     }
 
     fn row(&mut self) -> Option<u32> {
@@ -689,14 +784,12 @@ impl<'a> PostingCursors<'a> {
                 .lists
                 .iter()
                 .enumerate()
-                .filter_map(|(index, list)| {
-                    list.get(self.cursors[index]).map(|posting| posting.row)
-                })
+                .filter_map(|(index, list)| list.get(self.cursors[index]).map(PostingRow::row))
                 .min();
         };
         let mut diverged = false;
         'candidates: loop {
-            let row = self.lists[driver].get(self.cursors[driver])?.row;
+            let row = self.lists[driver].get(self.cursors[driver])?.row();
             if !self.allowed[row as usize] {
                 self.cursors[driver] += 1;
                 diverged = true;
@@ -711,15 +804,15 @@ impl<'a> PostingCursors<'a> {
             for (index, list) in self.lists.iter().enumerate() {
                 if list
                     .get(self.cursors[index])
-                    .is_some_and(|posting| posting.row < row)
+                    .is_some_and(|posting| posting.row() < row)
                 {
                     self.cursors[index] += Self::advance_before(&list[self.cursors[index]..], row);
                 }
                 let posting = list.get(self.cursors[index])?;
-                if posting.row > row {
+                if posting.row() > row {
                     self.cursors[driver] += Self::advance_before(
                         &self.lists[driver][self.cursors[driver]..],
-                        posting.row,
+                        posting.row(),
                     );
                     continue 'candidates;
                 }
@@ -736,7 +829,7 @@ pub struct Search {
     pub mode: String,
     pub top_k: usize,
     pub allowed: Vec<bool>,
-    pub lists: BTreeMap<String, Vec<Posting>>,
+    lists: PostingLists,
 }
 
 #[derive(Serialize)]
@@ -814,7 +907,11 @@ impl Search {
             mode: mode.into(),
             top_k,
             allowed,
-            lists: BTreeMap::new(),
+            lists: if mode == "phrase" {
+                PostingLists::Positions(BTreeMap::new())
+            } else {
+                PostingLists::Frequencies(BTreeMap::new())
+            },
         })
     }
 
@@ -823,40 +920,59 @@ impl Search {
         if !self.words.iter().any(|word| word == term) {
             return Err("Unrequested posting term".into());
         }
-        let postings = decode_postings(bytes)?;
-        let list = self.lists.entry(term.into()).or_default();
-        for posting in postings {
-            let doc = self
-                .header
-                .documents
-                .get(posting.row as usize)
-                .ok_or("Invalid posting row")?;
-            if posting.title.last().is_some_and(|p| *p >= doc.title_length)
-                || posting.body.last().is_some_and(|p| *p >= doc.body_length)
-            {
-                return Err("Invalid token position".into());
+        match &mut self.lists {
+            PostingLists::Positions(lists) => {
+                let postings = decode_postings(bytes)?;
+                let list = lists.entry(term.into()).or_default();
+                for posting in postings {
+                    validate_posting(
+                        &self.header,
+                        posting.row,
+                        posting.title.last().copied(),
+                        posting.body.last().copied(),
+                        list.last().map(|previous| previous.row),
+                    )?;
+                    list.push(posting);
+                }
             }
-            if list
-                .last()
-                .is_some_and(|previous| previous.row >= posting.row)
-            {
-                return Err("Posting blocks out of order".into());
+            PostingLists::Frequencies(lists) => {
+                let postings = decode_posting_rows::<false, _>(bytes, |row, title, body| {
+                    (
+                        FrequencyPosting {
+                            row,
+                            title: title.count,
+                            body: body.count,
+                        },
+                        title.last,
+                        body.last,
+                    )
+                })?;
+                let list = lists.entry(term.into()).or_default();
+                for (posting, title, body) in postings {
+                    validate_posting(
+                        &self.header,
+                        posting.row,
+                        title,
+                        body,
+                        list.last().map(|previous| previous.row),
+                    )?;
+                    list.push(posting);
+                }
             }
-            list.push(posting);
         }
         Ok(())
     }
 
-    fn phrase(postings: &[Option<&Posting>], order: &[usize]) -> bool {
+    fn phrase<T: PostingRow>(postings: &[Option<&T>], order: &[usize]) -> bool {
         let Some(first) = order.first().and_then(|index| postings[*index]) else {
             return false;
         };
-        for title in [true, false] {
-            let starts = if title { &first.title } else { &first.body };
+        for field in 0..2 {
+            let starts = first.positions()[field];
             for start in starts {
                 if order.iter().enumerate().all(|(offset, index)| {
                     postings[*index].is_some_and(|p| {
-                        let positions = if title { &p.title } else { &p.body };
+                        let positions = p.positions()[field];
                         u32::try_from(offset)
                             .ok()
                             .and_then(|offset| start.checked_add(offset))
@@ -900,8 +1016,8 @@ impl Search {
             .collect()
     }
 
-    fn skippable_block_end(
-        lists: &[&[Posting]],
+    fn skippable_block_end<T: PostingRow>(
+        lists: &[&[T]],
         cursors: &[usize],
         bounds: &[Vec<(&BlockMeta, f64)>],
         bound_cursors: &mut [usize],
@@ -914,14 +1030,14 @@ impl Search {
             if let Some(posting) = list.get(cursors[index]) {
                 if bounds[index]
                     .get(bound_cursors[index])
-                    .is_some_and(|(block, _)| block.last < posting.row)
+                    .is_some_and(|(block, _)| block.last < posting.row())
                 {
                     bound_cursors[index] += bounds[index][bound_cursors[index]..]
-                        .partition_point(|(block, _)| block.last < posting.row);
+                        .partition_point(|(block, _)| block.last < posting.row());
                 }
                 if let Some((block, score)) = bounds[index]
                     .get(bound_cursors[index])
-                    .filter(|(block, _)| block.first <= posting.row)
+                    .filter(|(block, _)| block.first <= posting.row())
                 {
                     end = end.min(block.last);
                     bound += score;
@@ -938,16 +1054,27 @@ impl Search {
 
     #[doc = "# Errors\nRejects posting frequencies that cannot fit the wire format."]
     pub fn finish(&self) -> Result<Vec<Hit>, String> {
+        match &self.lists {
+            PostingLists::Positions(lists) => self.finish_lists(lists),
+            PostingLists::Frequencies(lists) => {
+                if self.mode == "phrase" {
+                    return Err("Phrase search requires positional postings".into());
+                }
+                self.finish_lists(lists)
+            }
+        }
+    }
+
+    fn finish_lists<T: PostingRow>(
+        &self,
+        stored: &BTreeMap<String, Vec<T>>,
+    ) -> Result<Vec<Hit>, String> {
         let mut terms: Vec<_> = self.words.iter().collect();
         terms.sort_unstable();
         terms.dedup();
         let lists: Vec<_> = terms
             .iter()
-            .map(|term| {
-                self.lists
-                    .get(term.as_str())
-                    .map_or(&[] as &[Posting], Vec::as_slice)
-            })
+            .map(|term| stored.get(term.as_str()).map_or(&[] as &[T], Vec::as_slice))
             .collect();
         if self.mode != "any" && lists.iter().any(|list| list.is_empty()) {
             return Ok(Vec::new());
@@ -988,7 +1115,7 @@ impl Search {
             {
                 for (index, list) in positions.lists.iter().enumerate() {
                     positions.cursors[index] += list[positions.cursors[index]..]
-                        .partition_point(|posting| posting.row <= end);
+                        .partition_point(|posting| posting.row() <= end);
                 }
                 continue;
             }
@@ -996,7 +1123,7 @@ impl Search {
                 for (index, list) in positions.lists.iter().enumerate() {
                     positions.cursors[index] += usize::from(
                         list.get(positions.cursors[index])
-                            .is_some_and(|posting| posting.row == row),
+                            .is_some_and(|posting| posting.row() == row),
                     );
                 }
                 continue;
@@ -1005,11 +1132,14 @@ impl Search {
             let mut matched = 0;
             let mut score = 0.0;
             for (index, list) in positions.lists.iter().enumerate() {
-                if let Some(posting) = list.get(positions.cursors[index]).filter(|p| p.row == row) {
+                if let Some(posting) = list
+                    .get(positions.cursors[index])
+                    .filter(|p| p.row() == row)
+                {
                     let meta = &self.header.documents[row as usize];
                     score += scorers[index].score(
-                        u32::try_from(posting.title.len()).map_err(|cause| cause.to_string())?,
-                        u32::try_from(posting.body.len()).map_err(|cause| cause.to_string())?,
+                        u32::try_from(posting.counts()[0]).map_err(|cause| cause.to_string())?,
+                        u32::try_from(posting.counts()[1]).map_err(|cause| cause.to_string())?,
                         meta.title_length,
                         meta.body_length,
                     );
@@ -2086,7 +2216,7 @@ mod scoring_tests {
 
 #[cfg(test)]
 mod posting_decode_tests {
-    use super::{append, decode_postings};
+    use super::{append, decode_posting_rows, decode_postings};
 
     #[test]
     fn positional_fields_keep_order_and_reject_malformed_varints()
@@ -2118,6 +2248,143 @@ mod posting_decode_tests {
             let mut page = Vec::new();
             append(&mut page, &data)?;
             assert_eq!(decode_postings(&page).err().as_deref(), Some(expected));
+            assert_eq!(
+                decode_posting_rows::<false, _>(&page, |row, title, body| (
+                    row,
+                    title.count,
+                    body.count
+                ))
+                .err()
+                .as_deref(),
+                Some(expected)
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod frequency_tests {
+    use super::{Document, Filter, PostingLists, Search, Statistics, append, build};
+    use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::mem::size_of;
+    use std::rc::Rc;
+
+    #[test]
+    fn frequency_lists_match_positional_scoring_and_reduce_retained_capacity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (repetitions, total_body_length) in [(1, 759), (64, 48_576)] {
+            let docs: Vec<Document> = (0..256)
+                .map(|index| Document {
+                    id: format!("{index:05}"),
+                    revision: 0,
+                    title: "beta alpha".into(),
+                    text: "alpha beta alpha ".repeat(repetitions),
+                    attributes: BTreeMap::from([("group".into(), json!(index % 4))]),
+                    vector: None,
+                })
+                .collect();
+            let built = build(docs)?;
+            let base = 16 + serde_json::to_vec(&built.header)?.len();
+            let header = Rc::new(built.header);
+            for mode in ["any", "all"] {
+                let mut searches = Vec::new();
+                for positional in [false, true] {
+                    let stored_mode = if positional { "phrase" } else { mode };
+                    let mut search = Search::new(
+                        header.clone(),
+                        Statistics {
+                            documents: 253,
+                            title_length: 506,
+                            body_length: total_body_length,
+                            frequencies: BTreeMap::from([
+                                ("alpha".into(), 253),
+                                ("beta".into(), 253),
+                            ]),
+                        },
+                        "alpha beta",
+                        stored_mode,
+                        100,
+                        &[1, 3, 5],
+                        &[Filter {
+                            field: "group".into(),
+                            op: "eq".into(),
+                            value: json!(3),
+                        }],
+                    )?;
+                    search.mode = mode.into();
+                    for (term, metadata) in &header.terms {
+                        for block in &metadata.blocks {
+                            let start = base + block.data.offset as usize;
+                            search.add(
+                                term,
+                                &built.bytes[start..start + block.data.length as usize],
+                            )?;
+                        }
+                    }
+                    searches.push(search);
+                }
+                assert_eq!(searches[0].finish()?, searches[1].finish()?);
+                let compact = match &searches[0].lists {
+                    PostingLists::Frequencies(lists) => lists
+                        .values()
+                        .map(|list| list.capacity() * size_of::<super::FrequencyPosting>())
+                        .sum::<usize>(),
+                    PostingLists::Positions(_) => return Err("Expected frequencies".into()),
+                };
+                let positional = match &searches[1].lists {
+                    PostingLists::Positions(lists) => lists
+                        .values()
+                        .map(|list| {
+                            list.capacity() * size_of::<super::Posting>()
+                                + list
+                                    .iter()
+                                    .map(|posting| {
+                                        (posting.title.capacity() + posting.body.capacity())
+                                            * size_of::<u32>()
+                                    })
+                                    .sum::<usize>()
+                        })
+                        .sum::<usize>(),
+                    PostingLists::Frequencies(_) => return Err("Expected positions".into()),
+                };
+                assert!(compact * 2 < positional);
+                if repetitions == 64 {
+                    assert!(compact * 10 < positional);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn frequency_decoding_still_checks_positions_against_document_lengths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let built = build(serde_json::from_value(json!([
+            {"id":"a","text":"alpha beta alpha","attributes":{}}
+        ]))?)?;
+        let mut page = Vec::new();
+        append(&mut page, &[1, 0, 0, 1, 3])?;
+        for mode in ["any", "all", "phrase"] {
+            let mut search = Search::new(
+                built.header.clone(),
+                Statistics {
+                    documents: 1,
+                    title_length: 0,
+                    body_length: 3,
+                    frequencies: BTreeMap::from([("alpha".into(), 1)]),
+                },
+                "alpha",
+                mode,
+                10,
+                &[],
+                &[],
+            )?;
+            assert_eq!(
+                search.add("alpha", &page).err().as_deref(),
+                Some("Invalid token position")
+            );
         }
         Ok(())
     }

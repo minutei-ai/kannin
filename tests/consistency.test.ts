@@ -202,7 +202,7 @@ test("a still-valid older snapshot serves immediately while native background wo
   expect(state.refreshed).toBe(true);
 });
 
-test("query timings stay request scoped and preserve coordinator and gateway measurements", async () => {
+test("query timings stay request scoped and preserve manifest and gateway measurements", async () => {
   await request(worker, "timing", "write", write([document("a", "measured rust search")]));
   const responses = await Promise.all(
     ["strong", "edge-eventual", "edge-eventual"].map((consistency) =>
@@ -220,7 +220,8 @@ test("query timings stay request scoped and preserve coordinator and gateway mea
       ).toHaveLength(1);
     expect(response.headers.get("cache-control")).toBe("private, no-store");
   }
-  expect(responses[0]?.headers.get("server-timing")).toContain("raio;dur=");
+  expect(responses[0]?.headers.get("server-timing")).toContain("strong_manifest;dur=");
+  expect(responses[0]?.headers.get("server-timing")).not.toContain("raio;dur=");
   for (const response of responses.slice(1)) {
     expect(response.headers.get("server-timing")).toContain("edge_snapshot;dur=");
     expect(response.headers.get("server-timing")).not.toContain("raio;dur=");
@@ -275,4 +276,34 @@ test("parallel strong queries observe complete immutable revisions while writes 
     expect(fresh.sequence).toBe(revision);
     expect(fresh.rows[0]?.text).toBe(`shared revision${revision}`);
   }
+});
+
+test("strong manifest validation observes R2 replacements despite a warm coordinator and version cache", async () => {
+  const namespace = "etag-replacement";
+  await request(worker, namespace, "write", write([document("a", "immutable")]));
+  const first = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", textQuery("immutable"))).json(),
+  );
+  const bucket = await worker.getR2Bucket("STORAGE");
+  const object = await bucket.get(`namespaces/${namespace}/root.json`);
+  if (object === null) throw new Error("Missing manifest");
+  const manifest = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
+  await bucket.put(
+    `namespaces/${namespace}/root.json`,
+    Schema.encodeSync(Schema.fromJsonString(Root))({
+      ...manifest,
+      sequence: manifest.sequence + 1,
+    }),
+  );
+  const replaced = Schema.decodeUnknownSync(QueryResult)(
+    await (
+      await request(worker, namespace, "query", { ...textQuery("immutable"), minimumSequence: 2 })
+    ).json(),
+  );
+  expect(replaced.sequence).toBe(2);
+  expect(replaced.rows).toEqual(first.rows);
+  await bucket.put(`namespaces/${namespace}/root.json`, "corrupted");
+  expect((await request(worker, namespace, "query", textQuery("immutable"))).status).toBe(503);
+  await bucket.delete(`namespaces/${namespace}/root.json`);
+  expect((await request(worker, namespace, "query", textQuery("immutable"))).status).toBe(503);
 });

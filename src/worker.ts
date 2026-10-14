@@ -1602,6 +1602,68 @@ export class SearchNamespace extends DurableObject<Env> {
   }
 }
 
+const manifestVersions = new Map<
+  string,
+  { manifest: typeof Root.Type; etag: R2Object["etag"]; bytes: number }
+>();
+const manifestVersionBudget = { bytes: 0 };
+const MAX_MANIFEST_VERSION_BYTES = 4 * 1024 * 1024;
+
+const strongManifest = Effect.fn("kannin.strongManifest")(function* (env: Env, namespace: string) {
+  const rootKey = `namespaces/${namespace}/root.json`;
+  const key = `${env.STORAGE_CACHE_SCOPE}\0${rootKey}`;
+  const cached = manifestVersions.get(key);
+  const selected: { object: R2Object | R2ObjectBody | null } = { object: null };
+  if (cached === undefined)
+    selected.object = yield* Effect.tryPromise(() => env.STORAGE.get(rootKey));
+  else
+    selected.object = yield* Effect.tryPromise(() =>
+      env.STORAGE.get(rootKey, { onlyIf: { etagDoesNotMatch: cached.etag } }),
+    );
+  if (selected.object === null) {
+    const acknowledged = yield* Effect.tryPromise(() =>
+      env.STORAGE.list({ prefix: `namespaces/${namespace}/receipts/`, limit: 1 }),
+    );
+    if (acknowledged.objects.length === 0) return undefined;
+    selected.object = yield* Effect.tryPromise(() => env.STORAGE.get(rootKey));
+    if (selected.object === null)
+      return yield* new Rejected({
+        status: 503,
+        message: "R2 manifest missing for an acknowledged namespace",
+      });
+  }
+  const object = selected.object;
+  if (!("body" in object)) {
+    if (cached === undefined || object.etag !== cached.etag)
+      return yield* new Rejected({
+        status: 503,
+        message: "R2 manifest condition did not validate its cached version",
+      });
+    if (manifestVersions.get(key) === cached) {
+      manifestVersions.delete(key);
+      manifestVersions.set(key, cached);
+    }
+    return cached.manifest;
+  }
+  const encoded = yield* Effect.tryPromise(() => object.text());
+  const manifest = yield* Schema.decodeEffect(Schema.fromJsonString(Root))(encoded);
+  const previous = manifestVersions.get(key);
+  if (previous !== undefined) manifestVersionBudget.bytes -= previous.bytes;
+  manifestVersions.delete(key);
+  const bytes = new TextEncoder().encode(encoded).byteLength * 4 + 8192;
+  if (bytes <= MAX_MANIFEST_VERSION_BYTES) {
+    manifestVersions.set(key, { manifest, etag: object.etag, bytes });
+    manifestVersionBudget.bytes += bytes;
+    while (manifestVersionBudget.bytes > MAX_MANIFEST_VERSION_BYTES) {
+      const oldest = manifestVersions.entries().next().value;
+      if (oldest === undefined) break;
+      manifestVersions.delete(oldest[0]);
+      manifestVersionBudget.bytes -= oldest[1].bytes;
+    }
+  }
+  return manifest;
+});
+
 const warmSnapshots = new Map<string, { snapshot: typeof Snapshot.Type; bytes: number }>();
 const warmSnapshotBudget = { bytes: 0 };
 const MAX_WARM_SNAPSHOT_BYTES = 4 * 1024 * 1024;
@@ -1804,41 +1866,47 @@ export default {
           })(body).pipe(
             Effect.mapError(() => new Rejected({ status: 400, message: "Invalid query contract" })),
           );
-          if (input.consistency === "edge-eventual") {
-            if (input.kind !== "text")
-              return yield* new Rejected({
-                status: 400,
-                message: "Edge consistency is supported for text queries only",
-              });
+          if (input.consistency === "edge-eventual" && input.kind !== "text")
+            return yield* new Rejected({
+              status: 400,
+              message: "Edge consistency is supported for text queries only",
+            });
+          const evaluated = yield* Effect.gen(function* () {
             const snapshotStarted = yield* Clock.currentTimeNanos;
-            const manifest = yield* edgeSnapshot(ctx, env, namespace, input.minimumSequence ?? 0);
+            const manifest = yield* Effect.gen(function* () {
+              if (input.consistency === "edge-eventual")
+                return yield* edgeSnapshot(ctx, env, namespace, input.minimumSequence ?? 0);
+              return yield* strongManifest(env, namespace);
+            });
             const snapshotEnded = yield* Clock.currentTimeNanos;
-            if (manifest !== undefined) {
-              const evaluated = yield* Effect.tryPromise({
-                try: () => query(env, input, manifest),
-                catch: (cause) => {
-                  if (Schema.is(Rejected)(cause)) return cause;
-                  return new Cause.UnknownError(cause);
-                },
-              }).pipe(
-                Effect.timeoutOrElse({
-                  duration: "30 seconds",
-                  orElse: () =>
-                    Effect.fail(
-                      new Rejected({
-                        status: 504,
-                        message: "Edge query exceeded its 30-second snapshot lease",
-                      }),
-                    ),
-                }),
-              );
-              evaluated.headers.append(
-                "server-timing",
-                `edge_snapshot;dur=${Number(snapshotEnded - snapshotStarted) / 1e6}`,
-              );
-              return evaluated;
-            }
-          }
+            if (manifest === undefined) return undefined;
+            const queryResponse = yield* Effect.tryPromise({
+              try: () => query(env, input, manifest),
+              catch: (cause) => {
+                if (Schema.is(Rejected)(cause)) return cause;
+                return new Cause.UnknownError(cause);
+              },
+            });
+            const phase = { value: "strong_manifest" };
+            if (input.consistency === "edge-eventual") phase.value = "edge_snapshot";
+            queryResponse.headers.append(
+              "server-timing",
+              `${phase.value};dur=${Number(snapshotEnded - snapshotStarted) / 1e6}`,
+            );
+            return queryResponse;
+          }).pipe(
+            Effect.timeoutOrElse({
+              duration: "30 seconds",
+              orElse: () =>
+                Effect.fail(
+                  new Rejected({
+                    status: 504,
+                    message: "Query exceeded its 30-second snapshot lease",
+                  }),
+                ),
+            }),
+          );
+          if (evaluated !== undefined) return evaluated;
         }
         return yield* Effect.tryPromise(() =>
           env.NAMESPACES.get(env.NAMESPACES.idFromName(namespace)).fetch(request),

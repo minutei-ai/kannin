@@ -480,3 +480,21 @@ All projected dictionaries and minima matched. This isolates the WASM projection
 Native new-selector observations against the same million-document corpus measured selective/common/filtered before at 1,267.88/2,699.87/2,560.87 ms and after at 1,840.68/1,070.71/2,029.95 ms. Every result matched its strong base rows and scores. Selective total latency regressed while the directory interval decreased slightly, and its snapshot interval increased from 345 to 554 ms. These individual observations do not establish a universal improvement.
 
 The subsequent complete native mixed-query load retained one million documents and sequence 2,000; all ninety-six edge responses matched strong baselines. Concurrency 1/4/16 p50 was 66.92/78.14/139.78 ms, p95 was 369.75/655.99/1,118.67 ms and throughput was 7.24/20.23/25.76 requests/s. Relative to the preceding memory-path load, concurrency-one and concurrency-four improved while concurrency-sixteen p95 and throughput regressed. The sample size, deployment, prior warming and network variation keep causal and parity claims bounded. Initial acquisition remains above one second, high-concurrency tails remain open, and the earlier edge lease failure is not proven resolved.
+
+## Cache API overview batches
+
+Runtime `6b60343` recovers compressed overviews with one Cache API lookup per ordered batch, rather than one per segment. The private `raio-overview-batches-v1` namespace uses bucket identity, immutable keys/header lengths and filter digest; changing query terms does not change the source key. Its Schema-owned base64 array contains at most sixteen CRC-framed overviews and three MiB of compressed source bytes. Oversized groups bypass Cache API admission. The existing four-MiB per-segment memory LRU remains; complete memory hits perform no native cache acquisition. Partial memory hits survive a batch miss. Corrupt or mismatched batches are discarded, and missing data is rebuilt from verified directories. Root/index formats and the compact projection response remain unchanged.
+
+The full gate and CI passed with 113 Worker/tooling and 18 Rust tests. A workerd regression recovers seventeen segments after process eviction through two Cache API lookups, with seventeen source hits, zero rebuilds and identical rows/scores. The corruption test targets the new batch format and verifies source recovery. Existing global frequencies, filtered minima, phrase, revision, tombstone, namespace isolation and integrity regressions passed. The per-segment Cache API owner was removed in the same change; there are no compatibility reads of its previous namespace.
+
+Native new-selector observations against the million-document corpus were:
+
+| Query     | Before ms | First batch observation ms | Repeated new selector ms |
+| --------- | --------: | -------------------------: | -----------------------: |
+| selective |  2,953.15 |                   4,228.23 |                 4,161.52 |
+| common    |  2,326.83 |                   2,630.43 |                 1,771.87 |
+| filtered  |    863.06 |                   3,902.85 |                 2,625.32 |
+
+Every response matched its strong base rows and scores. Initial batch observations all regressed; the repetition improved common latency relative to the baseline, while selective and filtered remained slower. A new Cache API namespace begins empty, but that alone does not establish the cause of these variations. Reducing lookups does not prove lower native latency. New-selector acquisition remains unresolved.
+
+A subsequent native mixed-query load verified all ninety-six edge responses against strong baselines, retaining one million documents and sequence 2,000. Concurrency 1/4/16 p50 was 66.96/64.75/112.32 ms, p95 was 572.18/657.42/1,040.79 ms and throughput was 6.41/23.70/24.78 requests/s. Relative to the preceding parsing run, concurrency-four median and throughput improved, concurrency-sixteen median and p95 improved, and concurrency-one p95/throughput regressed. The small sample, prior requests, deployment and provider variation limit attribution. General parity, first-use edge deadline reliability and native peak isolate memory remain unverified.

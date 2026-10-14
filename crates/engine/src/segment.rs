@@ -522,21 +522,38 @@ pub fn bm25(
     statistics: &Statistics,
     df: u64,
 ) -> f64 {
-    if statistics.documents == 0 || df == 0 || df > statistics.documents {
-        return 0.0;
+    TermScorer::new(statistics, df).score(tf_title, tf_body, len_title, len_body)
+}
+
+struct TermScorer {
+    title_average: f64,
+    body_average: f64,
+    idf: Option<f64>,
+}
+
+impl TermScorer {
+    fn new(statistics: &Statistics, df: u64) -> Self {
+        let n = count_as_f64(statistics.documents);
+        let idf = if statistics.documents == 0 || df == 0 || df > statistics.documents {
+            None
+        } else {
+            Some(((n - count_as_f64(df) + 0.5) / (count_as_f64(df) + 0.5)).ln_1p())
+        };
+        Self {
+            title_average: count_as_f64(statistics.title_length) / n,
+            body_average: count_as_f64(statistics.body_length) / n,
+            idf,
+        }
     }
-    let n = count_as_f64(statistics.documents);
-    let tf = contribution(
-        tf_title,
-        len_title,
-        count_as_f64(statistics.title_length) / n,
-    )
-    .mul_add(
-        2.0,
-        contribution(tf_body, len_body, count_as_f64(statistics.body_length) / n),
-    );
-    let idf = ((n - count_as_f64(df) + 0.5) / (count_as_f64(df) + 0.5)).ln_1p();
-    idf * tf * 2.2 / (tf + 1.2)
+
+    fn score(&self, tf_title: u32, tf_body: u32, len_title: u32, len_body: u32) -> f64 {
+        let Some(idf) = self.idf else {
+            return 0.0;
+        };
+        let tf = contribution(tf_title, len_title, self.title_average)
+            .mul_add(2.0, contribution(tf_body, len_body, self.body_average));
+        idf * tf * 2.2 / (tf + 1.2)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -721,6 +738,7 @@ impl Search {
         terms: &[&String],
         lists: &[&[Posting]],
         cursors: &[usize],
+        scorers: &[TermScorer],
         cutoff: &Hit,
         row: u32,
     ) -> Option<u32> {
@@ -739,19 +757,11 @@ impl Search {
                     })
             {
                 end = end.min(block.last);
-                let df = self
-                    .statistics
-                    .frequencies
-                    .get(terms[index].as_str())
-                    .copied()
-                    .unwrap_or(0);
-                bound += bm25(
+                bound += scorers[index].score(
                     block.max_title_tf,
                     block.max_body_tf,
                     block.min_title_length,
                     block.min_body_length,
-                    &self.statistics,
-                    df,
                 );
             }
         }
@@ -782,6 +792,19 @@ impl Search {
         if self.mode != "any" && lists.iter().any(|list| list.is_empty()) {
             return Ok(Vec::new());
         }
+        let scorers: Vec<_> = terms
+            .iter()
+            .map(|term| {
+                TermScorer::new(
+                    &self.statistics,
+                    self.statistics
+                        .frequencies
+                        .get(term.as_str())
+                        .copied()
+                        .unwrap_or(0),
+                )
+            })
+            .collect();
         let mut cursors = vec![0usize; lists.len()];
         let mut heap: BinaryHeap<Hit> = BinaryHeap::new();
         while let Some(row) = lists
@@ -792,7 +815,8 @@ impl Search {
         {
             if heap.len() == self.top_k
                 && let Some(cutoff) = heap.peek()
-                && let Some(end) = self.skippable_block_end(&terms, &lists, &cursors, cutoff, row)
+                && let Some(end) =
+                    self.skippable_block_end(&terms, &lists, &cursors, &scorers, cutoff, row)
             {
                 for (index, list) in lists.iter().enumerate() {
                     cursors[index] +=
@@ -805,19 +829,11 @@ impl Search {
             for (index, list) in lists.iter().enumerate() {
                 if let Some(posting) = list.get(cursors[index]).filter(|p| p.row == row) {
                     let meta = &self.header.documents[row as usize];
-                    let df = self
-                        .statistics
-                        .frequencies
-                        .get(terms[index].as_str())
-                        .copied()
-                        .unwrap_or(0);
-                    score += bm25(
+                    score += scorers[index].score(
                         u32::try_from(posting.title.len()).map_err(|cause| cause.to_string())?,
                         u32::try_from(posting.body.len()).map_err(|cause| cause.to_string())?,
                         meta.title_length,
                         meta.body_length,
-                        &self.statistics,
-                        df,
                     );
                     selected.insert(terms[index].as_str(), posting);
                     cursors[index] += 1;
@@ -1794,5 +1810,41 @@ mod numeric_contract_tests {
         assert!(!bloom_contains(&bloom_build(&[])?, "a")?);
         assert!(bloom_contains(&vec![0; super::MAX_BYTES + 1], "a").is_err());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod scoring_tests {
+    use super::{Statistics, TermScorer, contribution, count_as_f64};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn prepared_scores_preserve_original_floating_point_results() {
+        for documents in [0, 1, 10_000, 9_007_199_254_740_993] {
+            for df in [0, 1, documents, documents + 1] {
+                for (title_length, body_length) in [(0, 0), (1, 17), (37, 1_000_000)] {
+                    let statistics = Statistics {
+                        documents,
+                        title_length,
+                        body_length,
+                        frequencies: BTreeMap::new(),
+                    };
+                    let scorer = TermScorer::new(&statistics, df);
+                    for (a, b, x, y) in [(0, 0, 0, 0), (1, 3, 5, 17), (37, 1024, 64, 2048)] {
+                        let original = if documents == 0 || df == 0 || df > documents {
+                            0.0
+                        } else {
+                            let n = count_as_f64(documents);
+                            let tf = contribution(a, x, count_as_f64(title_length) / n)
+                                .mul_add(2.0, contribution(b, y, count_as_f64(body_length) / n));
+                            let idf =
+                                ((n - count_as_f64(df) + 0.5) / (count_as_f64(df) + 0.5)).ln_1p();
+                            idf * tf * 2.2 / (tf + 1.2)
+                        };
+                        assert_eq!(scorer.score(a, b, x, y).to_bits(), original.to_bits());
+                    }
+                }
+            }
+        }
     }
 }

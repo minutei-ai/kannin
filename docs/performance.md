@@ -727,3 +727,20 @@ A 96-response load completed for each experimental and restored runtime, preserv
 | JSON restored |          16 | 272.29 | 1518.85 |      17.40 |
 
 The restored mixed load still regressed medians/throughput; reverting the experiment does not prove resolution of the wider workload variability. The README reports the latest restored run. The restoration passed the full 134-test gate and deployment completed. Native cold reliability, peak memory and fully indexed Turbopuffer parity remain open.
+
+## Prepared Rust BM25 scoring
+
+The ranker computes each term's live IDF and field-length averages once per `finish`, reusing them for posting scores and block bounds. It retains the original floating-point operation order, term ordering, cutoff guard, phrase matching, filters and tombstones. No persisted format or cache identity changes. A regression compares prepared scores bit for bit with the prior formula, including empty/invalid frequencies and counts beyond JavaScript integer precision.
+
+A local alternating old/new WASM microbenchmark ranks the same 10,000-document segment with ten warmup pairs and 100 measured pairs. Posting decompression, directory acquisition and ranker construction are outside the timed `finish` operation. Every result, ID and score matches exactly, including a repeated-term phrase, four tombstones and an equality filter.
+
+| Match  | Filter | Before p50 ms | After p50 ms |
+| ------ | ------ | ------------: | -----------: |
+| any    | False  |         7.871 |        4.607 |
+| any    | True   |         7.521 |        4.199 |
+| all    | False  |         7.753 |        4.541 |
+| all    | True   |         7.519 |        4.169 |
+| phrase | False  |         3.437 |        2.593 |
+| phrase | True   |         2.148 |        1.358 |
+
+These operation-level measurements do not establish an equivalent whole-query gain or Turbopuffer parity.

@@ -1804,63 +1804,41 @@ export default {
           })(body).pipe(
             Effect.mapError(() => new Rejected({ status: 400, message: "Invalid query contract" })),
           );
-          if (input.consistency === "edge-eventual" && input.kind !== "text")
-            return yield* new Rejected({
-              status: 400,
-              message: "Edge consistency is supported for text queries only",
-            });
-          const evaluated = yield* Effect.gen(function* () {
+          if (input.consistency === "edge-eventual") {
+            if (input.kind !== "text")
+              return yield* new Rejected({
+                status: 400,
+                message: "Edge consistency is supported for text queries only",
+              });
             const snapshotStarted = yield* Clock.currentTimeNanos;
-            const manifest = yield* Effect.gen(function* () {
-              if (input.consistency === "edge-eventual")
-                return yield* edgeSnapshot(ctx, env, namespace, input.minimumSequence ?? 0);
-              const rootKey = `namespaces/${namespace}/root.json`;
-              const object = { value: yield* Effect.tryPromise(() => env.STORAGE.get(rootKey)) };
-              if (object.value === null) {
-                const acknowledged = yield* Effect.tryPromise(() =>
-                  env.STORAGE.list({ prefix: `namespaces/${namespace}/receipts/`, limit: 1 }),
-                );
-                if (acknowledged.objects.length === 0) return undefined;
-                object.value = yield* Effect.tryPromise(() => env.STORAGE.get(rootKey));
-                if (object.value === null)
-                  return yield* new Rejected({
-                    status: 503,
-                    message: "R2 manifest missing for an acknowledged namespace",
-                  });
-              }
-              const canonical = object.value;
-              const encoded = yield* Effect.tryPromise(() => canonical.text());
-              return yield* Schema.decodeEffect(Schema.fromJsonString(Root))(encoded);
-            });
+            const manifest = yield* edgeSnapshot(ctx, env, namespace, input.minimumSequence ?? 0);
             const snapshotEnded = yield* Clock.currentTimeNanos;
-            if (manifest === undefined) return undefined;
-            const queryResponse = yield* Effect.tryPromise({
-              try: () => query(env, input, manifest),
-              catch: (cause) => {
-                if (Schema.is(Rejected)(cause)) return cause;
-                return new Cause.UnknownError(cause);
-              },
-            });
-            const phase = { value: "strong_snapshot" };
-            if (input.consistency === "edge-eventual") phase.value = "edge_snapshot";
-            queryResponse.headers.append(
-              "server-timing",
-              `${phase.value};dur=${Number(snapshotEnded - snapshotStarted) / 1e6}`,
-            );
-            return queryResponse;
-          }).pipe(
-            Effect.timeoutOrElse({
-              duration: "30 seconds",
-              orElse: () =>
-                Effect.fail(
-                  new Rejected({
-                    status: 504,
-                    message: "Query exceeded its 30-second snapshot lease",
-                  }),
-                ),
-            }),
-          );
-          if (evaluated !== undefined) return evaluated;
+            if (manifest !== undefined) {
+              const evaluated = yield* Effect.tryPromise({
+                try: () => query(env, input, manifest),
+                catch: (cause) => {
+                  if (Schema.is(Rejected)(cause)) return cause;
+                  return new Cause.UnknownError(cause);
+                },
+              }).pipe(
+                Effect.timeoutOrElse({
+                  duration: "30 seconds",
+                  orElse: () =>
+                    Effect.fail(
+                      new Rejected({
+                        status: 504,
+                        message: "Edge query exceeded its 30-second snapshot lease",
+                      }),
+                    ),
+                }),
+              );
+              evaluated.headers.append(
+                "server-timing",
+                `edge_snapshot;dur=${Number(snapshotEnded - snapshotStarted) / 1e6}`,
+              );
+              return evaluated;
+            }
+          }
         }
         return yield* Effect.tryPromise(() =>
           env.NAMESPACES.get(env.NAMESPACES.idFromName(namespace)).fetch(request),

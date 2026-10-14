@@ -912,3 +912,37 @@ Native deployment completed on the unchanged million-document corpus. The first 
 | After repeated |          16 | 155.17 | 1179.61 |      19.79 |
 
 The complete repeat improved median, p95 and throughput in all phases against this reference, but uncontrolled cache/isolate/network conditions prevent attributing that change solely to Rust. Kernel measurements support the local larger-segment any/all gain; the aborted snapshot request prevents a universal reliability or Turbopuffer parity claim.
+
+## Rejected fixed Rust positional field storage
+
+Posting decoding used a heap Vec to temporarily hold exactly two title/body positional vectors. An uncommitted experiment replaced it with a fixed two-element array and destructured the fields in wire order. The experiment was rejected after two native regressions and the prior decoder restored. The experiment retained exact capacity reservation, avoiding the larger minimum capacity of generic reserve for short fields. Varint overflow, row/position ordering, field length, empty posting, framing, CRC, decompressed length and trailing-byte validation remain unchanged; no wire or cache formats change.
+
+Alternating old/new WASM measurements used five warmup pairs and sixty measured pairs per fixture, timing all Ranker.add calls (WASM input transfer, decompression, decoding and header/list validation). Ranker acquisition, finish and release are outside the measured interval. Density one/twelve repeats `alpha beta gamma` one/twelve times in each body, with variable trailing gamma counts. Every finished row and score matched exactly.
+
+| Documents | Density | Blocks | Before p50 ms | After p50 ms |
+| --------: | ------: | -----: | ------------: | -----------: |
+|       500 |       1 |     12 |         0.559 |        0.444 |
+|       500 |      12 |     12 |         1.051 |        0.877 |
+|     10000 |       1 |    237 |         5.451 |        4.176 |
+|     10000 |      12 |    237 |         9.504 |        7.566 |
+
+All four local fixtures improved p50 by 16–23%; these are local decode/add measurements, not native whole-query latency. The full gate passed 117 Worker/tooling and 20 Rust tests, and 1,296 original/new differential query pairs preserved exact rows/scores.
+
+The unchanged million-document corpus completed four 96-response native loads: original, experimental first, experimental repeated and restored. All 384 edge responses matched strong rows/scores and sequence barriers. No corpus writes occurred.
+
+| Configuration     | Concurrency | p50 ms |  p95 ms | Requests/s |
+| ----------------- | ----------: | -----: | ------: | ---------: |
+| Original          |           1 |  64.38 |  108.03 |      12.25 |
+| Original          |           4 |  73.62 |  604.55 |      21.44 |
+| Original          |          16 | 190.17 |  972.22 |      26.32 |
+| Array first       |           1 |  75.55 |  462.07 |       4.77 |
+| Array first       |           4 |  74.39 | 2631.00 |       6.41 |
+| Array first       |          16 | 358.57 | 3111.74 |       7.46 |
+| Array repeated    |           1 |  74.90 |  354.65 |       6.48 |
+| Array repeated    |           4 |  72.97 | 1784.82 |       8.56 |
+| Array repeated    |          16 | 376.93 | 4649.08 |       5.78 |
+| Original restored |           1 |  63.97 |  226.37 |       9.93 |
+| Original restored |           4 |  89.89 |  954.59 |      16.65 |
+| Original restored |          16 | 129.12 | 1247.37 |      16.59 |
+
+Both experimental loads regressed throughput in every phase against the original run; the first concurrency-one server trace spent 955 ms in the rank phase, which also includes acquisition and is not a pure decode timer. Restored throughput improved against both experimental runs in every phase, although it remained below the original reference. Cache/isolate/network conditions were uncontrolled, so this does not independently prove the small Rust change caused the full regression. The native evidence did not justify retaining it. The original decoder source and deployment were restored, preserving the prior candidate-buffer and block-bound optimizations. The README reports the restored measurement; no application change from this experiment remains.

@@ -13,11 +13,11 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Concurrency | p50 ms |  p95 ms | Requests/s |
 | ----------: | -----: | ------: | ---------: |
-|           1 |  71.74 |  332.81 |       8.13 |
-|           4 |  68.60 |  571.81 |      16.80 |
-|          16 | 155.17 | 1179.61 |      19.79 |
+|           1 |  63.97 |  226.37 |       9.93 |
+|           4 |  89.89 |  954.59 |      16.65 |
+|          16 | 129.12 | 1247.37 |      16.59 |
 
-Latest complete 32-request phase measurements after query-local Rust block-bound reuse. All 96 edge responses matched strong rows and scores. The first post-deploy attempt failed with a snapshot freshness 503; the successful repeat does not resolve first-use reliability. Against the previous candidate-buffer implementation, local alternating WASM measurements reduced any/all finish p50 by **35–65% on 500/10,000-document fixtures**; tiny and phrase fixtures stayed near baseline with occasional microsecond regressions. Peak memory and general Turbopuffer parity remain unverified.
+Latest complete 32-request phase measurements after restoring the original positional decoder. All 96 edge responses matched strong rows and scores. A fixed-array decoder improved local decode/add by 16–23% but regressed both native experimental loads, so it was discarded. The retained query-local block-bound optimization reduced any/all finish p50 by **35–65% on 500/10,000-document fixtures** against the previous Rust ranker. First-use snapshot reliability, peak memory and general Turbopuffer parity remain unverified.
 
 The local million-document workload measured strong common/filtered p50 of **127/126 ms** across 2,000 uncompacted segments. These emulator results exclude native network latency. Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10** across 300 queries. Eight native vector/hybrid fixture cases also retained exact rows and scores.
 

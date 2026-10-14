@@ -211,8 +211,8 @@ test("corrupted compressed overview cache falls back to verified immutable sourc
   const manifest = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
   const segment = manifest.segments[0];
   if (segment === undefined) throw new Error("Missing segment");
-  const cache = await (await worker.getCaches()).open("raio-overview-batches-v2");
-  const key = new URL("https://overviews.internal/batch-v2");
+  const cache = await (await worker.getCaches()).open("raio-overview-batches-v3");
+  const key = new URL("https://overviews.internal/batch-v3");
   key.searchParams.set("bucket", "raio-test");
   const ranges = Schema.encodeSync(Schema.fromJsonString(TermProjectionProps.fields.ranges))([
     { key: segment.key, headerBytes: segment.headerBytes },

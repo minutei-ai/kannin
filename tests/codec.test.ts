@@ -170,37 +170,81 @@ test("shared attribute groups preserve minima across operators and different doc
   segment.free();
 });
 
-test("overview projection validates unrequested values and rejects malformed root fields", () => {
-  for (const json of [
-    '{"dictionary":{"unused":{"df":"bad","bounds":[]}},"eligibility":[[{},0,0]]}',
-    '{"dictionary":{"unused":{"df":1,"bounds":[[0,1,0,-1]]}},"eligibility":[[{},0,0]]}',
-    '{"dictionary":{"unused":{"df":1,"bounds":[[0,1,0]]}},"eligibility":[[{},0,0]]}',
-    '{"dictionary":{"unused":{"df":1,"bounds":[[0,1,0,1,0]]}},"eligibility":[[{},0,0]]}',
-    '{"dictionary":{"unused":{"df":1,"bounds":[[0,1,0,4294967296]]}},"eligibility":[[{},0,0]]}',
-    '{"dictionary":{"unused":{"df":1}},"eligibility":[[{},0,0]]}',
-    '{"dictionary":{"unused":{"df":1,"bounds":[],"bounds":[]}},"eligibility":[[{},0,0]]}',
-    '{"dictionary":{},"dictionary":{},"eligibility":[[{},0,0]]}',
-    '{"dictionary":{},"eligibility":[[{},0,0]],"eligibility":[[{},0,0]]}',
-    '{"dictionary":{},"eligibility":[["invalid",0,0]]}',
-    '{"dictionary":{},"eligibility":[[[],0,0]]}',
-    '{"dictionary":{},"eligibility":[[{"unused":1e400},0,0]]}',
-    '{"dictionary":{},"eligibility":[[{"unused":"\\ud800"},0,0]]}',
-    '{"dictionary":{},"eligibility":[[{},0,-1]]}',
-    '{"dictionary":{},"eligibility":[[{},0,0,0]]}',
-    '{"dictionary":{},"eligibility":[]}',
-    '{"dictionary":{}}',
-    '{"dictionary":{},"minimum":null,"eligibility":[[{},0,0]]}',
-    '{"dictionary":{},"eligibility":[[{},0,0]],"unknown":true}',
-    '{"dictionary":{},"eligibility":[[{},0,0]]} trailing',
-  ]) {
-    const data = new TextEncoder().encode(json);
+test("binary overviews reject rechecksummed malformed dictionaries and eligibility", () => {
+  const prefix = new Uint8Array(44);
+  prefix.set(new TextEncoder().encode("RAIOOVR3"));
+  const view = new DataView(prefix.buffer);
+  view.setUint32(8, 1, true);
+  view.setUint32(12, 4, true);
+  prefix.set(new TextEncoder().encode("rust"), 16);
+  view.setUint32(20, 1, true);
+  view.setUint32(24, 1, true);
+  view.setUint32(32, 1, true);
+  view.setUint32(40, 1, true);
+  const badMagic = prefix.slice();
+  badMagic[0] = 0;
+  const badUtf8 = prefix.slice();
+  badUtf8[16] = 255;
+  const duplicate = new Uint8Array(76);
+  duplicate.set(prefix);
+  duplicate.set(prefix.subarray(12), 44);
+  new DataView(duplicate.buffer).setUint32(8, 2, true);
+  const unordered = duplicate.slice();
+  unordered[48] = 97;
+  const corrupted = [
+    badMagic,
+    badUtf8,
+    duplicate,
+    unordered,
+    prefix.slice(0, 43),
+    ...[
+      [8, 4294967295],
+      [12, 4294967295],
+      [12, 0],
+      [20, 0],
+      [24, 0],
+      [24, 4294967295],
+    ].map(([offset, value]) => {
+      const bytes = prefix.slice();
+      if (offset === undefined || value === undefined)
+        throw new Error("Missing corruption fixture");
+      new DataView(bytes.buffer).setUint32(offset, value, true);
+      return bytes;
+    }),
+  ];
+  const cases = [
+    ...corrupted.map((bytes) => [bytes, "[[{},0,1]]"] as const),
+    ...[
+      "[]",
+      "[[[],0,0]]",
+      "[[{},-1,0]]",
+      "[[{},0,0,0]]",
+      '{"unknown":true}',
+      '[[{"unused":1e400},0,0]]',
+      '[[{"unused":"\\ud800"},0,0]]',
+      "[[{},0,0]] trailing",
+    ].map((json) => [prefix, json] as const),
+  ];
+  for (const [dictionary, json] of [[prefix, "[[{},0,1]]"] as const, ...cases]) {
+    const groups = new TextEncoder().encode(json);
+    const data = new Uint8Array(dictionary.length + groups.length);
+    data.set(dictionary);
+    data.set(groups, dictionary.length);
     const compressed = deflateSync(data);
     const bytes = new Uint8Array(8 + compressed.byteLength);
     const frame = new DataView(bytes.buffer);
     frame.setUint32(0, data.byteLength, true);
     frame.setUint32(4, crc32(data), true);
     bytes.set(compressed, 8);
-    expect(() => segment_overview_project(bytes, '["wanted"]', "[]")).toThrow();
+    if (dictionary === prefix && json === "[[{},0,1]]") {
+      expect(
+        Schema.decodeSync(Schema.fromJsonString(TermCatalog))(
+          segment_overview_project(bytes, '["rust"]', "[]"),
+        ).dictionary.rust?.df,
+      ).toBe(1);
+      continue;
+    }
+    expect(() => segment_overview_project(bytes, '["absent"]', "[]")).toThrow();
   }
 });
 

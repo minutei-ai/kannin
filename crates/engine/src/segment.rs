@@ -1014,128 +1014,12 @@ pub mod wasm {
         minimum: Option<(u32, u32)>,
     }
 
-    struct OverviewBounds<'a>(&'a [BlockMeta]);
-
-    impl Serialize for OverviewBounds<'_> {
-        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            serializer.collect_seq(self.0.iter().map(|block| {
-                (
-                    block.max_title_tf,
-                    block.max_body_tf,
-                    block.min_title_length,
-                    block.min_body_length,
-                )
-            }))
-        }
-    }
-
-    #[derive(Serialize)]
-    struct OverviewSummary<'a> {
-        df: u32,
-        bounds: OverviewBounds<'a>,
-    }
-
-    struct OverviewDictionary<'a>(&'a BTreeMap<String, TermMeta>);
-
-    impl Serialize for OverviewDictionary<'_> {
-        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            serializer.collect_map(self.0.iter().map(|(term, meta)| {
-                (
-                    term,
-                    OverviewSummary {
-                        df: meta.df,
-                        bounds: OverviewBounds(&meta.blocks),
-                    },
-                )
-            }))
-        }
-    }
-
-    #[derive(Serialize)]
-    struct DirectoryOverview<'a> {
-        dictionary: OverviewDictionary<'a>,
-        eligibility: OverviewEligibility<'a>,
-    }
-
     struct OverviewEligibility<'a>(BTreeMap<&'a str, (&'a serde_json::value::RawValue, u32, u32)>);
 
     impl Serialize for OverviewEligibility<'_> {
         fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
             serializer.collect_seq(self.0.values())
         }
-    }
-
-    struct SelectedTerms<'a> {
-        requested: &'a BTreeSet<String>,
-    }
-
-    struct DiscardedBounds;
-
-    impl<'de> serde::de::Visitor<'de> for DiscardedBounds {
-        type Value = ();
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("an array of four unsigned integer bounds")
-        }
-
-        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut sequence: A) -> Result<(), A::Error> {
-            while sequence.next_element::<(u32, u32, u32, u32)>()?.is_some() {}
-            Ok(())
-        }
-    }
-
-    fn discard_bounds<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<(), D::Error> {
-        deserializer.deserialize_seq(DiscardedBounds)
-    }
-
-    #[derive(Deserialize)]
-    struct DiscardedSummary {
-        #[serde(rename = "df")]
-        _df: u32,
-        #[serde(rename = "bounds", deserialize_with = "discard_bounds")]
-        _bounds: (),
-    }
-
-    impl<'de> serde::de::DeserializeSeed<'de> for SelectedTerms<'_> {
-        type Value = BTreeMap<String, TermSummary>;
-
-        fn deserialize<D: serde::Deserializer<'de>>(
-            self,
-            deserializer: D,
-        ) -> Result<Self::Value, D::Error> {
-            deserializer.deserialize_map(self)
-        }
-    }
-
-    impl<'de> serde::de::Visitor<'de> for SelectedTerms<'_> {
-        type Value = BTreeMap<String, TermSummary>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("a term summary dictionary")
-        }
-
-        fn visit_map<A: serde::de::MapAccess<'de>>(
-            self,
-            mut map: A,
-        ) -> Result<Self::Value, A::Error> {
-            let mut selected = BTreeMap::new();
-            while let Some(term) = map.next_key::<String>()? {
-                if self.requested.contains(&term) {
-                    let summary = map.next_value::<TermSummary>()?;
-                    selected.insert(term, summary);
-                } else {
-                    map.next_value::<DiscardedSummary>()?;
-                }
-            }
-            Ok(selected)
-        }
-    }
-
-    #[derive(Deserialize)]
-    #[serde(field_identifier, rename_all = "lowercase")]
-    enum OverviewField {
-        Dictionary,
-        Eligibility,
     }
 
     struct SelectedAttributes<'a>(&'a BTreeSet<&'a str>);
@@ -1266,59 +1150,30 @@ pub mod wasm {
         }
     }
 
-    struct SelectedOverview<'a> {
-        requested: &'a BTreeSet<String>,
-        filters: &'a [Filter],
+    fn overview_slice<'a>(
+        cursor: &mut std::io::Cursor<&'a [u8]>,
+        length: usize,
+    ) -> Result<&'a [u8], JsValue> {
+        let start = usize::try_from(cursor.position())
+            .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        let end = start
+            .checked_add(length)
+            .ok_or_else(|| JsValue::from_str("Invalid overview slice length"))?;
+        let bytes = cursor
+            .get_ref()
+            .get(start..end)
+            .ok_or_else(|| JsValue::from_str("Truncated overview"))?;
+        cursor.set_position(
+            u64::try_from(end).map_err(|cause| JsValue::from_str(&cause.to_string()))?,
+        );
+        Ok(bytes)
     }
 
-    impl<'de> serde::de::DeserializeSeed<'de> for SelectedOverview<'_> {
-        type Value = Overview;
-
-        fn deserialize<D: serde::Deserializer<'de>>(
-            self,
-            deserializer: D,
-        ) -> Result<Self::Value, D::Error> {
-            deserializer.deserialize_map(self)
-        }
-    }
-
-    impl<'de> serde::de::Visitor<'de> for SelectedOverview<'_> {
-        type Value = Overview;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("a segment overview")
-        }
-
-        fn visit_map<A: serde::de::MapAccess<'de>>(
-            self,
-            mut map: A,
-        ) -> Result<Self::Value, A::Error> {
-            let mut dictionary = None;
-            let mut minimum = None;
-            while let Some(field) = map.next_key::<OverviewField>()? {
-                match field {
-                    OverviewField::Dictionary => {
-                        if dictionary.is_some() {
-                            return Err(serde::de::Error::duplicate_field("dictionary"));
-                        }
-                        dictionary = Some(map.next_value_seed(SelectedTerms {
-                            requested: self.requested,
-                        })?);
-                    }
-                    OverviewField::Eligibility => {
-                        if minimum.is_some() {
-                            return Err(serde::de::Error::duplicate_field("eligibility"));
-                        }
-                        minimum = Some(map.next_value_seed(EligibleGroups(self.filters))?);
-                    }
-                }
-            }
-            Ok(Overview {
-                dictionary: dictionary
-                    .ok_or_else(|| serde::de::Error::missing_field("dictionary"))?,
-                minimum: minimum.ok_or_else(|| serde::de::Error::missing_field("eligibility"))?,
-            })
-        }
+    fn overview_u32(cursor: &mut std::io::Cursor<&[u8]>) -> Result<u32, JsValue> {
+        let bytes = overview_slice(cursor, 4)?;
+        Ok(u32::from_le_bytes(bytes.try_into().map_err(
+            |cause: std::array::TryFromSliceError| JsValue::from_str(&cause.to_string()),
+        )?))
     }
 
     fn term_bound(
@@ -1507,17 +1362,48 @@ pub mod wasm {
                 lengths.1 = lengths.1.min(document.title_length);
                 lengths.2 = lengths.2.min(document.body_length);
             }
-            let overview = DirectoryOverview {
-                dictionary: OverviewDictionary(&self.header.terms),
-                eligibility: OverviewEligibility(eligibility),
-            };
-            let json = serde_json::to_vec(&overview)
-                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
-            if json.len() > MAX_BYTES {
+            let mut payload = b"RAIOOVR3".to_vec();
+            payload.extend_from_slice(
+                &u32::try_from(self.header.terms.len())
+                    .map_err(|cause| JsValue::from_str(&cause.to_string()))?
+                    .to_le_bytes(),
+            );
+            for (term, meta) in &self.header.terms {
+                payload.extend_from_slice(
+                    &u32::try_from(term.len())
+                        .map_err(|cause| JsValue::from_str(&cause.to_string()))?
+                        .to_le_bytes(),
+                );
+                payload.extend_from_slice(term.as_bytes());
+                payload.extend_from_slice(&meta.df.to_le_bytes());
+                payload.extend_from_slice(
+                    &u32::try_from(meta.blocks.len())
+                        .map_err(|cause| JsValue::from_str(&cause.to_string()))?
+                        .to_le_bytes(),
+                );
+                for block in &meta.blocks {
+                    for bound in [
+                        block.max_title_tf,
+                        block.max_body_tf,
+                        block.min_title_length,
+                        block.min_body_length,
+                    ] {
+                        payload.extend_from_slice(&bound.to_le_bytes());
+                    }
+                }
+                if payload.len() > MAX_BYTES {
+                    return Err(JsValue::from_str("Overview exceeds decoded size budget"));
+                }
+            }
+            payload.extend_from_slice(
+                &serde_json::to_vec(&OverviewEligibility(eligibility))
+                    .map_err(|cause| JsValue::from_str(&cause.to_string()))?,
+            );
+            if payload.len() > MAX_BYTES {
                 return Err(JsValue::from_str("Overview exceeds decoded size budget"));
             }
             let mut bytes = Vec::new();
-            append(&mut bytes, &json).map_err(|cause| JsValue::from_str(&cause))?;
+            append(&mut bytes, &payload).map_err(|cause| JsValue::from_str(&cause))?;
             Ok(bytes)
         }
 
@@ -1613,23 +1499,73 @@ pub mod wasm {
         if terms.len() > 64 {
             return Err(JsValue::from_str("Overview projection exceeds 64 terms"));
         }
-        let requested = terms.into_iter().collect();
+        let requested: BTreeSet<_> = terms.into_iter().collect();
         let filters: Vec<Filter> =
             serde_json::from_str(filters).map_err(|cause| JsValue::from_str(&cause.to_string()))?;
         if filters.len() > 16 {
             return Err(JsValue::from_str("Overview projection exceeds 16 filters"));
         }
         let decoded = decode_page(bytes).map_err(|cause| JsValue::from_str(&cause))?;
-        let mut deserializer = serde_json::Deserializer::from_slice(&decoded);
-        let projected = SelectedOverview {
-            requested: &requested,
-            filters: &filters,
+        let mut cursor = std::io::Cursor::new(decoded.as_slice());
+        if overview_slice(&mut cursor, 8)? != b"RAIOOVR3" {
+            return Err(JsValue::from_str("Invalid overview version"));
         }
-        .deserialize(&mut deserializer)
-        .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        let count = overview_u32(&mut cursor)?;
+        if usize::try_from(count).map_err(|cause| JsValue::from_str(&cause.to_string()))?
+            > decoded.len() / 12
+        {
+            return Err(JsValue::from_str("Invalid overview term count"));
+        }
+        let mut dictionary = BTreeMap::new();
+        let mut previous = None;
+        for _ in 0..count {
+            let length = usize::try_from(overview_u32(&mut cursor)?)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            let term = std::str::from_utf8(overview_slice(&mut cursor, length)?)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            if term.is_empty() || previous.is_some_and(|key| key >= term) {
+                return Err(JsValue::from_str("Invalid overview term ordering"));
+            }
+            previous = Some(term);
+            let df = overview_u32(&mut cursor)?;
+            let blocks = usize::try_from(overview_u32(&mut cursor)?)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            if df == 0 || blocks == 0 {
+                return Err(JsValue::from_str("Invalid overview term summary"));
+            }
+            let size = blocks
+                .checked_mul(16)
+                .ok_or_else(|| JsValue::from_str("Invalid overview bounds size"))?;
+            let bytes = overview_slice(&mut cursor, size)?;
+            if requested.contains(term) {
+                let bounds = bytes
+                    .chunks_exact(16)
+                    .map(|block| {
+                        let mut cursor = std::io::Cursor::new(block);
+                        Ok((
+                            overview_u32(&mut cursor)?,
+                            overview_u32(&mut cursor)?,
+                            overview_u32(&mut cursor)?,
+                            overview_u32(&mut cursor)?,
+                        ))
+                    })
+                    .collect::<Result<_, JsValue>>()?;
+                dictionary.insert(term.to_owned(), TermSummary { df, bounds });
+            }
+        }
+        let position = usize::try_from(cursor.position())
+            .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        let mut deserializer = serde_json::Deserializer::from_slice(&decoded[position..]);
+        let minimum = EligibleGroups(&filters)
+            .deserialize(&mut deserializer)
+            .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
         deserializer
             .end()
             .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        let projected = Overview {
+            dictionary,
+            minimum,
+        };
         serde_json::to_string(&projected).map_err(|cause| JsValue::from_str(&cause.to_string()))
     }
 

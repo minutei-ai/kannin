@@ -259,6 +259,43 @@ test("term projection batches preserve global frequencies and filter eligibility
   expect(warm.termMemoryHits - changed.termMemoryHits).toBe(129);
 });
 
+test("mixed catalog misses preserve selectors, global frequencies and cached halves", async () => {
+  const namespace = "mixed-catalog-misses";
+  const selectedFilters = [{ field: "group", op: "eq", value: 1 }];
+  await request(worker, namespace, "write", write([document("a", "shared", { group: 1 })]));
+  await request(worker, namespace, "query", textQuery("shared"));
+  await request(worker, namespace, "write", write([document("b", "shared other", { group: 1 })]));
+  await request(worker, namespace, "query", textQuery("other", 10, selectedFilters));
+  await request(worker, namespace, "write", write([document("c", "shared", { group: 0 })]));
+  const before = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  const first = Schema.decodeUnknownSync(QueryResult)(
+    await (
+      await request(worker, namespace, "query", textQuery("shared", 10, selectedFilters))
+    ).json(),
+  );
+  const acquired = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(first.rows.map((row) => row.id)).toEqual(["a", "b"]);
+  expect(acquired.termRequests - before.termRequests).toBe(3);
+  expect(acquired.termReads - before.termReads).toBe(3);
+  const repeat = Schema.decodeUnknownSync(QueryResult)(
+    await (
+      await request(worker, namespace, "query", textQuery("shared", 10, selectedFilters))
+    ).json(),
+  );
+  const warm = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(repeat.rows).toEqual(first.rows);
+  expect(warm.termRequests - acquired.termRequests).toBe(0);
+  expect(warm.termMemoryHits - acquired.termMemoryHits).toBe(3);
+  expect(first.rows[0]?.score).toBeCloseTo(Math.log1p(0.5 / 3.5) * (176 / 158), 12);
+  expect(first.rows[1]?.score).toBeCloseTo(Math.log1p(0.5 / 3.5) * (88 / 106), 12);
+});
+
 test("incremental writes retain partial immutable term catalogs and recompute live scores", async () => {
   const namespace = "partial-catalogs";
   for (const index of Array.from({ length: 15 }, (_, ordinal) => ordinal))

@@ -230,6 +230,8 @@ export const Metadata = Schema.Struct({
   cache: CacheMetrics,
 });
 export const Health = Schema.Struct({
+  snapshotR2Reads: Schema.Int,
+  snapshotSharedReads: Schema.Int,
   name: Schema.Literal("kannin"),
   version: Schema.Literal("0.1.0"),
   engine: Schema.Literal("rust-wasm-r2"),

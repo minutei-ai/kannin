@@ -1,11 +1,65 @@
 import { afterAll, expect, test } from "bun:test";
 import { Response } from "miniflare";
 import { Clock, Effect, Schema } from "effect";
-import { QueryResult, Root, Snapshot, WriteResult } from "../src/protocol";
+import { Health, QueryResult, Root, Snapshot, WriteResult } from "../src/protocol";
 import { document, request, startWorker, textQuery, write } from "./harness";
 
 const worker = await startWorker();
 afterAll(() => worker.dispose());
+
+test("overlapping cold snapshots share R2 acquisition and check sequence barriers independently", async () => {
+  const namespace = "cold-snapshot-sharing";
+  await request(worker, namespace, "write", write([document("a", "shared snapshot")]));
+  const before = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  const responses = await Promise.all(
+    Array.from({ length: 12 }, (_, index) =>
+      request(worker, namespace, "query", {
+        ...textQuery("shared"),
+        consistency: "edge-eventual",
+        minimumSequence: 1 + (index % 2),
+      }),
+    ),
+  );
+  for (const [index, response] of responses.entries()) {
+    if (index % 2 === 1) {
+      expect(response.status).toBe(409);
+      continue;
+    }
+    expect(response.status).toBe(200);
+    const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+    expect(result.sequence).toBe(1);
+    expect(result.rows.map((row) => row.id)).toEqual(["a"]);
+  }
+  const after = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(after.snapshotR2Reads - before.snapshotR2Reads).toBeLessThan(responses.length);
+  expect(after.snapshotSharedReads - before.snapshotSharedReads).toBeGreaterThan(0);
+});
+
+test("failed shared snapshot acquisitions release their entry and allow canonical recovery", async () => {
+  const namespace = "snapshot-sharing-recovery";
+  await request(worker, namespace, "write", write([document("a", "recovered snapshot")]));
+  const bucket = await worker.getR2Bucket("STORAGE");
+  const key = `namespaces/${namespace}/root.json`;
+  const object = await bucket.get(key);
+  if (object === null) throw new Error("Missing canonical manifest");
+  const canonical = await object.text();
+  await bucket.put(key, "corrupted canonical manifest");
+  const input = { ...textQuery("recovered"), consistency: "edge-eventual", minimumSequence: 1 };
+  const failures = await Promise.all(
+    Array.from({ length: 6 }, () => request(worker, namespace, "query", input)),
+  );
+  for (const response of failures) expect(response.status).toBe(503);
+  await bucket.put(key, canonical);
+  const response = await request(worker, namespace, "query", input);
+  expect(response.status).toBe(200);
+  const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+  expect(result.sequence).toBe(1);
+  expect(result.rows.map((row) => row.id)).toEqual(["a"]);
+});
 
 async function seedSnapshot(namespace: string, observedAt: number) {
   const bucket = await worker.getR2Bucket("STORAGE");

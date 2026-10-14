@@ -1,6 +1,6 @@
 # API
 
-`GET /health` is public. All namespace operations require `Authorization: Bearer <token>`.
+`GET /health` is public. `snapshotR2Reads` counts snapshot acquisition attempts and `snapshotSharedReads` counts joins to pending acquisitions in the responding isolate. These diagnostic counters are process-local, not global Cloudflare request counts or persistence guarantees. All namespace operations require `Authorization: Bearer <token>`.
 
 ```sh
 curl "$RAIO_URL/v1/namespaces/example/write" \

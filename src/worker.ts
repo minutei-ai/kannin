@@ -1694,29 +1694,24 @@ function rememberSnapshot(key: string, snapshot: typeof Snapshot.Type, encoded: 
   }
 }
 
-const refreshSnapshot = Effect.fn("raio.refreshSnapshot")(function* (
+const snapshotMetrics = { snapshotR2Reads: 0, snapshotSharedReads: 0 };
+async function acquireSnapshot(
   env: Env,
   namespace: string,
-  minimumSequence: number,
+  observedAt: number,
   cacheKey: URL,
   cache: Cache | undefined,
 ) {
-  const now = yield* Clock.currentTimeMillis;
-  const object = yield* Effect.tryPromise(() =>
-    env.STORAGE.get(`namespaces/${namespace}/root.json`),
-  );
+  snapshotMetrics.snapshotR2Reads += 1;
+  const object = await env.STORAGE.get(`namespaces/${namespace}/root.json`);
   if (object === null) return undefined;
-  const manifest = yield* Effect.tryPromise(() => object.text()).pipe(
-    Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(Root))),
-  );
-  if (manifest.sequence < minimumSequence)
-    return yield* new Rejected({ status: 409, message: "Requested sequence is not committed" });
-  const snapshot = { observedAt: now, manifest };
-  const encoded = yield* Schema.encodeEffect(Schema.fromJsonString(Snapshot))(snapshot);
+  const manifest = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
+  const snapshot = { observedAt, manifest };
+  const encoded = Schema.encodeSync(Schema.fromJsonString(Snapshot))(snapshot);
   rememberSnapshot(cacheKey.href, snapshot, encoded);
   if (cache !== undefined) {
-    yield* Effect.tryPromise(() =>
-      cache.put(
+    await cache
+      .put(
         cacheKey,
         new Response(encoded, {
           headers: {
@@ -1724,13 +1719,42 @@ const refreshSnapshot = Effect.fn("raio.refreshSnapshot")(function* (
             "content-type": "application/json",
           },
         }),
-      ),
-    ).pipe(Effect.ignore);
+      )
+      .catch(() => undefined);
   }
+  return snapshot;
+}
+const pendingSnapshots = new Map<string, ReturnType<typeof acquireSnapshot>>();
+const refreshSnapshot = Effect.fn("raio.refreshSnapshot")(function* (
+  env: Env,
+  namespace: string,
+  minimumSequence: number,
+  cacheKey: URL,
+  cache: Cache | undefined,
+) {
+  const selected = { read: pendingSnapshots.get(cacheKey.href) };
+  if (selected.read === undefined) {
+    const now = yield* Clock.currentTimeMillis;
+    selected.read = acquireSnapshot(env, namespace, now, cacheKey, cache).finally(() =>
+      pendingSnapshots.delete(cacheKey.href),
+    );
+    pendingSnapshots.set(cacheKey.href, selected.read);
+  } else snapshotMetrics.snapshotSharedReads += 1;
+  const acquisition = selected.read;
+  const snapshot = yield* Effect.tryPromise({
+    try: () => acquisition,
+    catch: (cause) => {
+      if (Schema.isSchemaError(cause)) return cause;
+      return new Cause.UnknownError(cause);
+    },
+  });
+  if (snapshot === undefined) return undefined;
+  if (snapshot.manifest.sequence < minimumSequence)
+    return yield* new Rejected({ status: 409, message: "Requested sequence is not committed" });
   const selectedAt = yield* Clock.currentTimeMillis;
-  if (selectedAt - now >= 1000)
+  if (selectedAt < snapshot.observedAt || selectedAt - snapshot.observedAt >= 1000)
     return yield* new Rejected({ status: 503, message: "Snapshot freshness budget exceeded" });
-  return manifest;
+  return snapshot.manifest;
 });
 const snapshotRefreshes = new Set<string>();
 
@@ -1829,6 +1853,7 @@ export default {
           vectors: "cloudflare-vectorize",
           wasmMemoryBytes: wasm.memory.buffer.byteLength,
           ...cacheUsage(),
+          ...snapshotMetrics,
         }),
       );
     if (request.headers.get("authorization") !== `Bearer ${env.API_TOKEN}`)

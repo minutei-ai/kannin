@@ -20,7 +20,7 @@ import {
   segment_term_bounds,
 } from "../dist/wasm/raio_engine";
 import module from "raio:wasm";
-import type { Row } from "./protocol";
+import type { Row, Snapshot } from "./protocol";
 import {
   Attributes,
   Filter,
@@ -36,7 +36,6 @@ import {
   Receipt,
   Rejected,
   Root,
-  Snapshot,
   SnapshotCacheHeaders,
   SegmentDocument,
   DataRange,
@@ -82,6 +81,8 @@ import {
 } from "./storage";
 
 import { vectorMetadata, vectorPrefilter } from "./vector-filters";
+
+import { snapshotFrame, readSnapshotFrame } from "./snapshot";
 
 const wasm = initSync({ module });
 const SNAPSHOT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -1708,7 +1709,12 @@ export class SearchNamespace extends DurableObject<Env> {
 
 const warmSnapshots = new Map<
   string,
-  { snapshot: typeof Snapshot.Type; bytes: number; etag: R2Object["etag"] | undefined }
+  {
+    snapshot: typeof Snapshot.Type;
+    payload: Uint8Array<ArrayBuffer>;
+    bytes: number;
+    etag: R2Object["etag"] | undefined;
+  }
 >();
 const warmSnapshotBudget = { bytes: 0 };
 const MAX_WARM_SNAPSHOT_BYTES = 24 * 1024 * 1024;
@@ -1716,15 +1722,16 @@ const MAX_WARM_SNAPSHOT_BYTES = 24 * 1024 * 1024;
 function rememberSnapshot(
   key: string,
   snapshot: typeof Snapshot.Type,
-  encoded: string,
+  payload: Uint8Array<ArrayBuffer>,
+  frameBytes: number,
   etag?: R2Object["etag"],
 ) {
   const prior = warmSnapshots.get(key);
   if (prior !== undefined) warmSnapshotBudget.bytes -= prior.bytes;
   warmSnapshots.delete(key);
-  const bytes = new TextEncoder().encode(encoded).byteLength * 4;
+  const bytes = Math.max(frameBytes, payload.buffer.byteLength) * 4;
   if (bytes > MAX_WARM_SNAPSHOT_BYTES) return;
-  warmSnapshots.set(key, { snapshot, bytes, etag });
+  warmSnapshots.set(key, { snapshot, payload, bytes, etag });
   warmSnapshotBudget.bytes += bytes;
   while (warmSnapshotBudget.bytes > MAX_WARM_SNAPSHOT_BYTES) {
     const oldest = warmSnapshots.entries().next().value;
@@ -1758,10 +1765,17 @@ async function acquireSnapshot(
     Match.orElse((etag) => env.STORAGE.get(key, { onlyIf: { etagDoesNotMatch: etag } })),
   );
   if (object === null) return undefined;
-  const selected = { manifest: previous?.snapshot.manifest, revalidated: false };
+  const selected = {
+    manifest: previous?.snapshot.manifest,
+    payload: previous?.payload,
+    revalidated: false,
+  };
   if ("body" in object) {
     snapshotMetrics.snapshotR2BodyBytes += object.size;
     selected.manifest = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
+    selected.payload = new TextEncoder().encode(
+      Schema.encodeSync(Schema.fromJsonString(Root))(selected.manifest),
+    );
   } else {
     if (previous === undefined || previous.etag !== object.etag)
       throw new Rejected({ status: 503, message: "Conditional R2 read has no matching snapshot" });
@@ -1772,8 +1786,11 @@ async function acquireSnapshot(
   if (manifest === undefined)
     throw new Rejected({ status: 503, message: "R2 read omitted its manifest" });
   const snapshot = { observedAt, manifest };
-  const encoded = Schema.encodeSync(Schema.fromJsonString(Snapshot))(snapshot);
-  rememberSnapshot(cacheKey.href, snapshot, encoded, object.etag);
+  const payload = selected.payload;
+  if (payload === undefined)
+    throw new Rejected({ status: 503, message: "R2 snapshot omitted its encoded manifest" });
+  const encoded = snapshotFrame(snapshot, payload);
+  rememberSnapshot(cacheKey.href, snapshot, payload, encoded.size, object.etag);
   if (cache !== undefined) {
     ctx.waitUntil(
       cache
@@ -1782,7 +1799,7 @@ async function acquireSnapshot(
           new Response(encoded, {
             headers: {
               "cache-control": "public, max-age=2, must-revalidate",
-              "content-type": "application/json",
+              "content-type": "application/octet-stream",
               ...Schema.encodeSync(SnapshotCacheHeaders)({
                 "x-raio-observed-at": observedAt,
                 "x-raio-sequence": manifest.sequence,
@@ -1852,7 +1869,7 @@ const edgeSnapshot = Effect.fn("raio.edgeSnapshot")(function* (
     selection.snapshot.manifest.sequence < minimumSequence
   ) {
     selection.snapshot = undefined;
-    cache.value = yield* Effect.tryPromise(() => caches.open("raio-snapshots-v1")).pipe(
+    cache.value = yield* Effect.tryPromise(() => caches.open("raio-snapshots-v2")).pipe(
       Effect.orElseSucceed(() => undefined),
     );
     if (cache.value !== undefined) {
@@ -1872,16 +1889,22 @@ const edgeSnapshot = Effect.fn("raio.edgeSnapshot")(function* (
           cacheSelectedAt - metadata.value["x-raio-observed-at"] < 1000 &&
           metadata.value["x-raio-sequence"] >= minimumSequence
         ) {
-          const encoded = yield* Effect.tryPromise(() => cached.text()).pipe(
+          const encoded = yield* Effect.tryPromise(() => cached.arrayBuffer()).pipe(
             Effect.orElseSucceed(() => undefined),
           );
           if (encoded !== undefined) {
             snapshotMetrics.snapshotCacheDecodes += 1;
-            const decoded = yield* Schema.decodeEffect(Schema.fromJsonString(Snapshot))(
-              encoded,
-            ).pipe(Effect.orElseSucceed(() => undefined));
-            selection.snapshot = decoded;
-            if (decoded !== undefined) rememberSnapshot(cacheKey.href, decoded, encoded);
+            const decoded = yield* readSnapshotFrame(encoded).pipe(
+              Effect.orElseSucceed(() => undefined),
+            );
+            selection.snapshot = decoded?.snapshot;
+            if (decoded !== undefined)
+              rememberSnapshot(
+                cacheKey.href,
+                decoded.snapshot,
+                decoded.payload,
+                encoded.byteLength,
+              );
           }
         } else {
           snapshotMetrics.snapshotCacheRejected += 1;
@@ -1910,7 +1933,7 @@ const edgeSnapshot = Effect.fn("raio.edgeSnapshot")(function* (
       const refresh = yield* Effect.forkDetach(
         Effect.gen(function* () {
           const refreshCache = yield* Effect.tryPromise(() =>
-            caches.open("raio-snapshots-v1"),
+            caches.open("raio-snapshots-v2"),
           ).pipe(Effect.orElseSucceed(() => undefined));
           yield* refreshSnapshot(ctx, env, namespace, 0, cacheKey, refreshCache);
         }).pipe(
@@ -1949,6 +1972,11 @@ export default {
           engine: "rust-wasm-r2",
           vectors: "cloudflare-vectorize",
           wasmMemoryBytes: wasm.memory.buffer.byteLength,
+          snapshotMemoryChargedBytes: warmSnapshotBudget.bytes,
+          snapshotPayloadRetainedBytes: [...warmSnapshots.values()].reduce(
+            (total, entry) => total + entry.payload.buffer.byteLength,
+            0,
+          ),
           ...cacheUsage(),
           ...snapshotMetrics,
         }),

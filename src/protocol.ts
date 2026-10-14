@@ -128,6 +128,10 @@ export const Snapshot = Schema.Struct({
   observedAt: Schema.Finite,
   manifest: Root,
 });
+export const SnapshotFrameMetadata = Schema.Struct({
+  observedAt: Snapshot.fields.observedAt,
+  sequence: Root.fields.sequence,
+});
 export const SnapshotCacheHeaders = Schema.Struct({
   "x-raio-observed-at": Schema.NumberFromString.check(Schema.isFinite()),
   "x-raio-sequence": Schema.NumberFromString.check(
@@ -239,6 +243,8 @@ export const Metadata = Schema.Struct({
   cache: CacheMetrics,
 });
 export const Health = Schema.Struct({
+  snapshotMemoryChargedBytes: Schema.Int,
+  snapshotPayloadRetainedBytes: Schema.Int,
   snapshotR2Reads: Schema.Int,
   snapshotR2BodyBytes: Schema.Int,
   snapshotRevalidations: Schema.Int,

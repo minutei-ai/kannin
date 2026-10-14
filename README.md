@@ -13,11 +13,11 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Concurrency | p50 ms |  p95 ms | Requests/s |
 | ----------: | -----: | ------: | ---------: |
-|           1 |  76.51 |  523.52 |       7.27 |
-|           4 | 126.02 |  948.92 |       9.29 |
-|          16 | 319.47 | 1893.84 |      13.93 |
+|           1 | 137.06 |  406.26 |       5.50 |
+|           4 | 108.29 |  531.86 |      16.01 |
+|          16 | 242.35 | 1159.89 |      16.75 |
 
-Latest complete 32-request phases use rare, selective, common and filtered text queries; all **96 responses** matched strong rows/scores and sequence. The all/phrase comparison separately verified 288 responses. Rust intersection traversal reduced native median CPU by **97–98% for sparse all/phrase fixtures** and **84% for dense filtered all**; whole-query latency remained mixed. Native catalog diagnostics transferred **101 KB initially, then 7 KB per new filter**, with zero acquisitions on the next cycle. Cache/isolate/network placement was uncontrolled. Snapshot coordinator recovery preserves the one-second age budget and future-sequence HTTP 409; expired-acquisition recovery was not exercised in these completed loads. Peak memory and general Turbopuffer parity remain unverified.
+Latest complete 32-request phases use rare, selective, common and filtered text queries; all **96 responses** matched strong rows/scores and sequence. The snapshot frame comparison preserved **288 responses** across baseline and two candidate runs. Reusing encoded manifest bytes reduced controlled local warm revalidation median from **22.36 to 13.57 ms**; native whole-query medians remained mixed across repeats. The all/phrase comparison separately verified 288 responses. Rust intersection traversal reduced native median CPU by **97–98% for sparse all/phrase fixtures** and **84% for dense filtered all**; whole-query latency remained mixed. Native catalog diagnostics transferred **101 KB initially, then 7 KB per new filter**, with zero acquisitions on the next cycle. Cache/isolate/network placement was uncontrolled. Snapshot coordinator recovery preserves the one-second age budget and future-sequence HTTP 409; expired-acquisition recovery was not exercised in these completed loads. Peak memory and general Turbopuffer parity remain unverified.
 
 The local million-document workload measured strong common/filtered p50 of **127/126 ms** across 2,000 uncompacted segments. These emulator results exclude native network latency. Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10** across 300 queries. Eight native vector/hybrid fixture cases also retained exact rows and scores.
 

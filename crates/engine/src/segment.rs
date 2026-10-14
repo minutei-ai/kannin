@@ -83,6 +83,94 @@ pub struct Posting {
     pub body: Vec<u32>,
 }
 
+struct ValidatedDiscard;
+
+impl<'de> Deserialize<'de> for ValidatedDiscard {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(Self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for ValidatedDiscard {
+    type Value = Self;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a valid JSON value")
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self, E> {
+        if !value.is_finite() {
+            return Err(E::custom("number out of range"));
+        }
+        Ok(self)
+    }
+
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut sequence: A) -> Result<Self, A::Error> {
+        while sequence.next_element::<Self>()?.is_some() {}
+        Ok(self)
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self, A::Error> {
+        while map.next_key::<String>()?.is_some() {
+            map.next_value::<Self>()?;
+        }
+        Ok(self)
+    }
+}
+
+struct SelectedAttributes<'a>(&'a BTreeSet<&'a str>);
+
+impl<'de> serde::de::DeserializeSeed<'de> for SelectedAttributes<'_> {
+    type Value = BTreeMap<String, serde_json::Value>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for SelectedAttributes<'_> {
+    type Value = BTreeMap<String, serde_json::Value>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an attribute object")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut selected = BTreeMap::new();
+        while let Some(field) = map.next_key::<String>()? {
+            if self.0.contains(field.as_str()) {
+                selected.insert(field, map.next_value::<serde_json::Value>()?);
+            } else {
+                map.next_value::<ValidatedDiscard>()?;
+            }
+        }
+        Ok(selected)
+    }
+}
+
 impl Header {
     fn encode(&self, payload: &[u8]) -> Result<Vec<u8>, String> {
         let json = serde_json::to_vec(self).map_err(|e| e.to_string())?;
@@ -133,10 +221,15 @@ impl Header {
         if let Some(mask) = cached {
             allowed = mask;
         } else if !filters.is_empty() {
+            let fields = filters.iter().map(|filter| filter.field.as_str()).collect();
             for (index, doc) in self.documents.iter().enumerate() {
-                let attributes: BTreeMap<String, serde_json::Value> =
-                    serde_json::from_str(doc.attributes.get())
-                        .map_err(|cause| cause.to_string())?;
+                let mut decoder = serde_json::Deserializer::from_str(doc.attributes.get());
+                let attributes = serde::de::DeserializeSeed::deserialize(
+                    SelectedAttributes(&fields),
+                    &mut decoder,
+                )
+                .map_err(|cause| cause.to_string())?;
+                decoder.end().map_err(|cause| cause.to_string())?;
                 allowed[index] = matches(&attributes, filters)?;
             }
             let bytes = key.capacity() + allowed.capacity() + 128;
@@ -1335,8 +1428,8 @@ pub fn bloom_filter_many<'a>(
 pub mod wasm {
     use super::{
         BlockMeta, BuiltSegment, Document, DocumentMeta, FILTER_CACHE_BYTES, Filter, Header,
-        MAX_BYTES, Search, Statistics, TermMeta, append, bloom_build, bloom_filter_many, bm25,
-        build, decode_page, document_terms, matches, parse_header,
+        MAX_BYTES, Search, SelectedAttributes, Statistics, TermMeta, append, bloom_build,
+        bloom_filter_many, bm25, build, decode_page, document_terms, matches, parse_header,
     };
     use serde::{Deserialize, Serialize};
     use std::collections::{BTreeMap, BTreeSet};
@@ -1498,41 +1591,6 @@ pub mod wasm {
     enum OverviewField {
         Dictionary,
         Eligibility,
-    }
-
-    struct SelectedAttributes<'a>(&'a BTreeSet<&'a str>);
-
-    impl<'de> serde::de::DeserializeSeed<'de> for SelectedAttributes<'_> {
-        type Value = BTreeMap<String, serde_json::Value>;
-
-        fn deserialize<D: serde::Deserializer<'de>>(
-            self,
-            deserializer: D,
-        ) -> Result<Self::Value, D::Error> {
-            deserializer.deserialize_map(self)
-        }
-    }
-
-    impl<'de> serde::de::Visitor<'de> for SelectedAttributes<'_> {
-        type Value = BTreeMap<String, serde_json::Value>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("an attribute object")
-        }
-
-        fn visit_map<A: serde::de::MapAccess<'de>>(
-            self,
-            mut map: A,
-        ) -> Result<Self::Value, A::Error> {
-            let mut selected = BTreeMap::new();
-            while let Some(field) = map.next_key::<String>()? {
-                let value = map.next_value::<serde_json::Value>()?;
-                if self.0.contains(field.as_str()) {
-                    selected.insert(field, value);
-                }
-            }
-            Ok(selected)
-        }
     }
 
     struct SelectedGroup<'a>(&'a BTreeSet<&'a str>);
@@ -2599,5 +2657,53 @@ mod page_buffer_tests {
             assert!(decode_page(&bad_adler).is_err());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod attribute_projection_tests {
+    use super::SelectedAttributes;
+    use serde::de::DeserializeSeed;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn selected_attributes_preserve_value_validation_and_duplicate_keys() {
+        let fields = BTreeSet::from(["wanted", "escaped\nkey"]);
+        let deep_valid = format!("{{\"unused\":{}0{}}}", "[".repeat(126), "]".repeat(126));
+        let deep_invalid = format!("{{\"unused\":{}0{}}}", "[".repeat(129), "]".repeat(129));
+        let fixtures = [
+            "{}",
+            r#"{"wanted":1,"unused":[true,false,null,-7,18446744073709551615,1.5,"ação",{"nested":[1,2]}]}"#,
+            r#"{"unused":{"escaped\nkey":"\u65e5\u672c\u8a9e","value":"\ud83d\ude00"},"wanted":{"nested":[1,null]}}"#,
+            r#"{"wanted":1,"wanted":2,"unused":1,"unused":2,"escaped\nkey":false}"#,
+            r#"{"unused":1e400}"#,
+            r#"{"unused":[{"number":-1e400}]}"#,
+            r#"{"unused":"\ud800"}"#,
+            r#"{"unused":{"\ud800":1}}"#,
+            r#"{"wanted":"\ud800"}"#,
+            r#"{"unused":[1,]}"#,
+            r#"{"unused":true} trailing"#,
+            "[]",
+            deep_valid.as_str(),
+            deep_invalid.as_str(),
+        ];
+        for json in fixtures {
+            let reference = serde_json::from_str::<BTreeMap<String, serde_json::Value>>(json);
+            let mut decoder = serde_json::Deserializer::from_str(json);
+            let projected = SelectedAttributes(&fields)
+                .deserialize(&mut decoder)
+                .and_then(|value| {
+                    decoder.end()?;
+                    Ok(value)
+                });
+            assert_eq!(projected.is_ok(), reference.is_ok(), "{json}");
+            if let (Ok(projected), Ok(reference)) = (projected, reference) {
+                let expected = reference
+                    .into_iter()
+                    .filter(|(key, _)| fields.contains(key.as_str()))
+                    .collect::<BTreeMap<_, _>>();
+                assert_eq!(projected, expected, "{json}");
+            }
+        }
     }
 }

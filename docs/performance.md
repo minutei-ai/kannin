@@ -1424,3 +1424,35 @@ Among the second run's slowest observations, preparation ranged from 64 to 483 m
 A rejected prototype overlapped the three independent missing-catalog classes within each sixteen-segment window, using one query-local semaphore to retain the existing ceiling of eight in-flight acquisitions. A three-segment fixture exercises dictionary-only, filter-minimum-only and complete misses together. The retained regression verifies three acquisitions, correct eligible IDs, exact warm-cache results and no repeated catalog requests.
 
 Two local workerd comparisons used twenty alternating baseline/candidate pairs each, excluding the first four pairs from medians. All eighty measured queries preserved complete rows and scores. Baseline/candidate medians were 21.66/20.85 ms in the first comparison and 18.92/20.08 ms in the repetition. The initial 3.7% improvement reversed into a 6.1% regression. The prototype was removed before deployment; this experiment does not establish a native latency improvement. The final full gate passed 30 Rust and 132 Bun/workerd tests. Request-local preparation/posting timing remains the guide for further acquisition work.
+
+### Validated selective attribute decoding
+
+New filter masks previously materialized every attribute value into a complete map before evaluating the filter. They now retain only named fields. Overview projections with up to eight named fields reuse this reader. Unused values traverse a validating serde visitor without building value trees. Numeric overflow, invalid Unicode, nested structure, trailing data and recursion limits remain rejected; duplicate-key behavior remains equivalent to the complete-map parser. Existing filter-mask admission, tombstone handling, persisted bytes and scoring arithmetic are unchanged.
+
+Two local WASM comparisons used three 1,000-document fixtures, twenty distinct filter values, ten alternating baseline/candidate pairs and two excluded warmup pairs. Cycling twenty values exceeds the sixteen-entry filter-mask cache, so preparation measures new masks. The repeated comparison reports per-filter medians below. Preparation includes ranker construction and a cached minimum lookup; overview measurement includes framing/decompression and projection.
+
+| Attributes                 | Preparation before ms | Preparation after ms | Overview before ms | Overview after ms |
+| :------------------------- | --------------------: | -------------------: | -----------------: | ----------------: |
+| One field                  |                 0.364 |                0.347 |              0.053 |             0.060 |
+| Forty unused string fields |                15.089 |                5.479 |              0.356 |             0.307 |
+| Forty unused nested fields |                48.919 |               22.936 |              1.053 |             0.708 |
+
+Preparation improved 63.7% for unused strings and 53.1% for unused nested values in the repetition. The first comparison showed 62.6% and 56.4% improvements. The one-field overview control varied by approximately six microseconds and does not establish a speedup. The nested fixture exercises the Rust JSON reader; public HTTP attributes remain scalar values. Full baseline/candidate ranking returned 1,200 identical rows/scores across the three fixtures. The full gate passed 31 Rust and 132 Bun/workerd tests, including differential validation against complete-map decoding. This is evidence for selective decoding with large unused attributes, not a whole-query latency, provider CPU, peak-memory or Turbopuffer parity claim.
+
+Native deployment and the Vectorize metadata migration succeeded. A public-contract fixture used one hundred documents with forty unused scalar string fields. Twelve native queries covered any/all/phrase with eq, gte, in and missing-field exists filters; all 120 returned IDs/scores were identical to the previous WASM engine. Cleanup acknowledged deletion and metadata confirmed zero live documents. Canonical retention remains unchanged.
+
+Three million-document edge loads completed 288 exact strong-baseline comparisons at the same acknowledged sequence. Client p50/p95 observations were:
+
+| Run            | Concurrency | p50 ms |  p95 ms |
+| :------------- | ----------: | -----: | ------: |
+| Before         |           1 | 105.10 |  198.89 |
+| Before         |           4 |  97.17 |  940.94 |
+| Before         |          16 | 283.72 | 1129.22 |
+| After          |           1 |  80.37 |  820.60 |
+| After          |           4 |  76.67 | 1145.48 |
+| After          |          16 | 967.61 | 2090.13 |
+| Repeated after |           1 |  78.20 |  221.17 |
+| Repeated after |           4 |  81.44 |  304.39 |
+| Repeated after |          16 | 339.15 | 1449.17 |
+
+These whole-query observations remain mixed, especially at concurrency sixteen. The first after-deploy load's slow requests included snapshot fallback/selection and preparation waits; native clocks do not isolate CPU. The repeated load ran after fixture cleanup. The controlled WASM gain applies to new filters with large unused attributes; native peak-memory and stable whole-query latency remain outstanding.

@@ -247,3 +247,18 @@ A controlled local experiment used fifty vectors in fifty segments and the real 
 | 50    | 112.41 / 124.60     | 115.69 / 132.44    | 100 / 100                  |
 
 The full top-50 requires all candidate locations and pages; its timing regressed modestly in this run. These measurements isolate process-cache eviction in the local adapter, not a fully cold Cloudflare ANN service. Large native corpus throughput and consistent latency still require proof.
+
+Runtime `09418f5` deployed successfully and its full CI passed. A new native corpus contains 96 vectors in 32 immutable segments, with distinct cosine scores and exact long-string metadata filtering. Five warmups precede twenty measured requests per case. Baseline and isolated post-deploy runs each completed 200 requests without errors; all eight cases retained identical rows, scores, attributes and revisions. A first post-deploy run overlapped the separate BM25 load and is treated as correctness evidence only; the table uses the subsequent isolated run.
+
+| Native case        | Before p50 / p95 ms | After p50 / p95 ms |
+| ------------------ | ------------------- | ------------------ |
+| Vector 1           | 275.36 / 299.72     | 270.89 / 317.65    |
+| Vector 10          | 263.49 / 286.89     | 261.73 / 328.84    |
+| Vector 50          | 285.91 / 430.52     | 300.30 / 532.36    |
+| Vector filtered 10 | 266.66 / 278.88     | 269.33 / 300.53    |
+| Hybrid 1           | 266.82 / 282.51     | 266.65 / 279.11    |
+| Hybrid 10          | 271.46 / 286.81     | 279.70 / 302.02    |
+| Hybrid 50          | 317.61 / 545.20     | 311.15 / 341.37    |
+| Hybrid filtered 10 | 273.39 / 285.31     | 272.30 / 293.87    |
+
+The local I/O reduction does not produce a consistent native latency improvement. Several p95 values regressed. A separate 192-request native BM25 load on the unchanged 100,000-document corpus also completed without errors: concurrency 1/4/16 p50 was 56.09/62.48/75.89 ms, p95 200.90/187.76/688.30 ms, throughput 11.52/38.49/50.95 requests/s. That load overlapped the first retrieval run and is not an isolated causal comparison. The broad performance objective remains open.

@@ -203,13 +203,13 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
         reads.overviewMemoryHits += hits.length;
         return hits.map((hit) => hit.catalog);
       }
-      const cacheKey = new URL("https://overviews.internal/batch-v3");
+      const cacheKey = new URL("https://overviews.internal/batch-v2");
       cacheKey.searchParams.set("bucket", env.STORAGE_CACHE_SCOPE);
       const encodedRanges = yield* Schema.encodeEffect(
         Schema.fromJsonString(TermProjectionProps.fields.ranges),
       )(ranges);
       cacheKey.searchParams.set("ranges", yield* Effect.tryPromise(() => sha256(encodedRanges)));
-      const cache = yield* Effect.tryPromise(() => caches.open("raio-overview-batches-v3")).pipe(
+      const cache = yield* Effect.tryPromise(() => caches.open("raio-overview-batches-v2")).pipe(
         Effect.orElseSucceed(() => undefined),
       );
       if (cache !== undefined) {

@@ -15,6 +15,8 @@ import {
 } from "../dist/wasm/raio_engine";
 import {
   StoredDocument,
+  SegmentHeader,
+  DataRange,
   Filter,
   TermCatalog,
   TermSummaries,
@@ -202,6 +204,31 @@ test("overview projection validates unrequested values and rejects malformed roo
     bytes.set(compressed, 8);
     expect(() => segment_overview_project(bytes, '["wanted"]', "[]")).toThrow();
   }
+});
+
+test("WASM document ranges preserve requested order without copying document attributes", () => {
+  const segment = new Segment(
+    JSON.stringify([
+      { id: "a", text: "first", attributes: { large: "value".repeat(1000) } },
+      { id: "b", text: "second", attributes: {} },
+    ]),
+  );
+  const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
+  const directory = new Directory(segment.bytes());
+  const second = header.documents[1];
+  if (second === undefined) throw new Error("Missing second document");
+  const encoded = directory.document_ranges("[1,0,1]");
+  expect(Schema.decodeSync(Schema.fromJsonString(Schema.Array(DataRange)))(encoded)).toEqual([
+    second.data,
+    header.documents[0].data,
+    second.data,
+  ]);
+  expect(encoded.length).toBeLessThan(directory.rows("[1,0,1]").length / 10);
+  expect(directory.document_ranges("[]")).toBe("[]");
+  expect(() => directory.document_ranges("[2]")).toThrow("Invalid row");
+  expect(() => directory.document_ranges("[-1]")).toThrow();
+  directory.free();
+  segment.free();
 });
 
 test("WASM batched blooms preserve Unicode membership and reject broken offsets", () => {

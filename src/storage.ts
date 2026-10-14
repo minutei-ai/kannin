@@ -1,4 +1,5 @@
 import { Cause, Effect, Schema } from "effect";
+import type { Semaphore } from "effect";
 import { env, exports } from "cloudflare:workers";
 import {
   Segment,
@@ -540,6 +541,71 @@ export async function readDocument(
   const bytes = page.bytes;
   return Schema.decodeSync(Schema.fromJsonString(StoredDocument))(segment_document(bytes));
 }
+
+export const readDocuments = Effect.fn("raio.readDocuments")(function* (
+  key: string,
+  headerBytes: number,
+  pages: ReadonlyArray<typeof DataRange.Type>,
+  totalBytes: number,
+  permits: Semaphore.Semaphore,
+) {
+  if (pages.length > 4)
+    return yield* new Rejected({ status: 503, message: "Document batch exceeds four pages" });
+  const first = pages[0];
+  if (first === undefined) return [];
+  const span = { end: first.offset, contiguous: true, cached: false };
+  for (const page of pages) {
+    const offset = headerBytes + page.offset;
+    if (offset < headerBytes || offset + page.length > totalBytes || page.length < 8)
+      return yield* new Rejected({ status: 503, message: "Invalid segment document range" });
+    if (page.offset !== span.end) span.contiguous = false;
+    span.end = page.offset + page.length;
+    if (buffers.has(`${env.STORAGE_CACHE_SCOPE}:${key}/${offset}/${page.length}`))
+      span.cached = true;
+  }
+  if (pages.length < 2 || !span.contiguous || span.cached || span.end - first.offset > 1024 * 1024)
+    return yield* Effect.forEach(
+      pages,
+      (page) =>
+        permits.withPermit(
+          Effect.tryPromise({
+            try: () => readDocument(key, headerBytes, page, totalBytes),
+            catch: (cause) => {
+              if (Schema.is(Rejected)(cause)) return cause;
+              return new Cause.UnknownError(cause);
+            },
+          }),
+        ),
+      { concurrency: 4 },
+    );
+  const bytes = yield* permits.withPermit(
+    Effect.tryPromise({
+      try: () => range(key, headerBytes + first.offset, span.end - first.offset),
+      catch: (cause) => {
+        if (Schema.is(Rejected)(cause)) return cause;
+        return new Cause.UnknownError(cause);
+      },
+    }),
+  );
+  const documents = yield* Effect.forEach(pages, (page) =>
+    Effect.gen(function* () {
+      const start = page.offset - first.offset;
+      const frame = bytes.slice(start, start + page.length);
+      const encoded = yield* Effect.try({
+        try: () => segment_document(frame),
+        catch: (cause) => new Cause.UnknownError(cause),
+      });
+      const document = yield* Schema.decodeEffect(Schema.fromJsonString(StoredDocument))(encoded);
+      remember(
+        `${env.STORAGE_CACHE_SCOPE}:${key}/${headerBytes + page.offset}/${page.length}`,
+        frame,
+      );
+      return document;
+    }),
+  );
+
+  return documents;
+});
 
 export function clearImmutableCache(prefix: string) {
   const identity = `${env.STORAGE_CACHE_SCOPE}:${prefix}`;

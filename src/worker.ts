@@ -39,6 +39,7 @@ import {
   Snapshot,
   SnapshotCacheHeaders,
   SegmentDocument,
+  DataRange,
   SegmentHits,
   SegmentTerms,
   TermCatalog,
@@ -74,6 +75,7 @@ import {
   bloom,
   bloomCandidates,
   readDocument,
+  readDocuments,
   sha256,
   clearImmutableCache,
   cacheUsage,
@@ -527,48 +529,75 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
   const rankingEnded = Effect.runSync(Clock.currentTimeNanos);
   timings.append("server-timing", `text_rank;dur=${Number(rankingEnded - dictionaryEnded) / 1e6}`);
   const hits = ranked.slice(0, input.topK);
-  const rows = await Effect.runPromise(
-    Effect.forEach(
-      hits,
-      (hit) =>
-        Effect.gen(function* () {
-          const metadata = yield* withDirectory(
-            hit.segment.key,
-            hit.segment.headerBytes,
-            (decoded) =>
-              Effect.gen(function* () {
-                const encoded = yield* Schema.encodeEffect(integers)([hit.row]);
-                const matches = yield* Schema.decodeEffect(
-                  Schema.fromJsonString(Schema.Tuple([SegmentDocument])),
-                )(decoded.rows(encoded));
-                return matches[0];
-              }),
-          );
-          const document = yield* Effect.tryPromise({
-            try: () =>
-              readDocument(
-                hit.segment.key,
-                hit.segment.headerBytes,
-                metadata.data,
-                hit.segment.bytes,
+  const windows = EffectArray.chunksOf(hits, 4).flatMap((window) => {
+    const first = window[0];
+    if (first === undefined) return [];
+    if (
+      window.every(
+        (hit, index) =>
+          hit.segment.key === first.segment.key &&
+          hit.segment.headerBytes === first.segment.headerBytes &&
+          hit.segment.bytes === first.segment.bytes &&
+          hit.row === first.row + index,
+      )
+    )
+      return [window];
+    return window.map((hit) => [hit]);
+  });
+  const batches = await Effect.runPromise(
+    Effect.gen(function* () {
+      const permits = yield* Semaphore.make(4);
+      return yield* Effect.forEach(
+        windows,
+        (window) =>
+          Effect.gen(function* () {
+            const first = window[0];
+            if (first === undefined) return [];
+            const pages = yield* permits.withPermit(
+              withDirectory(first.segment.key, first.segment.headerBytes, (decoded) =>
+                Effect.gen(function* () {
+                  const encoded = yield* Schema.encodeEffect(integers)(
+                    window.map((hit) => hit.row),
+                  );
+                  return yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Array(DataRange)))(
+                    decoded.document_ranges(encoded),
+                  );
+                }),
               ),
-            catch: (cause) => {
-              if (Schema.is(Rejected)(cause)) return cause;
-              return new Cause.UnknownError(cause);
-            },
-          });
-          return {
-            id: document.id,
-            title: document.title ?? "",
-            text: document.text,
-            attributes: document.attributes,
-            revision: document.revision,
-            score: hit.score,
-          };
-        }),
-      { concurrency: 4 },
-    ),
+            );
+            if (pages.length !== window.length)
+              return yield* new Rejected({ status: 503, message: "Document ranges omitted a hit" });
+            const documents = yield* readDocuments(
+              first.segment.key,
+              first.segment.headerBytes,
+              pages,
+              first.segment.bytes,
+              permits,
+            );
+            return yield* Effect.forEach(documents, (document, index) =>
+              Effect.gen(function* () {
+                const hit = window[index];
+                if (hit === undefined)
+                  return yield* new Rejected({
+                    status: 503,
+                    message: "Document batch omitted its hit",
+                  });
+                return {
+                  id: document.id,
+                  title: document.title ?? "",
+                  text: document.text,
+                  attributes: document.attributes,
+                  revision: document.revision,
+                  score: hit.score,
+                };
+              }),
+            );
+          }),
+        { concurrency: 4 },
+      );
+    }),
   );
+  const rows = batches.flat();
   const documentsEnded = Effect.runSync(Clock.currentTimeNanos);
   timings.append(
     "server-timing",

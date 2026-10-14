@@ -8,6 +8,46 @@ import { document, request, startWorker, textQuery, write } from "./harness";
 const worker = await startWorker();
 afterAll(() => worker.dispose());
 
+test("contiguous top-k pages share bounded reads and retain individual memory cache hits", async () => {
+  const namespace = "contiguous-result-pages";
+  await request(
+    worker,
+    namespace,
+    "write",
+    write(
+      Array.from({ length: 40 }, (_, index) =>
+        document(String(index).padStart(4, "0"), "equal terms"),
+      ),
+    ),
+  );
+  const before = Schema.decodeUnknownSync(Metadata)(
+    await (await request(worker, namespace, "metadata")).json(),
+  );
+  const initial = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", textQuery("equal", 10))).json(),
+  );
+  expect(initial.rows.map((row) => row.id)).toEqual(
+    Array.from({ length: 10 }, (_, index) => String(index).padStart(4, "0")),
+  );
+  const after = Schema.decodeUnknownSync(Metadata)(
+    await (await request(worker, namespace, "metadata")).json(),
+  );
+  expect(after.cache.rangeReads - before.cache.rangeReads).toBeLessThanOrEqual(5);
+  const smaller = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", textQuery("equal", 1))).json(),
+  );
+  expect(smaller.rows).toEqual(initial.rows.slice(0, 1));
+  const warm = Schema.decodeUnknownSync(Metadata)(
+    await (await request(worker, namespace, "metadata")).json(),
+  );
+  expect(warm.cache.rangeReads - after.cache.rangeReads).toBe(0);
+  await request(worker, namespace, "rebuild", {});
+  const cold = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", textQuery("equal", 1))).json(),
+  );
+  expect(cold.rows).toEqual(smaller.rows);
+});
+
 test("native Cache API retains immutable ranges after the memory cache is discarded", async () => {
   await request(worker, "cached", "write", write([document("a", "original cached content")]));
   const initial = await request(worker, "cached", "query", textQuery("original"));
@@ -104,7 +144,7 @@ test("concurrent cold edge queries share immutable range acquisition", async () 
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(13);
+  expect(after.rangeReads - before.rangeReads).toBe(6);
 });
 
 test("term projection batches preserve global frequencies and filter eligibility at their boundary", async () => {

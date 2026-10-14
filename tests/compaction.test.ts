@@ -243,5 +243,5 @@ test("common terms load contiguous posting blocks with one range read per term",
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(13);
+  expect(after.rangeReads - before.rangeReads).toBe(6);
 });

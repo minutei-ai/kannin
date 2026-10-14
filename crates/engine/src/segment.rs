@@ -1743,6 +1743,24 @@ pub mod wasm {
             serde_json::to_string(&selected).map_err(|e| JsValue::from_str(&e.to_string()))
         }
 
+        #[doc = "# Errors\nRejects invalid row JSON, missing rows, or range serialization errors."]
+        pub fn document_ranges(&self, rows: &str) -> Result<String, JsValue> {
+            let rows: Vec<u32> = serde_json::from_str(rows)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            let selected = rows
+                .iter()
+                .map(|row| {
+                    self.header
+                        .documents
+                        .get(*row as usize)
+                        .map(|document| &document.data)
+                        .ok_or("Invalid row")
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(JsValue::from_str)?;
+            serde_json::to_string(&selected).map_err(|cause| JsValue::from_str(&cause.to_string()))
+        }
+
         #[doc = "# Errors\nRejects invalid query JSON, filters, term budgets, top-k, or match mode."]
         pub fn ranker(&self, query: &str) -> Result<Ranker, JsValue> {
             let input: Input =

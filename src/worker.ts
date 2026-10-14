@@ -31,6 +31,8 @@ import {
   SegmentDocument,
   SegmentHits,
   SegmentTerms,
+  TermCatalog,
+  EligibleMinimum,
   LocatedDocument,
   RankingInput,
   SearchStatistics,
@@ -153,12 +155,16 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
       return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });
     const input = decoded.value;
     const encodedTerms = this.ctx.props.terms;
+    const encodedFilters = this.ctx.props.filters;
     const cacheKey = new URL(request.url);
     cacheKey.hostname = "raio-terms.internal";
     cacheKey.searchParams.set("bucket", props.value.bucket);
-    cacheKey.searchParams.set("terms", await sha256(encodedTerms));
+    cacheKey.searchParams.set(
+      "selector",
+      await sha256(`${encodedTerms}\0${this.ctx.props.filters}`),
+    );
     const cache = await Effect.runPromise(
-      Effect.tryPromise(() => caches.open("raio-terms-v1")).pipe(
+      Effect.tryPromise(() => caches.open("raio-terms-v2")).pipe(
         Effect.orElseSucceed(() => undefined),
       ),
     );
@@ -175,9 +181,17 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
     }
     const response = await Effect.runPromise(
       withDirectory(input.key, input.headerBytes, (directory) =>
-        Schema.decodeEffect(Schema.fromJsonString(SegmentTerms))(directory.terms(encodedTerms)),
+        Effect.gen(function* () {
+          const dictionary = yield* Schema.decodeEffect(Schema.fromJsonString(SegmentTerms))(
+            directory.terms(encodedTerms),
+          );
+          const minimum = yield* Schema.decodeEffect(Schema.fromJsonString(EligibleMinimum))(
+            directory.minimum(encodedFilters),
+          );
+          return { dictionary, minimum };
+        }),
       ).pipe(
-        Effect.flatMap(Schema.encodeEffect(SegmentTerms)),
+        Effect.flatMap(Schema.encodeEffect(TermCatalog)),
         Effect.map((dictionary) =>
           Response.json(dictionary, {
             headers: { "cache-control": "public, max-age=31536000, immutable" },
@@ -303,17 +317,18 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
   const selected = candidates
     .filter((candidate) => candidate.terms.length > 0)
     .map((candidate) => candidate.segment);
-  const encodedTerms = Schema.encodeSync(strings)(terms);
   const projectionTerms = Schema.encodeSync(TermProjectionProps.fields.terms)(terms.toSorted());
-  const encodedFilters = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Filter)))(
-    input.filters,
-  );
+  const encodedFilters = Schema.encodeSync(TermProjectionProps.fields.filters)(input.filters);
   const catalog = await Effect.runPromise(
     Effect.forEach(
       selected,
       (segment) =>
-        readTerms(segment.key, segment.headerBytes, projectionTerms).pipe(
-          Effect.map((dictionary) => ({ segment, dictionary })),
+        readTerms(segment.key, segment.headerBytes, projectionTerms, encodedFilters).pipe(
+          Effect.map((projection) => ({
+            segment,
+            dictionary: projection.dictionary,
+            minimum: projection.minimum,
+          })),
         ),
       { concurrency: 4 },
     ),
@@ -335,22 +350,17 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
   };
   const encodedStatistics = Schema.encodeSync(Schema.fromJsonString(SearchStatistics))(statistics);
   const prioritized = catalog
-    .map((entry) => {
-      if (input.filters.length > 0 || entry.segment.dead.length > 0)
-        return { segment: entry.segment, dictionary: entry.dictionary, bound: undefined };
-      return {
-        segment: entry.segment,
-        dictionary: entry.dictionary,
-        bound: segment_term_bound(
-          encodedStatistics,
-          Schema.encodeSync(Schema.fromJsonString(SegmentTerms))(entry.dictionary),
-        ),
-      };
-    })
+    .map((entry) => ({
+      segment: entry.segment,
+      dictionary: entry.dictionary,
+      minimum: entry.minimum,
+      bound: segment_term_bound(
+        encodedStatistics,
+        Schema.encodeSync(Schema.fromJsonString(SegmentTerms))(entry.dictionary),
+        Schema.encodeSync(Schema.fromJsonString(EligibleMinimum))(entry.minimum),
+      ),
+    }))
     .sort((left, right) => {
-      if (left.bound === undefined && right.bound === undefined) return 0;
-      if (left.bound === undefined) return 1;
-      if (right.bound === undefined) return -1;
       if (left.bound !== right.bound) return right.bound - left.bound;
       if (left.segment.minimumId < right.segment.minimumId) return -1;
       if (left.segment.minimumId > right.segment.minimumId) return 1;
@@ -364,7 +374,8 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
     id: string;
     score: number;
   }> = [];
-  for (const { segment, dictionary, bound: unfilteredBound } of prioritized) {
+  for (const { segment, dictionary, minimum, bound } of prioritized) {
+    if (minimum === null) continue;
     if (Object.keys(dictionary).length === 0) continue;
     if (
       (input.match === "all" || input.match === "phrase") &&
@@ -375,17 +386,6 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
     )
       continue;
     if (ranked.length === input.topK) {
-      const bound = await Effect.runPromise(
-        Effect.gen(function* () {
-          if (unfilteredBound !== undefined) return unfilteredBound;
-          return yield* withDirectory(segment.key, segment.headerBytes, (decoded) =>
-            Effect.gen(function* () {
-              const dead = yield* Schema.encodeEffect(integers)(segment.dead);
-              return decoded.upper_bound(encodedStatistics, encodedTerms, encodedFilters, dead);
-            }),
-          );
-        }),
-      );
       const cutoff = ranked[ranked.length - 1];
       if (cutoff === undefined)
         throw new Rejected({ status: 503, message: "Invalid ranking cutoff" });

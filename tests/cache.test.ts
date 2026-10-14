@@ -57,7 +57,7 @@ test("cached old segments cannot resurrect updated or deleted documents", async 
 });
 
 test("the authenticated gateway never exposes immutable cache entrypoints", async () => {
-  for (const path of ["/range", "/catalog-v1"]) {
+  for (const path of ["/range", "/catalog-v2"]) {
     const url = new URL(path, await worker.ready);
     const anonymous = await fetch(url);
     expect(anonymous.status).toBe(401);
@@ -250,7 +250,7 @@ test("cached term bounds prune uncompetitive segments after directory eviction",
   expect(after.rangeReads - before.rangeReads).toBe(4);
 });
 
-test("term projections share immutable metadata while phrase order, filters and revisions remain query scoped", async () => {
+test("term projections keep phrase order, filter eligibility and revisions query scoped", async () => {
   const namespace = "projection-isolation";
   await request(
     worker,
@@ -297,8 +297,8 @@ test("term projections share immutable metadata while phrase order, filters and 
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.termReads - before.termReads).toBe(0);
-  expect(after.termMemoryHits - before.termMemoryHits).toBe(2);
+  expect(after.termReads - before.termReads).toBe(2);
+  expect(after.termMemoryHits - before.termMemoryHits).toBe(0);
   expect(after.termCacheBytes).toBeLessThanOrEqual(4 * 1024 * 1024);
   await request(worker, namespace, "write", write([document("left", "storage", { group: 3 })]));
   const changed = Schema.decodeUnknownSync(QueryResult)(
@@ -340,4 +340,126 @@ test("segment priority finds the equal-score winner before reading lower-priorit
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
   expect(after.rangeReads - before.rangeReads).toBe(19);
+});
+
+test("filtered score projections prune headers after directory eviction", async () => {
+  const namespace = "filtered-projection";
+  for (const index of Array.from({ length: 16 }, (_, ordinal) => ordinal))
+    await request(
+      worker,
+      namespace,
+      "write",
+      write([document(String(index).padStart(5, "0"), "equal terms", { group: 1 })]),
+    );
+  const input = {
+    ...textQuery("equal terms", 1, [{ field: "group", op: "eq", value: 1 }]),
+    consistency: "edge-eventual",
+  };
+  const original = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", input)).json(),
+  );
+  expect(original.rows.map((row) => row.id)).toEqual(["00000"]);
+  await request(worker, namespace, "rebuild", {});
+  const before = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  const restored = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", input)).json(),
+  );
+  expect(restored.rows).toEqual(original.rows);
+  const after = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(after.rangeReads - before.rangeReads).toBe(4);
+});
+
+test("ineligible segments still contribute namespace-wide frequencies", async () => {
+  const namespace = "projection-global-df";
+  await request(worker, namespace, "write", write([document("eligible", "target", { group: 1 })]));
+  await request(
+    worker,
+    namespace,
+    "write",
+    write([document("excluded", "target target", { group: 2 })]),
+  );
+  const all = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", textQuery("target"))).json(),
+  );
+  const filtered = Schema.decodeUnknownSync(QueryResult)(
+    await (
+      await request(
+        worker,
+        namespace,
+        "query",
+        textQuery("target", 10, [{ field: "group", op: "eq", value: 1 }]),
+      )
+    ).json(),
+  );
+  expect(filtered.rows.map((row) => row.id)).toEqual(["eligible"]);
+  expect(filtered.rows[0]?.score).toBe(all.rows.find((row) => row.id === "eligible")?.score);
+});
+
+test("physical filter minima remain conservative after deleting the shortest eligible document", async () => {
+  const namespace = "projection-live-minima";
+  await request(
+    worker,
+    namespace,
+    "write",
+    write([
+      document("short", "target", { group: 1 }),
+      document("long", "target target padding padding padding", { group: 1 }),
+      document("excluded", "target", { group: 2 }),
+    ]),
+  );
+  await request(
+    worker,
+    namespace,
+    "write",
+    write([document("other", "target target padding", { group: 1 })]),
+  );
+  const input = textQuery("target", 1, [{ field: "group", op: "eq", value: 1 }]);
+  await request(worker, namespace, "query", input);
+  await request(worker, namespace, "write", write([], ["short"]));
+  const before = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", input)).json(),
+  );
+  expect(before.rows).toHaveLength(1);
+  expect(before.rows[0]?.id).not.toBe("short");
+  await request(worker, namespace, "compact", {});
+  const after = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", input)).json(),
+  );
+  expect(after.rows).toEqual(before.rows);
+});
+
+test("cached negative filter eligibility avoids all directory and posting reads", async () => {
+  const namespace = "projection-empty-filter";
+  await request(worker, namespace, "write", write([document("a", "target", { group: 1 })]));
+  const input = {
+    ...textQuery("target", 10, [{ field: "group", op: "eq", value: 2 }]),
+    consistency: "edge-eventual",
+  };
+  expect(
+    Schema.decodeUnknownSync(QueryResult)(
+      await (await request(worker, namespace, "query", input)).json(),
+    ).rows,
+  ).toEqual([]);
+  await request(worker, namespace, "rebuild", {});
+  const before = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(
+    Schema.decodeUnknownSync(QueryResult)(
+      await (await request(worker, namespace, "query", input)).json(),
+    ).rows,
+  ).toEqual([]);
+  const after = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(after.rangeReads - before.rangeReads).toBe(0);
+  await request(worker, namespace, "write", write([document("a", "target", { group: 2 })]));
+  const changed = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", { ...input, minimumSequence: 2 })).json(),
+  );
+  expect(changed.rows.map((row) => row.id)).toEqual(["a"]);
 });

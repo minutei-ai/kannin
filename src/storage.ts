@@ -12,7 +12,7 @@ import {
   StoredDocument,
   SegmentHeader,
   SegmentRange,
-  SegmentTerms,
+  TermCatalog,
   SegmentCacheProps,
   Rejected,
 } from "./protocol";
@@ -23,7 +23,7 @@ const MAX_CACHE_BYTES = 12 * 1024 * 1024;
 const directories = new Map<string, { directory: Directory; bytes: number }>();
 const decodedBudget = { bytes: 0 };
 const MAX_DECODED_BYTES = 40 * 1024 * 1024;
-const termCatalogs = new Map<string, { dictionary: typeof SegmentTerms.Type; bytes: number }>();
+const termCatalogs = new Map<string, { catalog: typeof TermCatalog.Type; bytes: number }>();
 const termBudget = { bytes: 0 };
 const MAX_TERM_CACHE_BYTES = 4 * 1024 * 1024;
 const reads = {
@@ -146,18 +146,18 @@ export const withDirectory = Effect.fn("raio.withDirectory")(
 );
 
 export const readTerms = Effect.fn("kannin.readTerms")(
-  (key: string, headerBytes: number, terms: string) =>
+  (key: string, headerBytes: number, terms: string, filters: string) =>
     Effect.gen(function* () {
-      const props = { bucket: env.STORAGE_CACHE_SCOPE, terms };
-      const identity = `${env.STORAGE_CACHE_SCOPE}:${key}/${headerBytes}/${terms}`;
+      const props = { bucket: env.STORAGE_CACHE_SCOPE, terms, filters };
+      const identity = `${env.STORAGE_CACHE_SCOPE}:${key}/${headerBytes}/${terms}\0${filters}`;
       const cached = termCatalogs.get(identity);
       if (cached !== undefined) {
         reads.termMemoryHits += 1;
         termCatalogs.delete(identity);
         termCatalogs.set(identity, cached);
-        return cached.dictionary;
+        return cached.catalog;
       }
-      const url = new URL("https://terms.internal/catalog-v1");
+      const url = new URL("https://terms.internal/catalog-v2");
       url.searchParams.set("key", key);
       url.searchParams.set("headerBytes", String(headerBytes));
       const response = yield* Effect.tryPromise({
@@ -175,7 +175,7 @@ export const readTerms = Effect.fn("kannin.readTerms")(
       const text = yield* Effect.tryPromise(() => response.text());
       if (!response.ok)
         return yield* new Rejected({ status: 503, message: "Immutable term catalog unavailable" });
-      const dictionary = yield* Schema.decodeEffect(Schema.fromJsonString(SegmentTerms))(text);
+      const catalog = yield* Schema.decodeEffect(Schema.fromJsonString(TermCatalog))(text);
       const length = new TextEncoder().encode(text).byteLength;
       reads.termBytes += length;
       const bytes = 4 * (length + new TextEncoder().encode(identity).byteLength) + 256;
@@ -191,10 +191,10 @@ export const readTerms = Effect.fn("kannin.readTerms")(
           termCatalogs.delete(oldest[0]);
           termBudget.bytes -= oldest[1].bytes;
         }
-        termCatalogs.set(identity, { dictionary, bytes });
+        termCatalogs.set(identity, { catalog, bytes });
         termBudget.bytes += bytes;
       }
-      return dictionary;
+      return catalog;
     }),
 );
 

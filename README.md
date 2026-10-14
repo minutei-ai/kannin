@@ -13,14 +13,14 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Query     |        Strong | Edge eventual |
 | --------- | ------------: | ------------: |
-| Rare      |   3.45 / 4.85 |   3.03 / 3.76 |
-| Selective | 18.43 / 26.98 | 14.29 / 22.08 |
-| Common    | 20.15 / 26.29 | 21.81 / 41.22 |
-| Filtered  | 20.57 / 33.00 | 22.59 / 43.64 |
+| Rare      |   3.55 / 4.94 |   3.15 / 3.44 |
+| Selective | 16.70 / 25.76 | 18.25 / 26.85 |
+| Common    | 21.40 / 28.57 | 22.37 / 30.03 |
+| Filtered  | 19.21 / 27.30 | 20.18 / 27.54 |
 
-Local ingestion: **100,000 documents in 22.50 seconds**, approximately **4,445 documents/s**, in batches of 500. Intel Xeon E5-2680 v4, Bun 1.4.3. Each case/mode has five warmups and 50 measured requests, including HTTP and response decoding. Both modes share one process; no query-result cache. Local timings exclude Cloudflare regional network latency.
+Local ingestion: **100,000 documents in 23.61 seconds**, approximately **4,235 documents/s**, in batches of 500. Intel Xeon E5-2680 v4, Bun 1.4.3. Each case/mode has five warmups and 50 measured requests, including HTTP and response decoding. Both modes share one process; no query-result cache. Local timings exclude Cloudflare regional network latency.
 
-Immutable query catalogs now let cached queries recover global BM25 frequencies without reloading every segment header. After directory eviction, local regressions reduced range reads **33 → 4** for conjunctive queries and **19 → 4** for unfiltered score pruning. [Cache design and measurements](docs/performance.md#immutable-term-projections).
+Immutable query catalogs now let cached queries recover global BM25 frequencies without reloading every segment header. After directory eviction, local regressions reduced range reads **33 → 4** for conjunctive queries and **19 → 4** for both unfiltered and filtered score pruning. [Cache design and measurements](docs/performance.md#immutable-term-projections).
 
 Conjunctive segment pruning reduced local warm p50 from **14.11 to 6.83 ms** for `all` and **13.91 to 5.88 ms** for phrase queries in a separate 15,000-document, 30-segment workload. Impossible Bloom intersections avoid directory reads; exact live term frequencies avoid unnecessary postings. [Methodology and limits](docs/performance.md#conjunctive-query-pruning).
 
@@ -50,7 +50,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **96 Worker/tooling tests and 17 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **100 Worker/tooling tests and 17 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

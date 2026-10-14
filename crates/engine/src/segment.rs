@@ -920,12 +920,21 @@ pub mod wasm {
     }
 
     #[wasm_bindgen]
-    #[doc = "# Errors\nRejects invalid statistics or term metadata serialization."]
-    pub fn segment_term_bound(statistics: &str, terms: &str) -> Result<f64, JsValue> {
+    #[doc = "# Errors\nRejects invalid statistics, term metadata, or eligible minimum serialization."]
+    pub fn segment_term_bound(
+        statistics: &str,
+        terms: &str,
+        minimum: &str,
+    ) -> Result<f64, JsValue> {
         let statistics: Statistics = serde_json::from_str(statistics)
             .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
         let terms: BTreeMap<String, TermMeta> =
             serde_json::from_str(terms).map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        let minimum: Option<(u32, u32)> =
+            serde_json::from_str(minimum).map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        let Some(minimum) = minimum else {
+            return Ok(0.0);
+        };
         Ok(terms
             .iter()
             .map(|(term, meta)| {
@@ -933,7 +942,7 @@ pub mod wasm {
                     meta,
                     &statistics,
                     statistics.frequencies.get(term).copied().unwrap_or(0),
-                    (0, 0),
+                    minimum,
                 )
             })
             .sum())
@@ -1023,28 +1032,16 @@ pub mod wasm {
             serde_json::to_string(&selected).map_err(|e| JsValue::from_str(&e.to_string()))
         }
 
-        #[doc = "# Errors\nRejects invalid statistics, terms, filters, tombstones, or attributes."]
-        pub fn upper_bound(
-            &self,
-            statistics: &str,
-            terms: &str,
-            filters: &str,
-            dead: &str,
-        ) -> Result<f64, JsValue> {
-            let statistics: Statistics =
-                serde_json::from_str(statistics).map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let terms: Vec<String> =
-                serde_json::from_str(terms).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        #[doc = "# Errors\nRejects invalid filters, attributes, or minimum serialization."]
+        pub fn minimum(&self, filters: &str) -> Result<String, JsValue> {
             let filters: Vec<Filter> = serde_json::from_str(filters)
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
-            let dead: Vec<u32> = serde_json::from_str(dead)
-                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
-            let minima = if filters.is_empty() && dead.is_empty() {
+            let minimum = if filters.is_empty() {
                 Some((0, 0))
             } else {
                 let allowed = self
                     .header
-                    .allowed(&filters, &dead)
+                    .allowed(&filters, &[])
                     .map_err(|cause| JsValue::from_str(&cause))?;
                 self.header
                     .documents
@@ -1059,19 +1056,7 @@ pub mod wasm {
                         None => Some((document.title_length, document.body_length)),
                     })
             };
-            let Some((title_minimum, body_minimum)) = minima else {
-                return Ok(0.0);
-            };
-            let bound = terms
-                .iter()
-                .map(|term| {
-                    let df = statistics.frequencies.get(term).copied().unwrap_or(0);
-                    self.header.terms.get(term).map_or(0.0, |meta| {
-                        term_bound(meta, &statistics, df, (title_minimum, body_minimum))
-                    })
-                })
-                .sum();
-            Ok(bound)
+            serde_json::to_string(&minimum).map_err(|cause| JsValue::from_str(&cause.to_string()))
         }
 
         #[doc = "# Errors\nRejects invalid ids or tombstones, row overflow, or result serialization errors."]

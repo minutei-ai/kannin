@@ -258,6 +258,14 @@ export const SegmentBlock = Schema.Struct({
 });
 export const SegmentTerm = Schema.Struct({ df: Schema.Int, blocks: Schema.Array(SegmentBlock) });
 export const SegmentTerms = Schema.Record(Schema.String, SegmentTerm);
+export const EligibleMinimum = Schema.Union([
+  Schema.Null,
+  Schema.Tuple([
+    Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 4294967295 })),
+    Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 4294967295 })),
+  ]),
+]);
+export const TermCatalog = Schema.Struct({ dictionary: SegmentTerms, minimum: EligibleMinimum });
 export const SegmentHeader = Schema.Struct({
   version: Schema.Literal(1),
   documents: Schema.NonEmptyArray(SegmentDocument),
@@ -303,6 +311,7 @@ export const SegmentRange = Schema.Struct({
 export const TermProjectionProps = Schema.Struct({
   bucket: Schema.String.check(Schema.isBetweenLength(1, 63)),
   terms: Schema.fromJsonString(Schema.Array(Schema.String).check(Schema.isBetweenLength(1, 64))),
+  filters: Schema.fromJsonString(Schema.Array(Filter).check(Schema.isMaxLength(16))),
 });
 export const SegmentCacheProps = Schema.Struct({ bucket: TermProjectionProps.fields.bucket });
 export const TermProjectionRange = Schema.Struct({

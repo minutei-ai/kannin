@@ -63,6 +63,7 @@ for (const concurrency of [1, 4, 16]) {
           if (query === undefined || baseline === undefined)
             return yield* new LoadFailure({ message: "Missing load case" });
           const begin = yield* Clock.currentTimeNanos;
+          const startedAt = yield* Clock.currentTimeMillis;
           const encoded = yield* Schema.encodeEffect(Schema.fromJsonString(Query))({
             ...query,
             consistency: "edge-eventual",
@@ -95,8 +96,12 @@ for (const concurrency of [1, 4, 16]) {
             });
           const ended = yield* Clock.currentTimeNanos;
           return {
+            case: index % queries.length,
+            startedAt,
+            endedAt: yield* Clock.currentTimeMillis,
             ms: Number(ended - begin) / 1e6,
             serverTiming: response.headers.get("server-timing"),
+            ray: response.headers.get("cf-ray"),
           };
         }),
       { concurrency },
@@ -116,6 +121,7 @@ for (const concurrency of [1, 4, 16]) {
     p99: ordered[Math.floor((ordered.length - 1) * 0.99)],
     samples: durations,
     serverTimings: results.map((result) => result.serverTiming),
+    observations: results,
   };
   reports.push(report);
   console.error(

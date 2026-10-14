@@ -1753,11 +1753,10 @@ const refreshSnapshot = Effect.fn("raio.refreshSnapshot")(function* (
     },
   });
   if (snapshot === undefined) return undefined;
-  if (snapshot.manifest.sequence < minimumSequence)
-    return yield* new Rejected({ status: 409, message: "Requested sequence is not committed" });
+  if (snapshot.manifest.sequence < minimumSequence) return undefined;
   const selectedAt = yield* Clock.currentTimeMillis;
   if (selectedAt < snapshot.observedAt || selectedAt - snapshot.observedAt >= 1000)
-    return yield* new Rejected({ status: 503, message: "Snapshot freshness budget exceeded" });
+    return undefined;
   return snapshot.manifest;
 });
 const snapshotRefreshes = new Set<string>();
@@ -1902,6 +1901,7 @@ export default {
       });
     const namespace = match[1];
     const operation = match[2];
+    const snapshotTimings = new Headers();
     const started = Effect.runSync(Clock.currentTimeNanos);
     const response = await Effect.runPromise(
       Effect.gen(function* () {
@@ -1946,6 +1946,10 @@ export default {
               );
               return evaluated;
             }
+            snapshotTimings.append(
+              "server-timing",
+              `edge_snapshot_fallback;dur=${Number(snapshotEnded - snapshotStarted) / 1e6}`,
+            );
           }
         }
         return yield* Effect.tryPromise(() =>
@@ -1975,6 +1979,8 @@ export default {
     const ended = Effect.runSync(Clock.currentTimeNanos);
     const outgoing = new Response(response.body, response);
     outgoing.headers.set("cache-control", "private, no-store");
+    const snapshotTiming = snapshotTimings.get("server-timing");
+    if (snapshotTiming !== null) outgoing.headers.append("server-timing", snapshotTiming);
     outgoing.headers.append("server-timing", `gateway;dur=${Number(ended - started) / 1e6}`);
     return outgoing;
   },

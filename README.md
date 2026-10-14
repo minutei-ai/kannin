@@ -13,11 +13,11 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Concurrency | p50 ms |  p95 ms | Requests/s |
 | ----------: | -----: | ------: | ---------: |
-|           1 |  81.51 |  538.25 |       6.33 |
-|           4 |  80.70 |  971.67 |      12.98 |
-|          16 | 138.42 | 1215.32 |      17.96 |
+|           1 |  76.31 |  376.12 |       6.44 |
+|           4 |  81.00 |  885.96 |      18.98 |
+|          16 |  95.94 | 1530.77 |      36.43 |
 
-Latest complete 32-request phase measurements after restoring the original pruning-block lookup. All 96 edge responses matched strong rows and scores; all four comparison runs completed 384 exact responses. Binary lookup reduced native rank-only CPU medians by 18–25% on 10,000-document fixtures, but did not sustain improved whole-query latency and was discarded. The retained query-local block-bound optimization reduced any/all finish p50 by **35–65% on 500/10,000-document fixtures**. Earlier runs observed snapshot freshness 503s; first-use snapshot reliability, peak memory and general Turbopuffer parity remain unverified.
+Latest complete 64-request phases query `cloudflare` without a filter and with group filters 42/43/44. All **192 edge responses** matched strong rows, scores and sequence; cache/isolate/network placement was uncontrolled. Snapshots that arrive expired or below the requested sequence now route to the coordinator without extending the one-second age budget. The native future-sequence recovery preserved HTTP 409; no expired-acquisition recovery occurred in this load, so that native failure condition remains unverified. The retained Rust query-local block bounds reduced any/all finish p50 by **35–65% on 500/10,000-document fixtures**. Peak memory and general Turbopuffer parity remain unverified.
 
 The local million-document workload measured strong common/filtered p50 of **127/126 ms** across 2,000 uncompacted segments. These emulator results exclude native network latency. Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10** across 300 queries. Eight native vector/hybrid fixture cases also retained exact rows and scores.
 

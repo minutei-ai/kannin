@@ -361,3 +361,42 @@ test("parallel strong queries observe complete immutable revisions while writes 
     expect(fresh.rows[0]?.text).toBe(`shared revision${revision}`);
   }
 });
+
+test("coordinator snapshot recovery preserves request bodies and sequence barriers", async () => {
+  const namespace = "edge-coordinator-recovery";
+  const empty = await request(worker, namespace, "query", {
+    ...textQuery("recovered"),
+    consistency: "edge-eventual",
+  });
+  expect(empty.status).toBe(200);
+  expect(Schema.decodeUnknownSync(QueryResult)(await empty.json()).rows).toEqual([]);
+  expect(empty.headers.get("server-timing")).toContain("edge_snapshot_fallback;dur=");
+  const future = await request(worker, namespace, "query", {
+    ...textQuery("recovered"),
+    consistency: "edge-eventual",
+    minimumSequence: 1,
+  });
+  expect(future.status).toBe(409);
+  expect(future.headers.get("server-timing")).toContain("edge_snapshot_fallback;dur=");
+  const written = Schema.decodeUnknownSync(WriteResult)(
+    await (
+      await request(worker, namespace, "write", write([document("a", "recovered text")]))
+    ).json(),
+  );
+  const current = await request(worker, namespace, "query", {
+    ...textQuery("recovered"),
+    consistency: "edge-eventual",
+    minimumSequence: written.sequence,
+  });
+  expect(current.status).toBe(200);
+  const result = Schema.decodeUnknownSync(QueryResult)(await current.json());
+  expect(result.rows.map((row) => row.id)).toEqual(["a"]);
+  expect(result.sequence).toBe(written.sequence);
+  const uncommitted = await request(worker, namespace, "query", {
+    ...textQuery("recovered"),
+    consistency: "edge-eventual",
+    minimumSequence: written.sequence + 1,
+  });
+  expect(uncommitted.status).toBe(409);
+  expect(uncommitted.headers.get("server-timing")).toContain("edge_snapshot_fallback;dur=");
+});

@@ -41,6 +41,7 @@ import {
   SegmentHits,
   SegmentTerms,
   TermCatalog,
+  TermCatalogBatch,
   TermSummaries,
   EligibleMinimum,
   LocatedDocument,
@@ -63,13 +64,12 @@ import {
   IndexMessage,
   SegmentRange,
   TermProjectionProps,
-  TermProjectionRange,
   SegmentCacheProps,
 } from "./protocol";
 import {
   range,
   withDirectory,
-  readTerms,
+  readTermCatalogs,
   buildSegment,
   bloom,
   bloomCandidates,
@@ -154,29 +154,32 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
   override async fetch(request: Request) {
     const props = Schema.decodeExit(TermProjectionProps)(this.ctx.props);
     const url = new URL(request.url);
-    const decoded = Schema.decodeUnknownExit(TermProjectionRange)({
-      key: url.searchParams.get("key"),
-      headerBytes: Number(url.searchParams.get("headerBytes")),
-    });
     if (
       request.method !== "GET" ||
       props._tag === "Failure" ||
-      decoded._tag === "Failure" ||
+      url.pathname !== "/catalog-v4" ||
       props.value.bucket !== this.env.STORAGE_CACHE_SCOPE
     )
       return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });
-    const input = decoded.value;
     const encodedTerms = this.ctx.props.terms;
     const encodedFilters = this.ctx.props.filters;
     const cacheKey = new URL(request.url);
     cacheKey.hostname = "raio-terms.internal";
     cacheKey.searchParams.set("bucket", props.value.bucket);
     cacheKey.searchParams.set(
+      "ranges",
+      await sha256(
+        Schema.encodeSync(Schema.fromJsonString(TermProjectionProps.fields.ranges))(
+          props.value.ranges,
+        ),
+      ),
+    );
+    cacheKey.searchParams.set(
       "selector",
       await sha256(`${encodedTerms}\0${this.ctx.props.filters}`),
     );
     const cache = await Effect.runPromise(
-      Effect.tryPromise(() => caches.open("raio-terms-v3")).pipe(
+      Effect.tryPromise(() => caches.open("raio-terms-v4")).pipe(
         Effect.orElseSucceed(() => undefined),
       ),
     );
@@ -192,25 +195,30 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
       }
     }
     const response = await Effect.runPromise(
-      withDirectory(input.key, input.headerBytes, (directory) =>
-        Effect.gen(function* () {
-          const dictionary = yield* Schema.decodeEffect(Schema.fromJsonString(TermSummaries))(
-            directory.summary(encodedTerms),
-          );
-          const minimum = yield* Schema.decodeEffect(Schema.fromJsonString(EligibleMinimum))(
-            directory.minimum(encodedFilters),
-          );
-          return { dictionary, minimum };
-        }),
+      Effect.forEach(
+        props.value.ranges,
+        (input) =>
+          withDirectory(input.key, input.headerBytes, (directory) =>
+            Effect.gen(function* () {
+              const dictionary = yield* Schema.decodeEffect(Schema.fromJsonString(TermSummaries))(
+                directory.summary(encodedTerms),
+              );
+              const minimum = yield* Schema.decodeEffect(Schema.fromJsonString(EligibleMinimum))(
+                directory.minimum(encodedFilters),
+              );
+              return { dictionary, minimum };
+            }),
+          ),
+        { concurrency: 4 },
       ).pipe(
-        Effect.flatMap(Schema.encodeEffect(TermCatalog)),
+        Effect.flatMap(Schema.encodeEffect(TermCatalogBatch)),
         Effect.map((dictionary) =>
           Response.json(dictionary, {
             headers: { "cache-control": "public, max-age=31536000, immutable" },
           }),
         ),
         Effect.tapError((error) =>
-          Effect.logError("kannin.termProjection", { key: input.key, error }),
+          Effect.logError("kannin.termProjection", { ranges: props.value.ranges, error }),
         ),
         Effect.orElseSucceed(() =>
           Response.json(
@@ -353,20 +361,15 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
     .map((candidate) => candidate.segment);
   const projectionTerms = Schema.encodeSync(TermProjectionProps.fields.terms)(terms.toSorted());
   const encodedFilters = Schema.encodeSync(TermProjectionProps.fields.filters)(input.filters);
-  const catalog = await Effect.runPromise(
-    Effect.forEach(
-      selected,
-      (segment) =>
-        readTerms(segment.key, segment.headerBytes, projectionTerms, encodedFilters).pipe(
-          Effect.map((projection) => ({
-            segment,
-            dictionary: projection.dictionary,
-            minimum: projection.minimum,
-          })),
-        ),
-      { concurrency: 4 },
-    ),
+  const projections = await Effect.runPromise(
+    readTermCatalogs(selected, projectionTerms, encodedFilters),
   );
+  const catalog = selected.map((segment, index) => {
+    const projection = projections[index];
+    if (projection === undefined)
+      throw new Rejected({ status: 503, message: "Term projection batch omitted a segment" });
+    return { segment, dictionary: projection.dictionary, minimum: projection.minimum };
+  });
   const frequencies = new Map<string, number>();
   for (const { segment, dictionary } of catalog) {
     const removedFrequencies = new Map(Object.entries(segment.removedFrequencies));

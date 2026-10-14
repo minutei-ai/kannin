@@ -205,6 +205,7 @@ export const CacheMetrics = Schema.Struct({
   bloomCacheBytes: Schema.Int,
   termCacheBytes: Schema.Int,
   termReads: Schema.Int,
+  termRequests: Schema.Int,
   termBytes: Schema.Int,
   termMemoryHits: Schema.Int,
   termWorkerCacheHits: Schema.Int,
@@ -278,6 +279,7 @@ export const TermSummary = Schema.Struct({
 });
 export const TermSummaries = Schema.Record(Schema.String, TermSummary);
 export const TermCatalog = Schema.Struct({ dictionary: TermSummaries, minimum: EligibleMinimum });
+export const TermCatalogBatch = Schema.Array(TermCatalog).check(Schema.isBetweenLength(1, 16));
 export const SegmentHeader = Schema.Struct({
   version: Schema.Literal(1),
   documents: Schema.NonEmptyArray(SegmentDocument),
@@ -320,16 +322,17 @@ export const SegmentRange = Schema.Struct({
   offset: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   length: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 16777216 })),
 });
-export const TermProjectionProps = Schema.Struct({
-  bucket: Schema.String.check(Schema.isBetweenLength(1, 63)),
-  terms: Schema.fromJsonString(Schema.Array(Schema.String).check(Schema.isBetweenLength(1, 64))),
-  filters: Schema.fromJsonString(Schema.Array(Filter).check(Schema.isMaxLength(16))),
-});
-export const SegmentCacheProps = Schema.Struct({ bucket: TermProjectionProps.fields.bucket });
 export const TermProjectionRange = Schema.Struct({
   key: SegmentRange.fields.key,
   headerBytes: SegmentRange.fields.length,
 });
+export const TermProjectionProps = Schema.Struct({
+  bucket: Schema.String.check(Schema.isBetweenLength(1, 63)),
+  terms: Schema.fromJsonString(Schema.Array(Schema.String).check(Schema.isBetweenLength(1, 64))),
+  filters: Schema.fromJsonString(Schema.Array(Filter).check(Schema.isMaxLength(16))),
+  ranges: Schema.Array(TermProjectionRange).check(Schema.isBetweenLength(1, 16)),
+});
+export const SegmentCacheProps = Schema.Struct({ bucket: TermProjectionProps.fields.bucket });
 export class Rejected extends Schema.TaggedError<Rejected>()("Rejected", {
   status: Schema.Int,
   message: Schema.String,

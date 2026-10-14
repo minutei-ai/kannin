@@ -7,12 +7,13 @@ import {
   segment_bloom,
   segment_bloom_filter_many,
 } from "../dist/wasm/raio_engine";
-import type { DataRange } from "./protocol";
+import type { DataRange, TermProjectionRange } from "./protocol";
 import {
   StoredDocument,
   SegmentHeader,
   SegmentRange,
   TermCatalog,
+  TermCatalogBatch,
   SegmentCacheProps,
   Rejected,
 } from "./protocol";
@@ -28,6 +29,7 @@ const termBudget = { bytes: 0 };
 const MAX_TERM_CACHE_BYTES = 4 * 1024 * 1024;
 const reads = {
   termReads: 0,
+  termRequests: 0,
   termBytes: 0,
   termMemoryHits: 0,
   termWorkerCacheHits: 0,
@@ -144,56 +146,98 @@ export const withDirectory = Effect.fn("raio.withDirectory")(
     ),
 );
 
-export const readTerms = Effect.fn("kannin.readTerms")(
-  (key: string, headerBytes: number, terms: string, filters: string) =>
+export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
+  (ranges: ReadonlyArray<typeof TermProjectionRange.Type>, terms: string, filters: string) =>
     Effect.gen(function* () {
-      const props = { bucket: env.STORAGE_CACHE_SCOPE, terms, filters };
-      const identity = `${env.STORAGE_CACHE_SCOPE}:${key}/${headerBytes}/${terms}\0${filters}`;
-      const cached = termCatalogs.get(identity);
-      if (cached !== undefined) {
-        reads.termMemoryHits += 1;
-        termCatalogs.delete(identity);
-        termCatalogs.set(identity, cached);
-        return cached.catalog;
-      }
-      const url = new URL("https://terms.internal/catalog-v3");
-      url.searchParams.set("key", key);
-      url.searchParams.set("headerBytes", String(headerBytes));
-      const response = yield* Effect.tryPromise({
-        try: () => exports.Terms({ props }).fetch(url),
-        catch: (cause) => {
-          if (Schema.is(Rejected)(cause)) return cause;
-          return new Cause.UnknownError(cause);
-        },
-      });
-      reads.termReads += 1;
-      const status = response.headers.get("cf-cache-status");
-      if (status === "HIT") reads.termWorkerCacheHits += 1;
-      if (status !== "HIT" && response.headers.get("x-raio-cache") === "terms-api-hit")
-        reads.termCacheApiHits += 1;
-      const text = yield* Effect.tryPromise(() => response.text());
-      if (!response.ok)
-        return yield* new Rejected({ status: 503, message: "Immutable term catalog unavailable" });
-      const catalog = yield* Schema.decodeEffect(Schema.fromJsonString(TermCatalog))(text);
-      const length = new TextEncoder().encode(text).byteLength;
-      reads.termBytes += length;
-      const bytes = 4 * (length + new TextEncoder().encode(identity).byteLength) + 256;
-      if (bytes <= MAX_TERM_CACHE_BYTES) {
-        const concurrent = termCatalogs.get(identity);
-        if (concurrent !== undefined) {
-          termBudget.bytes -= concurrent.bytes;
-          termCatalogs.delete(identity);
-        }
-        while (termBudget.bytes + bytes > MAX_TERM_CACHE_BYTES) {
-          const oldest = termCatalogs.entries().next().value;
-          if (oldest === undefined) break;
-          termCatalogs.delete(oldest[0]);
-          termBudget.bytes -= oldest[1].bytes;
-        }
-        termCatalogs.set(identity, { catalog, bytes });
-        termBudget.bytes += bytes;
-      }
-      return catalog;
+      const windows = Array.from({ length: Math.ceil(ranges.length / 16) }, (_, index) =>
+        ranges.slice(index * 16, index * 16 + 16),
+      );
+      const batches = yield* Effect.forEach(
+        windows,
+        (window) =>
+          Effect.gen(function* () {
+            const hits = [];
+            for (const input of window) {
+              const identity = `${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}/${terms}\0${filters}`;
+              const entry = termCatalogs.get(identity);
+              if (entry === undefined) break;
+              hits.push({ identity, entry });
+            }
+            if (hits.length === window.length) {
+              reads.termMemoryHits += hits.length;
+              for (const hit of hits) {
+                termCatalogs.delete(hit.identity);
+                termCatalogs.set(hit.identity, hit.entry);
+              }
+              return hits.map((hit) => hit.entry.catalog);
+            }
+            const props = {
+              bucket: env.STORAGE_CACHE_SCOPE,
+              terms,
+              filters,
+              ranges: window.map((input) => ({ key: input.key, headerBytes: input.headerBytes })),
+            };
+            const response = yield* Effect.tryPromise({
+              try: () => exports.Terms({ props }).fetch("https://terms.internal/catalog-v4"),
+              catch: (cause) => {
+                if (Schema.is(Rejected)(cause)) return cause;
+                return new Cause.UnknownError(cause);
+              },
+            });
+            reads.termReads += window.length;
+            reads.termRequests += 1;
+            const status = response.headers.get("cf-cache-status");
+            if (status === "HIT") reads.termWorkerCacheHits += window.length;
+            if (status !== "HIT" && response.headers.get("x-raio-cache") === "terms-api-hit")
+              reads.termCacheApiHits += window.length;
+            const text = yield* Effect.tryPromise(() => response.text());
+            if (!response.ok)
+              return yield* new Rejected({
+                status: 503,
+                message: "Immutable term catalog unavailable",
+              });
+            const catalogs = yield* Schema.decodeEffect(Schema.fromJsonString(TermCatalogBatch))(
+              text,
+            );
+            if (catalogs.length !== window.length)
+              return yield* new Rejected({
+                status: 503,
+                message: "Term projection batch omitted a segment",
+              });
+            reads.termBytes += new TextEncoder().encode(text).byteLength;
+            for (const [index, catalog] of catalogs.entries()) {
+              const input = window[index];
+              if (input === undefined)
+                return yield* new Rejected({
+                  status: 503,
+                  message: "Term projection batch added a segment",
+                });
+              const identity = `${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}/${terms}\0${filters}`;
+              const encoded = yield* Schema.encodeEffect(Schema.fromJsonString(TermCatalog))(
+                catalog,
+              );
+              const length = new TextEncoder().encode(encoded).byteLength;
+              const bytes = 4 * (length + new TextEncoder().encode(identity).byteLength) + 256;
+              if (bytes > MAX_TERM_CACHE_BYTES) continue;
+              const concurrent = termCatalogs.get(identity);
+              if (concurrent !== undefined) {
+                termBudget.bytes -= concurrent.bytes;
+                termCatalogs.delete(identity);
+              }
+              while (termBudget.bytes + bytes > MAX_TERM_CACHE_BYTES) {
+                const oldest = termCatalogs.entries().next().value;
+                if (oldest === undefined) break;
+                termCatalogs.delete(oldest[0]);
+                termBudget.bytes -= oldest[1].bytes;
+              }
+              termCatalogs.set(identity, { catalog, bytes });
+              termBudget.bytes += bytes;
+            }
+            return catalogs;
+          }),
+        { concurrency: 1 },
+      );
+      return batches.flat();
     }),
 );
 

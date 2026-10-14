@@ -57,7 +57,7 @@ test("cached old segments cannot resurrect updated or deleted documents", async 
 });
 
 test("the authenticated gateway never exposes immutable cache entrypoints", async () => {
-  for (const path of ["/range", "/catalog-v3"]) {
+  for (const path of ["/range", "/catalog-v4"]) {
     const url = new URL(path, await worker.ready);
     const anonymous = await fetch(url);
     expect(anonymous.status).toBe(401);
@@ -103,6 +103,52 @@ test("concurrent cold edge queries share immutable range acquisition", async () 
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
   expect(after.rangeReads - before.rangeReads).toBe(13);
+});
+
+test("term projection batches preserve global frequencies and filter eligibility at their boundary", async () => {
+  const namespace = "batch-term-projections";
+  for (const index of Array.from({ length: 33 }, (_, ordinal) => ordinal))
+    await request(
+      worker,
+      namespace,
+      "write",
+      write([
+        document(String(index).padStart(3, "0"), "shared cold storage", { group: index % 2 }),
+      ]),
+    );
+  const before = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  const first = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", textQuery("shared storage"))).json(),
+  );
+  expect(first.rows.map((row) => row.id)).toEqual(
+    Array.from({ length: 10 }, (_, index) => String(index).padStart(3, "0")),
+  );
+  const acquired = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(acquired.termRequests - before.termRequests).toBe(3);
+  expect(acquired.termReads - before.termReads).toBe(33);
+  const filtered = Schema.decodeUnknownSync(QueryResult)(
+    await (
+      await request(
+        worker,
+        namespace,
+        "query",
+        textQuery("shared storage", 10, [{ field: "group", op: "eq", value: 1 }]),
+      )
+    ).json(),
+  );
+  expect(filtered.rows.map((row) => row.id)).toEqual(
+    Array.from({ length: 10 }, (_, index) => String(index * 2 + 1).padStart(3, "0")),
+  );
+  expect(filtered.rows.map((row) => row.score)).toEqual(first.rows.map((row) => row.score));
+  const after = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(after.termRequests - acquired.termRequests).toBe(3);
+  expect(after.termReads - acquired.termReads).toBe(33);
 });
 
 for (const match of ["all", "phrase"] as const)

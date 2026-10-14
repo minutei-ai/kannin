@@ -744,3 +744,20 @@ A local alternating old/new WASM microbenchmark ranks the same 10,000-document s
 | phrase | True   |         2.148 |        1.358 |
 
 These operation-level measurements do not establish an equivalent whole-query gain or Turbopuffer parity.
+
+Native runtime `8604bfe` completed the same read-only million-document load before/after deployment: 32 responses per concurrency phase, 192 exact edge/strong checks in total. Process, regional caches and network conditions were uncontrolled.
+
+| Runtime | Concurrency | p50 ms |  p95 ms | Requests/s |
+| ------- | ----------: | -----: | ------: | ---------: |
+| before  |           1 |  65.19 |  760.67 |       6.21 |
+| before  |           4 |  78.87 |  819.81 |      16.62 |
+| before  |          16 | 199.34 | 1272.02 |      19.96 |
+| after   |           1 |  68.83 |  545.02 |       7.90 |
+| after   |           4 |  73.78 | 1249.02 |      15.98 |
+| after   |          16 | 170.47 | 1151.99 |      19.70 |
+
+The lower local kernel cost is supported by alternating binary measurements. Native latency and throughput remain mixed; this is not a general whole-query acceleration claim. The full gate passed 116 Worker/tooling and 19 Rust tests. Deployment completed.
+
+Fresh native selector/filter diagnostics returned exact strong rows/scores in 1,056/949/1,247 ms for selective/common/filtered queries. Server timings attribute 567–914 ms to directory work, 207–224 ms to snapshots, and 0–11 ms to ranking; these observations leave directory/snapshot acquisition as the dominant measured next targets.
+
+The post-change local SciFact evaluation completed 5,183 documents and 300 queries: nDCG@10 0.673061970, Recall@10 0.795666667, MRR@10 0.641808201. Every evaluated query result matched the previous report. Source CI passed.

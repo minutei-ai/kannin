@@ -442,3 +442,21 @@ The same million-document diagnostic appends new absent tokens to selective, com
 A process health sample reported 496,516 charged overview bytes and thirty-two builds, with zero overview hits in that sampled isolate. Isolate routing and shared counters make that sample insufficient to identify the cache tier serving a specific query. The repeated timings are consistent with warming, but do not independently prove which native cache tier caused the improvement. Native peak isolate memory was not measured.
 
 A subsequent complete native mixed-query load checked all ninety-six edge responses against strong baselines, retaining one million documents and sequence 2,000. Concurrency 1/4/16 p50 was 80.83/83.75/142.43 ms, p95 was 682.73/772.23/860.56 ms and throughput was 6.40/13.55/24.17 requests/s. Concurrency-four throughput and p95 regressed relative to the preceding batch run; other tails improved. Small samples, prior requests, cache state, deployment and network variation limit causal attribution. New selectors still take seconds, concurrent tails remain substantial, and a fully indexed Turbopuffer comparison remains unavailable from the earlier readiness window. These limits keep general parity and first-use latency unresolved.
+
+## Memory overview path without native cache acquisition
+
+Runtime `8ee3b40` validates and projects a compressed memory overview before computing the filter SHA-256 or opening Cache API. A miss retains the existing native cache lookup and verified directory fallback; a malformed memory entry can still recover from a valid Cache API copy. Budgets, keys, CRC validation, filters and response formats are unchanged. The complete gate and CI passed with 112 Worker/tooling and 18 Rust tests.
+
+A controlled workerd workload creates sixty-four one-document segments, then issues sixty new selectors: ten warmups and fifty measured requests. Each selector appends an absent token, and every response matches the original rows and scores. Before/after both built sixty-four overviews, recorded 3,840 memory hits and retained 45,532 charged bytes. Before p50/p95 was 28.68/79.42 ms; after was 21.89/27.03 ms. Separate process runs and host variation limit attribution, but the source path now demonstrably skips the two native operations on a memory hit.
+
+Native million-document diagnostics reused the same corpus and filter predicates, with newly generated absent tokens in each run. Each cell is an individual observation; the first after-deploy run and its repetition are both retained:
+
+| Query     | Before ms | First after ms | Repeated new selector ms |
+| --------- | --------: | -------------: | -----------------------: |
+| selective |  2,575.24 |       2,894.75 |                 1,723.43 |
+| common    |  2,295.11 |       1,226.92 |                 1,608.26 |
+| filtered  |  2,318.06 |       1,189.87 |                 2,656.96 |
+
+All nine responses matched their strong base rows and scores. The first selective observation and the repeated filtered observation regressed relative to the baseline. These variations prevent a universal latency claim or attributing every change to the memory branch; cache locality and first-use acquisition still require work.
+
+The subsequent native mixed-query load verified all ninety-six edge responses against strong baselines at one million documents and sequence 2,000. Concurrency 1/4/16 p50 was 70.95/109.58/146.22 ms, p95 was 696.96/929.67/578.04 ms and throughput was 5.35/10.87/36.48 requests/s. Concurrency-sixteen p95 and throughput improved relative to the previous overview load, while concurrency-four p50, p95 and throughput regressed. The thirty-two samples per phase, prior cache warming and provider variation keep general throughput and parity claims unproven. New selectors remain above one second, and the earlier thirty-second first-use edge failure remains unproven resolved.

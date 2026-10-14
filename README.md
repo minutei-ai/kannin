@@ -13,11 +13,11 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Concurrency | p50 ms | p95 ms | Requests/s |
 | ----------: | -----: | -----: | ---------: |
-|           1 |  80.83 | 682.73 |       6.40 |
-|           4 |  83.75 | 772.23 |      13.55 |
-|          16 | 142.43 | 860.56 |      24.17 |
+|           1 |  70.95 | 696.96 |       5.35 |
+|           4 | 109.58 | 929.67 |      10.87 |
+|          16 | 146.22 | 578.04 |      36.48 |
 
-Runtime `a8df7ed`; 32 mixed-query requests per phase. All 96 edge responses matched strong rows and scores. Compressed segment overviews reuse immutable metadata across query selectors; repeated new selectors still took **1.79–3.19 seconds**. Cache state and network variation limit attribution. Concurrency-four tails slightly regressed, and an earlier edge request hit its 30-second lease; successful later runs do not prove that first-use failure resolved.
+Runtime `8ee3b40`; 32 mixed-query requests per phase. All 96 edge responses matched strong rows and scores. Compressed segment overviews reuse immutable metadata across query selectors; repeated new selectors still took **1.19–2.89 seconds**. Cache state and network variation limit attribution. Concurrency-four tails slightly regressed, and an earlier edge request hit its 30-second lease; successful later runs do not prove that first-use failure resolved.
 
 The local million-document workload measured strong common/filtered p50 of **127/126 ms** across 2,000 uncompacted segments. These emulator results exclude native network latency. Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10** across 300 queries. Eight native vector/hybrid fixture cases also retained exact rows and scores.
 

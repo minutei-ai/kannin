@@ -63,7 +63,7 @@ export const Worker = Cloudflare.Worker(
       entrypoints: {
         default: { cache: { enabled: false } },
         Segments: { cache: { enabled: true } },
-        HeaderBatches: { cache: { enabled: true } },
+        Terms: { cache: { enabled: true } },
       },
       compatibility: { date: "2026-10-01" },
       env: {

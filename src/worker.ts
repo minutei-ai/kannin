@@ -1742,9 +1742,7 @@ const edgeSnapshot = Effect.fn("raio.edgeSnapshot")(function* (
 ) {
   const cacheKey = new URL(`https://raio-cache.internal/snapshots/${namespace}`);
   cacheKey.searchParams.set("bucket", env.STORAGE_CACHE_SCOPE);
-  const cache = yield* Effect.tryPromise(() => caches.open("raio-snapshots-v1")).pipe(
-    Effect.orElseSucceed(() => undefined),
-  );
+  const cache: { value: Cache | undefined } = { value: undefined };
   const memory = warmSnapshots.get(cacheKey.href);
   const selection = { snapshot: memory?.snapshot };
   const observedAt = yield* Clock.currentTimeMillis;
@@ -1759,8 +1757,12 @@ const edgeSnapshot = Effect.fn("raio.edgeSnapshot")(function* (
       warmSnapshotBudget.bytes -= memory.bytes;
     }
     selection.snapshot = undefined;
-    if (cache !== undefined) {
-      const cached = yield* Effect.tryPromise(() => cache.match(cacheKey)).pipe(
+    cache.value = yield* Effect.tryPromise(() => caches.open("raio-snapshots-v1")).pipe(
+      Effect.orElseSucceed(() => undefined),
+    );
+    if (cache.value !== undefined) {
+      const selectedCache = cache.value;
+      const cached = yield* Effect.tryPromise(() => selectedCache.match(cacheKey)).pipe(
         Effect.orElseSucceed(() => undefined),
       );
       if (cached !== undefined) {
@@ -1793,7 +1795,12 @@ const edgeSnapshot = Effect.fn("raio.edgeSnapshot")(function* (
     if (selectedAt - snapshot.observedAt >= 250 && !snapshotRefreshes.has(cacheKey.href)) {
       snapshotRefreshes.add(cacheKey.href);
       const refresh = yield* Effect.forkDetach(
-        refreshSnapshot(env, namespace, 0, cacheKey, cache).pipe(
+        Effect.gen(function* () {
+          const refreshCache = yield* Effect.tryPromise(() =>
+            caches.open("raio-snapshots-v1"),
+          ).pipe(Effect.orElseSucceed(() => undefined));
+          yield* refreshSnapshot(env, namespace, 0, cacheKey, refreshCache);
+        }).pipe(
           Effect.asVoid,
           Effect.ignore,
           Effect.ensuring(Effect.sync(() => snapshotRefreshes.delete(cacheKey.href))),
@@ -1807,7 +1814,7 @@ const edgeSnapshot = Effect.fn("raio.edgeSnapshot")(function* (
     }
     return snapshot.manifest;
   }
-  return yield* refreshSnapshot(env, namespace, minimumSequence, cacheKey, cache);
+  return yield* refreshSnapshot(env, namespace, minimumSequence, cacheKey, cache.value);
 });
 
 export default {

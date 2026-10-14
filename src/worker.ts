@@ -1677,17 +1677,25 @@ export class SearchNamespace extends DurableObject<Env> {
   }
 }
 
-const warmSnapshots = new Map<string, { snapshot: typeof Snapshot.Type; bytes: number }>();
+const warmSnapshots = new Map<
+  string,
+  { snapshot: typeof Snapshot.Type; bytes: number; etag: R2Object["etag"] | undefined }
+>();
 const warmSnapshotBudget = { bytes: 0 };
 const MAX_WARM_SNAPSHOT_BYTES = 24 * 1024 * 1024;
 
-function rememberSnapshot(key: string, snapshot: typeof Snapshot.Type, encoded: string) {
+function rememberSnapshot(
+  key: string,
+  snapshot: typeof Snapshot.Type,
+  encoded: string,
+  etag?: R2Object["etag"],
+) {
   const prior = warmSnapshots.get(key);
   if (prior !== undefined) warmSnapshotBudget.bytes -= prior.bytes;
   warmSnapshots.delete(key);
   const bytes = new TextEncoder().encode(encoded).byteLength * 4;
   if (bytes > MAX_WARM_SNAPSHOT_BYTES) return;
-  warmSnapshots.set(key, { snapshot, bytes });
+  warmSnapshots.set(key, { snapshot, bytes, etag });
   warmSnapshotBudget.bytes += bytes;
   while (warmSnapshotBudget.bytes > MAX_WARM_SNAPSHOT_BYTES) {
     const oldest = warmSnapshots.entries().next().value;
@@ -1699,6 +1707,8 @@ function rememberSnapshot(key: string, snapshot: typeof Snapshot.Type, encoded: 
 
 const snapshotMetrics = {
   snapshotR2Reads: 0,
+  snapshotR2BodyBytes: 0,
+  snapshotRevalidations: 0,
   snapshotSharedReads: 0,
   snapshotCacheDecodes: 0,
   snapshotCacheRejected: 0,
@@ -1712,12 +1722,29 @@ async function acquireSnapshot(
   cache: Cache | undefined,
 ) {
   snapshotMetrics.snapshotR2Reads += 1;
-  const object = await env.STORAGE.get(`namespaces/${namespace}/root.json`);
+  const previous = warmSnapshots.get(cacheKey.href);
+  const key = `namespaces/${namespace}/root.json`;
+  const object = await Match.value(previous?.etag).pipe(
+    Match.when(undefined, () => env.STORAGE.get(key)),
+    Match.orElse((etag) => env.STORAGE.get(key, { onlyIf: { etagDoesNotMatch: etag } })),
+  );
   if (object === null) return undefined;
-  const manifest = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
+  const selected = { manifest: previous?.snapshot.manifest, revalidated: false };
+  if ("body" in object) {
+    snapshotMetrics.snapshotR2BodyBytes += object.size;
+    selected.manifest = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
+  } else {
+    if (previous === undefined || previous.etag !== object.etag)
+      throw new Rejected({ status: 503, message: "Conditional R2 read has no matching snapshot" });
+    snapshotMetrics.snapshotRevalidations += 1;
+    selected.revalidated = true;
+  }
+  const manifest = selected.manifest;
+  if (manifest === undefined)
+    throw new Rejected({ status: 503, message: "R2 read omitted its manifest" });
   const snapshot = { observedAt, manifest };
   const encoded = Schema.encodeSync(Schema.fromJsonString(Snapshot))(snapshot);
-  rememberSnapshot(cacheKey.href, snapshot, encoded);
+  rememberSnapshot(cacheKey.href, snapshot, encoded, object.etag);
   if (cache !== undefined) {
     ctx.waitUntil(
       cache
@@ -1737,7 +1764,7 @@ async function acquireSnapshot(
         .catch(() => undefined),
     );
   }
-  return snapshot;
+  return { snapshot, revalidated: selected.revalidated };
 }
 const pendingSnapshots = new Map<string, ReturnType<typeof acquireSnapshot>>();
 const refreshSnapshot = Effect.fn("raio.refreshSnapshot")(function* (
@@ -1747,6 +1774,7 @@ const refreshSnapshot = Effect.fn("raio.refreshSnapshot")(function* (
   minimumSequence: number,
   cacheKey: URL,
   cache: Cache | undefined,
+  timings?: Headers,
 ) {
   const selected = { read: pendingSnapshots.get(cacheKey.href) };
   if (selected.read === undefined) {
@@ -1757,14 +1785,16 @@ const refreshSnapshot = Effect.fn("raio.refreshSnapshot")(function* (
     pendingSnapshots.set(cacheKey.href, selected.read);
   } else snapshotMetrics.snapshotSharedReads += 1;
   const acquisition = selected.read;
-  const snapshot = yield* Effect.tryPromise({
+  const acquired = yield* Effect.tryPromise({
     try: () => acquisition,
     catch: (cause) => {
       if (Schema.isSchemaError(cause)) return cause;
       return new Cause.UnknownError(cause);
     },
   });
-  if (snapshot === undefined) return undefined;
+  if (acquired === undefined) return undefined;
+  if (acquired.revalidated) timings?.append("server-timing", "edge_snapshot_revalidated");
+  const snapshot = acquired.snapshot;
   if (snapshot.manifest.sequence < minimumSequence) return undefined;
   const selectedAt = yield* Clock.currentTimeMillis;
   if (selectedAt < snapshot.observedAt || selectedAt - snapshot.observedAt >= 1000)
@@ -1792,10 +1822,6 @@ const edgeSnapshot = Effect.fn("raio.edgeSnapshot")(function* (
     observedAt - selection.snapshot.observedAt >= 1000 ||
     selection.snapshot.manifest.sequence < minimumSequence
   ) {
-    if (memory !== undefined) {
-      warmSnapshots.delete(cacheKey.href);
-      warmSnapshotBudget.bytes -= memory.bytes;
-    }
     selection.snapshot = undefined;
     cache.value = yield* Effect.tryPromise(() => caches.open("raio-snapshots-v1")).pipe(
       Effect.orElseSucceed(() => undefined),
@@ -1872,7 +1898,15 @@ const edgeSnapshot = Effect.fn("raio.edgeSnapshot")(function* (
     }
     return snapshot.manifest;
   }
-  return yield* refreshSnapshot(ctx, env, namespace, minimumSequence, cacheKey, cache.value);
+  return yield* refreshSnapshot(
+    ctx,
+    env,
+    namespace,
+    minimumSequence,
+    cacheKey,
+    cache.value,
+    timings,
+  );
 });
 
 export default {

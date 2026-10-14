@@ -115,6 +115,62 @@ test("strong is the default and edge reads evaluate the same BM25 snapshot", asy
   expect(edge.sequence).toBe(strong.sequence);
 });
 
+test("expired warm snapshots revalidate unchanged R2 content without transferring its body", async () => {
+  const namespace = "etag-unchanged";
+  await request(worker, namespace, "write", write([document("a", "unchanged content")]));
+  const input = { ...textQuery("unchanged"), consistency: "edge-eventual", minimumSequence: 1 };
+  expect((await request(worker, namespace, "query", input)).status).toBe(200);
+  await Effect.runPromise(Effect.sleep(1100));
+  const cache = await (await worker.getCaches()).open("raio-snapshots-v1");
+  await cache.delete(`https://raio-cache.internal/snapshots/${namespace}?bucket=raio-test`);
+  const before = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  const response = await request(worker, namespace, "query", input);
+  expect(response.status).toBe(200);
+  expect(response.headers.get("server-timing")).toContain("edge_snapshot_revalidated");
+  const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+  expect(result.sequence).toBe(1);
+  expect(result.rows.map((row) => row.id)).toEqual(["a"]);
+  const after = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(after.snapshotRevalidations - before.snapshotRevalidations).toBe(1);
+  expect(after.snapshotR2BodyBytes - before.snapshotR2BodyBytes).toBe(0);
+  const future = await request(worker, namespace, "query", { ...input, minimumSequence: 2 });
+  expect(future.status).toBe(409);
+  expect(future.headers.get("server-timing")).toContain("edge_snapshot_revalidated");
+  expect(future.headers.get("server-timing")).toContain("edge_snapshot_fallback");
+  await request(worker, namespace, "write", write([document("a", "changed content")]));
+  const changedBefore = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  const changedResponse = await request(worker, namespace, "query", {
+    ...textQuery("changed"),
+    consistency: "edge-eventual",
+    minimumSequence: 2,
+  });
+  expect(changedResponse.status).toBe(200);
+  const changed = Schema.decodeUnknownSync(QueryResult)(await changedResponse.json());
+  expect(changed.sequence).toBe(2);
+  expect(changed.rows.map((row) => row.id)).toEqual(["a"]);
+  const changedAfter = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(changedAfter.snapshotRevalidations - changedBefore.snapshotRevalidations).toBe(0);
+  expect(changedAfter.snapshotR2BodyBytes - changedBefore.snapshotR2BodyBytes).toBeGreaterThan(0);
+  await request(worker, namespace, "write", write([], ["a"]));
+  const deletedResponse = await request(worker, namespace, "query", {
+    ...textQuery("changed"),
+    consistency: "edge-eventual",
+    minimumSequence: 3,
+  });
+  expect(deletedResponse.status).toBe(200);
+  const deleted = Schema.decodeUnknownSync(QueryResult)(await deletedResponse.json());
+  expect(deleted.sequence).toBe(3);
+  expect(deleted.rows).toEqual([]);
+});
+
 test("minimumSequence bypasses a cached manifest after update and deletion", async () => {
   await request(worker, "edge-barrier", "write", write([document("a", "old text")]));
   await seedSnapshot("edge-barrier", Effect.runSync(Clock.currentTimeMillis));

@@ -240,6 +240,8 @@ export const Metadata = Schema.Struct({
 });
 export const Health = Schema.Struct({
   snapshotR2Reads: Schema.Int,
+  snapshotR2BodyBytes: Schema.Int,
+  snapshotRevalidations: Schema.Int,
   snapshotSharedReads: Schema.Int,
   snapshotCacheDecodes: Schema.Int,
   snapshotCacheRejected: Schema.Int,

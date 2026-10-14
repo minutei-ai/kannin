@@ -69,24 +69,12 @@ test("compressed overviews preserve term bounds and exact filter minima across s
     const encodedFilters = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Filter)))(
       Schema.decodeUnknownSync(Schema.Array(Filter))(filters),
     );
-    const overview = directory.overview(encodedFilters);
-    expect(overview).toEqual(
-      pack(
-        Schema.encodeSync(Schema.fromJsonString(TermCatalog))({
-          dictionary: Schema.decodeSync(Schema.fromJsonString(TermSummaries))(
-            directory.summary('["cafe","cloudflare","rust","title"]'),
-          ),
-          minimum: Schema.decodeSync(Schema.fromJsonString(EligibleMinimum))(
-            directory.minimum(encodedFilters),
-          ),
-        }),
-      ).slice(8),
-    );
+    const overview = directory.overview();
     for (const terms of [["rust"], ["cafe", "absent"], ["cloudflare", "rust"]]) {
       const encodedTerms = JSON.stringify(terms);
       expect(
         Schema.decodeSync(Schema.fromJsonString(TermCatalog))(
-          segment_overview_project(overview, encodedTerms),
+          segment_overview_project(overview, encodedTerms, encodedFilters),
         ),
       ).toEqual({
         dictionary: Schema.decodeSync(Schema.fromJsonString(TermSummaries))(
@@ -99,10 +87,80 @@ test("compressed overviews preserve term bounds and exact filter minima across s
     }
     const corrupted = overview.slice();
     corrupted[4] = (corrupted[4] ?? 0) ^ 1;
-    expect(() => segment_overview_project(corrupted, '["rust"]')).toThrow();
+    expect(() => segment_overview_project(corrupted, '["rust"]', encodedFilters)).toThrow();
     expect(() =>
-      segment_overview_project(overview, JSON.stringify(Array.from({ length: 65 }, () => "rust"))),
+      segment_overview_project(
+        overview,
+        JSON.stringify(Array.from({ length: 65 }, () => "rust")),
+        encodedFilters,
+      ),
     ).toThrow("64 terms");
+  }
+  directory.free();
+  segment.free();
+});
+
+test("shared attribute groups preserve minima across operators and different document lengths", () => {
+  const segment = new Segment(
+    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))([
+      {
+        id: "a",
+        revision: 1,
+        title: "one two three",
+        text: "same",
+        attributes: { group: 1, year: 2020, flag: true, nullable: null },
+      },
+      {
+        id: "b",
+        revision: 1,
+        title: "one",
+        text: "same same same same",
+        attributes: { nullable: null, flag: true, year: 2020, group: 1 },
+      },
+      {
+        id: "c",
+        revision: 1,
+        title: "",
+        text: "same same",
+        attributes: { group: 1, year: 2021, flag: false },
+      },
+      {
+        id: "d",
+        revision: 1,
+        title: "one",
+        text: "same",
+        attributes: { group: 2, year: 2020, flag: true },
+      },
+      { id: "e", revision: 1, title: "one", text: "same", attributes: {} },
+    ]),
+  );
+  const directory = new Directory(segment.bytes());
+  const overview = directory.overview();
+  for (const predicate of [
+    [],
+    [
+      { field: "group", op: "eq", value: 1 },
+      { field: "year", op: "eq", value: 2020 },
+    ],
+    [{ field: "group", op: "ne", value: 1 }],
+    [{ field: "nullable", op: "eq", value: null }],
+    [{ field: "nullable", op: "exists", value: false }],
+    [{ field: "flag", op: "eq", value: true }],
+    [{ field: "group", op: "in", value: [1, 2] }],
+    [{ field: "year", op: "gt", value: 2020 }],
+    [{ field: "year", op: "gte", value: 2021 }],
+    [{ field: "year", op: "lt", value: 2021 }],
+    [{ field: "year", op: "lte", value: 2019 }],
+  ]) {
+    const filters = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Filter)))(
+      Schema.decodeUnknownSync(Schema.Array(Filter))(predicate),
+    );
+    const catalog = Schema.decodeSync(Schema.fromJsonString(TermCatalog))(
+      segment_overview_project(overview, '["same","absent"]', filters),
+    );
+    expect(catalog.minimum).toEqual(
+      Schema.decodeSync(Schema.fromJsonString(EligibleMinimum))(directory.minimum(filters)),
+    );
   }
   directory.free();
   segment.free();
@@ -110,17 +168,24 @@ test("compressed overviews preserve term bounds and exact filter minima across s
 
 test("overview projection validates unrequested values and rejects malformed root fields", () => {
   for (const json of [
-    '{"dictionary":{"unused":{"df":"bad","bounds":[]}},"minimum":null}',
-    '{"dictionary":{"unused":{"df":1,"bounds":[[0,1,0,-1]]}},"minimum":null}',
-    '{"dictionary":{"unused":{"df":1,"bounds":[[0,1,0]]}},"minimum":null}',
-    '{"dictionary":{"unused":{"df":1,"bounds":[[0,1,0,1,0]]}},"minimum":null}',
-    '{"dictionary":{"unused":{"df":1,"bounds":[[0,1,0,4294967296]]}},"minimum":null}',
-    '{"dictionary":{"unused":{"df":1}},"minimum":null}',
-    '{"dictionary":{"unused":{"df":1,"bounds":[],"bounds":[]}},"minimum":null}',
-    '{"dictionary":{},"dictionary":{},"minimum":null}',
-    '{"dictionary":{},"minimum":null,"minimum":null}',
-    '{"dictionary":{},"minimum":null,"unknown":true}',
-    '{"dictionary":{},"minimum":null} trailing',
+    '{"dictionary":{"unused":{"df":"bad","bounds":[]}},"eligibility":[[{},0,0]]}',
+    '{"dictionary":{"unused":{"df":1,"bounds":[[0,1,0,-1]]}},"eligibility":[[{},0,0]]}',
+    '{"dictionary":{"unused":{"df":1,"bounds":[[0,1,0]]}},"eligibility":[[{},0,0]]}',
+    '{"dictionary":{"unused":{"df":1,"bounds":[[0,1,0,1,0]]}},"eligibility":[[{},0,0]]}',
+    '{"dictionary":{"unused":{"df":1,"bounds":[[0,1,0,4294967296]]}},"eligibility":[[{},0,0]]}',
+    '{"dictionary":{"unused":{"df":1}},"eligibility":[[{},0,0]]}',
+    '{"dictionary":{"unused":{"df":1,"bounds":[],"bounds":[]}},"eligibility":[[{},0,0]]}',
+    '{"dictionary":{},"dictionary":{},"eligibility":[[{},0,0]]}',
+    '{"dictionary":{},"eligibility":[[{},0,0]],"eligibility":[[{},0,0]]}',
+    '{"dictionary":{},"eligibility":[["invalid",0,0]]}',
+    '{"dictionary":{},"eligibility":[[[],0,0]]}',
+    '{"dictionary":{},"eligibility":[[{},0,-1]]}',
+    '{"dictionary":{},"eligibility":[[{},0,0,0]]}',
+    '{"dictionary":{},"eligibility":[]}',
+    '{"dictionary":{}}',
+    '{"dictionary":{},"minimum":null,"eligibility":[[{},0,0]]}',
+    '{"dictionary":{},"eligibility":[[{},0,0]],"unknown":true}',
+    '{"dictionary":{},"eligibility":[[{},0,0]]} trailing',
   ]) {
     const data = new TextEncoder().encode(json);
     const compressed = deflateSync(data);
@@ -129,7 +194,7 @@ test("overview projection validates unrequested values and rejects malformed roo
     frame.setUint32(0, data.byteLength, true);
     frame.setUint32(4, crc32(data), true);
     bytes.set(compressed, 8);
-    expect(() => segment_overview_project(bytes, '["wanted"]')).toThrow();
+    expect(() => segment_overview_project(bytes, '["wanted"]', "[]")).toThrow();
   }
 });
 

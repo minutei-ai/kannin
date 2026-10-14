@@ -181,10 +181,12 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
     Effect.gen(function* () {
       const hits = [];
       for (const [index, input] of ranges.entries()) {
-        const identity = `${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}\0${filters}`;
+        const identity = `${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}`;
         const bytes = overviewBuffers.get(identity);
         if (bytes === undefined) continue;
-        const catalog = yield* Effect.try(() => segment_overview_project(bytes, terms)).pipe(
+        const catalog = yield* Effect.try(() =>
+          segment_overview_project(bytes, terms, filters),
+        ).pipe(
           Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(TermCatalog))),
           Effect.orElseSucceed(() => undefined),
         );
@@ -201,14 +203,13 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
         reads.overviewMemoryHits += hits.length;
         return hits.map((hit) => hit.catalog);
       }
-      const cacheKey = new URL("https://overviews.internal/batch-v1");
+      const cacheKey = new URL("https://overviews.internal/batch-v2");
       cacheKey.searchParams.set("bucket", env.STORAGE_CACHE_SCOPE);
       const encodedRanges = yield* Schema.encodeEffect(
         Schema.fromJsonString(TermProjectionProps.fields.ranges),
       )(ranges);
       cacheKey.searchParams.set("ranges", yield* Effect.tryPromise(() => sha256(encodedRanges)));
-      cacheKey.searchParams.set("filters", yield* Effect.tryPromise(() => sha256(filters)));
-      const cache = yield* Effect.tryPromise(() => caches.open("raio-overview-batches-v1")).pipe(
+      const cache = yield* Effect.tryPromise(() => caches.open("raio-overview-batches-v2")).pipe(
         Effect.orElseSucceed(() => undefined),
       );
       if (cache !== undefined) {
@@ -225,7 +226,7 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
             const projected = yield* Effect.forEach(
               candidate,
               (bytes) =>
-                Effect.try(() => segment_overview_project(bytes, terms)).pipe(
+                Effect.try(() => segment_overview_project(bytes, terms, filters)).pipe(
                   Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(TermCatalog))),
                 ),
               { concurrency: 1 },
@@ -239,7 +240,7 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
                     message: "Overview batch added a segment",
                   });
                 rememberOverview(
-                  `${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}\0${filters}`,
+                  `${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}`,
                   bytes,
                 );
               }
@@ -256,7 +257,7 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
       const sources = [];
       const admission = { bytes: 0, enabled: true };
       for (const [index, input] of ranges.entries()) {
-        const identity = `${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}\0${filters}`;
+        const identity = `${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}`;
         const hit = hits.find((entry) => entry.index === index);
         const selected = { bytes: hit?.bytes, catalog: hit?.catalog };
         if (selected.bytes === undefined || selected.catalog === undefined) {
@@ -268,17 +269,24 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
               const minimum = yield* Effect.try(() => directory.minimum(filters)).pipe(
                 Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(EligibleMinimum))),
               );
-              const bytes = yield* Effect.try(() => directory.overview(filters));
+              const bytes = yield* Effect.try(() => directory.overview()).pipe(
+                Effect.orElseSucceed(() => undefined),
+              );
               return { bytes, catalog: { dictionary, minimum } };
             }),
           );
           selected.bytes = projection.bytes;
           selected.catalog = projection.catalog;
-          reads.overviewBuilds += 1;
+          if (projection.bytes !== undefined) reads.overviewBuilds += 1;
         } else reads.overviewMemoryHits += 1;
         const bytes = selected.bytes;
-        rememberOverview(identity, bytes);
         catalogs.push(selected.catalog);
+        if (bytes === undefined) {
+          admission.enabled = false;
+          sources.length = 0;
+          continue;
+        }
+        rememberOverview(identity, bytes);
         admission.bytes += bytes.byteLength;
         if (admission.bytes > 3 * 1024 * 1024) {
           admission.enabled = false;

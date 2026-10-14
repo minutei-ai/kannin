@@ -1054,7 +1054,15 @@ pub mod wasm {
     #[derive(Serialize)]
     struct DirectoryOverview<'a> {
         dictionary: OverviewDictionary<'a>,
-        minimum: Option<(u32, u32)>,
+        eligibility: OverviewEligibility<'a>,
+    }
+
+    struct OverviewEligibility<'a>(BTreeMap<&'a str, (&'a serde_json::value::RawValue, u32, u32)>);
+
+    impl Serialize for OverviewEligibility<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.collect_seq(self.0.values())
+        }
     }
 
     struct SelectedTerms<'a> {
@@ -1127,11 +1135,61 @@ pub mod wasm {
     #[serde(field_identifier, rename_all = "lowercase")]
     enum OverviewField {
         Dictionary,
-        Minimum,
+        Eligibility,
+    }
+
+    struct EligibleGroups<'a>(&'a [Filter]);
+
+    impl<'de> serde::de::DeserializeSeed<'de> for EligibleGroups<'_> {
+        type Value = Option<(u32, u32)>;
+
+        fn deserialize<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_seq(self)
+        }
+    }
+
+    impl<'de> serde::de::Visitor<'de> for EligibleGroups<'_> {
+        type Value = Option<(u32, u32)>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("attribute groups with minimum document lengths")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut minimum = None;
+            let mut present = false;
+            while let Some((attributes, title, body)) =
+                sequence.next_element::<(BTreeMap<String, serde_json::Value>, u32, u32)>()?
+            {
+                present = true;
+                if matches(&attributes, self.0).map_err(serde::de::Error::custom)? {
+                    minimum = Some(match minimum {
+                        Some((minimum_title, minimum_body)) => {
+                            (title.min(minimum_title), body.min(minimum_body))
+                        }
+                        None => (title, body),
+                    });
+                }
+            }
+            if !present {
+                return Err(serde::de::Error::custom("Overview eligibility is empty"));
+            }
+            if self.0.is_empty() {
+                return Ok(Some((0, 0)));
+            }
+            Ok(minimum)
+        }
     }
 
     struct SelectedOverview<'a> {
         requested: &'a BTreeSet<String>,
+        filters: &'a [Filter],
     }
 
     impl<'de> serde::de::DeserializeSeed<'de> for SelectedOverview<'_> {
@@ -1168,18 +1226,18 @@ pub mod wasm {
                             requested: self.requested,
                         })?);
                     }
-                    OverviewField::Minimum => {
+                    OverviewField::Eligibility => {
                         if minimum.is_some() {
-                            return Err(serde::de::Error::duplicate_field("minimum"));
+                            return Err(serde::de::Error::duplicate_field("eligibility"));
                         }
-                        minimum = Some(map.next_value::<Option<(u32, u32)>>()?);
+                        minimum = Some(map.next_value_seed(EligibleGroups(self.filters))?);
                     }
                 }
             }
             Ok(Overview {
                 dictionary: dictionary
                     .ok_or_else(|| serde::de::Error::missing_field("dictionary"))?,
-                minimum: minimum.unwrap_or(None),
+                minimum: minimum.ok_or_else(|| serde::de::Error::missing_field("eligibility"))?,
             })
         }
     }
@@ -1354,16 +1412,25 @@ pub mod wasm {
             serde_json::to_string(&minimum).map_err(|cause| JsValue::from_str(&cause.to_string()))
         }
 
-        #[doc = "# Errors\nRejects invalid filters, attributes, summary serialization or size budgets."]
-        pub fn overview(&self, filters: &str) -> Result<Vec<u8>, JsValue> {
-            let filters: Vec<Filter> = serde_json::from_str(filters)
-                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        #[doc = "# Errors\nRejects summary serialization or size budgets."]
+        pub fn overview(&self) -> Result<Vec<u8>, JsValue> {
+            let mut eligibility = BTreeMap::new();
+            for document in &self.header.documents {
+                let lengths = eligibility
+                    .entry(document.attributes.get())
+                    .or_insert_with(|| {
+                        (
+                            document.attributes.as_ref(),
+                            document.title_length,
+                            document.body_length,
+                        )
+                    });
+                lengths.1 = lengths.1.min(document.title_length);
+                lengths.2 = lengths.2.min(document.body_length);
+            }
             let overview = DirectoryOverview {
                 dictionary: OverviewDictionary(&self.header.terms),
-                minimum: self
-                    .header
-                    .eligible_minimum(&filters)
-                    .map_err(|cause| JsValue::from_str(&cause))?,
+                eligibility: OverviewEligibility(eligibility),
             };
             let json = serde_json::to_vec(&overview)
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
@@ -1455,7 +1522,11 @@ pub mod wasm {
 
     #[wasm_bindgen]
     #[doc = "# Errors\nRejects corrupt overview framing, invalid terms, or projection serialization."]
-    pub fn segment_overview_project(bytes: &[u8], terms: &str) -> Result<String, JsValue> {
+    pub fn segment_overview_project(
+        bytes: &[u8],
+        terms: &str,
+        filters: &str,
+    ) -> Result<String, JsValue> {
         use serde::de::DeserializeSeed;
 
         let terms: Vec<String> =
@@ -1464,10 +1535,16 @@ pub mod wasm {
             return Err(JsValue::from_str("Overview projection exceeds 64 terms"));
         }
         let requested = terms.into_iter().collect();
+        let filters: Vec<Filter> =
+            serde_json::from_str(filters).map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        if filters.len() > 16 {
+            return Err(JsValue::from_str("Overview projection exceeds 16 filters"));
+        }
         let decoded = decode_page(bytes).map_err(|cause| JsValue::from_str(&cause))?;
         let mut deserializer = serde_json::Deserializer::from_slice(&decoded);
         let projected = SelectedOverview {
             requested: &requested,
+            filters: &filters,
         }
         .deserialize(&mut deserializer)
         .map_err(|cause| JsValue::from_str(&cause.to_string()))?;

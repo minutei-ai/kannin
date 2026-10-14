@@ -153,7 +153,7 @@ test("term projection batches preserve global frequencies and filter eligibility
   expect(after.termReads - acquired.termReads).toBe(33);
 });
 
-test("compressed overviews serve new selectors from memory and Cache API after process eviction", async () => {
+test("compressed overviews serve new selectors and filters after process eviction", async () => {
   const namespace = "overview-selectors";
   for (const index of Array.from({ length: 17 }, (_, ordinal) => ordinal))
     await request(
@@ -169,7 +169,12 @@ test("compressed overviews serve new selectors from memory and Cache API after p
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
   const second = Schema.decodeUnknownSync(QueryResult)(
-    await (await request(worker, namespace, "query", textQuery("beta gamma"))).json(),
+    await (
+      await request(worker, namespace, "query", {
+        ...textQuery("beta gamma"),
+        filters: [{ field: "missing", op: "exists", value: false }],
+      })
+    ).json(),
   );
   expect(second.rows).toEqual(first.rows);
   const memory = Schema.decodeUnknownSync(Health)(
@@ -180,7 +185,12 @@ test("compressed overviews serve new selectors from memory and Cache API after p
   expect(memory.overviewCacheBytes).toBeLessThanOrEqual(4 * 1024 * 1024);
   await request(worker, namespace, "rebuild", {});
   const third = Schema.decodeUnknownSync(QueryResult)(
-    await (await request(worker, namespace, "query", textQuery("gamma alpha"))).json(),
+    await (
+      await request(worker, namespace, "query", {
+        ...textQuery("gamma alpha"),
+        filters: [{ field: "missing", op: "ne", value: "anything" }],
+      })
+    ).json(),
   );
   expect(third.rows).toEqual(first.rows);
   const shared = Schema.decodeUnknownSync(Health)(
@@ -201,14 +211,13 @@ test("corrupted compressed overview cache falls back to verified immutable sourc
   const manifest = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
   const segment = manifest.segments[0];
   if (segment === undefined) throw new Error("Missing segment");
-  const cache = await (await worker.getCaches()).open("raio-overview-batches-v1");
-  const key = new URL("https://overviews.internal/batch-v1");
+  const cache = await (await worker.getCaches()).open("raio-overview-batches-v2");
+  const key = new URL("https://overviews.internal/batch-v2");
   key.searchParams.set("bucket", "raio-test");
   const ranges = Schema.encodeSync(Schema.fromJsonString(TermProjectionProps.fields.ranges))([
     { key: segment.key, headerBytes: segment.headerBytes },
   ]);
   key.searchParams.set("ranges", createHash("sha256").update(ranges).digest("hex"));
-  key.searchParams.set("filters", createHash("sha256").update("[]").digest("hex"));
   await cache.put(
     key,
     new Response('["AA=="]', {

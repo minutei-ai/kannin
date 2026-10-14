@@ -666,3 +666,35 @@ Native fresh-selector/filter diagnostics reused the unchanged million-document, 
 All first-run observations improved; the second filtered observation regressed. Uncontrolled cache/isolate/network state prevents causal general latency attribution.
 
 All 96 native mixed-load edge responses retained exact strong rows/scores and the acknowledged sequence. Concurrency 1/4/16 measured p50 68.94/66.61/152.74 ms, p95 510.22/348.31/1,036.17 ms and throughput 7.25/34.20/28.28 requests/s. Relative to the preceding latest group/snapshot-publication run, concurrency-four tails and throughput improved, while concurrency-one tails and concurrency-sixteen tails regressed. The README reports this latest complete load. Native cold reliability, peak memory and fully indexed Turbopuffer parity remain open.
+
+## Rejected Terms tier bypass
+
+The `7f6d00c` runtime was tested with the Alchemy per-entrypoint `Terms.cache.enabled` override temporarily set false. `Segments` retained native Workers Cache, and Terms retained its local LRU and Cache API projections/overviews. The full local gate passed 116 Worker/tooling and 18 Rust tests, but the resolved Alchemy provider explicitly does not emulate Workers Cache in local dev, so the decision relied on native measurements. The experimental setting was not committed and was restored to true; the final source and deployment retain the original configuration.
+
+Cloudflare documents that disabling an entrypoint skips its native cache lookup and preserves previously cached responses for reuse if it is enabled again. This made the setting reversible without purging immutable data. The tier-latency hypothesis was an inference to test, not proof that this workload would benefit. See [Workers Cache configuration](https://developers.cloudflare.com/workers/cache/configuration/).
+
+The same million-document corpus and fresh-selector/always-true-year diagnostic were used before, twice while disabled, and after restoration. Each response matched strong rows/scores and saved prior responses. Cache and isolate state were uncontrolled across deployments.
+
+| Query     | Enabled before ms | Disabled first ms | Disabled second ms | Enabled restored ms |
+| --------- | ----------------: | ----------------: | -----------------: | ------------------: |
+| Selective |            687.36 |           2671.73 |            2498.86 |             2222.02 |
+| Common    |           1052.28 |           1883.89 |            1783.82 |             1046.00 |
+| Filtered  |           1042.67 |           1328.61 |            1666.78 |              770.64 |
+
+All disabled observations regressed versus the initial enabled run. All restored observations improved versus both disabled runs, although the restored selective case remained much slower than the initial baseline. These observations do not isolate a universal causal gain, but provide no reason to retain the bypass.
+
+Three mixed loads completed, each with 32 requests per concurrency phase and exact strong-baseline rows/scores plus acknowledged sequence checks. All 288 edge responses passed.
+
+| Configuration    | Concurrency | p50 ms |  p95 ms | Requests/s |
+| ---------------- | ----------: | -----: | ------: | ---------: |
+| Enabled before   |           1 |  85.15 |  139.00 |       9.62 |
+| Enabled before   |           4 |  93.58 |  752.43 |      19.38 |
+| Enabled before   |          16 | 176.23 |  847.98 |      24.09 |
+| Disabled         |           1 |  64.15 |  584.62 |       6.29 |
+| Disabled         |           4 |  72.92 |  628.28 |      17.40 |
+| Disabled         |          16 | 166.64 | 1065.86 |      22.67 |
+| Enabled restored |           1 | 101.04 | 1183.56 |       3.67 |
+| Enabled restored |           4 |  95.41 |  764.86 |      16.61 |
+| Enabled restored |          16 | 149.87 |  877.11 |      25.76 |
+
+The restored concurrency-sixteen median and throughput improved, but concurrency-one and four throughput regressed. The README reports the latest restored run. The experiment did not produce a consistent whole-workload benefit, so no application change was retained. Native first-use reliability, peak memory and fully indexed Turbopuffer parity remain open.

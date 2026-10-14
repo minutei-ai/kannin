@@ -11,13 +11,13 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 **1,000,000 documents · deployed Cloudflare · client in Brazil · edge reads with acknowledged sequence barrier**
 
-| Concurrency | p50 ms | p95 ms | Requests/s |
-| ----------: | -----: | -----: | ---------: |
-|           1 |  60.09 | 526.21 |       7.93 |
-|           4 |  63.13 | 432.11 |      25.82 |
-|          16 | 110.42 | 806.83 |      26.62 |
+| Concurrency | p50 ms |  p95 ms | Requests/s |
+| ----------: | -----: | ------: | ---------: |
+|           1 | 101.04 | 1183.56 |       3.67 |
+|           4 |  95.41 |  764.86 |      16.61 |
+|          16 | 149.87 |  877.11 |      25.76 |
 
-Runtime `7f6d00c`; 32 mixed queries per phase. All 96 edge responses matched strong rows and scores. Reusable attribute groups retain only required fields for narrow filters, validating all discarded values; wider filters use native full-map decoding. New selector/filter observations took **0.84–1.83 s**, with a filtered-case regression in the second round. Cache/isolate/network state limits attribution. An earlier load failed the snapshot freshness guard; subsequent loads passed after Cache API publication moved off the read critical path. First-use reliability and general performance parity remain unverified.
+Runtime `7f6d00c`; latest 32-request phase measurements after restoring native Workers Cache for `Terms`. All 96 edge responses matched strong rows and scores. Disabling that tier regressed new-selector diagnostics and was rejected; the restored observations took **0.77–2.22 s**. Reusable overviews preserve exact filter minima and validate discarded attributes. Cache/isolate/network state limits attribution, and mixed-load tails remain variable. An earlier snapshot freshness failure remains recorded; later passing runs do not establish general first-use reliability or Turbopuffer parity.
 
 The local million-document workload measured strong common/filtered p50 of **127/126 ms** across 2,000 uncompacted segments. These emulator results exclude native network latency. Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10** across 300 queries. Eight native vector/hybrid fixture cases also retained exact rows and scores.
 

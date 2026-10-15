@@ -935,8 +935,8 @@ impl<'a, T: PostingRow> PostingCursors<'a, T> {
 
 pub struct Search {
     pub header: Rc<Header>,
-    pub statistics: Statistics,
-    pub words: Vec<String>,
+    pub statistics: Rc<Statistics>,
+    pub words: Rc<Vec<String>>,
     pub mode: String,
     pub top_k: usize,
     pub allowed: Vec<bool>,
@@ -1162,13 +1162,21 @@ impl Search {
             .map(str::to_owned)
             .collect();
         validate_search_budget(&words, mode, top_k)?;
-        Self::with_words(header, statistics, words, mode, top_k, dead, filters)
+        Self::with_words(
+            header,
+            Rc::new(statistics),
+            Rc::new(words),
+            mode,
+            top_k,
+            dead,
+            filters,
+        )
     }
 
     fn with_words(
         header: Rc<Header>,
-        statistics: Statistics,
-        words: Vec<String>,
+        statistics: Rc<Statistics>,
+        words: Rc<Vec<String>>,
         mode: &str,
         top_k: usize,
         dead: &[u32],
@@ -2247,12 +2255,12 @@ pub mod wasm {
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
             let search = Search::with_words(
                 self.header.clone(),
-                query.input.statistics.clone(),
+                query.statistics.clone(),
                 query.words.clone(),
-                &query.input.mode,
-                query.input.top_k,
+                &query.mode,
+                query.top_k,
                 &dead,
-                &query.input.filters,
+                &query.filters,
             )
             .map_err(|cause| JsValue::from_str(&cause))?;
             Ok(Ranker { search })
@@ -2449,8 +2457,11 @@ pub mod wasm {
 
     #[wasm_bindgen]
     pub struct PreparedQuery {
-        input: Input,
-        words: Vec<String>,
+        statistics: Rc<Statistics>,
+        words: Rc<Vec<String>>,
+        mode: String,
+        top_k: usize,
+        filters: Vec<Filter>,
     }
 
     #[wasm_bindgen]
@@ -2471,7 +2482,13 @@ pub mod wasm {
                 .collect::<Vec<_>>();
             validate_search_budget(&words, &input.mode, input.top_k)
                 .map_err(|cause| JsValue::from_str(&cause))?;
-            Ok(Self { input, words })
+            Ok(Self {
+                statistics: Rc::new(input.statistics),
+                words: Rc::new(words),
+                mode: input.mode,
+                top_k: input.top_k,
+                filters: input.filters,
+            })
         }
     }
 

@@ -11,13 +11,13 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 **1,000,000 documents · deployed Cloudflare · client in Brazil · edge reads with acknowledged sequence barrier**
 
-| Concurrency | p50 ms |  p95 ms | Requests/s |
-| ----------: | -----: | ------: | ---------: |
-|           1 |  61.63 |  188.82 |      13.23 |
-|           4 |  68.48 |  448.31 |      23.03 |
-|          16 |  76.07 | 1466.11 |      19.99 |
+| Concurrency | p50 ms | p95 ms | Requests/s |
+| ----------: | -----: | -----: | ---------: |
+|           1 |  50.70 |  69.57 |      17.06 |
+|           4 |  54.89 | 389.72 |      33.48 |
+|          16 |  68.07 | 550.12 |      57.48 |
 
-Each 32-request phase covers rare, selective, common and filtered text queries; all **96 responses** matched strong rows/scores and sequence. Page pruning reduced native common-query acquisition from **178 to 22 blocks** and filtered acquisition from **188 to 41 blocks**, including cache hits. Native placement, cache state and network conditions vary; uniform latency gains, peak memory and general Turbopuffer parity remain unverified.
+Each 128-request phase covers rare, selective, common and filtered text queries; all **384 responses** matched strong rows/scores and sequence. Page pruning reduced native common-query acquisition from **178 to 22 blocks** and filtered acquisition from **188 to 41 blocks**, including cache hits. Native placement, cache state and network conditions vary; uniform latency gains, peak memory and general Turbopuffer parity remain unverified.
 
 The local million-document workload measured strong common/filtered p50 of **127/126 ms** across 2,000 uncompacted segments. These emulator results exclude native network latency. The repeated independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10** across 300 queries. Eight native vector/hybrid fixture cases also retained exact rows and scores.
 

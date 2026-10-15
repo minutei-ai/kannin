@@ -1830,3 +1830,53 @@ The complete local gate passed 34 Rust and 148 Bun/workerd tests with 2,565 Bun 
 |          16 |  78.51 | 992.01 |      50.74 |                 27 |                     2 |
 
 The first foreground R2 acquisition reported 169 ms until the response and 25 ms for body consumption/validation/framing, preceded by 13 ms in cache acquisition. Concurrency sixteen had two R2 timing observations, each reporting 166 ms acquisition and 53 ms body preparation; shared operations can return the same timings to multiple callers, so these are not two proven distinct origin reads. Most foreground cache acquisitions returned without a subsequent R2 result. At concurrency sixteen, cache acquisition reached 432 ms and directory/ranker preparation reached 532 ms. These intervals include asynchronous waiting and scheduling and do not isolate Rust CPU. This narrows the next investigation to cold snapshot/directory acquisition and ranker preparation; it does not attribute all tail latency to R2. Client/network effects remain material: the slowest response took 1,492 ms while its reported gateway interval was 462 ms.
+
+### Shared immutable prepared-query data
+
+Prepared queries already avoided reparsing common input for each segment, but every ranker still deep-cloned normalized words and the live frequency map. Rust rankers now retain `Rc` references to immutable words/statistics. The plan releases its original text and validated empty shared tombstone vector after construction. Filters still create segment-local eligibility masks, tombstones still apply to query-local copies, and posting lists remain private. Releasing a plan before its rankers remains valid; the existing cross-segment any/all/phrase regression explicitly exercises that lifetime. Persisted formats, query limits, scoring arithmetic and cache budgets are unchanged.
+
+Two alternating WASM comparisons measured creation/release of 64 rankers per prepared query over identical 128-document directories. Each case used six excluded warmup pairs and 28 measured pairs. Short queries have two normalized terms; long queries have 64 terms with long Unicode input. Filters select alternating groups; tombstones alternate independently. Plan construction/release is included, while directory parsing, posting acquisition and scoring are outside the timed interval. Each run separately compared complete selected spans and final rows/scores for three tombstone states in all twelve cases. These microsecond measurements do not establish end-to-end gains.
+
+| Query | Mode   | Filtered | First before/after µs | Repeated before/after µs |
+| :---- | :----- | :------- | --------------------: | -----------------------: |
+| short | any    | false    |           2.45 / 1.90 |              2.10 / 1.63 |
+| short | any    | true     |           2.52 / 2.02 |              2.07 / 1.90 |
+| short | all    | false    |           1.66 / 1.38 |              1.29 / 1.04 |
+| short | all    | true     |           2.64 / 2.27 |              1.40 / 1.19 |
+| short | phrase | false    |           1.49 / 1.11 |              1.15 / 0.89 |
+| short | phrase | true     |           1.73 / 1.32 |              1.36 / 1.08 |
+| long  | any    | false    |          13.93 / 5.27 |             11.25 / 4.15 |
+| long  | any    | true     |          14.14 / 5.22 |             11.54 / 4.35 |
+| long  | all    | false    |          11.30 / 4.00 |             11.29 / 3.93 |
+| long  | all    | true     |          11.52 / 4.31 |             13.85 / 5.04 |
+| long  | phrase | false    |          12.42 / 4.21 |             13.60 / 4.82 |
+| long  | phrase | true     |          13.39 / 4.79 |             13.88 / 5.13 |
+
+The repeated preparation reductions ranged from 8–23% for short queries and 62–65% for long queries. The absolute saving is small per segment and does not remove cold snapshot or directory I/O. WASM decreased from 704,730 to 704,098 bytes.
+
+Two workerd comparisons used 32 segments and top-k 100 so both short and long cases scored every segment. Twelve alternating pairs of five queries excluded three warmup pairs per case; the repeat reversed worker creation order. All 480 complete responses retained identical rows and scores.
+
+| Query | First before/after ms | Repeated before/after ms |
+| :---- | --------------------: | -----------------------: |
+| short |         17.08 / 18.62 |            18.61 / 16.24 |
+| long  |         91.74 / 83.82 |            85.56 / 84.53 |
+
+The short case regressed 9.0% initially and improved 12.7% on repetition; the long case improved 8.6% initially and 1.2% on repetition. The full path does not repeat the large percentage seen in isolated preparation. Sharing eliminates per-ranker deep copies, but these measurements do not establish a uniform end-to-end improvement. The full gate passed 34 Rust and 148 Bun/workerd tests (182 total), with 2,565 Bun assertions, strict TypeScript/Effect/tsgo and native/WASM Clippy.
+
+The 5,183-document, 300-query SciFact report remained byte-identical to the reference (SHA-256 `9dbe36ba7a85f61312f089c631c4b0dc134e6e876796921ae8206e270415cb28`). No ranking-quality change was observed.
+
+Alchemy production deployment and the unconditional metadata migration completed successfully. Native before/after/repeated-after runs used 128 requests at each concurrency in the unchanged million-document, 200-segment corpus. All 1,152 edge responses matched strong rows/scores and acknowledged sequence 2,000. Common/filtered page acquisition remained 22/41 blocks and 731/2,090 compressed bytes.
+
+| Phase          | Concurrency | p50 ms | p95 ms | Requests/s |
+| :------------- | ----------: | -----: | -----: | ---------: |
+| Before         |           1 |  71.75 | 154.18 |      10.07 |
+| Before         |           4 |  63.66 | 241.67 |      34.55 |
+| Before         |          16 |  78.53 | 452.54 |      74.43 |
+| After          |           1 |  52.87 | 182.91 |      11.49 |
+| After          |           4 |  61.28 | 226.43 |      34.29 |
+| After          |          16 |  66.59 | 863.88 |      62.35 |
+| Repeated after |           1 |  50.70 |  69.57 |      17.06 |
+| Repeated after |           4 |  54.89 | 389.72 |      33.48 |
+| Repeated after |          16 |  68.07 | 550.12 |      57.48 |
+
+Repeated medians improved relative to the before run, while concurrency-four/sixteen p95 and throughput worsened. Cache/isolate/network placement was uncontrolled; the before run also overlapped a separate local SciFact process on the client host. These are operational observations, not proof that the Rust change caused a native latency improvement. The repeated preparation microbenchmark demonstrates the scoped gain. Stable native tails, actual peak Worker heap and fully indexed Turbopuffer parity remain outstanding. The README reports the latest 128-request repeated phases.

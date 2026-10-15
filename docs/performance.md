@@ -2576,3 +2576,24 @@ The three any-mode samples were approximately unchanged, 15.9% faster and 7.0% s
 Two isolated standard loads each preserved all 384 comparisons against strong baselines. The first measured concurrency 1/4/16 p50 56.50/54.45/76.29 ms, p95 137.53/192.32/813.21 ms and throughput 12.01/36.14/46.02 requests/s. The repeat measured p50 52.14/64.55/74.58 ms, p95 93.59/182.14/674.28 ms and throughput 16.04/33.44/62.88 requests/s. Compared with the preceding implementation's 81.97/156.30/905.33 ms p95, these remain mixed rather than a general speedup.
 
 Sequential edge warmups for group 77 and the first phrase returned exact references in 13,753.16/10,469.89 ms. The following mixed sixteen-request burst preserved every reference and measured p50/p95/max 1,375.46/1,573.48/1,607.44 ms with 9.94 requests/s. No HTTP error occurred in these runs. The Alchemy deployment and unconditional 30-namespace/398-submission vector migration completed, and the active Worker version was verified through the native API. Vectorize visibility, peak memory, fully cold reliability and general Turbopuffer parity remain separate unverified requirements.
+
+## Correlated length bounds on immutable segments
+
+Runtime `35990b31-99a0-4873-a2a7-2dd0f6398a0f` adds shared document-length partitions to disposable score summaries. Independent term maxima can combine frequencies and lengths from different documents. Taking the maximum of the summed bounds within shared partitions removes that slack while retaining the original scorer, live statistics, filters and tie order. Canonical segment bytes remain unchanged.
+
+A sequential native before/after comparison retained one million documents, 200 segments and sequence 2000. Each selection used a neutral missing-field predicate to create a new plan, preceded by an alternate-match-mode warmup. Every measured plan missed the completed-plan cache. Three eight-token any queries selected groups 80–82; three five-token phrases rotated `storage latency durable object`. All complete rows, revisions and scores matched their pre-change references.
+
+| Selection     | Before ms | After ms | Ranked segments before/after |
+| :------------ | --------: | -------: | ---------------------------: |
+| Any, group 80 |   7464.16 |   343.40 |                      200 / 3 |
+| Phrase 1      |   7306.84 |   288.27 |                      200 / 3 |
+| Any, group 81 |   7020.63 |  1876.52 |                      200 / 3 |
+| Phrase 2      |   6169.05 |  2061.57 |                      200 / 3 |
+| Any, group 82 |   7614.96 |  1238.48 |                      200 / 3 |
+| Phrase 3      |   7389.91 |  1584.71 |                      200 / 3 |
+
+These are new plans after priming immutable inputs, not isolated cold processes. The first alternate-mode warmup changed 10.31→5.10 seconds; its post-change directory interval alone was 4.21 seconds. The 200 R2 summaries were explicitly prepared and read back before deployment, occupying 3,860,042 compressed bytes and 5,191,921 bytes including envelopes. Their preparation preserved the canonical manifest byte for byte. New writes and compaction attempt to prepare summaries automatically; missing or unavailable summaries retain canonical fallback.
+
+An expanded prototype regressed a paired local 1,000-document SciFact sample from median 125.79→217.91 ms across 24 queries. It was not deployed. Admission now limits partition entries relative to vocabulary size and omits singleton entries, retaining their ordinary bound in every partition. The retained version preserved every complete response in another alternating 24-query comparison, with medians 103.69/98.52 ms. Cache preparation ran concurrently with that local comparison; it is a regression check, not an isolated CPU speedup claim. The final complete 300-query SciFact report equals the prior report. The full gate passed 187 Worker/tooling and 38 Rust tests, including conservative coarsening, singleton terms, corruption, cache loss, source identity, and WASM range overflow.
+
+Two subsequent 384-request native edge runs matched their strong baselines without errors. Concurrency 1/4/16 first-run p50 was 56.98/56.45/68.14 ms, p95 308.26/121.61/985.09 ms and throughput 3.45/42.36/47.23 requests/s. The first concurrency-one phase included a 12.07-second request with an 11.59-second directory interval. The repeat measured p50 49.42/60.11/66.35 ms, p95 91.63/128.85/764.23 ms and throughput 16.59/37.21/63.71 requests/s. Sequential warming and network/placement variation limit timing attribution. Cold catalogs, snapshot acquisition, concurrency tails, native vector visibility/recall, peak memory and a fully indexed Turbopuffer comparison remain open.

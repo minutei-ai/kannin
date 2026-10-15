@@ -114,6 +114,7 @@ test("compressed overviews preserve term bounds and exact filter minima across s
           segment_overview_project(overview, encodedTerms, encodedFilters),
         ),
       ).toEqual({
+        partitions: null,
         dictionary: Schema.decodeSync(Schema.fromJsonString(TermSummaries))(
           directory.summary(encodedTerms),
         ),
@@ -332,9 +333,9 @@ test("WASM term bounds preserve order, empty eligibility and batch limits", () =
     segment_term_bounds(
       statistics,
       JSON.stringify([
-        { dictionary, minimum: [0, 0] },
-        { dictionary, minimum: null },
-        { dictionary, minimum: [1, 10] },
+        { dictionary, partitions: null, minimum: [0, 0] },
+        { dictionary, partitions: null, minimum: null },
+        { dictionary, partitions: null, minimum: [1, 10] },
       ]),
     ),
   );
@@ -344,7 +345,9 @@ test("WASM term bounds preserve order, empty eligibility and batch limits", () =
   expect(() =>
     segment_term_bounds(
       statistics,
-      JSON.stringify(Array.from({ length: 65 }, () => ({ dictionary, minimum: null }))),
+      JSON.stringify(
+        Array.from({ length: 65 }, () => ({ dictionary, partitions: null, minimum: null })),
+      ),
     ),
   ).toThrow("Term bound batch exceeds segment budget");
 });
@@ -364,10 +367,10 @@ test("WASM catalog bounds retain global frequencies and filtered length clamps",
     ["alpha", "beta", "gamma", "missing"].map((term) => [term, { df: 10, bounds }]),
   );
   const catalogs = JSON.stringify([
-    { dictionary, minimum: [0, 0] },
-    { dictionary, minimum: [10, 100] },
-    { dictionary, minimum: null },
-    { dictionary: { missing: { df: 10, bounds } }, minimum: [0, 0] },
+    { dictionary, partitions: null, minimum: [0, 0] },
+    { dictionary, partitions: null, minimum: [10, 100] },
+    { dictionary, partitions: null, minimum: null },
+    { dictionary: { missing: { df: 10, bounds } }, partitions: null, minimum: [0, 0] },
   ]);
   expect(Array.from(segment_term_bounds(JSON.stringify(statistics), catalogs))).toEqual([
     4.708590140129787, 2.138753190125021, 0, 0,
@@ -968,8 +971,8 @@ test("compact term envelopes preserve full-block maxima and filter minima exactl
         segment_term_bounds(
           statistics,
           JSON.stringify([
-            { dictionary: full, minimum },
-            { dictionary: compact, minimum },
+            { dictionary: full, minimum, partitions: null },
+            { dictionary: compact, minimum, partitions: null },
           ]),
         ),
       );

@@ -77,6 +77,7 @@ import {
   addFrequencyPosting,
   readTermProjections,
   buildSegment,
+  storeCorrelatedOverview,
   bloom,
   bloomCandidates,
   readDocument,
@@ -185,7 +186,7 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
     if (
       request.method !== "GET" ||
       props._tag === "Failure" ||
-      url.pathname !== "/catalog-v5" ||
+      url.pathname !== "/catalog-v6" ||
       props.value.bucket !== this.env.STORAGE_CACHE_SCOPE
     )
       return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });
@@ -207,7 +208,7 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
       await sha256(`${encodedTerms}\0${this.ctx.props.filters}`),
     );
     const cache = await Effect.runPromise(
-      Effect.tryPromise(() => caches.open("raio-terms-v5")).pipe(
+      Effect.tryPromise(() => caches.open("raio-terms-v6")).pipe(
         Effect.orElseSucceed(() => undefined),
       ),
     );
@@ -470,7 +471,7 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
       const projection = projections[index];
       if (projection === undefined)
         throw new Rejected({ status: 503, message: "Term projection batch omitted a segment" });
-      return { segment, dictionary: projection.dictionary, minimum: projection.minimum };
+      return { segment, ...projection };
     });
     const frequencies = new Map<string, number>();
     for (const { segment, dictionary } of catalog) {
@@ -497,7 +498,11 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
     )) {
       const window = catalog.slice(offset, offset + 64);
       const encoded = Schema.encodeSync(Schema.fromJsonString(Schema.Array(TermCatalog)))(
-        window.map((entry) => ({ dictionary: entry.dictionary, minimum: entry.minimum })),
+        window.map((entry) => ({
+          dictionary: entry.dictionary,
+          minimum: entry.minimum,
+          partitions: entry.partitions,
+        })),
       );
       const bounds = Schema.decodeSync(Schema.Array(Schema.Finite))(
         Array.from(segment_term_bounds(encodedStatistics, encoded)),
@@ -1415,9 +1420,14 @@ export class SearchNamespace extends DurableObject<Env> {
         buildSegment(input.upserts.map((document) => ({ ...document, revision: sequence }))),
       );
       const key = `${this.prefix}/segments/${sequence}-${fingerprint}.rsix`;
-      writes.push(() => this.env.STORAGE.put(key, built.bytes));
       const headerBytes =
         16 + new DataView(built.bytes.buffer, built.bytes.byteOffset).getUint32(8, true);
+      writes.push(async () => {
+        const stored = await this.env.STORAGE.put(key, built.bytes);
+        if (stored !== null)
+          await Effect.runPromise(storeCorrelatedOverview(key, headerBytes, built.bytes));
+        return stored;
+      });
       segments.push({
         key,
         sequence,
@@ -1819,6 +1829,13 @@ export class SearchNamespace extends DurableObject<Env> {
       const stored = await this.env.STORAGE.put(key, built.bytes);
       if (stored === null)
         throw new Rejected({ status: 503, message: "Compacted R2 segment write failed" });
+      await Effect.runPromise(
+        storeCorrelatedOverview(
+          key,
+          16 + new DataView(built.bytes.buffer, built.bytes.byteOffset).getUint32(8, true),
+          built.bytes,
+        ),
+      );
       retained.push({
         key,
         sequence: current.manifest.sequence,

@@ -230,6 +230,9 @@ export const CacheMetrics = Schema.Struct({
   overviewCacheApiHits: Schema.Int,
   overviewCacheApiLookups: Schema.Int,
   overviewBuilds: Schema.Int,
+  correlatedReads: Schema.Int,
+  correlatedHits: Schema.Int,
+  correlatedBytes: Schema.Int,
   termReads: Schema.Int,
   termRequests: Schema.Int,
   termBytes: Schema.Int,
@@ -321,7 +324,14 @@ export const TermSummary = Schema.Struct({
   ),
 });
 export const TermSummaries = Schema.Record(Schema.String, TermSummary);
-export const TermCatalog = Schema.Struct({ dictionary: TermSummaries, minimum: EligibleMinimum });
+export const TermProjection = Schema.Struct({
+  dictionary: TermSummaries,
+  partitions: Schema.NullOr(Schema.Array(TermSummaries).check(Schema.isBetweenLength(1, 32))),
+});
+export const TermCatalog = TermProjection.mapFields((fields) => ({
+  ...fields,
+  minimum: EligibleMinimum,
+}));
 export const TermCatalogBatch = Schema.Array(TermCatalog).check(Schema.isBetweenLength(1, 16));
 export const OverviewBatch = Schema.Array(Schema.Uint8ArrayFromBase64)
   .check(Schema.isBetweenLength(1, 16))
@@ -407,6 +417,15 @@ export const SegmentRange = Schema.Struct({
 export const TermProjectionRange = Schema.Struct({
   key: SegmentRange.fields.key,
   headerBytes: SegmentRange.fields.length,
+});
+export const CorrelatedOverview = Schema.Struct({
+  bucket: Schema.String,
+  source: TermProjectionRange,
+  overview: Schema.Uint8ArrayFromBase64.check(
+    Schema.makeFilter(
+      (bytes) => bytes.byteLength <= 1024 * 1024 || "Correlated overview exceeds one MiB",
+    ),
+  ),
 });
 export const TermProjectionProps = Schema.Struct({
   bucket: Schema.String.check(Schema.isBetweenLength(1, 63)),

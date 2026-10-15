@@ -8,7 +8,15 @@ import { join } from "node:path";
 
 import { VectorFilterFields } from "./src/protocol";
 
-export const Bucket = Cloudflare.R2.Bucket("Storage");
+export const Bucket = Cloudflare.R2.Bucket("Storage", {
+  lifecycleRules: [
+    {
+      id: "expire-correlated-cache",
+      prefix: "cache/correlated-",
+      deleteObjectsTransition: { condition: { type: "Age", maxAge: 60 * 60 * 24 * 30 } },
+    },
+  ],
+});
 export const Vectors = Cloudflare.Vectorize.Index("Vectors", { dimensions: 768, metric: "cosine" });
 const EqualityIndexes = Array.from({ length: 5 }, (_, index) =>
   Cloudflare.Vectorize.MetadataIndex(

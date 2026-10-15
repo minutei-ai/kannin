@@ -40,6 +40,9 @@ test("shared tightened plans survive fresh workerd instances and reject corrupt 
         )
       ).status,
     ).toBe(200);
+  const bucket = await active.worker.getR2Bucket("STORAGE");
+  const derived = await bucket.list({ prefix: `cache/correlated-v2/namespaces/${namespace}/` });
+  await bucket.delete(derived.objects.map((object) => object.key));
   const query = textQuery("alpha beta gamma delta", 3);
   const first = await request(active.worker, namespace, "query", query);
   const expected = Schema.decodeUnknownSync(QueryResult)(await first.json());

@@ -1809,6 +1809,7 @@ pub mod wasm {
     struct Overview {
         dictionary: BTreeMap<String, TermSummary>,
         minimum: Option<(u32, u32)>,
+        partitions: Option<Vec<BTreeMap<String, TermSummary>>>,
     }
 
     struct OverviewBounds<'a>(&'a [BlockMeta]);
@@ -1845,6 +1846,7 @@ pub mod wasm {
     struct DirectoryOverview<'a> {
         dictionary: OverviewDictionary<'a>,
         eligibility: OverviewEligibility<'a>,
+        partitions: Option<Vec<BTreeMap<String, TermSummary>>>,
     }
 
     struct OverviewEligibility<'a>(BTreeMap<&'a str, (&'a serde_json::value::RawValue, u32, u32)>);
@@ -1857,6 +1859,31 @@ pub mod wasm {
 
     struct SelectedTerms<'a> {
         requested: &'a BTreeSet<String>,
+    }
+
+    struct SelectedTerm<'a>(&'a BTreeSet<String>);
+
+    impl<'de> serde::de::DeserializeSeed<'de> for SelectedTerm<'_> {
+        type Value = Option<String>;
+
+        fn deserialize<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_str(self)
+        }
+    }
+
+    impl serde::de::Visitor<'_> for SelectedTerm<'_> {
+        type Value = Option<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a term dictionary key")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, term: &str) -> Result<Self::Value, E> {
+            Ok(self.0.get(term).cloned())
+        }
     }
 
     struct DiscardedBounds;
@@ -1909,8 +1936,8 @@ pub mod wasm {
             mut map: A,
         ) -> Result<Self::Value, A::Error> {
             let mut selected = BTreeMap::new();
-            while let Some(term) = map.next_key::<String>()? {
-                if self.requested.contains(&term) {
+            while let Some(term) = map.next_key_seed(SelectedTerm(self.requested))? {
+                if let Some(term) = term {
                     let summary = map.next_value::<TermSummary>()?;
                     selected.insert(term, summary);
                 } else {
@@ -1926,6 +1953,7 @@ pub mod wasm {
     enum OverviewField {
         Dictionary,
         Eligibility,
+        Partitions,
     }
 
     struct SelectedGroup<'a>(&'a BTreeSet<&'a str>);
@@ -2050,6 +2078,7 @@ pub mod wasm {
         ) -> Result<Self::Value, A::Error> {
             let mut dictionary = None;
             let mut minimum = None;
+            let mut partitions = None;
             while let Some(field) = map.next_key::<OverviewField>()? {
                 match field {
                     OverviewField::Dictionary => {
@@ -2059,6 +2088,38 @@ pub mod wasm {
                         dictionary = Some(map.next_value_seed(SelectedTerms {
                             requested: self.requested,
                         })?);
+                    }
+                    OverviewField::Partitions => {
+                        if partitions.is_some() {
+                            return Err(serde::de::Error::duplicate_field("partitions"));
+                        }
+                        let raw: Option<Vec<&serde_json::value::RawValue>> = map.next_value()?;
+                        let selected = raw
+                            .map(|groups| {
+                                if groups.is_empty() || groups.len() > 32 {
+                                    return Err(serde::de::Error::custom(
+                                        "Invalid overview partitions",
+                                    ));
+                                }
+                                groups
+                                    .into_iter()
+                                    .map(|group| {
+                                        let mut decoder =
+                                            serde_json::Deserializer::from_str(group.get());
+                                        let selected = serde::de::DeserializeSeed::deserialize(
+                                            SelectedTerms {
+                                                requested: self.requested,
+                                            },
+                                            &mut decoder,
+                                        )
+                                        .map_err(serde::de::Error::custom)?;
+                                        decoder.end().map_err(serde::de::Error::custom)?;
+                                        Ok(selected)
+                                    })
+                                    .collect::<Result<Vec<_>, A::Error>>()
+                            })
+                            .transpose()?;
+                        partitions = Some(selected);
                     }
                     OverviewField::Eligibility => {
                         if minimum.is_some() {
@@ -2072,6 +2133,8 @@ pub mod wasm {
                 dictionary: dictionary
                     .ok_or_else(|| serde::de::Error::missing_field("dictionary"))?,
                 minimum: minimum.ok_or_else(|| serde::de::Error::missing_field("eligibility"))?,
+                partitions: partitions
+                    .ok_or_else(|| serde::de::Error::missing_field("partitions"))?,
             })
         }
     }
@@ -2094,6 +2157,7 @@ pub mod wasm {
     struct TermCatalog {
         dictionary: BTreeMap<String, TermSummary>,
         minimum: Option<(u32, u32)>,
+        partitions: Option<Vec<BTreeMap<String, TermSummary>>>,
     }
 
     #[wasm_bindgen]
@@ -2106,26 +2170,48 @@ pub mod wasm {
         if catalogs.len() > 64 {
             return Err(JsValue::from_str("Term bound batch exceeds segment budget"));
         }
-        let mut scorers = BTreeMap::new();
+        let scorers: BTreeMap<_, _> = statistics
+            .frequencies
+            .iter()
+            .map(|(term, df)| (term.as_str(), TermScorer::new(&statistics, *df)))
+            .collect();
         Ok(catalogs
             .iter()
             .map(|catalog| {
                 let Some(minimum) = catalog.minimum else {
                     return 0.0;
                 };
-                catalog
+                let upper = |term: &str, meta: &TermSummary| {
+                    scorers
+                        .get(term)
+                        .map_or(0.0, |scorer| term_bound(meta, scorer, minimum))
+                };
+                let independent = catalog
                     .dictionary
                     .iter()
-                    .map(|(term, meta)| {
-                        let scorer = scorers.entry(term).or_insert_with(|| {
-                            TermScorer::new(
-                                &statistics,
-                                statistics.frequencies.get(term).copied().unwrap_or(0),
-                            )
-                        });
-                        term_bound(meta, scorer, minimum)
-                    })
-                    .sum()
+                    .map(|(term, meta)| upper(term, meta))
+                    .sum::<f64>();
+                if let Some(partitions) = &catalog.partitions {
+                    let correlated = partitions
+                        .iter()
+                        .map(|partition| {
+                            catalog
+                                .dictionary
+                                .iter()
+                                .map(|(term, meta)| {
+                                    if meta.df == 1 {
+                                        return upper(term, meta);
+                                    }
+                                    partition
+                                        .get(term)
+                                        .map_or(0.0, |summary| upper(term, summary))
+                                })
+                                .sum::<f64>()
+                        })
+                        .fold(0.0, f64::max);
+                    return independent.min(correlated);
+                }
+                independent
             })
             .collect())
     }
@@ -2134,6 +2220,128 @@ pub mod wasm {
     #[doc = "# Errors\nRejects invalid canonical headers or size limits."]
     pub fn directory_compress(bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
         super::compress_directory(bytes).map_err(|cause| JsValue::from_str(&cause))
+    }
+
+    fn encode_overview(
+        header: &Header,
+        partitions: Option<Vec<BTreeMap<String, TermSummary>>>,
+    ) -> Result<Vec<u8>, String> {
+        let mut eligibility = BTreeMap::new();
+        for document in &header.documents {
+            let lengths = eligibility
+                .entry(document.attributes.get())
+                .or_insert_with(|| {
+                    (
+                        document.attributes.as_ref(),
+                        document.title_length,
+                        document.body_length,
+                    )
+                });
+            lengths.1 = lengths.1.min(document.title_length);
+            lengths.2 = lengths.2.min(document.body_length);
+        }
+        let json = serde_json::to_vec(&DirectoryOverview {
+            dictionary: OverviewDictionary(&header.terms),
+            eligibility: OverviewEligibility(eligibility),
+            partitions,
+        })
+        .map_err(|cause| cause.to_string())?;
+        if json.len() > MAX_BYTES {
+            return Err("Overview exceeds decoded size budget".into());
+        }
+        let mut bytes = Vec::new();
+        append(&mut bytes, &json)?;
+        Ok(bytes)
+    }
+
+    fn correlated_overview(bytes: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        let (header, base) = parse_header(bytes)?;
+        if header.documents.is_empty() {
+            return Ok(None);
+        }
+        let lengths: BTreeSet<_> = header
+            .documents
+            .iter()
+            .map(|document| (document.title_length, document.body_length))
+            .collect();
+        let groups: BTreeMap<_, _> = lengths
+            .iter()
+            .enumerate()
+            .map(|(index, pair)| (*pair, index * lengths.len().min(32) / lengths.len()))
+            .collect();
+        let mut partitions: Vec<BTreeMap<String, TermSummary>> = (0..lengths.len().min(32))
+            .map(|_| BTreeMap::new())
+            .collect();
+        let mut entries = 0;
+        let entry_budget = (header.terms.len() / 4).clamp(512, 65536);
+        for (term, metadata) in &header.terms {
+            if metadata.df == 1 {
+                continue;
+            }
+            let mut previous = None;
+            for block in &metadata.blocks {
+                let start = base
+                    .checked_add(block.data.offset as usize)
+                    .ok_or("Invalid posting range")?;
+                let end = start
+                    .checked_add(block.data.length as usize)
+                    .ok_or("Invalid posting range")?;
+                let page = bytes.get(start..end).ok_or("Invalid posting range")?;
+                let rows = super::decode_posting_rows::<false, _>(page, |row, title, body| {
+                    super::DecodedFrequencyPosting {
+                        posting: super::FrequencyPosting {
+                            row,
+                            title: title.count,
+                            body: body.count,
+                        },
+                        title_last: title.last,
+                        body_last: body.last,
+                    }
+                })?;
+                for row in rows {
+                    super::validate_posting(
+                        &header,
+                        row.posting.row,
+                        row.title_last,
+                        row.body_last,
+                        previous,
+                    )?;
+                    previous = Some(row.posting.row);
+                    let document = &header.documents[row.posting.row as usize];
+                    let group = groups[&(document.title_length, document.body_length)];
+                    let partition = &mut partitions[group];
+                    if !partition.contains_key(term) {
+                        entries += 1;
+                        if entries > entry_budget {
+                            return Ok(None);
+                        }
+                    }
+                    let summary = partition
+                        .entry(term.clone())
+                        .or_insert_with(|| TermSummary {
+                            df: 0,
+                            bounds: vec![(0, 0, document.title_length, document.body_length)],
+                        });
+                    summary.df += 1;
+                    let bound = &mut summary.bounds[0];
+                    bound.0 = bound.0.max(row.posting.title);
+                    bound.1 = bound.1.max(row.posting.body);
+                    bound.2 = bound.2.min(document.title_length);
+                    bound.3 = bound.3.min(document.body_length);
+                }
+            }
+        }
+        let encoded = encode_overview(&header, Some(partitions))?;
+        if encoded.len() > 1024 * 1024 {
+            return Ok(None);
+        }
+        Ok(Some(encoded))
+    }
+
+    #[wasm_bindgen]
+    #[doc = "# Errors\nRejects invalid canonical headers or malformed consumed posting pages."]
+    pub fn segment_correlated_overview(bytes: &[u8]) -> Result<Option<Vec<u8>>, JsValue> {
+        correlated_overview(bytes).map_err(|cause| JsValue::from_str(&cause))
     }
 
     #[wasm_bindgen]
@@ -2258,32 +2466,7 @@ pub mod wasm {
 
         #[doc = "# Errors\nRejects summary serialization or size budgets."]
         pub fn overview(&self) -> Result<Vec<u8>, JsValue> {
-            let mut eligibility = BTreeMap::new();
-            for document in &self.header.documents {
-                let lengths = eligibility
-                    .entry(document.attributes.get())
-                    .or_insert_with(|| {
-                        (
-                            document.attributes.as_ref(),
-                            document.title_length,
-                            document.body_length,
-                        )
-                    });
-                lengths.1 = lengths.1.min(document.title_length);
-                lengths.2 = lengths.2.min(document.body_length);
-            }
-            let overview = DirectoryOverview {
-                dictionary: OverviewDictionary(&self.header.terms),
-                eligibility: OverviewEligibility(eligibility),
-            };
-            let json = serde_json::to_vec(&overview)
-                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
-            if json.len() > MAX_BYTES {
-                return Err(JsValue::from_str("Overview exceeds decoded size budget"));
-            }
-            let mut bytes = Vec::new();
-            append(&mut bytes, &json).map_err(|cause| JsValue::from_str(&cause))?;
-            Ok(bytes)
+            encode_overview(&self.header, None).map_err(|cause| JsValue::from_str(&cause))
         }
 
         #[doc = "# Errors\nRejects invalid ids or tombstones, row overflow, or result serialization errors."]

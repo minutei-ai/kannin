@@ -13,23 +13,19 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Concurrency | p50 ms | p95 ms | Requests/s |
 | ----------: | -----: | -----: | ---------: |
-|           1 |  52.14 |  93.59 |      16.04 |
-|           4 |  64.55 | 182.14 |      33.44 |
-|          16 |  74.58 | 674.28 |      62.88 |
+|           1 |  49.42 |  91.63 |      16.59 |
+|           4 |  60.11 | 128.85 |      37.21 |
+|          16 |  66.35 | 764.23 |      63.71 |
 
-Each 128-request phase covers rare, selective, common and filtered text queries. Both latest runs matched their strong rows/scores and sequence in all **768 responses**. The table shows the second run; the first measured p95 **137.53/192.32/813.21 ms**. The preceding implementation measured **81.97/156.30/905.33 ms**. These bounded runs show mixed tails and do not isolate placement, cache or network variation or establish general Turbopuffer parity, concurrent reliability or peak memory.
+Two sequential load runs preserved strong baseline rows, scores and sequence in all **768 responses**. The table shows the repeat. The first run had p95 **308.26/121.61/985.09 ms** and a **12.07-second** cold edge request, mostly acquiring catalogs. These phases reuse caches and do not establish independent concurrency scaling, peak memory or general Turbopuffer parity.
 
-Strong queries capture an immutable root under the coordinator lock, then run up to four at a time while writes continue. Identical text requests against the same captured root now share active ranking and materialization; the entry ends with the calculation. In four paired native bursts of four identical requests, ranked segment visits fell from **800 to 200 per burst**, preserving all complete rows/scores. Burst completion changed **11.1–12.6 seconds→8.0–9.7 seconds**, a **13–37%** reduction in those samples after warming immutable inputs. [Active-query measurements](docs/performance.md#sharing-active-coordinator-text-evaluations).
+Rust now preserves document-length correlation in disposable R2 score summaries. Six fresh strong plans over the unchanged 200-segment corpus ranked **3 segments instead of 200**, preserving complete rows and scores. After alternate-mode warmups, elapsed queries changed **6.17–7.61 seconds→0.29–2.06 seconds**, a **67–96%** reduction in those samples. The first alternate-mode warmup still took **5.10 seconds**. Cache loss recovers through canonical R2; cold catalog acquisition remains a bottleneck. [Measurements and limits](docs/performance.md#correlated-length-bounds-on-immutable-segments).
 
-Dense first-use search remains multi-second. The latest two sequential edge selections took **13.75/10.47 seconds**; a subsequent sixteen-request mixed strong/edge burst preserved every reference with p95 **1.57 seconds**. Plans also reuse Rust-normalized equivalent selections across case, accents and any/all token order. These optimizations cover repeated or overlapping work; cold acquisition and concurrent tails remain unresolved.
+Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10**, with the complete 300-query report unchanged. The latest native Vectorize visibility probe remained empty through its bounded polling window; provider-backed vector/hybrid validation remains pending.
 
-The Rust any-mode cursor now uses a provably required term once other terms cannot beat the top-k cutoff. Paired finish-only measurements improved **73–85%** on selective eight-term fixtures with identical scores. Complete native queries showed mixed changes, so the scorer gain does not establish faster cold search. [Required-term measurements](docs/performance.md#required-term-candidate-traversal-in-rust).
+An earlier sequential million-document comparison measured p50 **159–173 ms strong**, **40–55 ms edge** and **59–81 ms Turbopuffer strong**. The comparator processed 14,500 unindexed WAL rows; edge has a weaker freshness contract. A fully indexed comparison remains unverified.
 
-The local million-document workload measured strong common/filtered p50 of **127/126 ms** across 2,000 uncompacted segments. Separate paired 50,000-document tests of deduplicated Rust score envelopes improved medians by **6–10%**. Emulator results exclude native network latency. Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10** across 300 queries. The latest native Vectorize visibility probe remained empty through its bounded polling window; current provider-backed vector/hybrid validation remains pending.
-
-A sequential million-document comparison measured p50 of **159–173 ms strong**, **40–55 ms edge** and **59–81 ms Turbopuffer strong**. The comparator processed 14,500 unindexed WAL rows; edge has a weaker freshness contract. Fully indexed comparison and general parity remain unverified.
-
-[Native and local measurements, regressions and methodology](docs/performance.md) · [contract comparison](docs/turbopuffer-contracts.md) · [ranking quality](docs/quality.md)
+[Native and local methodology](docs/performance.md) · [contract comparison](docs/turbopuffer-contracts.md) · [ranking quality](docs/quality.md)
 
 ## Run
 
@@ -42,7 +38,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **182 Worker/tooling tests and 38 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **187 Worker/tooling tests and 38 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

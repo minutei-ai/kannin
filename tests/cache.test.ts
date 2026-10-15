@@ -143,7 +143,7 @@ test("cached old segments cannot resurrect updated or deleted documents", async 
 });
 
 test("the authenticated gateway never exposes immutable cache entrypoints", async () => {
-  for (const path of ["/range", "/directory-v1", "/catalog-v5"]) {
+  for (const path of ["/range", "/directory-v1", "/catalog-v6"]) {
     const url = new URL(path, await worker.ready);
     const anonymous = await fetch(url);
     expect(anonymous.status).toBe(401);
@@ -404,8 +404,8 @@ test("corrupted compressed overview cache falls back to verified immutable sourc
   const manifest = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
   const segment = manifest.segments[0];
   if (segment === undefined) throw new Error("Missing segment");
-  const cache = await (await worker.getCaches()).open("raio-overview-batches-v3");
-  const key = new URL("https://overviews.internal/batch-v3");
+  const cache = await (await worker.getCaches()).open("raio-overview-batches-v4");
+  const key = new URL("https://overviews.internal/batch-v4");
   key.searchParams.set("bucket", "raio-test");
   const ranges = Schema.encodeSync(Schema.fromJsonString(TermProjectionProps.fields.ranges))([
     { key: segment.key, headerBytes: segment.headerBytes },
@@ -429,7 +429,7 @@ test("corrupted compressed overview cache falls back to verified immutable sourc
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.overviewBuilds - before.overviewBuilds).toBe(1);
+  expect(after.correlatedHits - before.correlatedHits).toBe(1);
   expect(after.overviewCacheApiHits - before.overviewCacheApiHits).toBe(0);
 });
 
@@ -459,8 +459,8 @@ for (const match of ["all", "phrase"] as const)
     const after = Schema.decodeUnknownSync(Health)(
       await (await fetch(new URL("/health", await worker.ready))).json(),
     );
-    if (match === "all") expect(after.rangeReads - before.rangeReads).toBe(32);
-    else expect(after.rangeReads - before.rangeReads).toBe(31);
+    if (match === "all") expect(after.rangeReads - before.rangeReads).toBe(3);
+    else expect(after.rangeReads - before.rangeReads).toBe(2);
     const any = Schema.decodeUnknownSync(QueryResult)(
       await (
         await request(worker, namespace, "query", textQuery("cloudflare rust cloudflare", 100))
@@ -514,7 +514,7 @@ test("conjunctive pruning uses live frequencies after deleting the only shared-t
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
   expect(after.rangeReads - before.rangeReads).toBe(0);
-  expect(after.directoryCacheHits - before.directoryCacheHits).toBe(1);
+  expect(after.directoryCacheHits - before.directoryCacheHits).toBe(0);
 });
 
 test("immutable query catalogs survive directory eviction without reloading irrelevant headers", async () => {
@@ -667,7 +667,7 @@ test("segment priority finds the equal-score winner before reading lower-priorit
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(18);
+  expect(after.rangeReads - before.rangeReads).toBe(3);
 });
 
 test("filtered score projections prune headers after directory eviction", async () => {
@@ -944,6 +944,9 @@ test("a prior segment cutoff rejects noncompetitive posting pages before acquisi
     );
     expect((await request(worker, namespace, "write", write(rows))).status).toBe(200);
   }
+  const bucket = await worker.getR2Bucket("STORAGE");
+  const derived = await bucket.list({ prefix: `cache/correlated-v2/namespaces/${namespace}/` });
+  await bucket.delete(derived.objects.map((object) => object.key));
   for (const match of ["any", "all", "phrase"] as const) {
     const response = await request(worker, namespace, "query", {
       ...textQuery("alpha beta"),

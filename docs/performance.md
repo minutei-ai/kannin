@@ -2048,3 +2048,18 @@ Alchemy deployment and the unconditional metadata migration completed. A subsequ
 |          16 |  66.80 | 864.85 |      58.16 |
 
 The README reports this latest operational run. It does not establish a native latency improvement: concurrency-one/four medians were slower than the preceding repeated run, while concurrency-sixteen p95 remained above 800 ms. Placement, cache state and network were uncontrolled. Local workerd inspector access now returns V8 heap, embedder and backing-storage measurements, but the initial one-document probe is not representative and does not prove peak memory at scale. Rust/scoring was unchanged; no new quality or Turbopuffer parity result is claimed.
+
+## Memory observations under indexing and reads
+
+A local workerd inspector run indexed 100,000 deterministic documents in 200 writes of 500 documents, with queues disabled and 200 uncompacted segments. Measurements were taken at 25,000-document boundaries and after query batches. GC ran automatically; the explicit inspector collection command did not respond and was excluded from the completed runs. These are sampled observations, not peak memory or a production capacity limit.
+
+| Observed phase                           | JS used heap MiB | ArrayBuffer/string backing MiB | WASM linear memory MiB |
+| :--------------------------------------- | ---------------: | -----------------------------: | ---------------------: |
+| After 75,000 indexed documents           |            87.54 |                          31.92 |                  21.38 |
+| After 100,000 indexed documents          |             8.45 |                          13.59 |                  26.81 |
+| After 84 queries in the indexing isolate |            29.18 |                          16.56 |                  26.81 |
+| After restart and 252 queries            |            45.66 |                           3.54 |                   2.44 |
+
+The 84 queries used concurrency 1/4/16, checked sequence 200 and expected row counts. After restarting against the same persisted R2 and derived-cache fixture, four strong baselines plus all 252 edge queries retained exact rows/scores and sequence. No index writes ran in the second process. The smaller WASM footprint after restart separates this read workload from the indexing-warmed allocation history; it does not prove a leak or justify shrinking directory caches. V8 used heap fell sharply during indexing, so allocated heap capacity alone is not evidence of live retention. The memory categories may overlap and must not be summed into a billed-memory estimate. Local native-service emulation, sparse sampling and different production GC/runtime limits prevent a claim that the million-document deployment fits a measured peak budget.
+
+A new ten-second production CPU profile of the Schema-adapter deployment was source-mapped against a byte-identical build. It contained 9.22 seconds of weighted samples, including 1.03 seconds idle, from one selected isolate. Request-body reading callbacks were the largest mapped application frames; they need a targeted comparison before attributing them to copies, Effect orchestration or native stream work. The accompanying 2,400 concurrent edge queries against the million-document corpus all matched their strong baselines. This profile and traffic run establish the next investigation boundary, not an additional latency improvement.

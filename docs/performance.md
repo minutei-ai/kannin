@@ -2033,4 +2033,18 @@ Alchemy production deployment and the unconditional Vectorize metadata migration
 | Repeated after |           4 |  52.70 | 526.45 |      30.69 |
 | Repeated after |          16 |  67.64 | 844.30 |      65.40 |
 
-Both after-run p95 sets were worse than the reference. Repeated concurrency-one/four medians improved slightly, while concurrency-sixteen worsened. Cache/isolate placement, warmup and network conditions were uncontrolled, so these data neither establish a general native latency improvement nor isolate the cause of the tail regressions. The verified improvement is avoided R2 body acquisition in the controlled identical-rehydration path. Native peak heap, stable tails and fully indexed Turbopuffer parity remain unproved. The README reports the latest repeated operational phases.
+Both after-run p95 sets were worse than the reference. Repeated concurrency-one/four medians improved slightly, while concurrency-sixteen worsened. Cache/isolate placement, warmup and network conditions were uncontrolled, so these data neither establish a general native latency improvement nor isolate the cause of the tail regressions. The verified improvement is avoided R2 body acquisition in the controlled identical-rehydration path. Native peak heap, stable tails and fully indexed Turbopuffer parity remain unproved.
+
+## Reusing native Schema adapters
+
+Query and immutable-segment adapters now retain Effect's compiled parser identity across requests. Two local alternating comparisons against the preceding bundle used 50,000 documents, eight query shapes and 100/30/8 segment layouts, reversing Worker creation order in the second run. All 2,688 responses retained exact rows, scores and sequence. Rare-query medians improved 8–28% and common-query medians 2–18%; individual filtered/phrase cells regressed up to 18%. These are local results, not production guarantees. The full gate passed 34 Rust and 152 Worker/Bun tests, with 2,607 Bun assertions, strict lint and type checks.
+
+Alchemy deployment and the unconditional metadata migration completed. A subsequent native read-only run against the unchanged million-document corpus verified all 384 edge responses against strong rows/scores at sequence 2,000:
+
+| Concurrency | p50 ms | p95 ms | Requests/s |
+| ----------: | -----: | -----: | ---------: |
+|           1 |  60.25 |  95.78 |      13.22 |
+|           4 |  63.56 | 563.98 |      35.61 |
+|          16 |  66.80 | 864.85 |      58.16 |
+
+The README reports this latest operational run. It does not establish a native latency improvement: concurrency-one/four medians were slower than the preceding repeated run, while concurrency-sixteen p95 remained above 800 ms. Placement, cache state and network were uncontrolled. Local workerd inspector access now returns V8 heap, embedder and backing-storage measurements, but the initial one-document probe is not representative and does not prove peak memory at scale. Rust/scoring was unchanged; no new quality or Turbopuffer parity result is claimed.

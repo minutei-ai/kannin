@@ -13,9 +13,9 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Concurrency | p50 ms | p95 ms | Requests/s |
 | ----------: | -----: | -----: | ---------: |
-|           1 |  49.07 | 146.42 |      13.54 |
-|           4 |  52.70 | 526.45 |      30.69 |
-|          16 |  67.64 | 844.30 |      65.40 |
+|           1 |  60.25 |  95.78 |      13.22 |
+|           4 |  63.56 | 563.98 |      35.61 |
+|          16 |  66.80 | 864.85 |      58.16 |
 
 Each 128-request phase covers rare, selective, common and filtered text queries; all **384 responses** matched strong rows/scores and sequence. Page pruning reduced native common-query acquisition from **178 to 22 blocks** and filtered acquisition from **188 to 41 blocks**, including cache hits. Native placement, cache state and network conditions vary; uniform latency gains, peak memory and general Turbopuffer parity remain unverified.
 

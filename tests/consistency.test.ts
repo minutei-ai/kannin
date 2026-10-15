@@ -233,7 +233,7 @@ test("same-sequence cache bodies with different bytes discard R2 provenance", as
     if (kind === "same-length") {
       changed.manifest = {
         ...manifest,
-        vectorEpoch: `${manifest.vectorEpoch.slice(0, 14)}5${manifest.vectorEpoch.slice(15)}`,
+        vectorEpoch: `${manifest.vectorEpoch.slice(0, 14)}${((Number.parseInt(manifest.vectorEpoch.slice(14, 15), 16) + 1) % 16).toString(16)}${manifest.vectorEpoch.slice(15)}`,
       };
       expect(changed.manifest.vectorEpoch).not.toBe(manifest.vectorEpoch);
       changed.text = Schema.encodeSync(Schema.fromJsonString(Root))(changed.manifest);

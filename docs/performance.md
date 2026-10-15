@@ -2069,3 +2069,25 @@ A new ten-second production CPU profile of the Schema-adapter deployment was sou
 A candidate consumed the original query stream in the gateway, retained its bounded bytes and constructed a replacement Request only for coordinator forwarding. Two local alternating comparisons against the deployed implementation used 50,000 documents, eight query shapes and 100/8 segment layouts, reversing Worker creation order in the second run. All 1,792 responses retained exact rows, scores and sequence. The median candidate/baseline ratios across workload cells were 1.032 and 1.008, with mixed individual gains and regressions. Removing the clone did not establish a general latency improvement and was reverted without deployment. A mapped CPU frame identifies a boundary to investigate; it does not prove that removing a particular operation will make that boundary faster.
 
 Transport coverage now checks streamed UTF-8 queries in both consistency modes and the exact 1,900,000-byte body boundary with multibyte text. One extra byte returns 413; an accepted strong query must still reach its coordinator with the same content and return the expected rows/sequence. The existing coordinator, snapshot fallback and validation behavior remains in place.
+
+## Sharing Rust term preparation between segment rankers
+
+PreparedQuery now retains sorted unique term indices, BM25 scorers and repeated-token phrase order alongside the existing immutable words/statistics. Rankers share that preparation through reference counting; filters, tombstones, postings and block bounds remain segment-local. The original term order and sorted-term score addition are preserved. No storage, HTTP or WASM method contract changed.
+
+Two alternating direct-WASM comparisons exercised one query plan across 32 rankers over a 500-document directory. Each ranker selected posting spans and finalized empty posting lists; the first ranker used local cutoff seeding and later rankers used a supplied cutoff. Plan construction was included and amortized across the 32 rankers. The second run reversed module initialization order. All 20,736 rankers retained identical serialized spans and empty results. Median amortized microseconds per ranker:
+
+| Terms | Mode   |  Before / after | Repeated before / after |
+| ----: | :----- | --------------: | ----------------------: |
+|     2 | any    |   29.96 / 27.24 |           17.93 / 17.50 |
+|     2 | all    |   26.40 / 24.53 |           15.71 / 14.83 |
+|     2 | phrase |   24.71 / 23.34 |           14.56 / 13.71 |
+|    16 | any    |   75.00 / 65.50 |           92.61 / 83.37 |
+|    16 | all    |   69.91 / 61.29 |           71.94 / 66.15 |
+|    16 | phrase |   65.03 / 61.36 |           70.16 / 65.92 |
+|    64 | any    | 470.04 / 421.66 |         483.54 / 434.22 |
+|    64 | all    | 443.06 / 438.64 |         448.18 / 418.02 |
+|    64 | phrase | 431.50 / 396.10 |         445.38 / 424.56 |
+
+These 1–13% improvements concern preparation/span selection, excluding I/O, posting ingestion and scoring populated lists. Two complete workerd comparisons used 50,000 documents, ten query shapes and 100/8 segment layouts, reversing Worker creation order in the second run. All 2,240 responses retained exact rows, scores and sequence. Median candidate/baseline ratios across workload cells were 0.992 and 1.008, with substantial individual regressions as well as gains; one common-query cell more than doubled. This does not establish a general query-latency improvement.
+
+The full local gate passed 34 Rust and 154 Worker/Bun tests with 2,648 assertions, strict lint and native/WASM Clippy. Prepared-query lifetime tests now include reversed and repeated terms in any/all/phrase modes. SciFact retained every evaluated row/order and metric from the prior directory-decoder result on the same 5,183-document corpus and 300 judgments: nDCG@10 0.6730619695232347, recall@10 0.7956666666666666 and MRR@10 0.641808201058201. The complete evaluated-array SHA-256 is `ca9bc9bd6ba7a68bb90d25b69582eda335b74d72fa45d5bbbac62e905c61bcac`. Native verification remains separate; the existing production deployment was retained while the million-document comparator was running.

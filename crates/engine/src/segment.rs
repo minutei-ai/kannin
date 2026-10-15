@@ -770,6 +770,50 @@ impl TermScorer {
     }
 }
 
+struct QueryTerms {
+    statistics: Rc<Statistics>,
+    words: Rc<Vec<String>>,
+    order: Vec<usize>,
+    scorers: Vec<TermScorer>,
+    phrase_order: Vec<usize>,
+}
+
+impl QueryTerms {
+    fn new(statistics: Statistics, words: Vec<String>, mode: &str) -> Self {
+        let mut order: Vec<_> = (0..words.len()).collect();
+        order.sort_unstable_by(|a, b| words[*a].cmp(&words[*b]));
+        order.dedup_by(|a, b| words[*a] == words[*b]);
+        let scorers = order
+            .iter()
+            .map(|index| {
+                TermScorer::new(
+                    &statistics,
+                    statistics
+                        .frequencies
+                        .get(&words[*index])
+                        .copied()
+                        .unwrap_or(0),
+                )
+            })
+            .collect();
+        let phrase_order = if mode == "phrase" {
+            words
+                .iter()
+                .map(|word| order.partition_point(|index| words[*index] < *word))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Self {
+            statistics: Rc::new(statistics),
+            words: Rc::new(words),
+            order,
+            scorers,
+            phrase_order,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Filter {
     pub field: String,
@@ -941,6 +985,7 @@ pub struct Search {
     pub mode: String,
     pub top_k: usize,
     pub allowed: Vec<bool>,
+    terms: Rc<QueryTerms>,
     lists: PostingLists,
     last_decoded_rows: BTreeMap<String, Option<u32>>,
 }
@@ -983,40 +1028,30 @@ impl Search {
         if self.mode == "phrase" {
             return None;
         }
-        let terms = self.words.iter().collect::<BTreeSet<_>>();
-        let dense: Vec<_> = terms
+        let dense: Vec<_> = self
+            .terms
+            .order
             .iter()
-            .filter(|term| {
+            .enumerate()
+            .filter(|(_, term)| {
                 self.header
                     .terms
-                    .get(term.as_str())
+                    .get(self.words[**term].as_str())
                     .is_some_and(|metadata| {
                         usize::try_from(metadata.df).ok() == Some(self.header.documents.len())
                     })
             })
+            .map(|(index, _)| &self.terms.scorers[index])
             .collect();
-        if dense.is_empty() || (self.mode == "all" && dense.len() != terms.len()) {
+        if dense.is_empty() || (self.mode == "all" && dense.len() != self.terms.order.len()) {
             return None;
         }
-        let scorers: Vec<_> = dense
-            .iter()
-            .map(|term| {
-                TermScorer::new(
-                    &self.statistics,
-                    self.statistics
-                        .frequencies
-                        .get(term.as_str())
-                        .copied()
-                        .unwrap_or(0),
-                )
-            })
-            .collect();
         let mut heap: BinaryHeap<Hit> = BinaryHeap::with_capacity(self.top_k);
         for (row, document) in self.header.documents.iter().enumerate() {
             if !self.allowed[row] {
                 continue;
             }
-            let score = scorers.iter().fold(0.0, |score, scorer| {
+            let score = dense.iter().fold(0.0, |score, scorer| {
                 score + scorer.minimum_score(document.title_length, document.body_length)
             });
             if score <= 0.0 {
@@ -1064,22 +1099,7 @@ impl Search {
         if !score.is_finite() || score <= 0.0 {
             return Err("Invalid ranking cutoff".into());
         }
-        let terms: Vec<_> = self
-            .words
-            .iter()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let scorers: Vec<_> = terms
-            .iter()
-            .map(|term| {
-                TermScorer::new(
-                    &self.statistics,
-                    self.statistics.frequencies.get(*term).copied().unwrap_or(0),
-                )
-            })
-            .collect();
-        let bounds = self.block_bounds(&terms, &scorers);
+        let bounds = self.block_bounds();
         Ok(self.posting_spans_matching(|candidate| {
             let bound = bounds.iter().fold(0.0, |total, blocks| {
                 let first = blocks.partition_point(|(block, _)| block.last < candidate.first);
@@ -1113,9 +1133,9 @@ impl Search {
         competitive: impl Fn(&BlockMeta) -> bool,
     ) -> Vec<PostingSpan<'_>> {
         let unrestricted = self.allowed.iter().all(|allowed| *allowed);
-        let terms: BTreeSet<_> = self.words.iter().collect();
         let mut spans: Vec<PostingSpan<'_>> = Vec::new();
-        for term in terms {
+        for index in &self.terms.order {
+            let term = &self.words[*index];
             let Some(metadata) = self.header.terms.get(term) else {
                 continue;
             };
@@ -1163,10 +1183,9 @@ impl Search {
             .map(str::to_owned)
             .collect();
         validate_search_budget(&words, mode, top_k)?;
-        Self::with_words(
+        Self::with_terms(
             header,
-            Rc::new(statistics),
-            Rc::new(words),
+            Rc::new(QueryTerms::new(statistics, words, mode)),
             mode,
             top_k,
             dead,
@@ -1174,10 +1193,9 @@ impl Search {
         )
     }
 
-    fn with_words(
+    fn with_terms(
         header: Rc<Header>,
-        statistics: Rc<Statistics>,
-        words: Rc<Vec<String>>,
+        terms: Rc<QueryTerms>,
         mode: &str,
         top_k: usize,
         dead: &[u32],
@@ -1186,8 +1204,9 @@ impl Search {
         let allowed = header.allowed(filters, dead)?;
         Ok(Self {
             header,
-            statistics,
-            words,
+            statistics: terms.statistics.clone(),
+            words: terms.words.clone(),
+            terms,
             mode: mode.into(),
             top_k,
             allowed,
@@ -1294,19 +1313,16 @@ impl Search {
         false
     }
 
-    fn block_bounds(
-        &self,
-        terms: &[&String],
-        scorers: &[TermScorer],
-    ) -> Vec<Vec<(&BlockMeta, f64)>> {
+    fn block_bounds(&self) -> Vec<Vec<(&BlockMeta, f64)>> {
         let unrestricted = self.allowed.iter().all(|allowed| *allowed);
-        terms
+        self.terms
+            .order
             .iter()
             .enumerate()
             .map(|(index, term)| {
                 self.header
                     .terms
-                    .get(term.as_str())
+                    .get(self.words[*term].as_str())
                     .into_iter()
                     .flat_map(|meta| meta.blocks.iter())
                     .map(|block| {
@@ -1327,7 +1343,7 @@ impl Search {
                                 })
                         };
                         let score = minimum.map_or(0.0, |(title, body)| {
-                            scorers[index].score(
+                            self.terms.scorers[index].score(
                                 block.max_title_tf,
                                 block.max_body_tf,
                                 block.min_title_length.max(title),
@@ -1394,35 +1410,22 @@ impl Search {
         &self,
         stored: &BTreeMap<String, Vec<T>>,
     ) -> Result<Vec<Hit>, String> {
-        let mut terms: Vec<_> = self.words.iter().collect();
-        terms.sort_unstable();
-        terms.dedup();
+        let terms = &self.terms.order;
         let lists: Vec<_> = terms
             .iter()
-            .map(|term| stored.get(term.as_str()).map_or(&[] as &[T], Vec::as_slice))
+            .map(|term| {
+                stored
+                    .get(self.words[*term].as_str())
+                    .map_or(&[] as &[T], Vec::as_slice)
+            })
             .collect();
         if self.mode != "any" && lists.iter().any(|list| list.is_empty()) {
             return Ok(Vec::new());
         }
-        let scorers: Vec<_> = terms
-            .iter()
-            .map(|term| {
-                TermScorer::new(
-                    &self.statistics,
-                    self.statistics.frequencies.get(*term).copied().unwrap_or(0),
-                )
-            })
-            .collect();
+        let scorers = &self.terms.scorers;
         let mut bounds = None;
         let mut bound_cursors = vec![0; terms.len()];
-        let phrase_order: Vec<_> = if self.mode == "phrase" {
-            self.words
-                .iter()
-                .map(|word| terms.partition_point(|term| *term < word))
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let phrase_order = &self.terms.phrase_order;
         let mut selected = vec![None; lists.len()];
         let mut positions = PostingCursors::new(lists, &self.allowed, self.mode != "any");
         let mut heap: BinaryHeap<Hit> = BinaryHeap::with_capacity(self.top_k);
@@ -1432,7 +1435,7 @@ impl Search {
                 && let Some(end) = Self::skippable_block_end(
                     &positions.lists,
                     &positions.cursors,
-                    bounds.get_or_insert_with(|| self.block_bounds(&terms, &scorers)),
+                    bounds.get_or_insert_with(|| self.block_bounds()),
                     &mut bound_cursors,
                     cutoff,
                     row,
@@ -1476,7 +1479,7 @@ impl Search {
             if self.mode != "any" && matched != terms.len() {
                 continue;
             }
-            if self.mode == "phrase" && !Self::phrase(&selected, &phrase_order) {
+            if self.mode == "phrase" && !Self::phrase(&selected, phrase_order) {
                 continue;
             }
             if score <= 0.0 {
@@ -1660,9 +1663,9 @@ pub fn bloom_filter_many<'a>(
 pub mod wasm {
     use super::{
         BlockMeta, BuiltSegment, Document, DocumentMeta, FILTER_CACHE_BYTES, Filter, Header,
-        MAX_BYTES, Search, SelectedAttributes, Statistics, TermMeta, append, bloom_build,
-        bloom_filter_many, bm25, build, decode_page, document_terms, matches, parse_header,
-        validate_search_budget,
+        MAX_BYTES, QueryTerms, Search, SelectedAttributes, Statistics, TermMeta, append,
+        bloom_build, bloom_filter_many, bm25, build, decode_page, document_terms, matches,
+        parse_header, validate_search_budget,
     };
     use serde::{Deserialize, Serialize};
     use std::collections::{BTreeMap, BTreeSet};
@@ -2254,10 +2257,9 @@ pub mod wasm {
         ) -> Result<Ranker, JsValue> {
             let dead: Vec<u32> = serde_json::from_str(dead)
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
-            let search = Search::with_words(
+            let search = Search::with_terms(
                 self.header.clone(),
-                query.statistics.clone(),
-                query.words.clone(),
+                query.terms.clone(),
                 &query.mode,
                 query.top_k,
                 &dead,
@@ -2458,8 +2460,7 @@ pub mod wasm {
 
     #[wasm_bindgen]
     pub struct PreparedQuery {
-        statistics: Rc<Statistics>,
-        words: Rc<Vec<String>>,
+        terms: Rc<QueryTerms>,
         mode: String,
         top_k: usize,
         filters: Vec<Filter>,
@@ -2484,8 +2485,7 @@ pub mod wasm {
             validate_search_budget(&words, &input.mode, input.top_k)
                 .map_err(|cause| JsValue::from_str(&cause))?;
             Ok(Self {
-                statistics: Rc::new(input.statistics),
-                words: Rc::new(words),
+                terms: Rc::new(QueryTerms::new(input.statistics, words, &input.mode)),
                 mode: input.mode,
                 top_k: input.top_k,
                 filters: input.filters,
@@ -3196,7 +3196,7 @@ mod eligible_bound_tests {
                     .iter()
                     .map(|term| TermScorer::new(&statistics, statistics.frequencies[*term]))
                     .collect();
-                let bounds = search.block_bounds(&terms, &scorers);
+                let bounds = search.block_bounds();
                 let PostingLists::Frequencies(lists) = &search.lists else {
                     return Err("Expected frequencies".into());
                 };

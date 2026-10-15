@@ -387,9 +387,12 @@ test("prepared queries preserve per-segment masks and outlive their query-plan h
   const segments = fixtures.map((docs) => new Segment(JSON.stringify(docs)));
   const buffers = segments.map((segment) => segment.bytes());
   const directories = buffers.map((bytes) => new Directory(bytes));
-  for (const mode of ["any", "all", "phrase"]) {
+  for (const [text, mode] of ["ÁLPHA beta", "beta ÁLPHA", "alpha alpha beta"].flatMap(
+    (selectedText) =>
+      ["any", "all", "phrase"].map((selectedMode) => [selectedText, selectedMode] as const),
+  )) {
     const input = {
-      text: "ÁLPHA beta",
+      text,
       mode,
       top_k: 10,
       dead: [],

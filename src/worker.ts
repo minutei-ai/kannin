@@ -585,10 +585,11 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
   };
   using plans = new DisposableStack();
   const compilation: { query: PreparedQuery | undefined } = { query: undefined };
-  const rankIo = Semaphore.makeUnsafe(4);
+  const rankingConcurrency = 6;
+  const rankIo = Semaphore.makeUnsafe(rankingConcurrency);
   const rankingWindows = [
     ...EffectArray.chunksOf(prioritized.slice(0, 4), 1),
-    ...EffectArray.chunksOf(prioritized.slice(4), 4),
+    ...EffectArray.chunksOf(prioritized.slice(4), rankingConcurrency),
   ];
   for (const rankingWindow of rankingWindows) {
     const cutoff = ranked[input.topK - 1];
@@ -782,7 +783,7 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
             rankIo,
           ).pipe(Effect.map((hits) => hits.map((hit) => ({ ...hit, segment }))));
         },
-        { concurrency: 4 },
+        { concurrency: rankingConcurrency },
       ),
     );
     ranked.push(...batches.flat());

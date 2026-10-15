@@ -960,15 +960,15 @@ test("a prior segment cutoff rejects noncompetitive posting pages before acquisi
 });
 
 test("parallel segment ranking matches an unfragmented index across revisions and phrase order", async () => {
-  const documents = Array.from({ length: 432 }, (_, index) => {
+  const documents = Array.from({ length: 624 }, (_, index) => {
     const words = ["alpha beta alpha", "beta alpha", "alpha gamma", "beta gamma"];
     const text = words[index % words.length];
     if (text === undefined) throw new Error("Missing fixture text");
-    return document(String(431 - index).padStart(4, "0"), text, { group: index % 3 });
+    return document(String(623 - index).padStart(4, "0"), text, { group: index % 3 });
   });
   const fragmented = "parallel-fragmented";
   const reference = "parallel-reference";
-  for (const offset of Array.from({ length: 9 }, (_, index) => index * 48))
+  for (const offset of Array.from({ length: 13 }, (_, index) => index * 48))
     for (const namespace of [fragmented, reference])
       await request(worker, namespace, "write", write(documents.slice(offset, offset + 48)));
   expect((await request(worker, reference, "compact", {})).status).toBe(200);
@@ -977,7 +977,7 @@ test("parallel segment ranking matches an unfragmented index across revisions an
       worker,
       namespace,
       "write",
-      write([document("0431", "alpha beta alpha", { group: 2 })], ["0000", "0048", "0096"]),
+      write([document("0623", "alpha beta alpha", { group: 2 })], ["0000", "0048", "0096"]),
     );
   for (const mode of ["any", "all", "phrase"] as const)
     for (const text of ["alpha beta alpha", "beta alpha"])
@@ -993,7 +993,7 @@ test("parallel segment ranking matches an unfragmented index across revisions an
           await (await request(worker, fragmented, "query", input)).json(),
         );
         expect(actual.rows).toEqual(expected.rows);
-        expect(actual.sequence).toBe(10);
+        expect(actual.sequence).toBe(14);
       }
 });
 

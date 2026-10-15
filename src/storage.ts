@@ -1,5 +1,4 @@
-import { Cause, Effect, Match, Schema } from "effect";
-import type { Semaphore } from "effect";
+import { Cause, Clock, Effect, Match, Schema, Semaphore } from "effect";
 import { env, exports } from "cloudflare:workers";
 import {
   Segment,
@@ -21,6 +20,7 @@ import {
   TermSummaries,
   TermProjection,
   CorrelatedOverview,
+  CatalogTelemetry,
   EligibleMinimum,
   TermCatalogBatch,
   OverviewBatch,
@@ -64,6 +64,9 @@ const MAX_TERM_CACHE_BYTES = 4 * 1024 * 1024;
 const overviewBuffers = new Map<string, Uint8Array>();
 const overviewBudget = { bytes: 0 };
 const MAX_OVERVIEW_BYTES = 4 * 1024 * 1024;
+const OVERVIEW_BODY_UNIT = 64 * 1024;
+const MAX_OVERVIEW_BODY_UNITS = 64;
+const overviewBodyReads = Semaphore.makeUnsafe(MAX_OVERVIEW_BODY_UNITS);
 const reads = {
   overviewMemoryHits: 0,
   overviewCacheApiHits: 0,
@@ -93,6 +96,7 @@ const bloomBudget = { bytes: 0 };
 const strings = Schema.fromJsonString(Schema.Array(Schema.String));
 const encodeStrings = Schema.encodeSync(strings);
 const decodeTermCatalog = Schema.decodeEffect(Schema.fromJsonString(TermCatalog));
+const decodeCatalogTelemetry = Schema.decodeEffect(Schema.fromJsonString(CatalogTelemetry));
 const correlatedOverviewJson = Schema.fromJsonString(CorrelatedOverview);
 const decodeCorrelatedOverview = Schema.decodeEffect(correlatedOverviewJson);
 const encodeCorrelatedOverview = Schema.encodeEffect(correlatedOverviewJson);
@@ -383,29 +387,56 @@ function rememberOverview(identity: string, bytes: Uint8Array) {
 export const readTermProjections = Effect.fn("kannin.readTermProjections")(
   (ranges: ReadonlyArray<typeof TermProjectionRange.Type>, terms: string, filters: string) =>
     Effect.gen(function* () {
-      const hits = [];
-      for (const [index, input] of ranges.entries()) {
-        const identity = `${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}`;
-        const bytes = overviewBuffers.get(identity);
-        if (bytes === undefined) continue;
-        const catalog = yield* Effect.try(() =>
-          segment_overview_project(bytes, terms, filters),
-        ).pipe(
-          Effect.flatMap(decodeTermCatalog),
-          Effect.orElseSucceed(() => undefined),
-        );
-        if (catalog === undefined) {
-          overviewBuffers.delete(identity);
-          overviewBudget.bytes -=
-            bytes.byteLength + new TextEncoder().encode(identity).byteLength * 4 + 128;
-          continue;
-        }
-        hits.push({ index, identity, bytes, catalog });
-      }
+      const started = yield* Clock.currentTimeNanos;
+      const telemetry = {
+        memoryHits: 0,
+        overviewCacheHits: 0,
+        overviewCacheLookups: 0,
+        r2Reads: 0,
+        r2Peak: 0,
+        r2Hits: 0,
+        r2Bytes: 0,
+        fallbackDirectories: 0,
+        overviewCacheMs: 0,
+        r2Ms: 0,
+        projectMs: 0,
+        fallbackMs: 0,
+        publishMs: 0,
+        entryMs: 0,
+        totalMs: 0,
+      };
+      const inspected = yield* Effect.forEach(
+        ranges,
+        (input, index) =>
+          Effect.gen(function* () {
+            const identity = `${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}`;
+            const bytes = overviewBuffers.get(identity);
+            if (bytes === undefined) return undefined;
+            const projectedAt = yield* Clock.currentTimeNanos;
+            const catalog = yield* Effect.try(() =>
+              segment_overview_project(bytes, terms, filters),
+            ).pipe(
+              Effect.flatMap(decodeTermCatalog),
+              Effect.orElseSucceed(() => undefined),
+            );
+            telemetry.projectMs += Number((yield* Clock.currentTimeNanos) - projectedAt) / 1e6;
+            if (catalog === undefined) {
+              overviewBuffers.delete(identity);
+              overviewBudget.bytes -=
+                bytes.byteLength + new TextEncoder().encode(identity).byteLength * 4 + 128;
+              return undefined;
+            }
+            return { index, identity, bytes, catalog };
+          }),
+        { concurrency: 1 },
+      );
+      const hits = inspected.filter((hit) => hit !== undefined);
       if (hits.length === ranges.length) {
         for (const hit of hits) rememberOverview(hit.identity, hit.bytes);
         reads.overviewMemoryHits += hits.length;
-        return hits.map((hit) => hit.catalog);
+        telemetry.memoryHits = hits.length;
+        telemetry.totalMs = Number((yield* Clock.currentTimeNanos) - started) / 1e6;
+        return { catalogs: hits.map((hit) => hit.catalog), telemetry };
       }
       const cacheKey = new URL("https://overviews.internal/batch-v4");
       cacheKey.searchParams.set("bucket", env.STORAGE_CACHE_SCOPE);
@@ -413,11 +444,13 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
         Schema.fromJsonString(TermProjectionProps.fields.ranges),
       )(ranges);
       cacheKey.searchParams.set("ranges", yield* Effect.tryPromise(() => sha256(encodedRanges)));
+      const cacheStarted = yield* Clock.currentTimeNanos;
       const cache = yield* Effect.tryPromise(() => caches.open("raio-overview-batches-v4")).pipe(
         Effect.orElseSucceed(() => undefined),
       );
       if (cache !== undefined) {
         reads.overviewCacheApiLookups += 1;
+        telemetry.overviewCacheLookups += 1;
         const cached = yield* Effect.tryPromise(() => cache.match(cacheKey)).pipe(
           Effect.orElseSucceed(() => undefined),
         );
@@ -427,6 +460,9 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
             Effect.orElseSucceed(() => undefined),
           );
           if (candidate !== undefined && candidate.length === ranges.length) {
+            telemetry.overviewCacheMs +=
+              Number((yield* Clock.currentTimeNanos) - cacheStarted) / 1e6;
+            const projectedAt = yield* Clock.currentTimeNanos;
             const projected = yield* Effect.forEach(
               candidate,
               (bytes) =>
@@ -435,6 +471,7 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
                 ),
               { concurrency: 1 },
             ).pipe(Effect.orElseSucceed(() => undefined));
+            telemetry.projectMs += Number((yield* Clock.currentTimeNanos) - projectedAt) / 1e6;
             if (projected !== undefined) {
               for (const [index, bytes] of candidate.entries()) {
                 const input = ranges[index];
@@ -449,7 +486,9 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
                 );
               }
               reads.overviewCacheApiHits += candidate.length;
-              return projected;
+              telemetry.overviewCacheHits = candidate.length;
+              telemetry.totalMs = Number((yield* Clock.currentTimeNanos) - started) / 1e6;
+              return { catalogs: projected, telemetry };
             }
           }
           yield* Effect.tryPromise(() => cache.delete(cacheKey)).pipe(
@@ -457,73 +496,137 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
           );
         }
       }
+      if (telemetry.overviewCacheMs === 0)
+        telemetry.overviewCacheMs = Number((yield* Clock.currentTimeNanos) - cacheStarted) / 1e6;
       const catalogs = [];
       const sources = [];
       const admission = { bytes: 0, enabled: true };
-      for (const [index, input] of ranges.entries()) {
-        const identity = `${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}`;
-        const hit = hits.find((entry) => entry.index === index);
-        const selected = { bytes: hit?.bytes, catalog: hit?.catalog };
-        if (selected.bytes === undefined || selected.catalog === undefined) {
-          const derived = yield* Effect.gen(function* () {
-            reads.correlatedReads += 1;
-            const object = yield* Effect.tryPromise(() =>
-              env.STORAGE.get(`cache/correlated-v2/${input.key}`),
-            );
-            if (object === null || object.size > 2 * 1024 * 1024) return undefined;
-            const encoded = yield* Effect.tryPromise(() => object.text());
-            reads.correlatedBytes += object.size;
-            const cached = yield* decodeCorrelatedOverview(encoded);
-            if (
-              cached.bucket !== env.STORAGE_CACHE_SCOPE ||
-              cached.source.key !== input.key ||
-              cached.source.headerBytes !== input.headerBytes
-            )
-              return undefined;
-            const bytes = cached.overview;
-            const catalog = yield* Effect.try(() =>
-              segment_overview_project(bytes, terms, filters),
-            ).pipe(Effect.flatMap(decodeTermCatalog));
-            if (catalog.partitions === null) return undefined;
-            reads.correlatedHits += 1;
-            return { bytes, catalog };
-          }).pipe(Effect.orElseSucceed(() => undefined));
-          const projection =
-            derived ??
-            (yield* withDirectory(input.key, input.headerBytes, (directory) =>
-              Effect.gen(function* () {
-                const dictionary = yield* Effect.try(() => directory.summary(terms)).pipe(
-                  Effect.flatMap(decodeTermSummaries),
-                );
-                const minimum = yield* Effect.try(() => directory.minimum(filters)).pipe(
-                  Effect.flatMap(decodeEligibleMinimum),
-                );
-                const bytes = yield* Effect.try(() => directory.overview()).pipe(
-                  Effect.orElseSucceed(() => undefined),
-                );
-                return { bytes, catalog: { dictionary, minimum, partitions: null } };
-              }),
-            ));
-          selected.bytes = projection.bytes;
-          selected.catalog = projection.catalog;
-          if (derived === undefined && projection.bytes !== undefined) reads.overviewBuilds += 1;
-        } else reads.overviewMemoryHits += 1;
-        const bytes = selected.bytes;
-        catalogs.push(selected.catalog);
-        if (bytes === undefined) {
-          admission.enabled = false;
-          sources.length = 0;
-          continue;
+      const r2Activity = { count: 0 };
+      for (const start of Array.from(
+        { length: Math.ceil(ranges.length / 4) },
+        (_, index) => index * 4,
+      )) {
+        const window = ranges.slice(start, start + 4);
+        const prefetched = yield* Effect.forEach(
+          window,
+          (input, offset) =>
+            Effect.gen(function* () {
+              if (hits.some((hit) => hit.index === start + offset)) return undefined;
+              reads.correlatedReads += 1;
+              telemetry.r2Reads += 1;
+              r2Activity.count += 1;
+              telemetry.r2Peak = Math.max(telemetry.r2Peak, r2Activity.count);
+              const r2Started = yield* Clock.currentTimeNanos;
+              const cached = yield* Effect.acquireUseRelease(
+                Effect.tryPromise(() => env.STORAGE.get(`cache/correlated-v2/${input.key}`)),
+                (object) =>
+                  Effect.gen(function* () {
+                    if (object === null || object.size > 2 * 1024 * 1024) return undefined;
+                    const units = Math.min(
+                      MAX_OVERVIEW_BODY_UNITS,
+                      Math.max(1, Math.ceil((object.size * 4) / OVERVIEW_BODY_UNIT)),
+                    );
+                    return yield* overviewBodyReads.withPermits(units)(
+                      Effect.gen(function* () {
+                        const encoded = yield* Effect.tryPromise(() => object.text());
+                        telemetry.r2Bytes += object.size;
+                        reads.correlatedBytes += object.size;
+                        const decodedAt = yield* Clock.currentTimeNanos;
+                        const decoded = yield* decodeCorrelatedOverview(encoded);
+                        telemetry.projectMs +=
+                          Number((yield* Clock.currentTimeNanos) - decodedAt) / 1e6;
+                        return decoded;
+                      }).pipe(Effect.uninterruptible),
+                    );
+                  }),
+                (object) => {
+                  if (object === null || object.bodyUsed) return Effect.void;
+                  return Effect.tryPromise(() => object.body.cancel()).pipe(Effect.ignore);
+                },
+              ).pipe(
+                Effect.ensuring(
+                  Effect.gen(function* () {
+                    telemetry.r2Ms += Number((yield* Clock.currentTimeNanos) - r2Started) / 1e6;
+                    r2Activity.count -= 1;
+                  }),
+                ),
+              );
+              if (cached === undefined) return undefined;
+              if (
+                cached.bucket !== env.STORAGE_CACHE_SCOPE ||
+                cached.source.key !== input.key ||
+                cached.source.headerBytes !== input.headerBytes
+              )
+                return undefined;
+              return cached.overview;
+            }).pipe(Effect.orElseSucceed(() => undefined)),
+          { concurrency: 4 },
+        );
+        for (const [offset, input] of window.entries()) {
+          const index = start + offset;
+          const identity = `${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}`;
+          const hit = hits.find((entry) => entry.index === index);
+          const selected = { bytes: hit?.bytes, catalog: hit?.catalog };
+          if (selected.bytes === undefined || selected.catalog === undefined) {
+            const derived = yield* Effect.gen(function* () {
+              const bytes = prefetched[offset];
+              if (bytes === undefined) return undefined;
+              const projectedAt = yield* Clock.currentTimeNanos;
+              const catalog = yield* Effect.try(() =>
+                segment_overview_project(bytes, terms, filters),
+              ).pipe(Effect.flatMap(decodeTermCatalog));
+              telemetry.projectMs += Number((yield* Clock.currentTimeNanos) - projectedAt) / 1e6;
+              if (catalog.partitions === null) return undefined;
+              telemetry.r2Hits += 1;
+              reads.correlatedHits += 1;
+              return { bytes, catalog };
+            }).pipe(Effect.orElseSucceed(() => undefined));
+            const fallbackStarted = yield* Clock.currentTimeNanos;
+            const projection =
+              derived ??
+              (yield* withDirectory(input.key, input.headerBytes, (directory) =>
+                Effect.gen(function* () {
+                  telemetry.fallbackDirectories += 1;
+                  const dictionary = yield* Effect.try(() => directory.summary(terms)).pipe(
+                    Effect.flatMap(decodeTermSummaries),
+                  );
+                  const minimum = yield* Effect.try(() => directory.minimum(filters)).pipe(
+                    Effect.flatMap(decodeEligibleMinimum),
+                  );
+                  const bytes = yield* Effect.try(() => directory.overview()).pipe(
+                    Effect.orElseSucceed(() => undefined),
+                  );
+                  return { bytes, catalog: { dictionary, minimum, partitions: null } };
+                }),
+              ));
+            if (derived === undefined)
+              telemetry.fallbackMs +=
+                Number((yield* Clock.currentTimeNanos) - fallbackStarted) / 1e6;
+            selected.bytes = projection.bytes;
+            selected.catalog = projection.catalog;
+            if (derived === undefined && projection.bytes !== undefined) reads.overviewBuilds += 1;
+          } else {
+            reads.overviewMemoryHits += 1;
+            telemetry.memoryHits += 1;
+          }
+          const bytes = selected.bytes;
+          catalogs.push(selected.catalog);
+          if (bytes === undefined) {
+            admission.enabled = false;
+            sources.length = 0;
+            continue;
+          }
+          rememberOverview(identity, bytes);
+          admission.bytes += bytes.byteLength;
+          if (admission.bytes > 3 * 1024 * 1024) {
+            admission.enabled = false;
+            sources.length = 0;
+          }
+          if (admission.enabled) sources.push(bytes);
         }
-        rememberOverview(identity, bytes);
-        admission.bytes += bytes.byteLength;
-        if (admission.bytes > 3 * 1024 * 1024) {
-          admission.enabled = false;
-          sources.length = 0;
-        }
-        if (admission.enabled) sources.push(bytes);
       }
       if (cache !== undefined && admission.enabled) {
+        const publishedAt = yield* Clock.currentTimeNanos;
         const encoded = yield* encodeOverviewBatch(sources);
         yield* Effect.tryPromise(() =>
           cache.put(
@@ -536,8 +639,10 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
             }),
           ),
         ).pipe(Effect.orElseSucceed(() => undefined));
+        telemetry.publishMs += Number((yield* Clock.currentTimeNanos) - publishedAt) / 1e6;
       }
-      return catalogs;
+      telemetry.totalMs = Number((yield* Clock.currentTimeNanos) - started) / 1e6;
+      return { catalogs, telemetry };
     }),
 );
 
@@ -565,8 +670,37 @@ function rememberTermCatalogs(identity: string, value: typeof CachedTermCatalogs
 }
 
 export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
-  (ranges: ReadonlyArray<typeof TermProjectionRange.Type>, terms: string, filters: string) =>
+  (
+    ranges: ReadonlyArray<typeof TermProjectionRange.Type>,
+    terms: string,
+    filters: string,
+    timings: Headers,
+  ) =>
     Effect.gen(function* () {
+      const metrics = {
+        requests: 0,
+        nativeHits: 0,
+        apiHits: 0,
+        originResponses: 0,
+        fetchMs: 0,
+        fetchMaxMs: 0,
+        bodyMs: 0,
+        decodeMs: 0,
+        sourceTotalMs: 0,
+        sourceEntryMs: 0,
+        sourcePublishMs: 0,
+        sourceCacheMs: 0,
+        sourceR2Ms: 0,
+        sourceProjectMs: 0,
+        sourceFallbackMs: 0,
+        sourceR2Reads: 0,
+        sourceR2Peak: 0,
+        sourceR2Hits: 0,
+        sourceR2Bytes: 0,
+        sourceMemoryHits: 0,
+        sourceApiHits: 0,
+        sourceFallbacks: 0,
+      };
       const windows = Array.from({ length: Math.ceil(ranges.length / 16) }, (_, index) =>
         ranges.slice(index * 16, index * 16 + 16),
       );
@@ -625,6 +759,7 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
                   headerBytes: input.headerBytes,
                 })),
               };
+              const fetchedAt = yield* Clock.currentTimeNanos;
               const response = yield* Effect.tryPromise({
                 try: () => exports.Terms({ props }).fetch("https://terms.internal/catalog-v6"),
                 catch: (cause) => {
@@ -632,19 +767,59 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
                   return new Cause.UnknownError(cause);
                 },
               });
+              const fetchMs = Number((yield* Clock.currentTimeNanos) - fetchedAt) / 1e6;
+              metrics.requests += 1;
+              metrics.fetchMs += fetchMs;
+              metrics.fetchMaxMs = Math.max(metrics.fetchMaxMs, fetchMs);
               reads.termReads += group.entries.length;
               reads.termRequests += 1;
               const status = response.headers.get("cf-cache-status");
-              if (status === "HIT") reads.termWorkerCacheHits += group.entries.length;
+              if (status === "HIT") {
+                reads.termWorkerCacheHits += group.entries.length;
+                metrics.nativeHits += 1;
+              }
               if (status !== "HIT" && response.headers.get("x-raio-cache") === "terms-api-hit")
                 reads.termCacheApiHits += group.entries.length;
+              const bodyAt = yield* Clock.currentTimeNanos;
               const text = yield* Effect.tryPromise(() => response.text());
+              metrics.bodyMs += Number((yield* Clock.currentTimeNanos) - bodyAt) / 1e6;
               if (!response.ok)
                 return yield* new Rejected({
                   status: 503,
                   message: "Immutable term catalog unavailable",
                 });
+              const decodedAt = yield* Clock.currentTimeNanos;
               const catalogs = yield* decodeTermCatalogBatch(text);
+              metrics.decodeMs += Number((yield* Clock.currentTimeNanos) - decodedAt) / 1e6;
+              if (status !== "HIT" && response.headers.get("x-raio-cache") === "terms-api-hit")
+                metrics.apiHits += 1;
+              const encodedTelemetry = response.headers.get("x-kannin-catalog-telemetry");
+              if (
+                status !== "HIT" &&
+                response.headers.get("x-raio-cache") === "terms-origin" &&
+                encodedTelemetry !== null
+              ) {
+                const telemetry = yield* decodeCatalogTelemetry(encodedTelemetry).pipe(
+                  Effect.orElseSucceed(() => undefined),
+                );
+                if (telemetry !== undefined) {
+                  metrics.originResponses += 1;
+                  metrics.sourceTotalMs += telemetry.totalMs;
+                  metrics.sourceEntryMs += telemetry.entryMs;
+                  metrics.sourcePublishMs += telemetry.publishMs;
+                  metrics.sourceCacheMs += telemetry.overviewCacheMs;
+                  metrics.sourceR2Ms += telemetry.r2Ms;
+                  metrics.sourceProjectMs += telemetry.projectMs;
+                  metrics.sourceFallbackMs += telemetry.fallbackMs;
+                  metrics.sourceR2Reads += telemetry.r2Reads;
+                  metrics.sourceR2Peak = Math.max(metrics.sourceR2Peak, telemetry.r2Peak);
+                  metrics.sourceR2Hits += telemetry.r2Hits;
+                  metrics.sourceR2Bytes += telemetry.r2Bytes;
+                  metrics.sourceMemoryHits += telemetry.memoryHits;
+                  metrics.sourceApiHits += telemetry.overviewCacheHits;
+                  metrics.sourceFallbacks += telemetry.fallbackDirectories;
+                }
+              }
               if (catalogs.length !== group.entries.length)
                 return yield* new Rejected({
                   status: 503,
@@ -684,6 +859,22 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
             });
           }),
         { concurrency: 8 },
+      );
+      timings.append(
+        "server-timing",
+        [
+          `catalog_rpc_sum;dur=${metrics.fetchMs};desc="requests=${metrics.requests} native_hits=${metrics.nativeHits} api_hits=${metrics.apiHits} origins=${metrics.originResponses}"`,
+          `catalog_rpc_max;dur=${metrics.fetchMaxMs}`,
+          `catalog_body_sum;dur=${metrics.bodyMs}`,
+          `catalog_decode_sum;dur=${metrics.decodeMs}`,
+          `catalog_origin_sum;dur=${metrics.sourceTotalMs}`,
+          `catalog_entry_sum;dur=${metrics.sourceEntryMs}`,
+          `catalog_publish_sum;dur=${metrics.sourcePublishMs}`,
+          `catalog_source_cache_sum;dur=${metrics.sourceCacheMs};desc="memory=${metrics.sourceMemoryHits} api=${metrics.sourceApiHits}"`,
+          `catalog_source_r2_sum;dur=${metrics.sourceR2Ms};desc="reads=${metrics.sourceR2Reads} hits=${metrics.sourceR2Hits} bytes=${metrics.sourceR2Bytes} batch_peak=${metrics.sourceR2Peak}"`,
+          `catalog_source_project_sum;dur=${metrics.sourceProjectMs}`,
+          `catalog_source_fallback_sum;dur=${metrics.sourceFallbackMs};desc="directories=${metrics.sourceFallbacks}"`,
+        ].join(", "),
       );
       return batches.flat();
     }),

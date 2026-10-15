@@ -332,6 +332,23 @@ export const TermCatalog = TermProjection.mapFields((fields) => ({
   ...fields,
   minimum: EligibleMinimum,
 }));
+export const CatalogTelemetry = Schema.Struct({
+  memoryHits: Schema.Int,
+  overviewCacheHits: Schema.Int,
+  overviewCacheLookups: Schema.Int,
+  r2Reads: Schema.Int,
+  r2Peak: Schema.Int,
+  r2Hits: Schema.Int,
+  r2Bytes: Schema.Int,
+  fallbackDirectories: Schema.Int,
+  overviewCacheMs: Schema.Finite,
+  r2Ms: Schema.Finite,
+  projectMs: Schema.Finite,
+  fallbackMs: Schema.Finite,
+  publishMs: Schema.Finite,
+  entryMs: Schema.Finite,
+  totalMs: Schema.Finite,
+});
 export const TermCatalogBatch = Schema.Array(TermCatalog).check(Schema.isBetweenLength(1, 16));
 export const OverviewBatch = Schema.Array(Schema.Uint8ArrayFromBase64)
   .check(Schema.isBetweenLength(1, 16))

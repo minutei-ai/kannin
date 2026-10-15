@@ -46,6 +46,7 @@ import {
   PostingSpans,
   TermCatalog,
   TermCatalogBatch,
+  CatalogTelemetry,
   LocatedDocument,
   RankingInput,
   SearchStatistics,
@@ -179,8 +180,11 @@ const decodeSegmentHits = Schema.decodeEffect(Schema.fromJsonString(SegmentHits)
 const encodeRankingInput = Schema.encodeSync(Schema.fromJsonString(RankingInput));
 const isNamespaceName = Schema.is(NamespaceName);
 const isOperation = Schema.is(Operation);
+const encodeCatalogTelemetry = Schema.encodeEffect(Schema.fromJsonString(CatalogTelemetry));
+
 export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Encoded> {
   override async fetch(request: Request) {
+    const entryStarted = Effect.runSync(Clock.currentTimeNanos);
     const props = Schema.decodeExit(TermProjectionProps)(this.ctx.props);
     const url = new URL(request.url);
     if (
@@ -225,10 +229,25 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
     }
     const response = await Effect.runPromise(
       readTermProjections(props.value.ranges, encodedTerms, encodedFilters).pipe(
-        Effect.flatMap(Schema.encodeEffect(TermCatalogBatch)),
-        Effect.map((dictionary) =>
+        Effect.flatMap(({ catalogs, telemetry }) =>
+          Effect.gen(function* () {
+            const entryEnded = yield* Clock.currentTimeNanos;
+            return yield* Effect.all([
+              Schema.encodeEffect(TermCatalogBatch)(catalogs),
+              encodeCatalogTelemetry({
+                ...telemetry,
+                entryMs: Number(entryEnded - entryStarted) / 1e6,
+              }),
+            ]);
+          }),
+        ),
+        Effect.map(([dictionary, telemetry]) =>
           Response.json(dictionary, {
-            headers: { "cache-control": "public, max-age=31536000, immutable" },
+            headers: {
+              "cache-control": "public, max-age=31536000, immutable",
+              "x-raio-cache": "terms-origin",
+              "x-kannin-catalog-telemetry": telemetry,
+            },
           }),
         ),
         Effect.tapError((error) =>
@@ -465,7 +484,7 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
     const projectionTerms = Schema.encodeSync(TermProjectionProps.fields.terms)(terms.toSorted());
     const encodedFilters = Schema.encodeSync(TermProjectionProps.fields.filters)(input.filters);
     const projections = await Effect.runPromise(
-      readTermCatalogs(selected, projectionTerms, encodedFilters),
+      readTermCatalogs(selected, projectionTerms, encodedFilters, timings),
     );
     const catalog = selected.map((segment, index) => {
       const projection = projections[index];
@@ -2187,6 +2206,13 @@ function rememberSnapshot(
   cacheAttemptedAt?: number,
 ) {
   const prior = warmSnapshots.get(key);
+  if (
+    prior !== undefined &&
+    (prior.snapshot.manifest.sequence > snapshot.manifest.sequence ||
+      (prior.snapshot.manifest.sequence === snapshot.manifest.sequence &&
+        prior.snapshot.observedAt > snapshot.observedAt))
+  )
+    return;
   if (prior !== undefined) warmSnapshotBudget.bytes -= prior.bytes;
   warmSnapshots.delete(key);
   const bytes = Math.max(frameBytes, payload.buffer.byteLength) * 4;
@@ -2377,6 +2403,15 @@ async function acquireCachedSnapshot(cacheKey: URL, minimumSequence: number) {
       snapshotMetrics.snapshotCacheDecodes += 1;
       const decoded = yield* readSnapshotFrame(encoded).pipe(Effect.orElseSucceed(() => undefined));
       if (decoded !== undefined) {
+        const decodedAt = yield* Clock.currentTimeMillis;
+        if (
+          decodedAt < decoded.snapshot.observedAt ||
+          decodedAt - decoded.snapshot.observedAt >= 1000 ||
+          decoded.snapshot.manifest.sequence < minimumSequence
+        ) {
+          snapshotMetrics.snapshotCacheRejected += 1;
+          return { cache, snapshot: undefined, rejected: true };
+        }
         const previous = warmSnapshots.get(cacheKey.href);
         if (
           previous?.etag !== undefined &&
@@ -2398,7 +2433,10 @@ async function acquireCachedSnapshot(cacheKey: URL, minimumSequence: number) {
     }),
   );
 }
-const pendingCachedSnapshots = new Map<string, ReturnType<typeof acquireCachedSnapshot>>();
+const pendingCachedSnapshots = new Map<
+  string,
+  Promise<Option.Option<Awaited<ReturnType<typeof acquireCachedSnapshot>>>>
+>();
 const MAX_PENDING_CACHED_SNAPSHOTS = 64;
 
 const snapshotRefreshes = new Set<string>();
@@ -2428,11 +2466,35 @@ const edgeSnapshot = Effect.fn("raio.edgeSnapshot")(function* (
     const pending = pendingCachedSnapshots.get(identity);
     const acquisition = { read: pending };
     if (acquisition.read === undefined) {
-      const read = acquireCachedSnapshot(cacheKey, minimumSequence);
-      if (pendingCachedSnapshots.size < MAX_PENDING_CACHED_SNAPSHOTS) {
-        acquisition.read = read.finally(() => pendingCachedSnapshots.delete(identity));
-        pendingCachedSnapshots.set(identity, acquisition.read);
-      } else acquisition.read = read;
+      const lookup = acquireCachedSnapshot(cacheKey, minimumSequence);
+      const budget = yield* Effect.forkDetach(
+        Effect.tryPromise(() => lookup).pipe(
+          Effect.timeoutOption("250 millis"),
+          Effect.orElseSucceed(() => Option.none()),
+        ),
+      );
+      const bounded = new Promise<Option.Option<Awaited<ReturnType<typeof acquireCachedSnapshot>>>>(
+        (resolve) => {
+          budget.addObserver((exit) => {
+            if (exit._tag === "Success") resolve(exit.value);
+            else resolve(Option.none());
+          });
+        },
+      );
+      acquisition.read = bounded;
+      if (pendingCachedSnapshots.size < MAX_PENDING_CACHED_SNAPSHOTS)
+        pendingCachedSnapshots.set(identity, bounded);
+      ctx.waitUntil(
+        lookup
+          .finally(() => {
+            if (pendingCachedSnapshots.get(identity) === bounded)
+              pendingCachedSnapshots.delete(identity);
+          })
+          .then(
+            () => undefined,
+            () => undefined,
+          ),
+      );
     }
     const read = acquisition.read;
     const acquired = yield* Effect.tryPromise(() => read);
@@ -2441,9 +2503,11 @@ const edgeSnapshot = Effect.fn("raio.edgeSnapshot")(function* (
       "server-timing",
       `edge_snapshot_cache;dur=${Number(cacheEnded - cacheStarted) / 1e6}`,
     );
-    cache.value = acquired.cache;
-    selection.snapshot = acquired.snapshot;
-    if (acquired.rejected) timings.append("server-timing", "edge_snapshot_cache_rejected");
+    if (Option.isSome(acquired)) {
+      cache.value = acquired.value.cache;
+      selection.snapshot = acquired.value.snapshot;
+      if (acquired.value.rejected) timings.append("server-timing", "edge_snapshot_cache_rejected");
+    } else timings.append("server-timing", "edge_snapshot_cache_timeout");
   }
   const snapshot = selection.snapshot;
   const selectedAt = yield* Clock.currentTimeMillis;

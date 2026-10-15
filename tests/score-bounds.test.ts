@@ -309,14 +309,17 @@ test("semantic text equivalents reuse plans while phrase order and repetitions s
     expect(after.cache.termRequests).toBe(before.cache.termRequests);
     expect(after.cache.textPlanCacheEntries).toBe(before.cache.textPlanCacheEntries);
   }
+  const distinct = new Map<string, typeof QueryResult.Type>();
   for (const text of ["beta alpha alpha", "alpha beta"]) {
     const response = await request(worker, namespace, "query", {
       ...textQuery(text, 3),
       match: "phrase",
     });
     expect(response.headers.get("server-timing")).toContain('text_plan;desc="miss"');
-    const expected = Schema.decodeUnknownSync(QueryResult)(await response.json());
-    expect((await request(worker, namespace, "rebuild", {})).status).toBe(200);
+    distinct.set(text, Schema.decodeUnknownSync(QueryResult)(await response.json()));
+  }
+  expect((await request(worker, namespace, "rebuild", {})).status).toBe(200);
+  for (const [text, expected] of distinct) {
     const fresh = await request(worker, namespace, "query", {
       ...textQuery(text, 3),
       match: "phrase",

@@ -2091,3 +2091,33 @@ Two alternating direct-WASM comparisons exercised one query plan across 32 ranke
 These 1–13% improvements concern preparation/span selection, excluding I/O, posting ingestion and scoring populated lists. Two complete workerd comparisons used 50,000 documents, ten query shapes and 100/8 segment layouts, reversing Worker creation order in the second run. All 2,240 responses retained exact rows, scores and sequence. Median candidate/baseline ratios across workload cells were 0.992 and 1.008, with substantial individual regressions as well as gains; one common-query cell more than doubled. This does not establish a general query-latency improvement.
 
 The full local gate passed 34 Rust and 154 Worker/Bun tests with 2,648 assertions, strict lint and native/WASM Clippy. Prepared-query lifetime tests now include reversed and repeated terms in any/all/phrase modes. SciFact retained every evaluated row/order and metric from the prior directory-decoder result on the same 5,183-document corpus and 300 judgments: nDCG@10 0.6730619695232347, recall@10 0.7956666666666666 and MRR@10 0.641808201058201. The complete evaluated-array SHA-256 is `ca9bc9bd6ba7a68bb90d25b69582eda335b74d72fa45d5bbbac62e905c61bcac`. Native verification remains separate; the existing production deployment was retained while the million-document comparator was running.
+
+## Reusing BM25 scorers during catalog-bound evaluation
+
+The at-most-64-catalog WASM call now builds each encountered term's scorer once and reuses it across catalogs and block-bound tuples. The temporary map borrows term keys from the decoded catalogs and is released with the call. Bounds retain the same global frequencies, segment-specific eligible length minima, sorted-term sum and floating-point arithmetic. A per-catalog alternative was also measured; sharing within the complete batch was faster in eight of nine paired workload cells.
+
+Two alternating direct-WASM runs evaluated 2/8/64 terms with 1/8/32 block tuples per term across 64 catalogs. All 96,768 returned bounds were identical to the preceding engine. The 64-term/32-block cell improved from 35.76 to 29.05 ms initially and from 27.78 to 25.30 ms on repetition. Small cells were mixed: the two-term/eight-block cell regressed 7.9% initially and improved 9.7% on repetition; the eight-term/one-block cell changed by -1.4% and +0.9%. These timings include JSON parsing and result transfer, excluding storage I/O.
+
+Two complete workerd comparisons used 50,000 documents and verified all 448 responses for exact rows, scores and acknowledged sequence. Worker creation order was reversed in the second run. Median milliseconds:
+
+| Segments | Query            |  Before / after | Repeated before / after |
+| -------: | :--------------- | --------------: | ----------------------: |
+|      100 | Eight terms      |   88.33 / 87.98 |           87.82 / 86.86 |
+|      100 | Four-term phrase | 116.10 / 112.93 |         112.93 / 110.74 |
+|        8 | Eight terms      |   56.79 / 54.10 |           59.45 / 62.35 |
+|        8 | Four-term phrase |   92.50 / 84.94 |           93.81 / 92.92 |
+
+Seven of eight cells improved; the repeated eight-segment/eight-term case regressed 4.9%. This establishes a bounded local improvement, not a general native latency guarantee. The full gate passed 155 Worker/Bun and 34 Rust tests with 2,650 assertions and strict lint/Clippy/type checks. Golden bounds cover missing/zero/out-of-range frequencies, filtered length clamps, absent eligibility and an empty namespace. The 300-query SciFact evaluated array and metrics remained identical to the preceding term-preparation result. Both Rust optimizations still awaited native verification during the operational measurement below.
+
+## Million-document operational comparison with a remaining WAL tail
+
+A separate read-only comparison reused the existing million-document Kannin corpus at sequence 2,000 and the million-document temporary Turbopuffer namespace owned by the ongoing strict benchmark. It ran on 2026-10-15 from 06:08:21 to 06:09:27 UTC, with six warmups and fifty measured sequential queries per case, top-k 10 and concurrency one. Every iteration ran Kannin strong, Kannin edge and Turbopuffer strong. Kannin responses came through GRU; Turbopuffer used aws-sa-east-1. No data or deployment changed. The confirmed active Kannin version was `9147bbc6-c7e6-4734-8b45-13a6b78bf659`, preceding both local Rust optimizations above.
+
+| Query     | Kannin strong p50 / p95 ms | Kannin edge p50 / p95 ms | Turbopuffer strong p50 / p95 ms |
+| :-------- | -------------------------: | -----------------------: | ------------------------------: |
+| Rare      |            159.23 / 170.42 |            39.80 / 70.60 |                   59.55 / 60.91 |
+| Selective |            163.56 / 176.43 |            43.07 / 68.48 |                   58.93 / 60.14 |
+| Common    |            173.06 / 181.16 |            54.98 / 87.11 |                   80.67 / 81.82 |
+| Filtered  |            168.42 / 173.50 |            49.67 / 79.42 |                   76.36 / 77.35 |
+
+All 448 Kannin responses, including warmups, matched exact strong rows/scores and sequence. Edge still uses snapshots younger than one second at selection and an acknowledged sequence barrier; its consistency contract differs from strong reads. Turbopuffer metadata reported one million rows and an up-to-date index, while every measured query reported 14,500 unindexed WAL rows, or 1.45% of the corpus. Its native explanation showed FetchBM25 with unindexed WAL identifiers excluded from that indexed branch. The strict driver's approximately-five-second readiness probes continued during this operational run. These conditions and limited samples prevent a fully indexed or general parity claim; the operational data do not satisfy or replace the strict driver's zero-unindexed gate. Ranking checks compare Kannin edge with Kannin strong; Turbopuffer contributes separate latency and telemetry. The strong-hop cost and variable tails remain material limits.

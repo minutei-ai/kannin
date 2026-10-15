@@ -18,6 +18,7 @@ import {
   segment_document_terms,
   segment_filter,
   segment_term_bounds,
+  PreparedQuery,
 } from "../dist/wasm/raio_engine";
 import module from "raio:wasm";
 import type { Row, Snapshot } from "./protocol";
@@ -425,6 +426,8 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
     bytes: 0,
     segments: 0,
   };
+  using plans = new DisposableStack();
+  const compilation: { query: PreparedQuery | undefined } = { query: undefined };
   for (const { segment, dictionary, minimum, bound } of prioritized) {
     if (minimum === null) continue;
     if (Object.keys(dictionary).length === 0) continue;
@@ -446,19 +449,26 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
       )
         continue;
     }
-    const ranking = Schema.encodeSync(Schema.fromJsonString(RankingInput))({
-      text: input.text,
-      mode: input.match ?? "any",
-      top_k: input.topK,
-      dead: segment.dead,
-      filters: input.filters,
-      statistics,
-    });
+    if (compilation.query === undefined)
+      compilation.query = plans.use(
+        new PreparedQuery(
+          Schema.encodeSync(Schema.fromJsonString(RankingInput))({
+            text: input.text,
+            mode: input.match ?? "any",
+            top_k: input.topK,
+            dead: [],
+            filters: input.filters,
+            statistics,
+          }),
+        ),
+      );
+    const prepared = compilation.query;
+    const dead = Schema.encodeSync(integers)(segment.dead);
     const prepareStarted = Effect.runSync(Clock.currentTimeNanos);
     const result = await Effect.runPromise(
       withDirectory(segment.key, segment.headerBytes, (decoded) =>
         Effect.acquireUseRelease(
-          Effect.sync(() => decoded.ranker(ranking)),
+          Effect.sync(() => decoded.ranker_prepared(prepared, dead)),
           (ranker) =>
             Effect.gen(function* () {
               rankMetrics.prepare += (yield* Clock.currentTimeNanos) - prepareStarted;

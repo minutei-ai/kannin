@@ -13,9 +13,11 @@ import {
   Segment,
   Directory,
   BloomBatch,
+  PreparedQuery,
 } from "../dist/wasm/raio_engine";
 import {
   StoredDocument,
+  PostingSpans,
   SegmentHeader,
   DataRange,
   Filter,
@@ -337,4 +339,91 @@ test("retained Bloom batches own their bytes and preserve direct-reader validati
     new Uint32Array(66),
   ])
     expect(() => new BloomBatch(new Uint8Array(0), invalid)).toThrow();
+});
+
+test("prepared queries preserve per-segment masks and outlive their query-plan handle", () => {
+  const fixtures = [
+    [
+      { id: "a", text: "alpha beta", attributes: { group: 1 } },
+      { id: "b", text: "beta alpha", attributes: { group: 0 } },
+      { id: "c", text: "alpha alpha beta", attributes: { group: 1 } },
+    ],
+    [
+      { id: "d", text: "alpha beta", attributes: { group: 1 } },
+      { id: "e", text: "beta", attributes: { group: 1 } },
+    ],
+  ];
+  const segments = fixtures.map((docs) => new Segment(JSON.stringify(docs)));
+  const buffers = segments.map((segment) => segment.bytes());
+  const directories = buffers.map((bytes) => new Directory(bytes));
+  for (const mode of ["any", "all", "phrase"]) {
+    const input = {
+      text: "ÁLPHA beta",
+      mode,
+      top_k: 10,
+      dead: [],
+      filters: [{ field: "group", op: "eq", value: 1 }],
+      statistics: {
+        documents: 4,
+        title_length: 0,
+        body_length: 8,
+        frequencies: { alpha: 3, beta: 4 },
+      },
+    };
+    const query = new PreparedQuery(JSON.stringify(input));
+    const rankers = directories.map((directory, index) => {
+      const dead = [];
+      if (index === 0) dead.push(0);
+      return {
+        legacy: directory.ranker(JSON.stringify({ ...input, dead })),
+        compiled: directory.ranker_prepared(query, JSON.stringify(dead)),
+      };
+    });
+    query.free();
+    for (const [index, pair] of rankers.entries()) {
+      const bytes = buffers[index];
+      if (bytes === undefined) throw new Error("Missing segment");
+      const base = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
+      expect(pair.compiled.posting_spans()).toBe(pair.legacy.posting_spans());
+      const spans = Schema.decodeSync(Schema.fromJsonString(PostingSpans))(
+        pair.legacy.posting_spans(),
+      );
+      for (const span of spans)
+        for (const block of span.blocks) {
+          const page = bytes.subarray(
+            base + block.data.offset,
+            base + block.data.offset + block.data.length,
+          );
+          pair.legacy.add(span.term, page);
+          pair.compiled.add(span.term, page);
+        }
+      expect(pair.compiled.finish()).toBe(pair.legacy.finish());
+      pair.legacy.free();
+      pair.compiled.free();
+    }
+  }
+  for (const directory of directories) directory.free();
+  for (const segment of segments) segment.free();
+});
+
+test("prepared queries reject shared tombstones and preserve query-budget failures", () => {
+  const input = {
+    text: "alpha",
+    mode: "any",
+    top_k: 10,
+    dead: [],
+    filters: [],
+    statistics: { documents: 1, title_length: 0, body_length: 1, frequencies: { alpha: 1 } },
+  };
+  expect(() => new PreparedQuery(JSON.stringify({ ...input, dead: [0] }))).toThrow(
+    "empty segment tombstones",
+  );
+  for (const invalid of [
+    { ...input, top_k: 0 },
+    { ...input, top_k: 101 },
+    { ...input, mode: "invalid" },
+    { ...input, text: Array.from({ length: 65 }, (_, index) => `term${index}`).join(" ") },
+    { ...input, mode: "phrase", text: "alpha ".repeat(65) },
+  ])
+    expect(() => new PreparedQuery(JSON.stringify(invalid))).toThrow();
 });

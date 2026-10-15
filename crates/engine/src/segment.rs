@@ -684,7 +684,7 @@ pub fn parse_header(bytes: &[u8]) -> Result<(Header, usize), String> {
     Ok((header, 16 + length))
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Statistics {
     pub documents: u64,
     pub title_length: u64,
@@ -932,6 +932,19 @@ pub struct PostingSpan<'a> {
     pub blocks: Vec<&'a BlockMeta>,
 }
 
+fn validate_search_budget(words: &[String], mode: &str, top_k: usize) -> Result<(), String> {
+    if top_k == 0 || top_k > 100 || words.iter().collect::<BTreeSet<_>>().len() > 64 {
+        return Err("Invalid search budget".into());
+    }
+    if mode != "any" && mode != "all" && mode != "phrase" {
+        return Err("Unknown match mode".into());
+    }
+    if mode == "phrase" && words.len() > 64 {
+        return Err("Phrase exceeds budget".into());
+    }
+    Ok(())
+}
+
 impl Search {
     #[must_use]
     pub fn posting_spans(&self) -> Vec<PostingSpan<'_>> {
@@ -984,15 +997,19 @@ impl Search {
             .split_whitespace()
             .map(str::to_owned)
             .collect();
-        if top_k == 0 || top_k > 100 || words.iter().collect::<BTreeSet<_>>().len() > 64 {
-            return Err("Invalid search budget".into());
-        }
-        if mode != "any" && mode != "all" && mode != "phrase" {
-            return Err("Unknown match mode".into());
-        }
-        if mode == "phrase" && words.len() > 64 {
-            return Err("Phrase exceeds budget".into());
-        }
+        validate_search_budget(&words, mode, top_k)?;
+        Self::with_words(header, statistics, words, mode, top_k, dead, filters)
+    }
+
+    fn with_words(
+        header: Rc<Header>,
+        statistics: Statistics,
+        words: Vec<String>,
+        mode: &str,
+        top_k: usize,
+        dead: &[u32],
+        filters: &[Filter],
+    ) -> Result<Self, String> {
         let allowed = header.allowed(filters, dead)?;
         Ok(Self {
             header,
@@ -1434,6 +1451,7 @@ pub mod wasm {
         BlockMeta, BuiltSegment, Document, DocumentMeta, FILTER_CACHE_BYTES, Filter, Header,
         MAX_BYTES, Search, SelectedAttributes, Statistics, TermMeta, append, bloom_build,
         bloom_filter_many, bm25, build, decode_page, document_terms, matches, parse_header,
+        validate_search_budget,
     };
     use serde::{Deserialize, Serialize};
     use std::collections::{BTreeMap, BTreeSet};
@@ -2017,6 +2035,27 @@ pub mod wasm {
             serde_json::to_string(&selected).map_err(|cause| JsValue::from_str(&cause.to_string()))
         }
 
+        #[doc = "# Errors\nRejects invalid tombstone JSON, filter attributes, or deleted rows."]
+        pub fn ranker_prepared(
+            &self,
+            query: &PreparedQuery,
+            dead: &str,
+        ) -> Result<Ranker, JsValue> {
+            let dead: Vec<u32> = serde_json::from_str(dead)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            let search = Search::with_words(
+                self.header.clone(),
+                query.input.statistics.clone(),
+                query.words.clone(),
+                &query.input.mode,
+                query.input.top_k,
+                &dead,
+                &query.input.filters,
+            )
+            .map_err(|cause| JsValue::from_str(&cause))?;
+            Ok(Ranker { search })
+        }
+
         #[doc = "# Errors\nRejects invalid query JSON, filters, term budgets, top-k, or match mode."]
         pub fn ranker(&self, query: &str) -> Result<Ranker, JsValue> {
             let input: Input =
@@ -2171,6 +2210,34 @@ pub mod wasm {
         dead: Vec<u32>,
         filters: Vec<Filter>,
         statistics: Statistics,
+    }
+
+    #[wasm_bindgen]
+    pub struct PreparedQuery {
+        input: Input,
+        words: Vec<String>,
+    }
+
+    #[wasm_bindgen]
+    impl PreparedQuery {
+        #[wasm_bindgen(constructor)]
+        #[doc = "# Errors\nRejects invalid query JSON, query budgets, match mode, or nonempty segment tombstones."]
+        pub fn new(query: &str) -> Result<Self, JsValue> {
+            let input: Input = serde_json::from_str(query)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            if !input.dead.is_empty() {
+                return Err(JsValue::from_str(
+                    "Prepared query requires empty segment tombstones",
+                ));
+            }
+            let words = crate::normalize_text(&input.text)
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            validate_search_budget(&words, &input.mode, input.top_k)
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            Ok(Self { input, words })
+        }
     }
 
     #[wasm_bindgen]

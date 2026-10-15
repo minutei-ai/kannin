@@ -13,11 +13,11 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Concurrency | p50 ms |  p95 ms | Requests/s |
 | ----------: | -----: | ------: | ---------: |
-|           1 |  86.44 |  193.78 |       9.80 |
-|           4 |  87.74 |  908.45 |      14.17 |
-|          16 | 223.05 | 1708.32 |      15.69 |
+|           1 |  61.92 |  231.01 |       8.38 |
+|           4 |  76.02 | 1001.88 |      12.04 |
+|          16 | 226.05 | 1246.32 |      22.37 |
 
-The latest 32-request phases cover rare, selective, common and filtered text queries; all **96 responses** matched strong rows/scores and sequence. Native latency remains mixed across runs, with uncontrolled cache/isolate/network placement. Adjacent result pages reduced text/vector/hybrid acquisitions from **12/11/18 to 5/4/6** in an owned native fixture. Local compact-frequency pipelines improved **20–23%** in 10,000-document unfiltered/interleaved cases; bounded top-k pipelines improved **8–16%** in 5,000-document loose-bound cases. Retained WASM Bloom batches improved a synthetic large-bitmap rehydration fixture by **24–30%** while keeping the 4 MiB charged budget. These are scoped gains, not uniform whole-query speedups. Full methodology, controls and regressions are linked below. Peak memory and general Turbopuffer parity remain unverified.
+The latest 32-request phases cover rare, selective, common and filtered text queries; all **96 responses** matched strong rows/scores and sequence. Native latency varies across runs, with uncontrolled cache/isolate/network placement. A controlled local 32-segment comparison improved complete short/long query medians by **10–12%** after preparing shared ranking input once per request. Other scoped Rust/cache gains, controls and regressions are documented below; they do not prove uniform native latency. Peak memory and general Turbopuffer parity remain unverified.
 
 The local million-document workload measured strong common/filtered p50 of **127/126 ms** across 2,000 uncompacted segments. These emulator results exclude native network latency. The repeated independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10** across 300 queries. Eight native vector/hybrid fixture cases also retained exact rows and scores.
 

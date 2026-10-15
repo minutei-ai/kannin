@@ -13,15 +13,17 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Concurrency | p50 ms | p95 ms | Requests/s |
 | ----------: | -----: | -----: | ---------: |
-|           1 |  48.23 |  81.97 |      15.01 |
-|           4 |  53.53 | 156.30 |      23.74 |
-|          16 |  70.95 | 905.33 |      65.89 |
+|           1 |  52.14 |  93.59 |      16.04 |
+|           4 |  64.55 | 182.14 |      33.44 |
+|          16 |  74.58 | 674.28 |      62.88 |
 
-Each 128-request phase covers rare, selective, common and filtered text queries. All **384 responses** matched their strong rows/scores and sequence. The preceding implementation's latest run measured p95 **83.28/111.87/784.07 ms**. The current concurrency-four phase included a **4.17-second** outlier whose timings showed slow R2 snapshot acquisition followed by coordinator fallback. These bounded runs do not isolate placement, cache or network variation and do not establish concurrent reliability, peak memory or general Turbopuffer parity.
+Each 128-request phase covers rare, selective, common and filtered text queries. Both latest runs matched their strong rows/scores and sequence in all **768 responses**. The table shows the second run; the first measured p95 **137.53/192.32/813.21 ms**. The preceding implementation measured **81.97/156.30/905.33 ms**. These bounded runs show mixed tails and do not isolate placement, cache or network variation or establish general Turbopuffer parity, concurrent reliability or peak memory.
 
 Strong queries capture an immutable root under the coordinator lock, then run up to four at a time while writes continue. Identical text requests against the same captured root now share active ranking and materialization; the entry ends with the calculation. In four paired native bursts of four identical requests, ranked segment visits fell from **800 to 200 per burst**, preserving all complete rows/scores. Burst completion changed **11.1–12.6 seconds→8.0–9.7 seconds**, a **13–37%** reduction in those samples after warming immutable inputs. [Active-query measurements](docs/performance.md#sharing-active-coordinator-text-evaluations).
 
-Dense first-use search remains multi-second. Two sequential edge selections took **11.76/6.68 seconds**; a subsequent sixteen-request mixed strong/edge burst preserved every reference with p95 **2.12 seconds**. Its producers ranked three segments and three coordinator requests joined active work. Plans also reuse Rust-normalized equivalent selections across case, accents and any/all token order. These optimizations cover repeated or overlapping work; cold acquisition and concurrent tails remain unresolved.
+Dense first-use search remains multi-second. The latest two sequential edge selections took **13.75/10.47 seconds**; a subsequent sixteen-request mixed strong/edge burst preserved every reference with p95 **1.57 seconds**. Plans also reuse Rust-normalized equivalent selections across case, accents and any/all token order. These optimizations cover repeated or overlapping work; cold acquisition and concurrent tails remain unresolved.
+
+The Rust any-mode cursor now uses a provably required term once other terms cannot beat the top-k cutoff. Paired finish-only measurements improved **73–85%** on selective eight-term fixtures with identical scores. Complete native queries showed mixed changes, so the scorer gain does not establish faster cold search. [Required-term measurements](docs/performance.md#required-term-candidate-traversal-in-rust).
 
 The local million-document workload measured strong common/filtered p50 of **127/126 ms** across 2,000 uncompacted segments. Separate paired 50,000-document tests of deduplicated Rust score envelopes improved medians by **6–10%**. Emulator results exclude native network latency. Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10** across 300 queries. The latest native Vectorize visibility probe remained empty through its bounded polling window; current provider-backed vector/hybrid validation remains pending.
 
@@ -40,7 +42,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **182 Worker/tooling tests and 36 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **182 Worker/tooling tests and 38 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

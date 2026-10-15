@@ -2536,3 +2536,43 @@ These are four paired selection samples, not a statistical latency distribution.
 The deployed standard load preserved all 384 strong-baseline comparisons. Concurrency 1/4/16 measured p50 48.23/53.53/70.95 ms, p95 81.97/156.30/905.33 ms and throughput 15.01/23.74/65.89 requests/s. Its worst phase-four request took 4,172.14 ms: timing reported slow R2 snapshot acquisition/body handling, an expired snapshot and coordinator fallback. The response still matched its strong reference. The worst phase-sixteen request took 1,747.74 ms and also fell back after slow R2 snapshot revalidation. Those tails are not solved by sharing coordinator ranking.
 
 Two sequential edge selections for group 75 and the first six-token phrase matched their original strong references in 11,760.34/6,679.39 ms. After those warmups, a sixteen-request mixed strong/edge burst preserved all references, measuring p50/p95/max 1,668.42/2,115.49/2,120.03 ms and 7.54 requests/s. Every producer ranked three segments; three strong requests joined active coordinator work. No HTTP error occurred in these measured runs. This does not establish cold-edge reliability, native vector visibility, or general Turbopuffer parity. The deployment completed the unconditional 30-namespace/398-submission vector reconciliation, and its active version was verified through the native API; provider visibility remains separate.
+
+## Required-term candidate traversal in Rust
+
+Any-mode ranking now switches from union traversal to a required-term driver when top-k is full and the cutoff strictly exceeds the conservative maximum contribution of all other terms. Per-term maxima come from the same validated block bounds used by existing pruning. Their sum retains sorted term order, and the existing `1e-12` tolerance is preserved. The largest upper bound is selected, with shorter lists preferred on a tie. A document without that term cannot improve top-k; all other lists are sought to each retained candidate so their contributions remain included. All/phrase semantics, canonical segment bytes and cache formats stay unchanged.
+
+A counted real-scorer regression fixture previously made 24,536 frequency accesses during scoring; the new traversal remains below 8,000, while exactly matching an exhaustive row/score oracle. A second oracle covers 72 combinations of query terms, top-k, filters, deletions and changed global statistics. The full gate passed 182 Worker/tooling and 38 Rust tests. The complete 300-query SciFact report remained identical.
+
+The paired WASM finish-only comparison built identical fixtures independently in each engine, verified byte-identical canonical segments and every returned row/score, alternated engine order over 24 pairs and excluded the first four pairs. Ranker construction and posting loading occurred outside the measured interval. Each median contains twenty samples.
+
+| Documents | Query                                   | Original finish ms | Required-term finish ms |
+| --------: | :-------------------------------------- | -----------------: | ----------------------: |
+|     5,000 | Eight terms including a selective group |             1.1749 |                  0.3191 |
+|    10,000 | Eight terms including a selective group |             2.2919 |                  0.3511 |
+|     5,000 | Four common terms                       |             0.6691 |                  0.6857 |
+|    10,000 | Four common terms                       |             1.3517 |                  1.3742 |
+|     5,000 | All-mode                                |             0.0796 |                  0.0819 |
+|    10,000 | All-mode                                |             0.1345 |                  0.1333 |
+|     5,000 | Phrase                                  |             1.2915 |                  1.3415 |
+|    10,000 | Phrase                                  |             3.1126 |                  3.0450 |
+|     5,000 | Filtered eight terms                    |             0.0876 |                  0.0876 |
+|    10,000 | Filtered eight terms                    |             0.1501 |                  0.1561 |
+
+The selective any-mode case improved approximately 73–85%; the controls showed small increases and decreases. An earlier fixture setup allocated the segment builder only in the baseline engine and produced misleading phrase-control differences; those timings are excluded above. The balanced setup prevents that unequal retained allocation. Finish-only results exclude directory decoding, posting transfer and materialization, so they do not establish an equivalent complete-query gain.
+
+The million-document native comparison retained 200 segments and sequence 2,000. Each measured selection followed an alternate-mode warmup and required a plan miss; these are new-plan comparisons with warmed immutable inputs. Every complete row, revision and score matched its pre-change reference.
+
+| Selection                                     | Original ms | Required-term ms |
+| :-------------------------------------------- | ----------: | ---------------: |
+| Group 77 / eight terms                        |    7,464.67 |         7,471.77 |
+| Storage-latency-durable-object-storage phrase |    6,425.87 |         6,434.20 |
+| Group 78 / eight terms                        |    7,895.73 |         6,642.12 |
+| Latency-durable-object-storage-latency phrase |    6,369.49 |         6,356.27 |
+| Group 79 / eight terms                        |    7,030.97 |         7,524.08 |
+| Durable-object-storage-latency-durable phrase |    6,656.03 |         6,603.91 |
+
+The three any-mode samples were approximately unchanged, 15.9% faster and 7.0% slower respectively. Phrase controls stayed within 0.8%. Each request still ranked all 200 segments. Reduced score evaluation did not reduce directory/posting acquisition, and the complete-query samples do not establish a uniform improvement. The Rust change is retained for its directly verified reduction in redundant scoring; the cold storage/catalog bottleneck remains open.
+
+Two isolated standard loads each preserved all 384 comparisons against strong baselines. The first measured concurrency 1/4/16 p50 56.50/54.45/76.29 ms, p95 137.53/192.32/813.21 ms and throughput 12.01/36.14/46.02 requests/s. The repeat measured p50 52.14/64.55/74.58 ms, p95 93.59/182.14/674.28 ms and throughput 16.04/33.44/62.88 requests/s. Compared with the preceding implementation's 81.97/156.30/905.33 ms p95, these remain mixed rather than a general speedup.
+
+Sequential edge warmups for group 77 and the first phrase returned exact references in 13,753.16/10,469.89 ms. The following mixed sixteen-request burst preserved every reference and measured p50/p95/max 1,375.46/1,573.48/1,607.44 ms with 9.94 requests/s. No HTTP error occurred in these runs. The Alchemy deployment and unconditional 30-namespace/398-submission vector migration completed, and the active Worker version was verified through the native API. Vectorize visibility, peak memory, fully cold reliability and general Turbopuffer parity remain separate unverified requirements.

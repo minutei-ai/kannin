@@ -948,6 +948,8 @@ struct PostingCursors<'a, T: PostingRow> {
     cursors: Vec<usize>,
     allowed: &'a [bool],
     driver: Option<usize>,
+    required: Option<usize>,
+    requirement: Option<(usize, f64)>,
     dense: bool,
 }
 
@@ -968,6 +970,8 @@ impl<'a, T: PostingRow> PostingCursors<'a, T> {
             lists,
             allowed,
             driver,
+            required: None,
+            requirement: None,
             dense,
         }
     }
@@ -985,7 +989,44 @@ impl<'a, T: PostingRow> PostingCursors<'a, T> {
         start + list[start..stop].partition_point(|posting| posting.row() < target)
     }
 
+    fn require_term(&mut self, bounds: &[Vec<(&BlockMeta, f64)>], cutoff: &Hit) -> bool {
+        if self.requirement.is_none() {
+            let upper: Vec<_> = bounds
+                .iter()
+                .map(|blocks| {
+                    blocks
+                        .iter()
+                        .fold(0.0_f64, |score, (_, bound)| score.max(*bound))
+                })
+                .collect();
+            let Some((index, _)) = upper.iter().enumerate().max_by(|(left, a), (right, b)| {
+                a.total_cmp(b)
+                    .then_with(|| self.lists[*right].len().cmp(&self.lists[*left].len()))
+            }) else {
+                return false;
+            };
+            let others = upper.iter().enumerate().fold(0.0, |total, (term, score)| {
+                if term == index { total } else { total + score }
+            });
+            self.requirement = Some((index, others));
+        }
+        if let Some((index, others)) = self.requirement
+            && others + 1e-12 < cutoff.score
+        {
+            self.required = Some(index);
+            return true;
+        }
+        false
+    }
+
     fn row(&mut self) -> Option<u32> {
+        if let Some(required) = self.required {
+            let row = self.lists[required].get(self.cursors[required])?.row();
+            for (index, list) in self.lists.iter().enumerate() {
+                self.cursors[index] += Self::advance_before(&list[self.cursors[index]..], row);
+            }
+            return Some(row);
+        }
         let Some(driver) = self.driver else {
             return self
                 .lists
@@ -1483,20 +1524,28 @@ impl Search {
         while let Some(row) = positions.row() {
             if heap.len() == self.top_k
                 && let Some(cutoff) = heap.peek()
-                && let Some(end) = Self::skippable_block_end(
+            {
+                let bounds = bounds.get_or_insert_with(|| self.block_bounds());
+                if self.mode == "any"
+                    && positions.required.is_none()
+                    && positions.require_term(bounds, cutoff)
+                {
+                    continue;
+                }
+                if let Some(end) = Self::skippable_block_end(
                     &positions.lists,
                     &positions.cursors,
-                    bounds.get_or_insert_with(|| self.block_bounds()),
+                    bounds,
                     &mut bound_cursors,
                     cutoff,
                     row,
-                )
-            {
-                for (index, list) in positions.lists.iter().enumerate() {
-                    positions.cursors[index] += list[positions.cursors[index]..]
-                        .partition_point(|posting| posting.row() <= end);
+                ) {
+                    for (index, list) in positions.lists.iter().enumerate() {
+                        positions.cursors[index] += list[positions.cursors[index]..]
+                            .partition_point(|posting| posting.row() <= end);
+                    }
+                    continue;
                 }
-                continue;
             }
             if !self.allowed[row as usize] {
                 for (index, list) in positions.lists.iter().enumerate() {
@@ -3286,6 +3335,222 @@ mod eligible_bound_tests {
                                 document.body_length,
                             );
                             assert!(actual <= bound + 1e-12);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod required_term_tests {
+    use super::{
+        Document, Posting, PostingRow, Search, Statistics, build, decode_postings, parse_header,
+    };
+    use std::cell::Cell;
+    use std::collections::BTreeMap;
+    use std::rc::Rc;
+
+    struct CountedPosting {
+        posting: Posting,
+        calls: Rc<Cell<usize>>,
+    }
+
+    impl PostingRow for CountedPosting {
+        fn row(&self) -> u32 {
+            self.posting.row
+        }
+        fn counts(&self) -> [usize; 2] {
+            self.calls.set(self.calls.get() + 1);
+            [self.posting.title.len(), self.posting.body.len()]
+        }
+        fn positions(&self) -> [&[u32]; 2] {
+            [&self.posting.title, &self.posting.body]
+        }
+    }
+
+    fn exhaustive(
+        search: &Search,
+        lists: &BTreeMap<String, Vec<CountedPosting>>,
+    ) -> Result<Vec<super::Hit>, Box<dyn std::error::Error>> {
+        let mut hits = Vec::new();
+        for (row, document) in search.header.documents.iter().enumerate() {
+            if !search.allowed[row] {
+                continue;
+            }
+            let row = u32::try_from(row)?;
+            let mut score = 0.0;
+            for (index, term) in search.terms.order.iter().enumerate() {
+                if let Some(postings) = lists.get(&search.words[*term])
+                    && let Ok(position) = postings.binary_search_by_key(&row, |p| p.posting.row)
+                {
+                    let posting = &postings[position].posting;
+                    score += search.terms.scorers[index].score(
+                        u32::try_from(posting.title.len())?,
+                        u32::try_from(posting.body.len())?,
+                        document.title_length,
+                        document.body_length,
+                    );
+                }
+            }
+            if score > 0.0 {
+                hits.push(super::Hit { row, score });
+            }
+        }
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.row.cmp(&b.row)));
+        hits.truncate(search.top_k);
+        Ok(hits)
+    }
+
+    #[test]
+    fn a_required_rare_term_avoids_scoring_common_only_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let docs = (0..4096)
+            .map(|row| Document {
+                id: format!("{row:05}"),
+                revision: 1,
+                title: String::new(),
+                text: format!(
+                    "{} {}",
+                    "alpha beta gamma ".repeat(8 + row % 8),
+                    if row % 97 == 0 { "needle" } else { "filler" }
+                ),
+                attributes: BTreeMap::new(),
+                vector: None,
+            })
+            .collect();
+        let built = build(docs)?;
+        let (header, base) = parse_header(&built.bytes)?;
+        let statistics = Statistics {
+            documents: u64::try_from(header.documents.len())?,
+            title_length: header.total_title_length,
+            body_length: header.total_body_length,
+            frequencies: header
+                .terms
+                .iter()
+                .map(|(term, meta)| (term.clone(), u64::from(meta.df)))
+                .collect(),
+        };
+        let search = Search::new(
+            header.clone(),
+            statistics,
+            "alpha beta gamma needle",
+            "any",
+            10,
+            &[],
+            &[],
+        )?;
+        let calls = Rc::new(Cell::new(0));
+        let mut lists = BTreeMap::new();
+        for term in ["alpha", "beta", "gamma", "needle"] {
+            let metadata = header.terms.get(term).ok_or("Missing term")?;
+            let mut postings = Vec::new();
+            for block in &metadata.blocks {
+                let start = base + block.data.offset as usize;
+                postings.extend(
+                    decode_postings(&built.bytes[start..start + block.data.length as usize])?
+                        .into_iter()
+                        .map(|posting| CountedPosting {
+                            posting,
+                            calls: calls.clone(),
+                        }),
+                );
+            }
+            lists.insert(term.into(), postings);
+        }
+        let hits = search.finish_lists(&lists)?;
+        assert_eq!(hits, exhaustive(&search, &lists)?);
+        assert_eq!(hits.len(), 10);
+        assert!(hits.iter().all(|hit| hit.row % 97 == 0));
+        assert!(
+            calls.get() < 8000,
+            "scored frequency reads: {}",
+            calls.get()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn required_terms_preserve_exhaustive_scores_with_filters_deletions_and_changed_statistics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let docs = (0..1024)
+            .map(|row| Document {
+                id: format!("{row:05}"),
+                revision: 1,
+                title: if row % 97 == 0 {
+                    "needle alpha".into()
+                } else {
+                    "gamma ".repeat(row % 3)
+                },
+                text: format!(
+                    "{} {} {} {} {}",
+                    "alpha ".repeat(row % 5),
+                    "beta ".repeat(row % 7),
+                    "gamma ".repeat(row % 11),
+                    if row % 53 == 0 { "scarce" } else { "filler" },
+                    "padding ".repeat(row % 17)
+                ),
+                attributes: BTreeMap::from([("group".into(), serde_json::json!(row % 2))]),
+                vector: None,
+            })
+            .collect();
+        let built = build(docs)?;
+        let (header, base) = parse_header(&built.bytes)?;
+        let calls = Rc::new(Cell::new(0));
+        let mut lists = BTreeMap::new();
+        for term in ["alpha", "beta", "gamma", "needle", "scarce"] {
+            let mut postings = Vec::new();
+            for block in &header.terms.get(term).ok_or("Missing term")?.blocks {
+                let start = base + block.data.offset as usize;
+                postings.extend(
+                    decode_postings(&built.bytes[start..start + block.data.length as usize])?
+                        .into_iter()
+                        .map(|posting| CountedPosting {
+                            posting,
+                            calls: calls.clone(),
+                        }),
+                );
+            }
+            lists.insert(term.into(), postings);
+        }
+        for factor in [1, 3] {
+            let statistics = Statistics {
+                documents: u64::try_from(header.documents.len())? * factor,
+                title_length: header.total_title_length * factor + 1000,
+                body_length: header.total_body_length * factor + 1234,
+                frequencies: header
+                    .terms
+                    .iter()
+                    .map(|(term, meta)| (term.clone(), u64::from(meta.df) * factor))
+                    .collect(),
+            };
+            for query in [
+                "alpha beta gamma needle",
+                "alpha beta gamma scarce",
+                "alpha beta gamma needle scarce",
+            ] {
+                for top_k in [1, 10, 100] {
+                    for dead in [Vec::new(), (0..1024).step_by(5).collect()] {
+                        for filters in [
+                            Vec::new(),
+                            vec![super::Filter {
+                                field: "group".into(),
+                                op: "eq".into(),
+                                value: serde_json::json!(1),
+                            }],
+                        ] {
+                            let search = Search::new(
+                                header.clone(),
+                                statistics.clone(),
+                                query,
+                                "any",
+                                top_k,
+                                &dead,
+                                &filters,
+                            )?;
+                            assert_eq!(search.finish_lists(&lists)?, exhaustive(&search, &lists)?);
                         }
                     }
                 }

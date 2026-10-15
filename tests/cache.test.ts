@@ -940,6 +940,7 @@ test("a prior segment cutoff rejects noncompetitive posting pages before acquisi
     expect(result.rows.map((row) => row.id)).toEqual(
       Array.from({ length: 10 }, (_, row) => `a${String(row).padStart(4, "0")}`),
     );
-    expect(response.headers.get("server-timing")).toContain("blocks=12");
+    const expectedBlocks = { any: 8, all: 8, phrase: 12 };
+    expect(response.headers.get("server-timing")).toContain(`blocks=${expectedBlocks[match]}`);
   }
 });

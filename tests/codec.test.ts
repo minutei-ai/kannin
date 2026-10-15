@@ -643,3 +643,119 @@ test("cutoff equality uses UTF-16 identifiers before discarding tied pages", () 
     expect(span.blocks[0].last).toBe(127);
   }
 });
+
+test("dense term seed cutoffs preserve complete top-k including their own cutoff row", () => {
+  const fixtures = [
+    ["alpha beta", "beta alpha", "alpha gamma beta"].flatMap((text, group) =>
+      Array.from({ length: 256 }, (_, index) => ({
+        id: `${group}-${String(index).padStart(4, "0")}`,
+        title: "alpha ".repeat(index % 3),
+        text: `${text} ${"padding ".repeat(index % 17)}`,
+        attributes: { group },
+      })),
+    ),
+    [
+      { title: "alpha", text: "beta" },
+      { title: "beta", text: "alpha" },
+    ].flatMap((seed, group) =>
+      Array.from({ length: 256 }, (_, index) => ({
+        id: `${group}-${String(index).padStart(4, "0")}`,
+        title: `${seed.title} `.repeat(1 + (index % 3)),
+        text: `${seed.text} ${"gamma ".repeat(index % 17)}`,
+        attributes: { group },
+      })),
+    ),
+  ];
+  for (const docs of fixtures) {
+    using segment = new Segment(JSON.stringify(docs));
+    const bytes = segment.bytes();
+    const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
+    const base = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
+    using directory = new Directory(bytes);
+    for (const mode of ["any", "all", "phrase"] as const)
+      for (const text of ["alpha beta", "alpha gamma", "alpha alpha", "missing"])
+        for (const top_k of [1, 10, 100])
+          for (const dead of [[], [0, 1, 128, 256]])
+            for (const filters of [[], [{ field: "group", op: "eq", value: 1 }]] as const) {
+              const input = Schema.encodeSync(Schema.fromJsonString(RankingInput))({
+                text,
+                mode,
+                top_k,
+                dead,
+                filters,
+                statistics: {
+                  documents: docs.length,
+                  title_length: header.total_title_length,
+                  body_length: header.total_body_length,
+                  frequencies: Object.fromEntries(
+                    Object.entries(header.terms).map(([term, meta]) => [term, meta.df]),
+                  ),
+                },
+              });
+              using full = directory.ranker(input);
+              using seeded = directory.ranker(input);
+              for (const [ranker, spans] of [
+                [full, full.posting_spans()],
+                [seeded, seeded.posting_spans_seeded()],
+              ] as const)
+                for (const span of Schema.decodeSync(Schema.fromJsonString(PostingSpans))(spans))
+                  for (const block of span.blocks)
+                    ranker.add(
+                      span.term,
+                      bytes.subarray(
+                        base + block.data.offset,
+                        base + block.data.offset + block.data.length,
+                      ),
+                    );
+              expect(seeded.finish()).toBe(full.finish());
+            }
+  }
+});
+
+test("seed ties retain top-k one and a kth row at the first eligible row of a page", () => {
+  using segment = new Segment(
+    JSON.stringify(
+      Array.from({ length: 2048 }, (_, index) => ({
+        id: String(index).padStart(5, "0"),
+        text: "alpha beta",
+        attributes: { selected: index % 128 === 0 },
+      })),
+    ),
+  );
+  const bytes = segment.bytes();
+  const base = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
+  using directory = new Directory(bytes);
+  for (const mode of ["any", "all", "phrase"] as const)
+    for (const top_k of [1, 10, 100])
+      for (const dead of [[], [0, 128, 256]]) {
+        const input = Schema.encodeSync(Schema.fromJsonString(RankingInput))({
+          text: "alpha beta",
+          mode,
+          top_k,
+          dead,
+          filters: [{ field: "selected", op: "eq", value: true }],
+          statistics: {
+            documents: 2048,
+            title_length: 0,
+            body_length: 4096,
+            frequencies: { alpha: 2048, beta: 2048 },
+          },
+        });
+        using full = directory.ranker(input);
+        using seeded = directory.ranker(input);
+        for (const [ranker, spans] of [
+          [full, full.posting_spans()],
+          [seeded, seeded.posting_spans_seeded()],
+        ] as const)
+          for (const span of Schema.decodeSync(Schema.fromJsonString(PostingSpans))(spans))
+            for (const block of span.blocks)
+              ranker.add(
+                span.term,
+                bytes.subarray(
+                  base + block.data.offset,
+                  base + block.data.offset + block.data.length,
+                ),
+              );
+        expect(seeded.finish()).toBe(full.finish());
+      }
+});

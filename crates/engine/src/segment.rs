@@ -748,6 +748,17 @@ impl TermScorer {
         }
     }
 
+    fn minimum_score(&self, title: u32, body: u32) -> f64 {
+        match (title > 0, body > 0) {
+            (true, true) => self
+                .score(1, 0, title, body)
+                .min(self.score(0, 1, title, body)),
+            (true, false) => self.score(1, 0, title, body),
+            (false, true) => self.score(0, 1, title, body),
+            (false, false) => 0.0,
+        }
+    }
+
     fn score(&self, tf_title: u32, tf_body: u32, len_title: u32, len_body: u32) -> f64 {
         let Some(idf) = self.idf else {
             return 0.0;
@@ -964,6 +975,91 @@ impl Search {
         score: f64,
         id: &str,
     ) -> Result<Vec<PostingSpan<'_>>, String> {
+        self.posting_spans_cutoff(score, id, false)
+    }
+
+    fn dense_cutoff(&self) -> Option<Hit> {
+        if self.mode == "phrase" {
+            return None;
+        }
+        let terms = self.words.iter().collect::<BTreeSet<_>>();
+        let dense: Vec<_> = terms
+            .iter()
+            .filter(|term| {
+                self.header
+                    .terms
+                    .get(term.as_str())
+                    .is_some_and(|metadata| {
+                        usize::try_from(metadata.df).ok() == Some(self.header.documents.len())
+                    })
+            })
+            .collect();
+        if dense.is_empty() || (self.mode == "all" && dense.len() != terms.len()) {
+            return None;
+        }
+        let scorers: Vec<_> = dense
+            .iter()
+            .map(|term| {
+                TermScorer::new(
+                    &self.statistics,
+                    self.statistics
+                        .frequencies
+                        .get(term.as_str())
+                        .copied()
+                        .unwrap_or(0),
+                )
+            })
+            .collect();
+        let mut heap: BinaryHeap<Hit> = BinaryHeap::with_capacity(self.top_k);
+        for (row, document) in self.header.documents.iter().enumerate() {
+            if !self.allowed[row] {
+                continue;
+            }
+            let score = scorers.iter().fold(0.0, |score, scorer| {
+                score + scorer.minimum_score(document.title_length, document.body_length)
+            });
+            if score <= 0.0 {
+                continue;
+            }
+            let hit = Hit {
+                row: u32::try_from(row).ok()?,
+                score,
+            };
+            if heap.len() < self.top_k {
+                heap.push(hit);
+            } else if let Some(mut cutoff) = heap.peek_mut()
+                && hit < *cutoff
+            {
+                *cutoff = hit;
+            }
+        }
+        if heap.len() == self.top_k {
+            heap.peek().cloned()
+        } else {
+            None
+        }
+    }
+
+    #[doc = "# Errors\nRejects an invalid derived cutoff."]
+    pub fn posting_spans_seeded(&self) -> Result<Vec<PostingSpan<'_>>, String> {
+        self.dense_cutoff().map_or_else(
+            || Ok(self.posting_spans()),
+            |cutoff| {
+                self.posting_spans_cutoff(
+                    cutoff.score,
+                    &self.header.documents[cutoff.row as usize].id,
+                    true,
+                )
+            },
+        )
+    }
+
+    fn posting_spans_cutoff(
+        &self,
+        score: f64,
+        id: &str,
+        inclusive: bool,
+    ) -> Result<Vec<PostingSpan<'_>>, String> {
         if !score.is_finite() || score <= 0.0 {
             return Err("Invalid ranking cutoff".into());
         }
@@ -1002,11 +1098,11 @@ impl Search {
                 .iter()
                 .position(|allowed| *allowed)
                 .is_some_and(|offset| {
-                    self.header.documents[candidate.first as usize + offset]
+                    let order = self.header.documents[candidate.first as usize + offset]
                         .id
                         .encode_utf16()
-                        .cmp(id.encode_utf16())
-                        == Ordering::Less
+                        .cmp(id.encode_utf16());
+                    order == Ordering::Less || (inclusive && order == Ordering::Equal)
                 })
         }))
     }
@@ -2369,6 +2465,15 @@ pub mod wasm {
             serde_json::to_string(&self.search.posting_spans())
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))
         }
+        #[doc = "# Errors\nRejects invalid derived cutoffs or posting span serialization errors."]
+        pub fn posting_spans_seeded(&self) -> Result<String, JsValue> {
+            let spans = self
+                .search
+                .posting_spans_seeded()
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            serde_json::to_string(&spans).map_err(|cause| JsValue::from_str(&cause.to_string()))
+        }
+
         #[doc = "# Errors\nRejects invalid cutoffs or posting span serialization errors."]
         pub fn posting_spans_after(&self, score: f64, id: &str) -> Result<String, JsValue> {
             let spans = self
@@ -2945,6 +3050,37 @@ mod attribute_projection_tests {
                     .filter(|(key, _)| fields.contains(key.as_str()))
                     .collect::<BTreeMap<_, _>>();
                 assert_eq!(projected, expected, "{json}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod dense_cutoff_tests {
+    use super::{Statistics, TermScorer};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn minimum_term_score_bounds_every_possible_nonempty_field_assignment() {
+        let statistics = Statistics {
+            documents: 100,
+            title_length: 300,
+            body_length: 1000,
+            frequencies: BTreeMap::new(),
+        };
+        for df in [0, 1, 50, 100] {
+            let scorer = TermScorer::new(&statistics, df);
+            for title in [0, 1, 32] {
+                for body in [0, 1, 64] {
+                    let minimum = scorer.minimum_score(title, body);
+                    for title_tf in 0..=title.min(4) {
+                        for body_tf in 0..=body.min(4) {
+                            if title_tf + body_tf > 0 {
+                                assert!(minimum <= scorer.score(title_tf, body_tf, title, body));
+                            }
+                        }
+                    }
+                }
             }
         }
     }

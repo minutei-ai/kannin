@@ -474,7 +474,7 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
             Effect.gen(function* () {
               rankMetrics.prepare += (yield* Clock.currentTimeNanos) - prepareStarted;
               const encodedSpans = Match.value(cutoff).pipe(
-                Match.when(undefined, () => ranker.posting_spans()),
+                Match.when(undefined, () => ranker.posting_spans_seeded()),
                 Match.orElse((hit) => ranker.posting_spans_after(hit.score, hit.id)),
               );
               const requested = yield* Schema.decodeEffect(Schema.fromJsonString(PostingSpans))(

@@ -1706,3 +1706,54 @@ Before/after/repeated native loads on the million-document corpus completed 288 
 | Repeated after |          16 | 140.26 | 1066.76 |      22.33 |
 
 The repeated load improved all medians/tails against this reference, but the initial candidate worsened concurrency-four median/tail and concurrency-sixteen tail. Cache/isolate/network placement was uncontrolled; stable native latency and causal CPU attribution remain unproved. Page acquisition reduction is separately observed in every phase. The README shows the repeated values. Peak Worker heap, fully indexed Turbopuffer parity and general ANN/hybrid recall remain separate outstanding gates.
+
+### Dense-term lower cutoff before the first posting read
+
+When no global cutoff is available, the first ranker may derive one from terms whose physical segment df equals its document count. Any-mode eligibility is guaranteed by at least one such term; all requires every distinct requested term to be dense. Phrase does not use this seed. For each currently filter/tombstone-eligible document, Rust sums conservative one-occurrence BM25 contributions, choosing the cheaper possible nonempty field. Other terms contribute zero. Non-negative scoring makes these lower scores no greater than complete scores. A bounded top-k heap supplies a threshold only when k positive eligible rows exist.
+
+The seeded threshold includes its own kth identifier on exact score equality, preserving the supporting rows that have not yet been materialized. The existing global threshold remains exclusive because its supporting rows already belong to prior segments. Both paths share page upper bounds and span grouping. No probe posting reads, query-result cache, persisted metadata or public input are added. A header scan has a cost even when its lower bound cannot prune a page.
+
+The gate passed 33 Rust and 147 Bun/workerd tests (180 total). A field-assignment unit test checks the minimum-score bound against every tested nonempty title/body assignment. Differential WASM matrices cover any/all/phrase, dense and missing terms, mixed fields, multiplicity, masks, tombstones and top-k 1/10/100. A sparse eligible-row fixture checks a kth row at the start of a page, including insufficient-row fallback. An existing workerd fixture now acquires eight pages for any/all, rather than twelve; phrase remains twelve, with the same winners.
+
+Two full workerd comparisons used 50,000 documents at 100/30/8 segments, fourteen alternating pairs of two requests and three excluded warmup pairs. The repeat reversed worker creation order. Every one of the 2,016 responses retained complete rows/scores and sequence.
+
+| Segments | Case            | First before/after ms | Repeated before/after ms |
+| -------: | :-------------- | --------------------: | -----------------------: |
+|      100 | Rare strong     |           3.90 / 4.75 |              5.68 / 4.80 |
+|      100 | Common strong   |         13.15 / 13.05 |            13.00 / 12.72 |
+|      100 | Filtered strong |         10.94 / 11.04 |            11.76 / 11.56 |
+|      100 | Common edge     |          10.40 / 9.85 |            12.44 / 13.04 |
+|      100 | All strong      |         12.63 / 12.81 |            13.95 / 13.57 |
+|      100 | Phrase strong   |         13.73 / 13.81 |            12.60 / 12.24 |
+|       30 | Rare strong     |           7.38 / 7.56 |              5.15 / 4.34 |
+|       30 | Common strong   |         23.36 / 17.73 |             10.53 / 9.23 |
+|       30 | Filtered strong |         16.93 / 14.05 |            11.08 / 10.58 |
+|       30 | Common edge     |         17.69 / 14.08 |            11.79 / 10.47 |
+|       30 | All strong      |         17.79 / 17.06 |            10.45 / 10.58 |
+|       30 | Phrase strong   |         15.93 / 16.19 |            12.14 / 10.69 |
+|        8 | Rare strong     |         12.45 / 12.45 |              3.75 / 3.09 |
+|        8 | Common strong   |         29.79 / 20.85 |             11.92 / 9.46 |
+|        8 | Filtered strong |         22.79 / 22.21 |            12.35 / 12.88 |
+|        8 | Common edge     |         25.02 / 18.12 |            12.53 / 10.92 |
+|        8 | All strong      |         30.32 / 21.74 |            12.95 / 11.08 |
+|        8 | Phrase strong   |         26.23 / 28.77 |            15.39 / 15.52 |
+
+Common/all acquisition changed from 24 to 18 blocks at 100 segments, 74 to twelve at thirty, and 168 to twelve at eight. At the two compacted layouts it acquired 398 compressed bytes, versus 2,519/5,764. Filtered and phrase block counts stayed unchanged. Repeated eight-segment any/all medians improved about 21%/14%; thirty-segment all and hundred-segment edge controls regressed slightly. The first phrase regression did not repeat at the same magnitude. Changed code layout, cache placement and scheduling also affect these local timings. The measured page reduction is separate from uniform latency, native CPU, peak-memory or billing claims.
+
+The complete 300-query SciFact report remained byte-identical to the validated baseline. Formatting, strict lint/typecheck, both Clippy targets and secret scanning passed. Native Alchemy deployment and the unconditional Vectorize metadata migration succeeded. The WASM artifact grew from 699,557 to 703,966 bytes; source-level avoided work alone is not a cold-start or peak-memory measurement.
+
+Before/after/repeated native loads on the million-document corpus completed 288 exact strong-baseline rows/scores/sequence checks at sequence 2,000. Common acquisition consistently fell from 178 to 22 blocks and 6,097 to 731 compressed bytes, approximately 88% less page acquisition work relative to global-cutoff-only pruning. The earlier pre-pruning reference used 378 blocks; the two changes together reduce that to 22 on this workload. Six spans remain, so origin requests and billing cannot be inferred from these cache-inclusive counters. Filtered queries still use 188 blocks and 6,377 bytes.
+
+| Run            | Concurrency | p50 ms |  p95 ms | Requests/s |
+| :------------- | ----------: | -----: | ------: | ---------: |
+| Before         |           1 |  61.69 |  297.35 |       9.22 |
+| Before         |           4 |  69.62 |  219.89 |      31.55 |
+| Before         |          16 | 176.86 |  994.77 |      20.66 |
+| After          |           1 |  72.03 |  683.39 |       6.75 |
+| After          |           4 |  70.01 |  864.24 |      22.58 |
+| After          |          16 | 114.35 | 1015.58 |      27.03 |
+| Repeated after |           1 |  75.19 |  164.37 |      10.91 |
+| Repeated after |           4 |  75.67 |  246.55 |      29.10 |
+| Repeated after |          16 | 190.62 | 1319.52 |      21.84 |
+
+The first concurrency-sixteen median improvement did not repeat. Every repeated median was worse than the reference, while concurrency-one p95 improved. Cache/isolate/network placement was uncontrolled, and each phase has only 32 requests. These data do not establish an overall native latency gain. The repeated page counts are the distinct verified reduction; the README includes the latest latency values and limitations. Stable native tail latency, actual peak heap and fully indexed Turbopuffer parity remain outstanding.

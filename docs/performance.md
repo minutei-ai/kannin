@@ -1486,3 +1486,26 @@ Native deployment and the Vectorize metadata migration succeeded. Before/after/r
 | Repeated after |          16 | 349.91 | 1393.29 |
 
 The initial after-deploy load overlapped the future-barrier probe; the repetition ran after that probe completed. These observations do not establish a uniform native latency improvement. Pending-only sharing is retained for the demonstrated reduction in duplicate cache lookup/body decoding. Stable whole-query latency, actual peak memory and controlled indexed Turbopuffer comparison remain delivery gates.
+
+### Bounded top-k heap updates
+
+The Rust scorer previously pushed every positive candidate into the heap and popped its worst hit when size exceeded top-k. It now reserves top-k capacity and replaces the current worst hit only when the candidate wins the existing total score/row ordering. Score accumulation, bounds, phrase checks and the UTF-16 row ordering are unchanged. The heap never inserts a transient k-plus-one candidate.
+
+Local WASM comparisons exercised 5,000-document fixtures with ascending scores, descending scores, equal-score ties and loose conservative block bounds. Each ran any/all/phrase at top-k 1/10/100, for 36 cases. Scoring used twelve alternating pairs of eight repetitions, excluding three warmup pairs. A repetition also measured nine alternating pairs of four complete ranker/posting-decode/finish pipelines, excluding three warmup pairs. Every repeated result matched baseline serialized rows and scores bit for bit.
+
+At top-k ten, repeated scoring improved 27.7–28.6% with ascending scores and 31.0–34.2% with loose bounds. Complete pipelines improved 4.1–5.5% and 8.0–10.9%, respectively. At top-k one hundred, loose-bound scoring improved 43.3–44.7% and complete pipelines 14.9–16.2%. Descending-score and tie controls were mostly near neutral; the largest repeated tie-pipeline regression was 6.7% for phrase/top-k one hundred. This is targeted local evidence, not a uniform whole-query speedup. The full gate passed 31 Rust and 133 Bun/workerd tests. Exhaustive ranking and equal-score tests now cover top-k 1/4/8/10/64/100.
+
+A separate pre-deploy native diagnostic used two primers before each sixteen-query burst in six query cases: rare, common, filtered, all, phrase and absent-filter matches. All 192 results matched strong baselines at the acknowledged sequence. Snapshot-selection native-clock medians still ranged from 105 to 179 ms, while many ranking intervals stayed zero. Native clocks freeze during uninterrupted CPU, so zero intervals are not zero CPU evidence. A second diagnostic overlapped the deployment and is excluded from latency comparison. Native tail observations timestamped before deployment included 175 query events with rounded provider CPU values from 1 to 1,335 ms. These are partial event observations, include gateway/coordinator/background lifetimes and are not one-to-one request percentiles or isolated scorer CPU measurements.
+
+Native deployment and the Vectorize metadata migration succeeded. The complete 300-query SciFact report remained byte-identical to the earlier validated baseline, preserving 0.673062 nDCG@10, 0.795667 recall@10 and 0.641808 MRR@10. The post-deploy warmed diagnostic completed 192 exact query results. A partial native tail captured 172 query events with rounded CPU values from 1 to 1,192 ms; this does not isolate heap/scorer work or establish a CPU population improvement.
+
+| Warmed query case | Pre-deploy p50 ms | Post-deploy p50 ms | Pre-deploy p95 ms | Post-deploy p95 ms |
+| :---------------- | ----------------: | -----------------: | ----------------: | -----------------: |
+| Rare              |            308.43 |             546.18 |            861.44 |            1318.96 |
+| Common any        |            353.50 |             626.43 |           1098.89 |            1219.21 |
+| Filtered any      |            398.44 |             714.78 |           1272.63 |            1751.76 |
+| Common all        |            292.25 |             404.00 |            985.93 |            1041.48 |
+| Common phrase     |            308.31 |             382.85 |           1005.36 |            2073.09 |
+| Absent filter     |            396.57 |             565.98 |           1028.49 |            1453.25 |
+
+Every warmed case's client latency worsened in this post-deploy observation, including the absent-filter case where no heap scoring occurs. Placement/cache state was uncontrolled, and the data does not establish an isolated heap-induced regression or a whole-query gain. The local scorer/pipeline improvements remain distinct evidence. A subsequent standard rare/selective/common/filtered load completed 96 exact responses at concurrency 1/4/16: p50 94.71/76.49/366.60 ms, p95 384.56/1121.28/1523.95 ms and throughput 4.75/12.50/16.99 requests/s. Those latest standard values appear in the README. Stable native whole-query latency and actual peak-memory attribution remain outstanding; snapshot/Bloom acquisition and lifecycle work remain important investigation targets.

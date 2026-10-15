@@ -1197,7 +1197,7 @@ impl Search {
         };
         let mut selected = vec![None; lists.len()];
         let mut positions = PostingCursors::new(lists, &self.allowed, self.mode != "any");
-        let mut heap: BinaryHeap<Hit> = BinaryHeap::new();
+        let mut heap: BinaryHeap<Hit> = BinaryHeap::with_capacity(self.top_k);
         while let Some(row) = positions.row() {
             if heap.len() == self.top_k
                 && let Some(cutoff) = heap.peek()
@@ -1254,9 +1254,13 @@ impl Search {
             if score <= 0.0 {
                 continue;
             }
-            heap.push(Hit { row, score });
-            if heap.len() > self.top_k {
-                heap.pop();
+            let hit = Hit { row, score };
+            if heap.len() < self.top_k {
+                heap.push(hit);
+            } else if let Some(mut cutoff) = heap.peek_mut()
+                && hit < *cutoff
+            {
+                *cutoff = hit;
             }
         }
         let mut hits = heap.into_vec();

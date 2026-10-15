@@ -13,11 +13,11 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Concurrency | p50 ms |  p95 ms | Requests/s |
 | ----------: | -----: | ------: | ---------: |
-|           1 |  71.34 |  127.84 |      12.03 |
-|           4 |  85.32 |  968.52 |       9.11 |
-|          16 | 303.44 | 2523.25 |       7.45 |
+|           1 |  94.71 |  384.56 |       4.75 |
+|           4 |  76.49 | 1121.28 |      12.50 |
+|          16 | 366.60 | 1523.95 |      16.99 |
 
-Latest complete 32-request phases use rare, selective, common and filtered text queries; all **96 responses** matched strong rows/scores and sequence. Baseline and two candidate runs retained **288 exact comparisons**. Adjacent result pages now share bounded reads in any ranking order: the native fixture reduced text/vector/hybrid acquisitions from **12/11/18 to 5/4/6**, preserving scores and provider order. Compact Rust frequency lists improved local 10,000-document any/all pipeline medians by **20–23%** in unfiltered/interleaved fixtures, preserving exact scores. Controlled local reverse-ranked materialization fell from **42.17 to 22.74 ms**. Pending-only sharing additionally reduced a 32-consumer local range fixture from **32 bodies to one**; this does not establish native origin-transfer or CPU savings. Cache/isolate/network placement was uncontrolled and native client latency remained mixed. Earlier Rust and cache measurements, including regressions and controls, are linked below. Peak memory and general Turbopuffer parity remain unverified.
+The latest 32-request phases cover rare, selective, common and filtered text queries; all **96 responses** matched strong rows/scores and sequence. Native latency remains mixed across runs, with uncontrolled cache/isolate/network placement. Adjacent result pages reduced text/vector/hybrid acquisitions from **12/11/18 to 5/4/6** in an owned native fixture. Local compact-frequency pipelines improved **20–23%** in 10,000-document unfiltered/interleaved cases; bounded top-k pipelines improved **8–16%** in 5,000-document loose-bound cases. These are scoped gains, not uniform whole-query speedups. Full methodology, controls and regressions are linked below. Peak memory and general Turbopuffer parity remain unverified.
 
 The local million-document workload measured strong common/filtered p50 of **127/126 ms** across 2,000 uncompacted segments. These emulator results exclude native network latency. The repeated independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10** across 300 queries. Eight native vector/hybrid fixture cases also retained exact rows and scores.
 

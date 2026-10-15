@@ -258,13 +258,19 @@ fn block_pruning_matches_exhaustive_bm25_on_varied_documents()
         })
         .collect::<Result<Vec<_>, _>>()?;
     expected.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    let actual = search(docs, "alpha beta", "any", &[], &[], 10)?;
-    assert_eq!(
-        actual.iter().map(|h| &h.0).collect::<Vec<_>>(),
-        expected.iter().take(10).map(|h| &h.0).collect::<Vec<_>>()
-    );
-    for (actual, expected) in actual.iter().zip(expected.iter()) {
-        assert!((actual.1 - expected.1).abs() < 1e-10);
+    for top_k in [1, 4, 8, 10, 64, 100] {
+        let actual = search(docs.clone(), "alpha beta", "any", &[], &[], top_k)?;
+        assert_eq!(
+            actual.iter().map(|h| &h.0).collect::<Vec<_>>(),
+            expected
+                .iter()
+                .take(top_k)
+                .map(|h| &h.0)
+                .collect::<Vec<_>>()
+        );
+        for (actual, expected) in actual.iter().zip(expected.iter()) {
+            assert!((actual.1 - expected.1).abs() < 1e-10);
+        }
     }
 
     Ok(())
@@ -272,16 +278,18 @@ fn block_pruning_matches_exhaustive_bm25_on_varied_documents()
 
 #[test]
 fn equal_score_blocks_preserve_exact_top_k_ties() -> Result<(), Box<dyn std::error::Error>> {
-    let docs = (0..2048)
+    let docs: Vec<_> = (0..2048)
         .map(|index| document(format!("{index:05}"), "equal terms"))
         .collect();
-    let hits = search(docs, "equal terms", "any", &[], &[], 10)?;
-    assert_eq!(
-        hits.iter().map(|h| h.0.clone()).collect::<Vec<_>>(),
-        (0..10)
-            .map(|index| format!("{index:05}"))
-            .collect::<Vec<_>>()
-    );
+    for top_k in [1, 4, 8, 10, 64, 100] {
+        let hits = search(docs.clone(), "equal terms", "any", &[], &[], top_k)?;
+        assert_eq!(
+            hits.iter().map(|h| h.0.clone()).collect::<Vec<_>>(),
+            (0..top_k)
+                .map(|index| format!("{index:05}"))
+                .collect::<Vec<_>>()
+        );
+    }
 
     Ok(())
 }

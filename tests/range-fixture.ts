@@ -1,9 +1,22 @@
 import { env } from "cloudflare:workers";
-import { Schema } from "effect";
-import { cacheUsage, clearImmutableCache, range, addFrequencyPosting } from "../src/storage";
+import { Effect, Match, Option, Schema } from "effect";
+import {
+  cacheUsage,
+  clearImmutableCache,
+  range,
+  addFrequencyPosting,
+  withDirectory,
+} from "../src/storage";
 import { Segment, Directory } from "../dist/wasm/raio_engine";
 import { SegmentHeader, RankingInput } from "../src/protocol";
-import { RangeProbeInput, RangeProbeResult } from "./range-contract";
+import {
+  RangeProbeInput,
+  RangeProbeResult,
+  DirectoryScanInput,
+  DirectoryScanResult,
+  DirectoryAgingInput,
+  DirectoryAgingResult,
+} from "./range-contract";
 
 export { Segments, SearchNamespace } from "../src/worker";
 
@@ -12,6 +25,43 @@ export default {
     if (request.headers.get("authorization") !== `Bearer ${env.API_TOKEN}`)
       return new Response(null, { status: 401 });
     if (request.method !== "POST") return new Response(null, { status: 405 });
+    if (new URL(request.url).pathname === "/directory-aging") {
+      const inputs = Schema.decodeUnknownSync(DirectoryAgingInput)(await request.json());
+      clearImmutableCache("namespaces");
+      for (const directoryRange of inputs)
+        await range(directoryRange.key, directoryRange.offset, directoryRange.length, true);
+      const before = cacheUsage();
+      const hot = inputs[0];
+      for (const directoryRange of Array.from({ length: 4096 }, () => hot))
+        await range(directoryRange.key, directoryRange.offset, directoryRange.length, true);
+      const after = cacheUsage();
+      return new Response(
+        Schema.encodeSync(Schema.fromJsonString(DirectoryAgingResult))({
+          before: before.encodedDirectoryAdmissionChargedBytes,
+          after: after.encodedDirectoryAdmissionChargedBytes,
+          reads: after.rangeReads - before.rangeReads,
+          hits: after.encodedDirectoryCacheHits - before.encodedDirectoryCacheHits,
+        }),
+      );
+    }
+    if (new URL(request.url).pathname === "/directory-scan") {
+      const inputs = Schema.decodeUnknownSync(DirectoryScanInput)(await request.json());
+      clearImmutableCache("namespaces");
+      const reports = [];
+      for (const cycle of [0, 1, 2]) {
+        const before = cacheUsage();
+        for (const directoryRange of inputs)
+          await range(directoryRange.key, directoryRange.offset, directoryRange.length, true);
+        const after = cacheUsage();
+        reports[cycle] = {
+          reads: after.rangeReads - before.rangeReads,
+          encodedDirectoryCacheEntries: after.encodedDirectoryCacheEntries,
+          encodedDirectoryAdmissionChargedBytes: after.encodedDirectoryAdmissionChargedBytes,
+          encodedDirectoryCacheChargedBytes: after.encodedDirectoryCacheChargedBytes,
+        };
+      }
+      return new Response(Schema.encodeSync(Schema.fromJsonString(DirectoryScanResult))(reports));
+    }
     const input = Schema.decodeUnknownSync(RangeProbeInput)(await request.json());
     clearImmutableCache(input.key.slice(0, input.key.indexOf("/segments/")));
     if (input.preloadFrequency === true) {
@@ -40,15 +90,37 @@ export default {
         bytes.subarray(start, start + block.data.length),
       );
     }
+    if (input.evictionRanges !== undefined) {
+      await range(input.key, input.offset, input.length, true);
+      for (const pressure of input.evictionRanges)
+        await range(pressure.key, pressure.offset, pressure.length);
+    }
+    const decodedDirectoryBytes = await Effect.runPromise(
+      Match.value(input.decodeDirectory).pipe(
+        Match.when(true, () =>
+          withDirectory(input.key, input.length, (directory) =>
+            Effect.sync(() => directory.heap_bytes()),
+          ).pipe(Effect.asSome),
+        ),
+        Match.orElse(() => Effect.succeedNone),
+      ),
+    );
     const before = cacheUsage();
     const results = await Promise.allSettled(
-      Array.from({ length: input.count }, () => range(input.key, input.offset, input.length)),
+      Array.from({ length: input.count }, () =>
+        range(input.key, input.offset, input.length, input.evictionRanges !== undefined),
+      ),
     );
     const after = cacheUsage();
     const successes = results.filter((result) => result.status === "fulfilled");
     return new Response(
       Schema.encodeSync(Schema.fromJsonString(RangeProbeResult))({
         postingBefore: before.postingCacheBytes,
+        rangeBefore: before.rangeCacheBytes,
+        rangeChargedAfter: after.rangeCacheChargedBytes,
+        decodedDirectoryBytes: Option.getOrUndefined(decodedDirectoryBytes),
+        directoryCacheChargedBytes: after.directoryCacheChargedBytes,
+        encodedDirectoryCacheChargedBytes: after.encodedDirectoryCacheChargedBytes,
         postingAfter: after.postingCacheBytes,
         rangeAfter: after.rangeCacheBytes,
         reads: after.rangeReads - before.rangeReads,

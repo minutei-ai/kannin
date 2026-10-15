@@ -32,11 +32,18 @@ const frequencyBudget = { bytes: 0 };
 const cacheOrder = new Map<string, "range" | "frequency">();
 const pendingRanges = new Map<string, Promise<Uint8Array>>();
 const MAX_PENDING_RANGES = 64;
-const budget = { bytes: 0 };
+const budget = { bytes: 0, payloadBytes: 0 };
 const MAX_CACHE_BYTES = 12 * 1024 * 1024;
+const encodedDirectories = new Map<string, Uint8Array>();
+const encodedBudget = { bytes: 0 };
+const MAX_ENCODED_DIRECTORY_BYTES = 20 * 1024 * 1024;
+const admissionCounts = new Map<string, number>();
+const admissionBudget = { bytes: 0, requests: 0 };
+const MAX_ADMISSION_BYTES = 1024 * 1024;
 const directories = new Map<string, { directory: Directory; bytes: number }>();
 const decodedBudget = { bytes: 0 };
 const MAX_DECODED_BYTES = 40 * 1024 * 1024;
+const MAX_DECODED_CACHE_BYTES = 20 * 1024 * 1024;
 const CachedTermCatalogs = Schema.Struct({
   dictionaries: Schema.Record(Schema.String, TermSummaries),
   minima: Schema.Record(Schema.String, EligibleMinimum),
@@ -62,6 +69,7 @@ const reads = {
   rangeBytes: 0,
   rangeCacheHits: 0,
   directoryCacheHits: 0,
+  encodedDirectoryCacheHits: 0,
   workerCacheHits: 0,
   workerCacheMisses: 0,
   cacheApiHits: 0,
@@ -89,7 +97,10 @@ function evictFor(bytes: number) {
     const key = oldest[0].slice(2);
     if (oldest[1] === "range") {
       const prior = buffers.get(key);
-      if (prior !== undefined) budget.bytes -= prior.byteLength;
+      if (prior !== undefined) {
+        budget.bytes -= prior.byteLength + key.length * 4 + 128;
+        budget.payloadBytes -= prior.byteLength;
+      }
       buffers.delete(key);
     } else {
       const prior = frequencyPages.get(key);
@@ -104,14 +115,68 @@ function evictFor(bytes: number) {
 
 function remember(key: string, bytes: Uint8Array) {
   const previous = buffers.get(key);
-  if (previous !== undefined) budget.bytes -= previous.byteLength;
+  if (previous !== undefined) {
+    budget.bytes -= previous.byteLength + key.length * 4 + 128;
+    budget.payloadBytes -= previous.byteLength;
+  }
   buffers.delete(key);
   cacheOrder.delete(`r:${key}`);
-  if (bytes.byteLength > MAX_CACHE_BYTES) return;
-  evictFor(bytes.byteLength);
+  const charge = bytes.byteLength + key.length * 4 + 128;
+  if (charge > MAX_CACHE_BYTES) return;
+  evictFor(charge);
   buffers.set(key, bytes);
   cacheOrder.set(`r:${key}`, "range");
-  budget.bytes += bytes.byteLength;
+  budget.bytes += charge;
+  budget.payloadBytes += bytes.byteLength;
+}
+
+function noteDirectoryRequest(key: string) {
+  admissionBudget.requests += 1;
+  if (admissionBudget.requests >= 4096) {
+    admissionBudget.requests = 0;
+    for (const [identity, count] of admissionCounts) {
+      const aged = Math.floor(count / 2);
+      if (aged === 0) {
+        admissionCounts.delete(identity);
+        admissionBudget.bytes -= identity.length * 4 + 128;
+      } else admissionCounts.set(identity, aged);
+    }
+  }
+  const previous = admissionCounts.get(key);
+  if (previous !== undefined) {
+    admissionCounts.delete(key);
+    admissionCounts.set(key, Math.min(255, previous + 1));
+    return;
+  }
+  const charge = key.length * 4 + 128;
+  if (charge > MAX_ADMISSION_BYTES) return;
+  while (admissionBudget.bytes + charge > MAX_ADMISSION_BYTES) {
+    const oldest = admissionCounts.keys().next().value;
+    if (oldest === undefined) break;
+    admissionCounts.delete(oldest);
+    admissionBudget.bytes -= oldest.length * 4 + 128;
+  }
+  admissionCounts.set(key, 1);
+  admissionBudget.bytes += charge;
+}
+
+function rememberEncodedDirectory(key: string, bytes: Uint8Array) {
+  if (encodedDirectories.has(key)) return;
+  const charge = bytes.byteLength + key.length * 4 + 128;
+  const maximum = MAX_ENCODED_DIRECTORY_BYTES - MAX_ADMISSION_BYTES;
+  if (charge > maximum) return;
+  const victims = [];
+  const remaining = { bytes: encodedBudget.bytes };
+  const frequency = admissionCounts.get(key) ?? 0;
+  for (const [identity, value] of encodedDirectories) {
+    if (remaining.bytes + charge <= maximum) break;
+    if (frequency <= (admissionCounts.get(identity) ?? 0)) return;
+    victims.push(identity);
+    remaining.bytes -= value.byteLength + identity.length * 4 + 128;
+  }
+  for (const identity of victims) encodedDirectories.delete(identity);
+  encodedDirectories.set(key, bytes);
+  encodedBudget.bytes = remaining.bytes + charge;
 }
 
 export function addFrequencyPosting(
@@ -159,13 +224,21 @@ export async function range(
     Match.when(true, () => `${rawIdentity}/directory-v1`),
     Match.orElse(() => rawIdentity),
   );
-  const cached = buffers.get(cacheKey);
+  if (compressedDirectory) noteDirectoryRequest(cacheKey);
+  const cache = Match.value(compressedDirectory).pipe(
+    Match.when(true, () => encodedDirectories),
+    Match.orElse(() => buffers),
+  );
+  const cached = cache.get(cacheKey);
   if (cached !== undefined) {
     reads.rangeCacheHits += 1;
-    buffers.delete(cacheKey);
-    buffers.set(cacheKey, cached);
-    cacheOrder.delete(`r:${cacheKey}`);
-    cacheOrder.set(`r:${cacheKey}`, "range");
+    cache.delete(cacheKey);
+    cache.set(cacheKey, cached);
+    if (compressedDirectory) reads.encodedDirectoryCacheHits += 1;
+    else {
+      cacheOrder.delete(`r:${cacheKey}`);
+      cacheOrder.set(`r:${cacheKey}`, "range");
+    }
     return cached;
   }
   const pending = pendingRanges.get(cacheKey);
@@ -195,7 +268,8 @@ export async function range(
     reads.rangeBytes += bytes.byteLength;
     if (!compressedDirectory && bytes.byteLength !== length)
       throw new Rejected({ status: 503, message: "R2 range returned a truncated segment" });
-    remember(cacheKey, bytes);
+    if (compressedDirectory) rememberEncodedDirectory(cacheKey, bytes);
+    else remember(cacheKey, bytes);
     return bytes;
   })();
   if (pendingRanges.size >= MAX_PENDING_RANGES) return acquisition;
@@ -234,7 +308,8 @@ async function acquireDirectory(key: string, headerBytes: number) {
       message: "Segment directory exceeds the decoded-memory budget",
     });
   }
-  while (decodedBudget.bytes + entry.bytes > MAX_DECODED_BYTES) {
+  if (entry.bytes > MAX_DECODED_CACHE_BYTES) return decoded;
+  while (decodedBudget.bytes + entry.bytes > MAX_DECODED_CACHE_BYTES) {
     const oldest = directories.entries().next().value;
     if (oldest === undefined) break;
     directories.delete(oldest[0]);
@@ -766,11 +841,22 @@ export function clearImmutableCache(prefix: string) {
       termCatalogs.delete(key);
       termBudget.bytes -= entry.bytes;
     }
+  for (const key of admissionCounts.keys())
+    if (key.startsWith(`${identity}/`)) {
+      admissionCounts.delete(key);
+      admissionBudget.bytes -= key.length * 4 + 128;
+    }
+  for (const [key, bytes] of encodedDirectories)
+    if (key.startsWith(`${identity}/`)) {
+      encodedDirectories.delete(key);
+      encodedBudget.bytes -= bytes.byteLength + key.length * 4 + 128;
+    }
   for (const [key, bytes] of buffers)
     if (key.startsWith(`${identity}/`)) {
       buffers.delete(key);
       cacheOrder.delete(`r:${key}`);
-      budget.bytes -= bytes.byteLength;
+      budget.bytes -= bytes.byteLength + key.length * 4 + 128;
+      budget.payloadBytes -= bytes.byteLength;
     }
   for (const [key, entry] of frequencyPages)
     if (key.startsWith(`${identity}/`)) {
@@ -795,9 +881,13 @@ export function clearImmutableCache(prefix: string) {
 
 export function cacheUsage() {
   return {
-    rangeCacheBytes: budget.bytes,
+    rangeCacheBytes: budget.payloadBytes,
+    rangeCacheChargedBytes: budget.bytes,
     postingCacheBytes: frequencyBudget.bytes,
     directoryCacheChargedBytes: decodedBudget.bytes,
+    encodedDirectoryCacheChargedBytes: encodedBudget.bytes + admissionBudget.bytes,
+    encodedDirectoryAdmissionChargedBytes: admissionBudget.bytes,
+    encodedDirectoryCacheEntries: encodedDirectories.size,
     bloomCacheBytes: bloomBudget.bytes,
     termCacheBytes: termBudget.bytes,
     overviewCacheBytes: overviewBudget.bytes,

@@ -212,8 +212,12 @@ export const WriteResult = Schema.Struct({
 export const ErrorBody = Schema.Struct({ error: Schema.String });
 export const CacheMetrics = Schema.Struct({
   rangeCacheBytes: Schema.Int,
+  rangeCacheChargedBytes: Schema.Int,
   postingCacheBytes: Schema.Int,
   directoryCacheChargedBytes: Schema.Int,
+  encodedDirectoryCacheChargedBytes: Schema.Int,
+  encodedDirectoryAdmissionChargedBytes: Schema.Int,
+  encodedDirectoryCacheEntries: Schema.Int,
   bloomCacheBytes: Schema.Int,
   termCacheBytes: Schema.Int,
   overviewCacheBytes: Schema.Int,
@@ -231,6 +235,7 @@ export const CacheMetrics = Schema.Struct({
   rangeBytes: Schema.Int,
   rangeCacheHits: Schema.Int,
   directoryCacheHits: Schema.Int,
+  encodedDirectoryCacheHits: Schema.Int,
   workerCacheHits: Schema.Int,
   workerCacheMisses: Schema.Int,
   cacheApiHits: Schema.Int,

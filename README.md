@@ -13,15 +13,15 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Concurrency | p50 ms | p95 ms | Requests/s |
 | ----------: | -----: | -----: | ---------: |
-|           1 |  49.34 |  85.28 |      15.28 |
-|           4 |  53.07 | 216.97 |      41.20 |
-|          16 |  63.78 | 831.54 |      58.43 |
+|           1 |  49.51 |  73.90 |      17.62 |
+|           4 |  52.66 | 210.53 |      48.39 |
+|          16 |  69.39 | 685.70 |      67.69 |
 
-Each 128-request phase covers rare, selective, common and filtered text queries; all **384 responses** matched strong rows/scores and sequence. This is the latest complete run; the preceding run of the same revision timed out on a common query at concurrency sixteen. Concurrent reliability remains unresolved. Page pruning reduced native common-query acquisition from **178 to 22 blocks** and filtered acquisition from **188 to 41 blocks**, including cache hits. Native placement, cache state and network conditions vary; uniform latency gains, peak memory and general Turbopuffer parity remain unverified.
+Each 128-request phase covers rare, selective, common and filtered text queries. Across two runs, all **768 responses** matched strong rows/scores and sequence; the table shows the second run. An earlier revision timed out on a common query at concurrency sixteen. These successful runs do not establish concurrent reliability. Page pruning reduced native common-query acquisition from **178 to 22 blocks** and filtered acquisition from **188 to 41 blocks**, including cache hits. Native placement, cache state and network conditions vary; uniform latency gains, peak memory and general Turbopuffer parity remain unverified.
 
-Dense eight-term and phrase probes most recently took **9.7/8.9 seconds strong** and **7.0/6.4 seconds edge**, with exact results. Cache warming affects these observations; earlier probes exceeded 30 seconds and one cold query returned 503. Dense-query latency and stability remain unresolved.
+Eight dense eight-term/phrase probes measured **5.6–6.0 seconds strong** and **5.0–24.4 seconds edge**, with exact results. Internal compressed directories reduced the initialization-plus-query range-byte counter by **91.9%** at the same acquisition count. Cache states were not controlled; earlier probes exceeded 30 seconds and one cold query returned 503. Dense-query latency and stability remain unresolved.
 
-The local million-document workload measured strong common/filtered p50 of **127/126 ms** across 2,000 uncompacted segments. These emulator results exclude native network latency. The repeated independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10** across 300 queries. Eight native vector/hybrid fixture cases also retained exact rows and scores.
+The local million-document workload measured strong common/filtered p50 of **127/126 ms** across 2,000 uncompacted segments. These emulator results exclude native network latency. The repeated independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10** across 300 queries. The latest native Vectorize visibility probe remained empty through its bounded polling window; current provider-backed vector/hybrid validation remains pending.
 
 A sequential million-document comparison measured p50 of **159–173 ms strong**, **40–55 ms edge** and **59–81 ms Turbopuffer strong**. The comparator processed 14,500 unindexed WAL rows; edge has a weaker freshness contract. Fully indexed comparison and general parity remain unverified.
 

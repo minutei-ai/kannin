@@ -1642,3 +1642,24 @@ A full workerd comparison seeded ten 500-document segments, exercised the same t
 |    64 | phrase |    176.03 |       218.37 |
 
 The experiment was removed before any native deployment. These observations reject this implementation; they do not identify whether code layout, compilation or another runtime effect caused the regression. Removing source-level bookkeeping did not establish faster execution. Production retains the preceding scorer, and snapshot/manifest behavior is unchanged. Rebuilding the restored source reproduced the baseline WASM byte for byte.
+
+### Segment fragmentation and compaction trade-off
+
+Two isolated local workerd runs ingested the same deterministic 50,000-document corpus in 100 writes of 500 documents, with queue consumption disabled. Each run measured the initial 100-segment layout, manually compacted toward 32 (reaching 30), then toward eight. Each layout ran rare/selective/common/filtered queries in strong and edge-eventual modes, five warmups and twenty timed requests per case. All 1,200 responses across both runs retained complete rows/scores and acknowledged sequence 100. Layouts were sequential within each run rather than alternating; cache placement/warmth and runtime scheduling remain limitations. These are local observations, not a native compaction latency claim.
+
+| Query / consistency | First p50 at 100 / 30 / 8 segments, ms | Repeated p50 at 100 / 30 / 8 segments, ms |
+| :------------------ | -------------------------------------: | ----------------------------------------: |
+| Rare / strong       |                     3.67 / 4.25 / 2.78 |                        6.09 / 2.54 / 2.48 |
+| Selective / strong  |                    11.23 / 4.79 / 4.85 |                       10.28 / 6.59 / 4.32 |
+| Common / strong     |                  12.42 / 12.03 / 12.86 |                      7.61 / 14.83 / 13.89 |
+| Filtered / strong   |                   9.36 / 10.24 / 11.14 |                       7.93 / 9.62 / 10.64 |
+| Rare / edge         |                     2.61 / 3.44 / 3.12 |                        3.12 / 4.12 / 2.93 |
+| Selective / edge    |                     6.64 / 7.73 / 5.75 |                        7.86 / 7.45 / 6.67 |
+| Common / edge       |                   6.50 / 15.25 / 18.15 |                      8.55 / 14.36 / 21.75 |
+| Filtered / edge     |                    7.36 / 5.81 / 13.93 |                      10.31 / 9.84 / 13.60 |
+
+In the repeated run's first measured common query, scoring visited three/two/two segments but acquired 24/128/284 posting blocks and 804/4,372/9,758 compressed bytes at the three layouts. Those counters include memory cache acquisitions; they are not R2-origin request or billing counts. The existing scorer still fetches/decompresses selected pages before its finish-time block pruning. Larger competitive segments can therefore increase posting work despite reducing catalog/segment count. This is evidence to investigate earlier safe block pruning, not proof that all latency changes came from that mechanism.
+
+Reaching 30 segments required ten compactions, reindexing 40,000 document versions into 20,992,712 newly written segment bytes plus 3,012,413 manifest bytes. Reaching eight required six additional compactions, reindexing another 42,000 versions into 22,009,851 segment bytes plus 1,644,530 manifest bytes. Repeated elapsed compaction totals were 11.24 and 10.92 seconds. These counts exclude ingestion, caches, retained old segments and collection; they do not estimate a Cloudflare bill. Manifest size decreased only from 322,722 to 283,639 to 271,443 bytes, since Bloom payloads still represent the corpus.
+
+The automatic compaction policy remains unchanged: the measured selective-query gains did not justify claiming that a lower segment threshold uniformly speeds search or lowers cost. Only disposable local namespaces were modified; the owned native million-document corpus and deployed runtime were untouched by this experiment.

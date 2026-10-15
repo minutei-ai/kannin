@@ -133,7 +133,9 @@ test("learned cutoffs match an unfragmented oracle across posting blocks and top
       worker,
       "bound-blocks",
       "query",
-      textQuery(`alpha beta gamma${" ".repeat(variation)}`),
+      textQuery("alpha beta gamma", 10, [
+        { field: "group", op: "in", value: [0, 1, 2, variation + 3] },
+      ]),
     );
     expect(response.status).toBe(200);
     await response.arrayBuffer();
@@ -233,7 +235,7 @@ test("text plan eviction stays within its byte quota and recomputes exact rows",
           worker,
           namespace,
           "write",
-          write([document(String(index).padStart(2, "0"), text)]),
+          write([document(String(index).padStart(2, "0"), text, { cohort: 0 })]),
         )
       ).status,
     ).toBe(200);
@@ -245,7 +247,7 @@ test("text plan eviction stays within its byte quota and recomputes exact rows",
       worker,
       namespace,
       "query",
-      textQuery(`${text}${" ".repeat(variation)}`),
+      textQuery(text, 10, [{ field: "cohort", op: "in", value: [0, variation] }]),
     );
     expect(response.status).toBe(200);
     const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
@@ -265,3 +267,60 @@ test("text plan eviction stays within its byte quota and recomputes exact rows",
   );
   expect(final.cache.textPlanCacheHits).toBe(filled.cache.textPlanCacheHits);
 }, 15000);
+
+test("semantic text equivalents reuse plans while phrase order and repetitions stay distinct", async () => {
+  const namespace = "semantic-plan-identity";
+  for (const index of Array.from({ length: 8 }, (_, row) => row))
+    await request(
+      worker,
+      namespace,
+      "write",
+      write([
+        document(`${index}-a`, "alpha beta alpha"),
+        document(`${index}-b`, "beta alpha alpha"),
+        document(`${index}-c`, "alpha beta"),
+        document(`${index}-d`, "alpha alpha beta"),
+      ]),
+    );
+  for (const match of ["any", "all", "phrase"] as const) {
+    const response = await request(worker, namespace, "query", {
+      ...textQuery("alpha beta alpha", 3),
+      match,
+    });
+    const expected = Schema.decodeUnknownSync(QueryResult)(await response.json());
+    const before = Schema.decodeUnknownSync(Metadata)(
+      await (await request(worker, namespace, "metadata")).json(),
+    );
+    const variants = ["  ÁLPHA\tBÉTA   alpha  ", "alpha, beta; alpha"];
+    if (match !== "phrase") variants.push("BETA alpha", "alpha alpha beta beta");
+    for (const text of variants) {
+      const equivalent = await request(worker, namespace, "query", {
+        ...textQuery(text, 3),
+        match,
+      });
+      expect(equivalent.status).toBe(200);
+      expect(equivalent.headers.get("server-timing")).toContain('text_plan;desc="memory"');
+      expect(Schema.decodeUnknownSync(QueryResult)(await equivalent.json())).toEqual(expected);
+    }
+    const after = Schema.decodeUnknownSync(Metadata)(
+      await (await request(worker, namespace, "metadata")).json(),
+    );
+    expect(after.cache.textPlanCacheHits - before.cache.textPlanCacheHits).toBe(variants.length);
+    expect(after.cache.termRequests).toBe(before.cache.termRequests);
+    expect(after.cache.textPlanCacheEntries).toBe(before.cache.textPlanCacheEntries);
+  }
+  for (const text of ["beta alpha alpha", "alpha beta"]) {
+    const response = await request(worker, namespace, "query", {
+      ...textQuery(text, 3),
+      match: "phrase",
+    });
+    expect(response.headers.get("server-timing")).toContain('text_plan;desc="miss"');
+    const expected = Schema.decodeUnknownSync(QueryResult)(await response.json());
+    expect((await request(worker, namespace, "rebuild", {})).status).toBe(200);
+    const fresh = await request(worker, namespace, "query", {
+      ...textQuery(text, 3),
+      match: "phrase",
+    });
+    expect(Schema.decodeUnknownSync(QueryResult)(await fresh.json())).toEqual(expected);
+  }
+});

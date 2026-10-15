@@ -355,6 +355,10 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
   if (terms.length > 64 || (input.match === "phrase" && words.length > 64))
     throw new Rejected({ status: 400, message: "Query exceeds 64 normalized terms" });
   if (terms.length === 0 || root.documents === 0) return [];
+  const identityText = Match.value(input.match).pipe(
+    Match.when("phrase", () => words.join(" ")),
+    Match.orElse(() => terms.toSorted().join(" ")),
+  );
   const bloomMatches = bloomCandidates(root.segments, terms, "termBloom");
   const candidates = root.segments.map((segment, index) => {
     const selected = bloomMatches[index];
@@ -382,7 +386,7 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
   const firstSelected = selected[0];
   if (selected.length > 4 && firstSelected !== undefined) {
     const identity = Schema.encodeSync(Schema.fromJsonString(TextPlanIdentity))({
-      text: input.text,
+      text: identityText,
       mode: input.match ?? "any",
       filters: input.filters,
       documents: root.documents,
@@ -531,7 +535,7 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
   if (selected.length > 4)
     selection.digest = await sha256(
       encodeRankingInput({
-        text: input.text,
+        text: identityText,
         mode: input.match ?? "any",
         top_k: 1,
         dead: [],

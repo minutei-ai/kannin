@@ -54,7 +54,7 @@ test("shared tightened plans survive fresh workerd instances and reject corrupt 
   const segment = root.segments[0];
   if (segment === undefined) throw new Error("Missing fixture segment");
   const identity = Schema.encodeSync(Schema.fromJsonString(TextPlanIdentity))({
-    text: query.text,
+    text: "alpha beta delta gamma",
     mode: "any",
     filters: [],
     documents: root.documents,
@@ -82,7 +82,10 @@ test("shared tightened plans survive fresh workerd instances and reject corrupt 
     minimumSequence: 13,
   });
   expect(blocked.status).toBe(409);
-  const restored = await request(active.worker, namespace, "query", query);
+  const restored = await request(active.worker, namespace, "query", {
+    ...query,
+    text: " DÉLTA alpha ALPHA gamma beta ",
+  });
   expect(Schema.decodeUnknownSync(QueryResult)(await restored.json())).toEqual(expected);
   expect(restored.headers.get("server-timing")).toContain('text_plan;desc="shared"');
   expect(restored.headers.get("server-timing")).toContain('text_bound_hits;desc="0"');

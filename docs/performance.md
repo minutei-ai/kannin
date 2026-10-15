@@ -1590,3 +1590,33 @@ Concurrency-four/sixteen medians improved in both candidate loads, while concurr
 A local prototype scanned every requested any/all page before attaching any handle. If all immutable decoded pages were retained, it attached them synchronously without compressed range acquisition; a miss preserved the original path without partially mutating the ranker. Per-page position/order validation, span bounds, filters and tombstones remained in force. Phrase queries kept their original path. The gate passed 31 Rust and 141 Bun/workerd tests; a targeted partial-cache seed additionally covered a retained first term with a missing second term.
 
 Two comparisons checked 420 exact full-result rows/scores each on the same 5,000-document low/high-frequency fixtures, using fourteen alternating pairs of three queries and excluding three warmup pairs. The first overlapped the test gate, so its timing is provisional; the repetition ran after the gate and targeted tests finished. High-frequency any changed 7.23→6.21 ms initially but 5.74→5.93 ms on repetition. High-frequency all regressed 5.98→7.22 ms and 7.44→8.93 ms, approximately 20% in both. Repeated low-frequency any/all controls were 7.20→7.12 and 9.10→8.79 ms; the unchanged phrase control was 10.38→10.61 ms. The prototype was removed before deployment. Production retains the prior frequency-page cache and acquisition policy; avoiding an acquisition alone did not establish a speedup. The additional partial-cache lifecycle test remains.
+
+### Retain validated R2 manifest bytes
+
+Fresh edge snapshot acquisition previously decoded the R2 JSON through Root Schema, encoded the entire Root back to JSON and encoded that string into UTF-8 for the cache frame. It now validates the same R2 body and retains its original UTF-8 bytes. Cache rehydration still validates framing, metadata, Root, matching sequence and age; conditional ETag reuse and the 24 MiB charged budget are unchanged. Strong reads do not use snapshot caches. The test seeds a valid Unicode manifest with surrounding whitespace and verifies both exact cached payload bytes and the decoded Root.
+
+Two full workerd comparisons used fourteen alternating baseline/candidate pairs per size, excluding three warmup pairs, with a fresh namespace/R2 observation per query. All 168 results preserved complete rows/scores and sequence. The second run's initial setup overlapped the short lint/typecheck commands, which completed before its larger fixtures. These synthetic fixtures expand a valid document Bloom string while retaining a one-document text result; they measure cold acquisition rather than a million-document ranking workload.
+
+| Manifest bytes | First before/after ms | Repeated before/after ms |
+| -------------: | --------------------: | -----------------------: |
+|            666 |         35.99 / 33.26 |            34.92 / 36.16 |
+|      2,097,830 |         45.37 / 36.25 |            41.00 / 40.70 |
+|      4,194,982 |         42.64 / 40.24 |            49.75 / 48.15 |
+
+A separate Bun pipeline measurement used a Schema-generated 5,438,950-byte manifest with 200 segment records, eighteen alternating pairs of four validations/retentions, excluding four warmup pairs. Median fell from 8.661 to 3.230 ms. It includes common UTF-8 decoding and Root validation, plus full encoding on the former path; it excludes R2, snapshot framing, ranking and native Worker CPU telemetry. The repeated full-path gain is much smaller than this isolated result, and the small-manifest control regressed. Avoided serialization does not establish uniform latency, actual peak heap or Turbopuffer parity.
+
+The final gate passed 31 Rust and 142 Bun/workerd tests, including corrupt canonical input/recovery, conditional ETag reuse, expired/future snapshot rejection, minimum-sequence barriers and the exact Unicode payload test. Strict lint/typecheck, both Clippy targets and secret scanning passed. Native deployment and the unconditional Vectorize metadata migration succeeded. Before/after/repeated million-document loads completed 288 exact strong-baseline rows/scores/sequence checks.
+
+| Run            | Concurrency | p50 ms |  p95 ms | Requests/s |
+| :------------- | ----------: | -----: | ------: | ---------: |
+| Before         |           1 |  80.53 |  152.94 |       9.99 |
+| Before         |           4 |  91.94 |  220.95 |      35.04 |
+| Before         |          16 | 139.93 | 1106.26 |      23.13 |
+| After          |           1 |  87.59 |  489.09 |       6.30 |
+| After          |           4 | 110.46 | 1241.77 |      10.18 |
+| After          |          16 | 221.28 | 1483.59 |      18.91 |
+| Repeated after |           1 |  70.26 |  190.20 |      12.17 |
+| Repeated after |           4 |  87.83 |  383.04 |      22.63 |
+| Repeated after |          16 | 198.96 | 1567.23 |      18.20 |
+
+All initial candidate phases worsened against this baseline. Repetition improved concurrency-one/four medians but all p95 values remained worse, as did concurrency-sixteen median. The retained change removes demonstrated serialization work, but these uncontrolled native results do not establish a whole-query speedup. The README shows the repeated load. No snapshot fallback occurred in these 288 observations. In the repeated concurrency-sixteen phase, snapshot selection reached 977 ms and ranking reached 585 ms in separate observations; gateway elapsed reached 1,378 ms. These include I/O and concurrent scheduling, and native clocks freeze during uninterrupted CPU, so zero phase timings are not zero CPU evidence. Cache placement, actual peak heap and stable tail latency remain unresolved; no new ranking-quality or vector-recall claim is made by this snapshot-only change.

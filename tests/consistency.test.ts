@@ -63,6 +63,38 @@ test("failed shared snapshot acquisitions release their entry and allow canonica
   expect(result.rows.map((row) => row.id)).toEqual(["a"]);
 });
 
+test("R2 snapshot frames retain validated original UTF-8 bytes without reserialization", async () => {
+  const namespace = "original-root-bytes";
+  await request(
+    worker,
+    namespace,
+    "write",
+    write([document("café-日本語", "original café 日本語")]),
+  );
+  const bucket = await worker.getR2Bucket("STORAGE");
+  const rootKey = `namespaces/${namespace}/root.json`;
+  const object = await bucket.get(rootKey);
+  if (object === null) throw new Error("Missing canonical manifest");
+  const manifest = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
+  const payload = `\n${Schema.encodeSync(Schema.fromJsonString(Root))(manifest)}\n`;
+  await bucket.put(rootKey, payload);
+  const response = await request(worker, namespace, "query", {
+    ...textQuery("café 日本語"),
+    consistency: "edge-eventual",
+    minimumSequence: 1,
+  });
+  expect(response.status).toBe(200);
+  const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+  expect(result.rows.map((row) => row.id)).toEqual(["café-日本語"]);
+  const cache = await (await worker.getCaches()).open("raio-snapshots-v2");
+  const key = `https://raio-cache.internal/snapshots/${namespace}?bucket=raio-test`;
+  const cached = await cache.match(key);
+  if (cached === undefined) throw new Error("Missing snapshot frame");
+  const decoded = await Effect.runPromise(readSnapshotFrame(await cached.arrayBuffer()));
+  expect(new TextDecoder().decode(decoded.payload)).toBe(payload);
+  expect(decoded.snapshot.manifest).toEqual(manifest);
+});
+
 async function seedSnapshot(namespace: string, observedAt: number, advertisedAt = observedAt) {
   const bucket = await worker.getR2Bucket("STORAGE");
   const object = await bucket.get(`namespaces/${namespace}/root.json`);

@@ -1868,10 +1868,11 @@ async function acquireSnapshot(
   };
   if ("body" in object) {
     snapshotMetrics.snapshotR2BodyBytes += object.size;
-    selected.manifest = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
-    selected.payload = new TextEncoder().encode(
-      Schema.encodeSync(Schema.fromJsonString(Root))(selected.manifest),
+    const payload = new Uint8Array(await object.arrayBuffer());
+    selected.manifest = Schema.decodeSync(Schema.fromJsonString(Root))(
+      new TextDecoder().decode(payload),
     );
+    selected.payload = payload;
   } else {
     if (previous === undefined || previous.etag !== object.etag)
       throw new Rejected({ status: 503, message: "Conditional R2 read has no matching snapshot" });

@@ -13,9 +13,9 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Concurrency | p50 ms |  p95 ms | Requests/s |
 | ----------: | -----: | ------: | ---------: |
-|           1 |  70.05 |  253.75 |       8.43 |
-|           4 |  75.54 |  852.19 |      16.34 |
-|          16 | 252.17 | 1316.89 |      14.23 |
+|           1 |  70.26 |  190.20 |      12.17 |
+|           4 |  87.83 |  383.04 |      22.63 |
+|          16 | 198.96 | 1567.23 |      18.20 |
 
 The latest 32-request phases cover rare, selective, common and filtered text queries; all **96 responses** matched strong rows/scores and sequence. Native latency varies across runs, with uncontrolled cache/isolate/network placement. A controlled local 32-segment comparison improved complete short/long query medians by **10–12%** after preparing shared ranking input once per request. A separate repeated-frequency fixture improved local any/all medians by 15–20% and 7–26% across two runs after retaining decoded posting pages; single-occurrence controls varied, including a regression. Other scoped Rust/cache gains, controls and regressions are documented below; they do not prove uniform native latency. Peak memory and general Turbopuffer parity remain unverified.
 
@@ -36,7 +36,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **141 Worker/tooling tests and 31 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **142 Worker/tooling tests and 31 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

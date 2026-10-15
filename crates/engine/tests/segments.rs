@@ -674,6 +674,8 @@ fn compressed_directories_preserve_headers_and_reject_frame_corruption()
         3,
     ));
     assert!(segment::parse_compressed_directory(&forged_payload, length).is_err());
+    forged_payload[12..16].copy_from_slice(&crc32fast::hash(&invalid_payload).to_le_bytes());
+    assert!(segment::parse_compressed_directory(&forged_payload, length).is_err());
     let mut oversized = encoded.clone();
     oversized[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(segment::parse_compressed_directory(&oversized, u32::MAX as usize).is_err());

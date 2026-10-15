@@ -733,12 +733,26 @@ pub fn parse_compressed_directory(bytes: &[u8], expected: usize) -> Result<Heade
     );
     let decoded = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&bytes[16..], length)
         .map_err(|cause| cause.to_string())?;
-    if decoded.len() != length || crc32fast::hash(&decoded) != checksum {
+    if decoded.len() != length {
         return Err("Compressed directory integrity check failed".into());
     }
     let (header, header_bytes) = parse_header(&decoded)?;
     if header_bytes != length {
         return Err("Compressed directory contains trailing bytes".into());
+    }
+    let canonical_checksum = u32::from_le_bytes(
+        decoded[12..16]
+            .try_into()
+            .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
+    );
+    let mut framed_checksum = crc32fast::Hasher::new();
+    framed_checksum.update(&decoded[..16]);
+    framed_checksum.combine(&crc32fast::Hasher::new_with_initial_len(
+        canonical_checksum,
+        u64::try_from(length - 16).map_err(|cause| cause.to_string())?,
+    ));
+    if framed_checksum.finalize() != checksum {
+        return Err("Compressed directory integrity check failed".into());
     }
     Ok(header)
 }

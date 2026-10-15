@@ -13,11 +13,11 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Concurrency | p50 ms |  p95 ms | Requests/s |
 | ----------: | -----: | ------: | ---------: |
-|           1 |  53.42 |  181.72 |      12.01 |
-|           4 |  56.57 |  678.80 |      23.92 |
-|          16 |  82.02 | 1251.10 |      40.04 |
+|           1 |  65.37 |  300.66 |       8.30 |
+|           4 |  66.76 |  867.82 |      20.62 |
+|          16 |  88.66 | 1064.76 |      45.50 |
 
-The latest deployed candidate preserved strong baseline rows, scores and sequence in all **384 standard load responses**, with GRU in their `CF-Ray` suffixes. Its maximum request took **2.27 s**. Eight additional responses to sixteen-rare-term probes also preserved complete strong/edge equality, but one edge query took **7.04 s**, including **5.22 s** preparing rankers and acquiring their directories. These phases reuse caches and do not establish independent concurrency scaling, peak memory or general Turbopuffer parity.
+The latest deployed candidate preserved strong baseline rows, scores and sequence in all **384 standard load responses**, with GRU in their `CF-Ray` suffixes. Its maximum request took **2.22 s**. The Rust directory decoder reduced local median decoding time by **11.9–12.8%** by reusing a validated CRC; this load run does not establish an end-to-end native speedup. Earlier sixteen-rare-term probes preserved complete strong/edge equality but included a **7.04 s** edge query, with **5.22 s** preparing rankers and acquiring their directories. These phases reuse caches and do not establish independent concurrency scaling, peak memory or general Turbopuffer parity.
 
 Rust now preserves document-length correlation in disposable R2 score summaries. Six fresh strong plans over the unchanged 200-segment corpus ranked **3 segments instead of 200**, preserving complete rows and scores. After alternate-mode warmups, elapsed queries changed **6.17–7.61 seconds→0.29–2.06 seconds**, a **67–96%** reduction in those samples. The first alternate-mode warmup still took **5.10 seconds**. Cache loss recovers through canonical R2; cold catalog acquisition remains a bottleneck. [Measurements and limits](docs/performance.md#correlated-length-bounds-on-immutable-segments).
 

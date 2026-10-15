@@ -879,7 +879,7 @@ test("eligible document lengths prune filtered pages while preserving sparse top
   }
 });
 
-test("compressed directory CRC composition still validates payload and frame checksums", () => {
+test("compressed directories validate payload and frame checksums independently", () => {
   using segment = new Segment(
     JSON.stringify(
       Array.from({ length: 128 }, (_, index) => ({

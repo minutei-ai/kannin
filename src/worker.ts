@@ -2021,8 +2021,24 @@ async function acquireCachedSnapshot(cacheKey: URL, minimumSequence: number) {
       if (encoded === undefined) return { cache, snapshot: undefined, rejected: false };
       snapshotMetrics.snapshotCacheDecodes += 1;
       const decoded = yield* readSnapshotFrame(encoded).pipe(Effect.orElseSucceed(() => undefined));
-      if (decoded !== undefined)
-        rememberSnapshot(cacheKey.href, decoded.snapshot, decoded.payload, encoded.byteLength);
+      if (decoded !== undefined) {
+        const previous = warmSnapshots.get(cacheKey.href);
+        if (
+          previous?.etag !== undefined &&
+          previous.snapshot.manifest.sequence === decoded.snapshot.manifest.sequence &&
+          previous.payload.byteLength === decoded.payload.byteLength &&
+          crypto.subtle.timingSafeEqual(previous.payload, decoded.payload)
+        )
+          rememberSnapshot(
+            cacheKey.href,
+            decoded.snapshot,
+            decoded.payload,
+            encoded.byteLength,
+            previous.etag,
+            previous.cacheAttemptedAt,
+          );
+        else rememberSnapshot(cacheKey.href, decoded.snapshot, decoded.payload, encoded.byteLength);
+      }
       return { cache, snapshot: decoded?.snapshot, rejected: false };
     }),
   );

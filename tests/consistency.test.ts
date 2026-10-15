@@ -175,6 +175,106 @@ test("strong is the default and edge reads evaluate the same BM25 snapshot", asy
   expect(edge.sequence).toBe(strong.sequence);
 });
 
+test("identical cache rehydration preserves R2 conditional-read provenance", async () => {
+  const namespace = "cache-etag-identity";
+  await request(worker, namespace, "write", write([document("a", "same payload")]));
+  const input = { ...textQuery("payload"), consistency: "edge-eventual", minimumSequence: 1 };
+  expect((await request(worker, namespace, "query", input)).status).toBe(200);
+  const object = await (
+    await worker.getR2Bucket("STORAGE")
+  ).get(`namespaces/${namespace}/root.json`);
+  if (object === null) throw new Error("Missing canonical manifest");
+  const payload = new Uint8Array(await object.arrayBuffer());
+  const manifest = Schema.decodeSync(Schema.fromJsonString(Root))(
+    new TextDecoder().decode(payload),
+  );
+  await Effect.runPromise(Effect.sleep(1100));
+  const observedAt = Effect.runSync(Clock.currentTimeMillis);
+  const cache = await (await worker.getCaches()).open("raio-snapshots-v2");
+  await cache.put(
+    `https://raio-cache.internal/snapshots/${namespace}?bucket=raio-test`,
+    new Response(await snapshotFrame({ observedAt, manifest }, payload).arrayBuffer(), {
+      headers: {
+        "cache-control": "public, max-age=60",
+        ...Schema.encodeSync(SnapshotCacheHeaders)({
+          "x-raio-observed-at": observedAt,
+          "x-raio-sequence": manifest.sequence,
+        }),
+      },
+    }),
+  );
+  expect((await request(worker, namespace, "query", input)).status).toBe(200);
+  const before = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  const response = await request(worker, namespace, "query", { ...input, minimumSequence: 2 });
+  expect(response.status).toBe(409);
+  expect(response.headers.get("server-timing")).toContain("edge_snapshot_revalidated");
+  const after = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(after.snapshotRevalidations - before.snapshotRevalidations).toBe(1);
+  expect(after.snapshotR2BodyBytes - before.snapshotR2BodyBytes).toBe(0);
+});
+
+test("same-sequence cache bodies with different bytes discard R2 provenance", async () => {
+  for (const kind of ["same-length", "different-length"]) {
+    const namespace = `cache-etag-${kind}`;
+    await request(worker, namespace, "write", write([document("a", "original payload")]));
+    const input = { ...textQuery("payload"), consistency: "edge-eventual", minimumSequence: 1 };
+    expect((await request(worker, namespace, "query", input)).status).toBe(200);
+    const object = await (
+      await worker.getR2Bucket("STORAGE")
+    ).get(`namespaces/${namespace}/root.json`);
+    if (object === null) throw new Error("Missing canonical manifest");
+    const original = await object.text();
+    const manifest = Schema.decodeSync(Schema.fromJsonString(Root))(original);
+    const changed = { manifest, text: `\n${original}\n` };
+    if (kind === "same-length") {
+      changed.manifest = {
+        ...manifest,
+        vectorEpoch: `${manifest.vectorEpoch.slice(0, 14)}5${manifest.vectorEpoch.slice(15)}`,
+      };
+      expect(changed.manifest.vectorEpoch).not.toBe(manifest.vectorEpoch);
+      changed.text = Schema.encodeSync(Schema.fromJsonString(Root))(changed.manifest);
+      expect(changed.text.length).toBe(original.length);
+    }
+    await Effect.runPromise(Effect.sleep(1100));
+    const observedAt = Effect.runSync(Clock.currentTimeMillis);
+    const cache = await (await worker.getCaches()).open("raio-snapshots-v2");
+    await cache.put(
+      `https://raio-cache.internal/snapshots/${namespace}?bucket=raio-test`,
+      new Response(
+        await snapshotFrame(
+          { observedAt, manifest: changed.manifest },
+          new TextEncoder().encode(changed.text),
+        ).arrayBuffer(),
+        {
+          headers: {
+            "cache-control": "public, max-age=60",
+            ...Schema.encodeSync(SnapshotCacheHeaders)({
+              "x-raio-observed-at": observedAt,
+              "x-raio-sequence": manifest.sequence,
+            }),
+          },
+        },
+      ),
+    );
+    expect((await request(worker, namespace, "query", input)).status).toBe(200);
+    const before = Schema.decodeUnknownSync(Health)(
+      await (await fetch(new URL("/health", await worker.ready))).json(),
+    );
+    const response = await request(worker, namespace, "query", { ...input, minimumSequence: 2 });
+    expect(response.status).toBe(409);
+    expect(response.headers.get("server-timing")).not.toContain("edge_snapshot_revalidated");
+    const after = Schema.decodeUnknownSync(Health)(
+      await (await fetch(new URL("/health", await worker.ready))).json(),
+    );
+    expect(after.snapshotRevalidations - before.snapshotRevalidations).toBe(0);
+    expect(after.snapshotR2BodyBytes - before.snapshotR2BodyBytes).toBeGreaterThan(0);
+  }
+});
+
 test("recent unchanged snapshot publications coalesce without hiding changes or cache eviction", async () => {
   const namespace = "publication-interval";
   await request(worker, namespace, "write", write([document("a", "original content")]));

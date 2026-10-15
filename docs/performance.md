@@ -1990,3 +1990,47 @@ Alchemy production deployment and the unconditional Vectorize metadata migration
 | Repeated after |          16 |  64.76 | 675.37 |      72.12 |
 
 Repeated medians and p95 improved against the reference, but the first after concurrency-sixteen p95 worsened slightly. Placement, cache/isolate state and client/network conditions were uncontrolled; these operational observations do not establish causal native latency gains. A sampled GRU isolate after the first after run reported 39 R2 acquisitions, 37 revalidations, 21 publication attempts, 18 skips and 114,427,299 offered frame bytes, with a 5,448,863-byte retained payload and 21,795,676 charged bytes. This proves the suppression path executed natively in that isolate; it is not aggregate usage or a before/after billing comparison. Stable native tails, actual peak Worker heap and fully indexed Turbopuffer parity remain outstanding. The README reports the latest repeated phases.
+
+### Retaining R2 provenance across identical cache rehydration
+
+Cache rehydration previously discarded a retained R2-sourced ETag even when its validated body was byte-identical to the known origin payload. The next refresh consequently fetched and decoded the whole root again. It now retains that ETag and the publication-attempt timestamp only after matching sequence, byte length and every byte with the native [equal-buffer operation](https://developers.cloudflare.com/workers/runtime-apis/web-crypto/#timingsafeequal). The length guard runs before the native call. No digest, Node compatibility layer or new cache metadata is introduced. Native type augmentation inherits the installed Cloudflare signature instead of hand-copying the API over the host ambient types.
+
+The cached frame still supplies its original observation time and undergoes framing, Root Schema, sequence and age validation. Known ETags come exclusively from prior R2 reads under the same bucket/namespace key. Cold hydration without prior origin, changed payloads and equal-sequence changes still discard provenance. The next conditional R2 read must confirm the preserved tag before establishing a new observation. Strong reads, the one-second lease, canonical formats, cache budgets and ranking remain unchanged.
+
+A regression failed against the old behavior and passed after the change, verifying that identical rehydration retains conditional reads and transfers zero origin-body bytes. Additional cases use different bytes of equal length at the same sequence and different-length whitespace; both still force a full R2 body read. The clean full gate passed 34 Rust and 152 Bun/workerd tests (186 total), with 2,607 Bun assertions and all strict lint/typecheck targets.
+
+Two controlled workerd comparisons used small and approximately 5 MiB valid synthetic manifests, 24 alternating pairs and four excluded warmup pairs. The repeat reversed worker creation order. Private fixture-only hooks expire the memory observation and disable background refresh in both variants to isolate cached hydration followed by a foreground future-sequence probe. Setup/cache seeding is outside timing. These hooks are absent from the production bundle. Initial uncontrolled attempts had extra background acquisitions and are excluded from these isolated measurements.
+
+All 192 hydrated responses across the two runs retained exact rows/scores and sequence one; all 192 future probes remained 409. Each variant decoded 24 cached frames and made 24 foreground R2 acquisitions per size/run. Reference acquisitions transferred the full body with zero revalidations; the candidate made 24 revalidations and transferred zero body bytes. Each large reference transferred 125,846,520 bytes; both candidates transferred zero.
+
+| Payload | First before/after ms | Repeated before/after ms |
+| :------ | --------------------: | -----------------------: |
+| small   |         18.04 / 14.62 |            13.95 / 12.43 |
+| large   |         38.94 / 27.16 |            39.40 / 30.25 |
+
+A further controlled run covered equal-length changed payloads and missing origin provenance. All 192 hydrated queries and 192 future barriers retained their expected results; both variants made 24 full-body R2 reads per size/mode.
+
+| Payload | Control   | Before/after ms |
+| :------ | :-------- | --------------: |
+| small   | different |   20.36 / 20.89 |
+| small   | unknown   |   18.73 / 19.80 |
+| large   | different |   39.66 / 40.86 |
+| large   | unknown   |   37.64 / 38.86 |
+
+Control medians regressed approximately 3–6%; the identity path improves the targeted cycle, not every query. The controlled fixtures do not establish native latency, provider CPU/billing savings or actual peak heap. Rust/WASM remains byte-identical to the prior runtime; no new ranking-quality result is claimed.
+
+Alchemy production deployment and the unconditional Vectorize metadata migration completed. The deployed bundle excludes the private expiry/background controls. Three native runs used 128 requests per concurrency in the unchanged read-only million-document, 200-segment corpus. All 1,152 edge responses matched strong rows/scores and acknowledged sequence 2,000. Common/filtered acquisitions remained 22/41 blocks and 731/2,090 compressed bytes.
+
+| Phase          | Concurrency | p50 ms | p95 ms | Requests/s |
+| :------------- | ----------: | -----: | -----: | ---------: |
+| Before         |           1 |  50.88 |  69.09 |      16.09 |
+| Before         |           4 |  54.23 | 158.60 |      51.46 |
+| Before         |          16 |  60.81 | 563.54 |      71.90 |
+| After          |           1 |  63.29 |  94.23 |      12.90 |
+| After          |           4 |  57.81 | 210.07 |      42.51 |
+| After          |          16 |  68.26 | 925.82 |      50.76 |
+| Repeated after |           1 |  49.07 | 146.42 |      13.54 |
+| Repeated after |           4 |  52.70 | 526.45 |      30.69 |
+| Repeated after |          16 |  67.64 | 844.30 |      65.40 |
+
+Both after-run p95 sets were worse than the reference. Repeated concurrency-one/four medians improved slightly, while concurrency-sixteen worsened. Cache/isolate placement, warmup and network conditions were uncontrolled, so these data neither establish a general native latency improvement nor isolate the cause of the tail regressions. The verified improvement is avoided R2 body acquisition in the controlled identical-rehydration path. Native peak heap, stable tails and fully indexed Turbopuffer parity remain unproved. The README reports the latest repeated operational phases.

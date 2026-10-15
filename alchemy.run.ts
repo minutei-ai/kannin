@@ -67,6 +67,7 @@ export const Worker = Cloudflare.Worker(
       },
       compatibility: { date: "2026-10-01" },
       env: {
+        CF_VERSION_METADATA: Cloudflare.VersionMetadata(),
         API_TOKEN: token,
         STORAGE: yield* Bucket,
         STORAGE_CACHE_SCOPE: (yield* Bucket).bucketName,

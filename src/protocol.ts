@@ -372,7 +372,17 @@ export const TextPlanIdentity = Schema.Struct({
 });
 export const TextPlan = Schema.Struct({
   statistics: SearchStatistics,
-  segments: Schema.Array(Schema.Struct({ bound: Schema.Finite, eligible: Schema.Boolean })),
+  segments: Schema.Array(
+    Schema.Struct({
+      bound: Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0)),
+      eligible: Schema.Boolean,
+    }),
+  ),
+});
+export const SharedTextPlan = Schema.Struct({
+  identity: Schema.NonEmptyString,
+  version: Schema.NonEmptyString,
+  plan: TextPlan,
 });
 export const SegmentHits = Schema.Array(
   Schema.Struct({ row: Schema.Int, id: Id, score: Schema.Finite }),

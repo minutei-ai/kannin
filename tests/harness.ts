@@ -7,6 +7,7 @@ export async function startWorker(
   persistence?: string,
   consumeQueues = false,
   artifactRoot = join(root, "dist/worker"),
+  versionId = "kannin-local-test-version",
 ) {
   const bundle = await Bun.build({
     entrypoints: [join(root, "tests/vector-backend.ts")],
@@ -53,6 +54,10 @@ export async function startWorker(
             },
           },
           env: {
+            CF_VERSION_METADATA: {
+              type: "json" as const,
+              value: { id: versionId, tag: "", timestamp: "2026-10-01T00:00:00Z" },
+            },
             VECTOR_FILTER_FIELDS: {
               type: "text" as const,
               value: '["group","year","category","__proto__","flag"]',

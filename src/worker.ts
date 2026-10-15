@@ -49,6 +49,7 @@ import {
   RankingInput,
   SearchStatistics,
   TextPlanIdentity,
+  SharedTextPlan,
   Write,
   WriteResult,
   VectorMessage,
@@ -369,6 +370,11 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
   const selected = candidates
     .filter((candidate) => candidate.terms.length > 0)
     .map((candidate) => candidate.segment);
+  const reuse = { plan: "bypass", bounds: 0 };
+  const shared: { cache: Cache | undefined; key: URL | undefined } = {
+    cache: undefined,
+    key: undefined,
+  };
   const planning: { key: string | undefined; value: typeof TextPlan.Type | undefined } = {
     key: undefined,
     value: undefined,
@@ -386,6 +392,68 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
     });
     planning.key = `${workerEnv.STORAGE_CACHE_SCOPE}:${firstSelected.key}/plan:${await sha256(identity)}`;
     planning.value = textPlan(planning.key);
+    shared.key = new URL("https://raio-cache.internal/text-plans-v1");
+    shared.key.searchParams.set("identity", planning.key);
+    shared.key.searchParams.set("version", workerEnv.CF_VERSION_METADATA.id);
+    reuse.plan = "memory";
+    if (planning.value === undefined) {
+      reuse.plan = "miss";
+      shared.cache = await Effect.runPromise(
+        Effect.tryPromise(() => caches.open("kannin-text-plans-v1")).pipe(
+          Effect.orElseSucceed(() => undefined),
+        ),
+      );
+      if (shared.cache !== undefined) {
+        const cache = shared.cache;
+        const cacheKey = shared.key;
+        const cached = await Effect.runPromise(
+          Effect.tryPromise(() => cache.match(cacheKey)).pipe(
+            Effect.orElseSucceed(() => undefined),
+          ),
+        );
+        if (cached !== undefined) {
+          const length = Number(cached.headers.get("content-length"));
+          if (Number.isSafeInteger(length) && length > 0 && length <= 256 * 1024) {
+            const decoded = await Effect.runPromise(
+              Effect.tryPromise(() => cached.arrayBuffer()).pipe(
+                Effect.flatMap((buffer) =>
+                  Effect.try(() => {
+                    if (
+                      buffer.byteLength !== length ||
+                      buffer.byteLength < 16 ||
+                      new DataView(buffer).getUint32(8, true) > 1024 * 1024
+                    )
+                      return undefined;
+                    return unpack(new Uint8Array(buffer));
+                  }),
+                ),
+                Effect.flatMap((encoded) => {
+                  if (encoded === undefined || encoded.length > 1024 * 1024)
+                    return Effect.succeed(Option.none<typeof SharedTextPlan.Type>());
+                  return Schema.decodeEffect(Schema.fromJsonString(SharedTextPlan))(encoded).pipe(
+                    Effect.asSome,
+                  );
+                }),
+                Effect.orElseSucceed(() => Option.none()),
+              ),
+            );
+            if (
+              Option.isSome(decoded) &&
+              decoded.value.identity === planning.key &&
+              decoded.value.version === workerEnv.CF_VERSION_METADATA.id &&
+              decoded.value.plan.segments.length === selected.length &&
+              decoded.value.plan.statistics.documents === root.documents &&
+              decoded.value.plan.statistics.title_length === root.titleLength &&
+              decoded.value.plan.statistics.body_length === root.bodyLength
+            ) {
+              planning.value = decoded.value.plan;
+              rememberTextPlan(planning.key, decoded.value.plan);
+              reuse.plan = "shared";
+            }
+          }
+        }
+      }
+    }
   }
   if (planning.value === undefined) {
     const projectionTerms = Schema.encodeSync(TermProjectionProps.fields.terms)(terms.toSorted());
@@ -479,9 +547,12 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
     const retained = { bound: planned.bound };
     if (selection.digest !== "") {
       const learned = segmentScoreBound(identity);
-      if (learned !== undefined) retained.bound = Math.min(planned.bound, learned);
+      if (learned !== undefined) {
+        retained.bound = Math.min(planned.bound, learned);
+        reuse.bounds += 1;
+      }
     }
-    return { segment, eligible: planned.eligible, bound: retained.bound, identity };
+    return { segment, index, eligible: planned.eligible, bound: retained.bound, identity };
   });
   const prioritized = bounded.sort((left, right) => {
     if (left.bound !== right.bound) return right.bound - left.bound;
@@ -489,6 +560,10 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
     if (left.segment.minimumId > right.segment.minimumId) return 1;
     return 0;
   });
+  timings.append(
+    "server-timing",
+    `text_plan;desc="${reuse.plan}", text_bound_hits;desc="${reuse.bounds}"`,
+  );
   const dictionaryEnded = Effect.runSync(Clock.currentTimeNanos);
   timings.append("server-timing", `text_directory;dur=${Number(dictionaryEnded - started) / 1e6}`);
   const ranked: Array<{
@@ -720,6 +795,66 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
     ranked.splice(input.topK);
   }
   const rankingEnded = Effect.runSync(Clock.currentTimeNanos);
+  if (planning.key !== undefined && shared.key !== undefined) {
+    const tightened = [...plan.segments];
+    const publication = { improved: false };
+    for (const entry of prioritized) {
+      const upper = segmentScoreBound(entry.identity);
+      const original = plan.segments[entry.index];
+      if (upper !== undefined && original !== undefined && upper < original.bound) {
+        tightened[entry.index] = { bound: upper, eligible: original.eligible };
+        publication.improved = true;
+      }
+    }
+    if (publication.improved || reuse.plan === "miss") {
+      const value = { statistics, segments: tightened };
+      rememberTextPlan(planning.key, value);
+      const encoded = Schema.encodeSync(Schema.fromJsonString(SharedTextPlan))({
+        identity: planning.key,
+        version: workerEnv.CF_VERSION_METADATA.id,
+        plan: value,
+      });
+      if (new TextEncoder().encode(encoded).byteLength <= 1024 * 1024) {
+        const packed = pack(encoded);
+        if (packed.byteLength <= 256 * 1024) {
+          if (shared.cache === undefined)
+            shared.cache = await Effect.runPromise(
+              Effect.tryPromise(() => caches.open("kannin-text-plans-v1")).pipe(
+                Effect.orElseSucceed(() => undefined),
+              ),
+            );
+          if (shared.cache !== undefined) {
+            const cache = shared.cache;
+            const cacheKey = shared.key;
+            const putStarted = Effect.runSync(Clock.currentTimeNanos);
+            const published = await Effect.runPromise(
+              Effect.tryPromise(() =>
+                cache.put(
+                  cacheKey,
+                  new Response(new Uint8Array(packed), {
+                    headers: {
+                      "cache-control": "public, max-age=3600",
+                      "content-type": "application/octet-stream",
+                      "content-length": String(packed.byteLength),
+                    },
+                  }),
+                ),
+              ).pipe(
+                Effect.as(true),
+                Effect.orElseSucceed(() => false),
+              ),
+            );
+            const putEnded = Effect.runSync(Clock.currentTimeNanos);
+            timings.append(
+              "server-timing",
+              `text_plan_put;dur=${Number(putEnded - putStarted) / 1e6}`,
+            );
+            if (published) timings.append("server-timing", "text_plan_published");
+          }
+        }
+      }
+    }
+  }
   timings.append("server-timing", `text_rank;dur=${Number(rankingEnded - dictionaryEnded) / 1e6}`);
   timings.append("server-timing", `text_rank_prepare;dur=${Number(rankMetrics.prepare) / 1e6}`);
   timings.append(

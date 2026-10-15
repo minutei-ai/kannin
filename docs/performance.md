@@ -2121,3 +2121,45 @@ A separate read-only comparison reused the existing million-document Kannin corp
 | Filtered  |            168.42 / 173.50 |            49.67 / 79.42 |                   76.36 / 77.35 |
 
 All 448 Kannin responses, including warmups, matched exact strong rows/scores and sequence. Edge still uses snapshots younger than one second at selection and an acknowledged sequence barrier; its consistency contract differs from strong reads. Turbopuffer metadata reported one million rows and an up-to-date index, while every measured query reported 14,500 unindexed WAL rows, or 1.45% of the corpus. Its native explanation showed FetchBM25 with unindexed WAL identifiers excluded from that indexed branch. The strict driver's approximately-five-second readiness probes continued during this operational run. These conditions and limited samples prevent a fully indexed or general parity claim; the operational data do not satisfy or replace the strict driver's zero-unindexed gate. Ranking checks compare Kannin edge with Kannin strong; Turbopuffer contributes separate latency and telemetry. The strong-hop cost and variable tails remain material limits.
+
+## Native Rust deployment and dense-query limit
+
+The strict million-document comparator terminated after 360 readiness probes with 14,500 unindexed WAL rows still reported. Its temporary namespace deletion was confirmed. No fully indexed comparison was produced. Alchemy subsequently deployed both Rust scorer-sharing optimizations and completed the unconditional metadata migration; the confirmed active version was `6e9bef6d-1c25-4a55-9791-f7bef8433df4`.
+
+The standard read-only million-document workload passed all 384 edge/strong row, score and sequence checks, with 128 requests at each concurrency:
+
+| Concurrency | p50 ms | p95 ms | Requests/s |
+| ----------: | -----: | -----: | ---------: |
+|           1 |  51.27 |  80.69 |      16.23 |
+|           4 |  53.60 | 145.97 |      42.28 |
+|          16 |  62.62 | 758.61 |      80.21 |
+
+These operational values update the README's standard-workload table. They do not isolate the Rust change from placement, cache state or network variation, and the concurrency-sixteen tail remains large.
+
+A separate dense eight-term/phrase load failed before its concurrency phases: its first strong baseline returned 503 after approximately 132 seconds. Native telemetry showed a normal application outcome, approximately 2,516 ms coordinator CPU and an application rejection at immutable range acquisition. The original diagnostic discarded the upstream response status, so the underlying service failure remains unclassified. Two subsequent strong probes returned correct results at sequence 2,000:
+
+| Query            | Elapsed ms | Directory/ranker preparation ms | Posting acquisition ms | Selected spans | Selected blocks | Posting bytes |
+| :--------------- | ---------: | ------------------------------: | ---------------------: | -------------: | --------------: | ------------: |
+| Eight terms      |     61,650 |                          13,482 |                 47,274 |          1,600 |          54,653 |     3,335,715 |
+| Four-term phrase |     36,932 |                           9,992 |                 26,142 |            800 |          31,792 |     2,565,337 |
+
+Each probe scored all 200 segments. These elapsed intervals include I/O; frozen native timers do not measure scorer CPU. The successful probes do not establish dense-query stability. A separate tiny native fixture confirmed identical-body strong queries and metadata reflected successive writes at sequences one and two; deleting both fixture records returned sequence three and zero rows. This tested freshness without a minimumSequence barrier and left no searchable fixture documents.
+
+## Grouping nearby posting spans
+
+The query reader now groups neighboring requested spans before its four-way acquisition windows. Each merged range is at most 1 MiB, with at most 4 KiB of additional gap bytes across the complete group. Larger existing single spans retain their previous limit. Only requested block slices enter Rust, preserving their original per-term order and CRC/row/position validation. Server-Timing retains logical spans/blocks and additionally reports grouped ranges; its byte count includes admitted gaps. Failed range responses now retain the upstream HTTP status and Ray ID in server-side rejection diagnostics, while the public error body remains unchanged.
+
+A deterministic 5,000-document segment matching the million-document layout demonstrated why zero-gap merging was insufficient: the eight-term query retained eight ranges. A 4 KiB total-gap budget reduced it to one range, increasing posting bytes from 16,519 to 20,382. The phrase geometry reduced four ranges to two, increasing bytes from 12,661 to 16,307. This is a bounded transfer/request tradeoff, not fewer transferred bytes.
+
+Red/green native-workerd regressions reduced a six-term fixture from ten total range acquisitions to five, including header and result-document reads. Tests separately cover nearby pruned spans, gaps beyond the budget, crossing the old four-term window, any/all/phrase equality and warm reuse. Seven existing exact I/O assertions were reduced by one without changing row/score assertions. The full gate passed 157 Worker/Bun and 34 Rust tests with 2,663 assertions. The snapshot-provenance fixture now always changes its selected hexadecimal digit, eliminating a one-in-sixteen chance of substituting the same byte.
+
+Two alternating complete local comparisons over 50,000 documents retained all 448 exact rows/scores/sequence responses. Worker creation order was reversed on repetition. Median milliseconds:
+
+| Segments | Query            |  Before / after | Repeated before / after |
+| -------: | :--------------- | --------------: | ----------------------: |
+|      100 | Eight terms      | 105.93 / 101.51 |           95.04 / 86.14 |
+|      100 | Four-term phrase | 130.31 / 124.94 |         121.44 / 119.38 |
+|        8 | Eight terms      | 134.16 / 143.81 |           61.25 / 59.14 |
+|        8 | Four-term phrase | 114.33 / 113.52 |           93.30 / 89.68 |
+
+Seven cells improved; one regressed 7.2%. Acquisition counts in representative after responses fell from 800 logical spans to 100 grouped ranges and from 64 spans to nine ranges. SciFact retained the complete prior 300-query evaluated array and metrics. Native dense-query verification of this grouping remains a separate delivery step.

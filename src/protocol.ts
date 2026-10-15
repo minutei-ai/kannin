@@ -478,3 +478,7 @@ export const VectorCandidates = Schema.Array(
     metadata: Schema.Struct({ id: Id, revision: Schema.Int }),
   }),
 ).check(Schema.isMaxLength(50));
+export const VectorCandidateFrame = Schema.Struct({
+  observedAt: Schema.Finite,
+  candidates: VectorCandidates.check(Schema.isMinLength(1)),
+});

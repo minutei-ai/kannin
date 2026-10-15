@@ -60,6 +60,7 @@ import {
   VectorFilterFields,
   VectorSelection,
   VectorCandidates,
+  VectorCandidateFrame,
   VectorRebuild,
   VectorRebuildSnapshot,
   VectorRebuildResult,
@@ -369,10 +370,40 @@ async function vectorId(epoch: string, id: string, sequence: number) {
   return sha256(`${epoch}\0${id}\0${sequence}`);
 }
 
-const pendingPlanPublications = new Map<string, number>();
-const planPublicationBudget = { bytes: 0 };
-const MAX_PLAN_PUBLICATION_BYTES = 2 * 1024 * 1024;
-const MAX_PLAN_PUBLICATIONS = 16;
+const pendingQueryPublications = new Map<string, number>();
+const queryPublicationBudget = { bytes: 0 };
+const MAX_QUERY_PUBLICATION_BYTES = 2 * 1024 * 1024;
+const MAX_QUERY_PUBLICATIONS = 16;
+
+function publishQueryCache(
+  identity: string,
+  charge: number,
+  publication: Effect.Effect<void, Cause.UnknownError>,
+  ctx: ExecutionContext | DurableObjectState,
+) {
+  if (
+    pendingQueryPublications.has(identity) ||
+    pendingQueryPublications.size >= MAX_QUERY_PUBLICATIONS ||
+    queryPublicationBudget.bytes + charge > MAX_QUERY_PUBLICATION_BYTES
+  )
+    return false;
+  pendingQueryPublications.set(identity, charge);
+  queryPublicationBudget.bytes += charge;
+  ctx.waitUntil(
+    Effect.runPromise(
+      publication.pipe(
+        Effect.ignore,
+        Effect.ensuring(
+          Effect.sync(() => {
+            pendingQueryPublications.delete(identity);
+            queryPublicationBudget.bytes -= charge;
+          }),
+        ),
+      ),
+    ),
+  );
+  return true;
+}
 
 async function textQuery(
   input: typeof Query.Type,
@@ -893,46 +924,34 @@ async function textQuery(
           const cacheKey = shared.key;
           const identity = cacheKey.href;
           const charge = packed.byteLength * 4 + identity.length * 4 + 128;
+          const retainedCache = shared.cache;
           if (
-            !pendingPlanPublications.has(identity) &&
-            pendingPlanPublications.size < MAX_PLAN_PUBLICATIONS &&
-            planPublicationBudget.bytes + charge <= MAX_PLAN_PUBLICATION_BYTES
-          ) {
-            pendingPlanPublications.set(identity, charge);
-            planPublicationBudget.bytes += charge;
-            const retainedCache = shared.cache;
-            ctx.waitUntil(
-              Effect.runPromise(
-                Effect.gen(function* () {
-                  const cache = yield* Match.value(retainedCache).pipe(
-                    Match.when(undefined, () =>
-                      Effect.tryPromise(() => caches.open("kannin-text-plans-v1")),
-                    ),
-                    Match.orElse((opened) => Effect.succeed(opened)),
-                  );
-                  yield* Effect.tryPromise(() =>
-                    cache.put(
-                      cacheKey,
-                      new Response(new Uint8Array(packed), {
-                        headers: {
-                          "cache-control": "public, max-age=3600",
-                          "content-type": "application/octet-stream",
-                          "content-length": String(packed.byteLength),
-                        },
-                      }),
-                    ),
-                  );
-                }).pipe(
-                  Effect.ignore,
-                  Effect.ensuring(
-                    Effect.sync(() => {
-                      pendingPlanPublications.delete(identity);
-                      planPublicationBudget.bytes -= charge;
+            publishQueryCache(
+              identity,
+              charge,
+              Effect.gen(function* () {
+                const cache = yield* Match.value(retainedCache).pipe(
+                  Match.when(undefined, () =>
+                    Effect.tryPromise(() => caches.open("kannin-text-plans-v1")),
+                  ),
+                  Match.orElse((opened) => Effect.succeed(opened)),
+                );
+                yield* Effect.tryPromise(() =>
+                  cache.put(
+                    cacheKey,
+                    new Response(new Uint8Array(packed), {
+                      headers: {
+                        "cache-control": "public, max-age=3600",
+                        "content-type": "application/octet-stream",
+                        "content-length": String(packed.byteLength),
+                      },
                     }),
                   ),
-                ),
-              ),
-            );
+                );
+              }),
+              ctx,
+            )
+          ) {
             timings.append("server-timing", "text_plan_publish_scheduled");
           } else timings.append("server-timing", "text_plan_publish_skipped");
         }
@@ -1040,6 +1059,7 @@ async function vectorQuery(
   input: typeof Query.Type,
   root: typeof Root.Type,
   timings: Headers,
+  ctx: ExecutionContext | DurableObjectState,
 ) {
   if (input.kind === "text") return [];
   if (input.vector.length !== 768)
@@ -1072,10 +1092,10 @@ async function vectorQuery(
     filters: input.filters,
     fields,
   });
-  const cacheKey = new URL(`https://raio-cache.internal/vectors-v1/${await sha256(selector)}`);
+  const cacheKey = new URL(`https://raio-cache.internal/vectors-v2/${await sha256(selector)}`);
   cacheKey.searchParams.set("bucket", env.STORAGE_CACHE_SCOPE);
   const cache = await Effect.runPromise(
-    Effect.tryPromise(() => caches.open("kannin-vectors-v1")).pipe(
+    Effect.tryPromise(() => caches.open("kannin-vectors-v2")).pipe(
       Effect.orElseSucceed(() => undefined),
     ),
   );
@@ -1087,29 +1107,45 @@ async function vectorQuery(
     if (cached !== undefined) {
       const decoded = await Effect.runPromise(
         Effect.tryPromise(() => cached.text()).pipe(
-          Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(VectorCandidates))),
+          Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(VectorCandidateFrame))),
           Effect.orElseSucceed(() => undefined),
         ),
       );
-      candidates.value = decoded;
+      if (decoded !== undefined) {
+        const now = Effect.runSync(Clock.currentTimeMillis);
+        if (decoded.observedAt <= now && now - decoded.observedAt < 1000)
+          candidates.value = decoded.candidates;
+        else timings.append("server-timing", "vector_cache_rejected");
+      }
     }
   }
   if (candidates.value === undefined) {
+    const observedAt = Effect.runSync(Clock.currentTimeMillis);
     const result = await env.VECTORS.query([...input.vector], options);
     candidates.value = Schema.decodeUnknownSync(VectorCandidates)(result.matches);
     timings.append("server-timing", 'vector_cache;desc="miss"');
     if (cache !== undefined && candidates.value.length > 0) {
-      const encoded = Schema.encodeSync(Schema.fromJsonString(VectorCandidates))(candidates.value);
-      await Effect.runPromise(
+      const encoded = Schema.encodeSync(Schema.fromJsonString(VectorCandidateFrame))({
+        observedAt,
+        candidates: candidates.value,
+      });
+      const bytes = new TextEncoder().encode(encoded);
+      const charge = bytes.byteLength * 4 + cacheKey.href.length * 4 + 128;
+      const scheduled = publishQueryCache(
+        cacheKey.href,
+        charge,
         Effect.tryPromise(() =>
           cache.put(
             cacheKey,
-            new Response(encoded, {
-              headers: { "cache-control": "public, max-age=1", "content-type": "application/json" },
+            new Response(new Uint8Array(bytes), {
+              headers: { "cache-control": "public, max-age=2", "content-type": "application/json" },
             }),
           ),
-        ).pipe(Effect.ignore),
+        ),
+        ctx,
       );
+      if (scheduled) timings.append("server-timing", "vector_publish_scheduled");
+      else timings.append("server-timing", "vector_publish_skipped");
     }
   } else timings.append("server-timing", 'vector_cache;desc="hit"');
   const indexEnded = Effect.runSync(Clock.currentTimeNanos);
@@ -1251,7 +1287,7 @@ async function query(
   }
   const [text, vectors] = await Promise.all([
     textQuery(input, manifest, timings, ctx),
-    vectorQuery(env, input, manifest, timings),
+    vectorQuery(env, input, manifest, timings, ctx),
   ]);
   const scores = new Map<string, typeof Row.Type>();
   if (input.kind === "hybrid") {

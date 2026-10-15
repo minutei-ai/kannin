@@ -1620,3 +1620,25 @@ The final gate passed 31 Rust and 142 Bun/workerd tests, including corrupt canon
 | Repeated after |          16 | 198.96 | 1567.23 |      18.20 |
 
 All initial candidate phases worsened against this baseline. Repetition improved concurrency-one/four medians but all p95 values remained worse, as did concurrency-sixteen median. The retained change removes demonstrated serialization work, but these uncontrolled native results do not establish a whole-query speedup. The README shows the repeated load. No snapshot fallback occurred in these 288 observations. In the repeated concurrency-sixteen phase, snapshot selection reached 977 ms and ranking reached 585 ms in separate observations; gateway elapsed reached 1,378 ms. These include I/O and concurrent scheduling, and native clocks freeze during uninterrupted CPU, so zero phase timings are not zero CPU evidence. Cache placement, actual peak heap and stable tail latency remain unresolved; no new ranking-quality or vector-recall claim is made by this snapshot-only change.
+
+### Rejected scoring specialization for phrase state
+
+An uncommitted Rust prototype specialized finish_lists by a compile-time phrase flag, removing the positional selection vector from any/all scoring. The first variant appended phrase selections and regressed the 64-term all scorer by 26.9% initially and 15.2% on repetition. A second variant retained phrase's original indexed selection/fill, with an empty selection for any/all. Both variants passed the strict gate with 31 Rust and 142 Bun/workerd tests, including independent exhaustive scoring and compact/positional equivalence. No ranking arithmetic, bounds, filters, tombstones or tie order changed.
+
+The WASM comparison used 5,000 documents, 2/16/64 terms, any/all/phrase, top-k 100, excluded rows and group filters. Scoring used eighteen alternating pairs of four finish calls, excluding four warmup pairs; complete ranker/decode/score pipelines used ten pairs of two calls, excluding three warmup pairs. All serialized rows/scores matched. The second variant improved some 16-term cases but its repeated 64-term pipeline medians regressed: any 66.17→70.86 ms, all 68.24→68.95 ms and phrase 83.91→91.51 ms. Its WASM binary grew from 695,480 to 705,061 bytes.
+
+A full workerd comparison seeded ten 500-document segments, exercised the same term counts/modes at top-k 100 and group filtering, and checked 756 exact responses over fourteen alternating pairs of three queries, excluding three warmup pairs. Every candidate median regressed:
+
+| Terms | Mode   | Before ms | Candidate ms |
+| ----: | :----- | --------: | -----------: |
+|     2 | any    |    146.62 |       188.47 |
+|     2 | all    |    159.04 |       183.25 |
+|     2 | phrase |    157.89 |       177.55 |
+|    16 | any    |    153.77 |       183.87 |
+|    16 | all    |    156.40 |       183.25 |
+|    16 | phrase |    177.32 |       185.95 |
+|    64 | any    |    171.14 |       202.15 |
+|    64 | all    |    166.16 |       192.29 |
+|    64 | phrase |    176.03 |       218.37 |
+
+The experiment was removed before any native deployment. These observations reject this implementation; they do not identify whether code layout, compilation or another runtime effect caused the regression. Removing source-level bookkeeping did not establish faster execution. Production retains the preceding scorer, and snapshot/manifest behavior is unchanged. Rebuilding the restored source reproduced the baseline WASM byte for byte.

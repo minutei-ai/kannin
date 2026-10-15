@@ -1816,3 +1816,17 @@ Filtered acquisition fell from 188 blocks/6,377 compressed bytes to 41 blocks/2,
 | Repeated after |          16 |  76.07 | 1466.11 |      19.99 |
 
 The repeated concurrency-sixteen median improved, while its p95 worsened to 1,466 ms. The first after run regressed concurrency-one/four medians. Placement, cache state and network conditions were uncontrolled, and each phase has only 32 samples. The reduced filtered page acquisition repeated; stable native tail-latency improvement, actual peak Worker memory and fully indexed Turbopuffer parity remain unproved. The README reports the latest repeated run.
+
+### Snapshot acquisition stage timings
+
+Authenticated edge queries now distinguish Cache API acquisition (`edge_snapshot_cache`), R2 response acquisition (`edge_snapshot_r2`) and manifest body consumption, validation and frame preparation (`edge_snapshot_body`) in Server-Timing. Cache time includes opening/matching the internal cache and consuming/validating a selected frame, or waiting for that shared operation. R2/body durations describe the shared acquisition as a whole; a caller joining an existing acquisition may wait less than those reported durations. They are not additive per-request CPU measurements. Warm-memory hits omit these acquisition fields. Native Worker clocks may remain frozen during uninterrupted CPU, so zero does not establish zero processing cost. Cache policy, original observation-age enforcement, sequence barriers and ranking are unchanged.
+
+The complete local gate passed 34 Rust and 148 Bun/workerd tests with 2,565 Bun assertions. The Alchemy production deployment and metadata migration completed. A diagnostic native run increased each concurrency phase to 128 requests; all 384 responses retained strong rows/scores and sequence 2,000 in the unchanged million-document corpus. This diagnostic has no paired baseline and does not establish a performance improvement.
+
+| Concurrency | p50 ms | p95 ms | Requests/s | Cache acquisitions | Foreground R2 results |
+| ----------: | -----: | -----: | ---------: | -----------------: | --------------------: |
+|           1 |  50.02 |  76.85 |      17.27 |                  1 |                     1 |
+|           4 |  60.85 | 603.97 |      28.25 |                 14 |                     0 |
+|          16 |  78.51 | 992.01 |      50.74 |                 27 |                     2 |
+
+The first foreground R2 acquisition reported 169 ms until the response and 25 ms for body consumption/validation/framing, preceded by 13 ms in cache acquisition. Concurrency sixteen had two R2 timing observations, each reporting 166 ms acquisition and 53 ms body preparation; shared operations can return the same timings to multiple callers, so these are not two proven distinct origin reads. Most foreground cache acquisitions returned without a subsequent R2 result. At concurrency sixteen, cache acquisition reached 432 ms and directory/ranker preparation reached 532 ms. These intervals include asynchronous waiting and scheduling and do not isolate Rust CPU. This narrows the next investigation to cold snapshot/directory acquisition and ranker preparation; it does not attribute all tail latency to R2. Client/network effects remain material: the slowest response took 1,492 ms while its reported gateway interval was 462 ms.

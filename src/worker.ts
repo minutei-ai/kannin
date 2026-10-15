@@ -1860,10 +1860,12 @@ async function acquireSnapshot(
   snapshotMetrics.snapshotR2Reads += 1;
   const previous = warmSnapshots.get(cacheKey.href);
   const key = `namespaces/${namespace}/root.json`;
+  const started = Effect.runSync(Clock.currentTimeNanos);
   const object = await Match.value(previous?.etag).pipe(
     Match.when(undefined, () => env.STORAGE.get(key)),
     Match.orElse((etag) => env.STORAGE.get(key, { onlyIf: { etagDoesNotMatch: etag } })),
   );
+  const received = Effect.runSync(Clock.currentTimeNanos);
   if (object === null) return undefined;
   const selected = {
     manifest: previous?.snapshot.manifest,
@@ -1891,6 +1893,7 @@ async function acquireSnapshot(
   if (payload === undefined)
     throw new Rejected({ status: 503, message: "R2 snapshot omitted its encoded manifest" });
   const encoded = snapshotFrame(snapshot, payload);
+  const prepared = Effect.runSync(Clock.currentTimeNanos);
   rememberSnapshot(cacheKey.href, snapshot, payload, encoded.size, object.etag);
   if (cache !== undefined) {
     ctx.waitUntil(
@@ -1911,7 +1914,12 @@ async function acquireSnapshot(
         .catch(() => undefined),
     );
   }
-  return { snapshot, revalidated: selected.revalidated };
+  return {
+    snapshot,
+    revalidated: selected.revalidated,
+    r2Ms: Number(received - started) / 1e6,
+    bodyMs: Number(prepared - received) / 1e6,
+  };
 }
 const pendingSnapshots = new Map<string, ReturnType<typeof acquireSnapshot>>();
 const refreshSnapshot = Effect.fn("raio.refreshSnapshot")(function* (
@@ -1940,6 +1948,8 @@ const refreshSnapshot = Effect.fn("raio.refreshSnapshot")(function* (
     },
   });
   if (acquired === undefined) return undefined;
+  timings?.append("server-timing", `edge_snapshot_r2;dur=${acquired.r2Ms}`);
+  timings?.append("server-timing", `edge_snapshot_body;dur=${acquired.bodyMs}`);
   if (acquired.revalidated) timings?.append("server-timing", "edge_snapshot_revalidated");
   const snapshot = acquired.snapshot;
   if (snapshot.manifest.sequence < minimumSequence) return undefined;
@@ -2012,6 +2022,7 @@ const edgeSnapshot = Effect.fn("raio.edgeSnapshot")(function* (
     selection.snapshot.manifest.sequence < minimumSequence
   ) {
     selection.snapshot = undefined;
+    const cacheStarted = yield* Clock.currentTimeNanos;
     const identity = `${cacheKey.href}/minimumSequence=${minimumSequence}`;
     const pending = pendingCachedSnapshots.get(identity);
     const acquisition = { read: pending };
@@ -2024,6 +2035,11 @@ const edgeSnapshot = Effect.fn("raio.edgeSnapshot")(function* (
     }
     const read = acquisition.read;
     const acquired = yield* Effect.tryPromise(() => read);
+    const cacheEnded = yield* Clock.currentTimeNanos;
+    timings.append(
+      "server-timing",
+      `edge_snapshot_cache;dur=${Number(cacheEnded - cacheStarted) / 1e6}`,
+    );
     cache.value = acquired.cache;
     selection.snapshot = acquired.snapshot;
     if (acquired.rejected) timings.append("server-timing", "edge_snapshot_cache_rejected");

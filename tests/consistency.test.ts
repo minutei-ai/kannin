@@ -39,6 +39,11 @@ test("overlapping cold snapshots share R2 acquisition and check sequence barrier
   );
   expect(after.snapshotR2Reads - before.snapshotR2Reads).toBeLessThan(responses.length);
   expect(after.snapshotSharedReads - before.snapshotSharedReads).toBeGreaterThan(0);
+  expect(
+    responses.some((response) =>
+      /edge_snapshot_cache;dur=\d/.test(response.headers.get("server-timing") ?? ""),
+    ),
+  ).toBe(true);
 });
 
 test("failed shared snapshot acquisitions release their entry and allow canonical recovery", async () => {
@@ -184,6 +189,8 @@ test("expired warm snapshots revalidate unchanged R2 content without transferrin
   const response = await request(worker, namespace, "query", input);
   expect(response.status).toBe(200);
   expect(response.headers.get("server-timing")).toContain("edge_snapshot_revalidated");
+  expect(response.headers.get("server-timing")).toMatch(/edge_snapshot_r2;dur=\d/);
+  expect(response.headers.get("server-timing")).toMatch(/edge_snapshot_body;dur=\d/);
   const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
   expect(result.sequence).toBe(1);
   expect(result.rows.map((row) => row.id)).toEqual(["a"]);

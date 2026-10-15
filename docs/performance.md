@@ -1928,3 +1928,23 @@ Alchemy production deployment and the unconditional Vectorize metadata migration
 | Repeated after |          16 |  78.21 | 992.29 |      48.08 |
 
 The repeated concurrency-sixteen p95 worsened to 992 ms from 710 ms before deployment; throughput also worsened. Concurrency-four p95 improved on repetition after regressing in the first after run. Placement, cache/isolate state and network conditions were uncontrolled. These data do not establish a native latency gain from the parser change. The accepted scoped result is faster large-directory construction in the tested WASM fixtures, with the full-path regressions recorded above. Stable native tails, measured peak Worker heap and fully indexed Turbopuffer parity remain outstanding. The README reports the latest repeated operational phases.
+
+### Rejected snapshot payload and stream publication experiments
+
+Revalidation currently republishes the complete point-in-time frame, including when R2 returns unchanged content. Three local workerd experiments tested reducing frame construction costs while preserving canonical R2 ownership, cache frequency, the original observation timestamp, sequence barriers and the existing binary format. None was retained or deployed. The previous runtime was restored.
+
+Retaining a native Blob instead of the original validated byte array did not improve batched frame construction: the large fixture measured 1.82→1.85 ms per frame without consumption and 3.26→3.28 ms with consumption. A plain ReadableStream Response reduced large frame construction 1.73→0.16 ms, and construction plus consumption 3.33→2.76 ms, but that isolated result did not survive the full Cache API path. These private batched fixtures used eight frames per request, twenty-eight alternating pairs and four excluded warmup pairs in small/large and construction/consumption cases (224 requests per experiment). They do not measure provider CPU, peak memory or billing.
+
+The full-path fixture retained a valid small or roughly 5 MiB synthetic manifest whose all-positive document Bloom enlarges the body. Each variant first queried its acknowledged sequence, then used twenty-eight sequential future-sequence requests to force unchanged-ETag revalidation. Each response retained the expected 409 sequence barrier; every variant had twenty-eight R2 reads/revalidations and zero transferred R2 body bytes. Cached payload bytes, including surrounding whitespace, remained exact. Four warmup pairs were excluded, leaving twenty-four measured alternating pairs per size. Each experiment completed 112 future-barrier responses plus four successful primers.
+
+| Prototype                       | Small before/after ms | Large before/after ms |
+| :------------------------------ | --------------------: | --------------------: |
+| Retained Blob                   |           7.88 / 8.28 |         22.02 / 23.97 |
+| Plain stream Response           |           6.87 / 7.80 |         22.98 / 87.67 |
+| Fixed-length stream publication |           7.93 / 8.32 |         20.49 / 18.92 |
+
+The fixed-length variant used the installed native FixedLengthStream and cancellation-aware producer lifetime. Cloudflare documents its [known-length transport contract](https://developers.cloudflare.com/workers/runtime-apis/streams/transformstream/); that contract does not promise faster caching. The small path still regressed approximately 5%, while the large request-only median improved 7.6%. Those request intervals do not guarantee the background cache write has finished.
+
+A follow-up probe attempted to include observable publication completion by reading the cache observation header after each request. It emitted results but terminated with `ERR_INVALID_STATE: Writer is not bound to a WritableStream` and connection resets during cleanup. That run is excluded from passing performance evidence; it did not establish completed-publication savings or classify a production defect. All writes were to disposable local fixtures. No native deployment or production mutation occurred in these experiments.
+
+The retained implementation remains the original validated byte payload plus Blob frame. The next publication investigation should address how often the full manifest body must be republished, rather than infer complete-path gains from cheaper frame construction alone. Freshness and minimumSequence remain mandatory; no cache lease was extended.

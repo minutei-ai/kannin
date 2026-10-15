@@ -629,11 +629,23 @@ async function textQuery(
   const compilation: { query: PreparedQuery | undefined } = { query: undefined };
   const rankingConcurrency = 4;
   const rankIo = Semaphore.makeUnsafe(rankingConcurrency);
-  const rankingWindows = [
-    ...EffectArray.chunksOf(prioritized.slice(0, 4), 1),
-    ...EffectArray.chunksOf(prioritized.slice(4), rankingConcurrency),
-  ];
-  for (const rankingWindow of rankingWindows) {
+  const scheduling = { offset: 0, matches: 0 };
+  while (scheduling.offset < prioritized.length) {
+    const capacity = rankingConcurrency - (scheduling.offset % rankingConcurrency);
+    const width = Match.value(scheduling.offset).pipe(
+      Match.when(0, () => 1),
+      Match.when(
+        () => ranked.length < input.topK && scheduling.matches > 0,
+        () => Math.min(capacity, input.topK - ranked.length),
+      ),
+      Match.when(
+        (offset) => offset < rankingConcurrency && ranked.length === input.topK,
+        () => 1,
+      ),
+      Match.orElse(() => capacity),
+    );
+    const rankingWindow = prioritized.slice(scheduling.offset, scheduling.offset + width);
+    scheduling.offset += rankingWindow.length;
     const cutoff = ranked[input.topK - 1];
     const eligible = rankingWindow.filter(({ segment, eligible: allowed, bound }) => {
       if (!allowed) return false;
@@ -648,6 +660,7 @@ async function textQuery(
       }
       return true;
     });
+    scheduling.matches = 0;
     if (eligible.length === 0) continue;
     if (compilation.query === undefined)
       compilation.query = plans.use(
@@ -828,6 +841,7 @@ async function textQuery(
         { concurrency: rankingConcurrency },
       ),
     );
+    scheduling.matches = batches.reduce((count, batch) => count + batch.length, 0);
     ranked.push(...batches.flat());
     ranked.sort((a, b) => {
       if (a.score !== b.score) return b.score - a.score;

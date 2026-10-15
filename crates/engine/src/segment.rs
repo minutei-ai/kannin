@@ -656,7 +656,8 @@ pub fn parse_header(bytes: &[u8]) -> Result<(Header, usize), String> {
     if crc32fast::hash(json) != crc {
         return Err("Header integrity check failed".into());
     }
-    let header: Header = serde_json::from_slice(json).map_err(|e| e.to_string())?;
+    let text = std::str::from_utf8(json).map_err(|cause| cause.to_string())?;
+    let header: Header = serde_json::from_str(text).map_err(|e| e.to_string())?;
     if header.version != 1 || header.documents.len() > 10000 {
         return Err("Invalid segment version or document count".into());
     }

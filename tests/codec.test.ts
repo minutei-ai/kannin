@@ -50,6 +50,34 @@ test("WASM text tokenization agrees across normalization forms", () => {
   expect(tokenize("cafe\u0301")).toBe(tokenize("café"));
 });
 
+test("directory parsing rejects invalid UTF-8 even with a valid header checksum", () => {
+  const segment = new Segment(
+    JSON.stringify([{ id: "café", text: "alpha", attributes: { city: "São Paulo" } }]),
+  );
+  const encoded = new TextEncoder().encode(segment.header_json());
+  const position = encoded.findIndex((byte) => byte === 0xc3);
+  expect(position).toBeGreaterThanOrEqual(0);
+  for (const invalid of [0xff, 0xc0]) {
+    const json = encoded.slice();
+    json[position] = invalid;
+    const frame = new Uint8Array(16 + json.byteLength);
+    frame.set(new TextEncoder().encode("RAIOSEG1"));
+    const view = new DataView(frame.buffer);
+    view.setUint32(8, json.byteLength, true);
+    view.setUint32(12, crc32(json), true);
+    frame.set(json, 16);
+    expect(() => new Directory(frame)).toThrow();
+  }
+  const directory = new Directory(segment.bytes());
+  expect(
+    Schema.decodeSync(Schema.fromJsonString(EligibleMinimum))(
+      directory.minimum('[{"field":"city","op":"eq","value":"São Paulo"}]'),
+    ),
+  ).toEqual([0, 1]);
+  directory.free();
+  segment.free();
+});
+
 test("WASM codec enforces the log-size budget", () => {
   expect(() => pack("x".repeat(2 * 1024 * 1024 + 1))).toThrow("TooLarge");
   expect(() => unpack(new Uint8Array(15))).toThrow("InvalidHeader");

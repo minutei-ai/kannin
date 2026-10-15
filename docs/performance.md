@@ -1880,3 +1880,51 @@ Alchemy production deployment and the unconditional metadata migration completed
 | Repeated after |          16 |  68.07 | 550.12 |      57.48 |
 
 Repeated medians improved relative to the before run, while concurrency-four/sixteen p95 and throughput worsened. Cache/isolate/network placement was uncontrolled; the before run also overlapped a separate local SciFact process on the client host. These are operational observations, not proof that the Rust change caused a native latency improvement. The repeated preparation microbenchmark demonstrates the scoped gain. Stable native tails, actual peak Worker heap and fully indexed Turbopuffer parity remain outstanding. The README reports the latest 128-request repeated phases.
+
+### UTF-8 validation before directory JSON parsing
+
+Cold directory construction now validates the header UTF-8 once and passes the borrowed string to the installed serde_json string reader, replacing its byte-slice reader. Framing, CRC, document ordering, version/count checks, document frequencies and posting interval validation remain active. No header format, cache key/budget, scoring arithmetic or storage ownership changes. Invalid UTF-8 is rejected even with a valid CRC; the new WASM test also verifies a valid Unicode attribute filter. The clean full gate passed 34 Rust and 149 Bun/workerd tests (183 total), with 2,569 Bun assertions and all strict lint/typecheck targets.
+
+Two alternating WASM constructor comparisons used 128/5,000-document dense/sparse/Unicode fixtures, six excluded warmup pairs and thirty measured pairs. Only directory construction is timed; release occurs afterward. Both variants retained the same charged heap estimates, term summaries, eligible minima, posting spans and final rows/scores. Low-level fixtures include nested attributes accepted by the engine. These are parsing measurements without R2/network acquisition.
+
+| Documents | Fixture | Header bytes | First before/after ms | Repeated before/after ms |
+| --------: | :------ | -----------: | --------------------: | -----------------------: |
+|       128 | dense   |        21778 |         0.263 / 0.255 |            0.259 / 0.261 |
+|       128 | sparse  |        61096 |         0.577 / 0.515 |            0.583 / 0.542 |
+|       128 | unicode |        64934 |         0.577 / 0.521 |            0.576 / 0.523 |
+|      5000 | dense   |       852007 |         5.409 / 4.689 |            5.542 / 4.770 |
+|      5000 | sparse  |      1760174 |       13.185 / 11.910 |          13.285 / 12.135 |
+|      5000 | unicode |      1905486 |       14.510 / 12.816 |          14.738 / 13.091 |
+
+Repeated 5,000-document construction improved approximately 9–14%. The small dense control regressed 0.8%; small sparse/Unicode cases improved 7–9%. WASM increased from 704,098 to 704,753 bytes. Equal charged heap estimates are not measured peak-memory proof.
+
+Two complete workerd comparisons used 5,000 documents compacted into one segment, scalar attributes matching the public API, fourteen alternating pairs and four excluded warmup pairs. Namespace rebuild clears decoded directories before every timed query; immutable Worker/Cache API storage may remain warm. Rebuild/ingestion/compaction are outside timing. The corrected runs checked all 336 complete responses for identical rows/scores and sequence five. The repeat reversed worker creation order.
+
+| Fixture | Filtered | First before/after ms | Repeated before/after ms |
+| :------ | :------- | --------------------: | -----------------------: |
+| dense   | false    |         29.18 / 28.32 |            28.44 / 26.42 |
+| dense   | true     |         38.43 / 36.95 |            39.36 / 38.98 |
+| sparse  | false    |         33.28 / 33.36 |            38.67 / 34.84 |
+| sparse  | true     |         42.01 / 48.21 |            50.81 / 45.81 |
+| unicode | false    |         36.18 / 32.46 |            31.44 / 29.26 |
+| unicode | true     |         40.76 / 42.96 |            41.84 / 43.13 |
+
+Five repeated cases improved 1–10%; Unicode filtered regressed 3.1% after a 5.4% initial regression. Initial sparse filtered also regressed 14.7%, then improved 9.9% on repetition. The consistent scoped result is faster construction for large tested directories; these full-path results do not prove a gain for every query or native Worker CPU. Cold snapshot/directory I/O and native tail stability remain separate work.
+
+The 5,183-document, 300-query SciFact report remained byte-identical to the reference (SHA-256 `9dbe36ba7a85f61312f089c631c4b0dc134e6e876796921ae8206e270415cb28`).
+
+Alchemy production deployment and the unconditional Vectorize metadata migration completed successfully. Three native runs used 128 requests per concurrency in the same read-only million-document, 200-segment corpus. All 1,152 edge responses matched their strong rows/scores and acknowledged sequence 2,000. Common/filtered acquisitions stayed at 22/41 blocks and 731/2,090 compressed bytes.
+
+| Phase          | Concurrency | p50 ms | p95 ms | Requests/s |
+| :------------- | ----------: | -----: | -----: | ---------: |
+| Before         |           1 |  64.60 | 271.14 |       8.64 |
+| Before         |           4 |  65.20 | 286.59 |      32.23 |
+| Before         |          16 |  76.62 | 710.12 |      61.27 |
+| After          |           1 |  58.16 |  92.62 |      13.85 |
+| After          |           4 |  70.12 | 624.88 |      25.03 |
+| After          |          16 |  68.88 | 907.86 |      51.69 |
+| Repeated after |           1 |  63.61 | 161.42 |      11.83 |
+| Repeated after |           4 |  62.53 | 172.98 |      30.80 |
+| Repeated after |          16 |  78.21 | 992.29 |      48.08 |
+
+The repeated concurrency-sixteen p95 worsened to 992 ms from 710 ms before deployment; throughput also worsened. Concurrency-four p95 improved on repetition after regressing in the first after run. Placement, cache/isolate state and network conditions were uncontrolled. These data do not establish a native latency gain from the parser change. The accepted scoped result is faster large-directory construction in the tested WASM fixtures, with the full-path regressions recorded above. Stable native tails, measured peak Worker heap and fully indexed Turbopuffer parity remain outstanding. The README reports the latest repeated operational phases.

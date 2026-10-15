@@ -13,9 +13,9 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Concurrency | p50 ms | p95 ms | Requests/s |
 | ----------: | -----: | -----: | ---------: |
-|           1 |  50.70 |  69.57 |      17.06 |
-|           4 |  54.89 | 389.72 |      33.48 |
-|          16 |  68.07 | 550.12 |      57.48 |
+|           1 |  63.61 | 161.42 |      11.83 |
+|           4 |  62.53 | 172.98 |      30.80 |
+|          16 |  78.21 | 992.29 |      48.08 |
 
 Each 128-request phase covers rare, selective, common and filtered text queries; all **384 responses** matched strong rows/scores and sequence. Page pruning reduced native common-query acquisition from **178 to 22 blocks** and filtered acquisition from **188 to 41 blocks**, including cache hits. Native placement, cache state and network conditions vary; uniform latency gains, peak memory and general Turbopuffer parity remain unverified.
 
@@ -36,7 +36,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **148 Worker/tooling tests and 34 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **149 Worker/tooling tests and 34 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

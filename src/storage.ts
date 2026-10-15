@@ -30,6 +30,41 @@ import {
   TextPlan,
 } from "./protocol";
 
+const pendingQueryPublications = new Map<string, number>();
+const queryPublicationBudget = { bytes: 0 };
+const MAX_QUERY_PUBLICATION_BYTES = 2 * 1024 * 1024;
+const MAX_QUERY_PUBLICATIONS = 16;
+
+export function publishQueryCache(
+  identity: string,
+  charge: number,
+  publication: Effect.Effect<void, Cause.UnknownError>,
+  ctx: ExecutionContext | DurableObjectState,
+) {
+  if (
+    pendingQueryPublications.has(identity) ||
+    pendingQueryPublications.size >= MAX_QUERY_PUBLICATIONS ||
+    queryPublicationBudget.bytes + charge > MAX_QUERY_PUBLICATION_BYTES
+  )
+    return false;
+  pendingQueryPublications.set(identity, charge);
+  queryPublicationBudget.bytes += charge;
+  ctx.waitUntil(
+    Effect.runPromise(
+      publication.pipe(
+        Effect.ignore,
+        Effect.ensuring(
+          Effect.sync(() => {
+            pendingQueryPublications.delete(identity);
+            queryPublicationBudget.bytes -= charge;
+          }),
+        ),
+      ),
+    ),
+  );
+  return true;
+}
+
 const buffers = new Map<string, Uint8Array>();
 const frequencyPages = new Map<string, { page: FrequencyPage; bytes: number }>();
 const frequencyBudget = { bytes: 0 };
@@ -432,7 +467,12 @@ function rememberOverview(identity: string, bytes: Uint8Array) {
 }
 
 export const readTermProjections = Effect.fn("kannin.readTermProjections")(
-  (ranges: ReadonlyArray<typeof TermProjectionRange.Type>, terms: string, filters: string) =>
+  (
+    ranges: ReadonlyArray<typeof TermProjectionRange.Type>,
+    terms: string,
+    filters: string,
+    ctx: ExecutionContext,
+  ) =>
     Effect.gen(function* () {
       const started = yield* Clock.currentTimeNanos;
       const telemetry = {
@@ -675,17 +715,23 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
       if (cache !== undefined && admission.enabled) {
         const publishedAt = yield* Clock.currentTimeNanos;
         const encoded = yield* encodeOverviewBatch(sources);
-        yield* Effect.tryPromise(() =>
-          cache.put(
-            cacheKey,
-            new Response(encoded, {
-              headers: {
-                "cache-control": "public, max-age=31536000, immutable",
-                "content-type": "application/json",
-              },
-            }),
+        const bytes = new TextEncoder().encode(encoded);
+        publishQueryCache(
+          cacheKey.href,
+          bytes.byteLength * 4 + cacheKey.href.length * 4 + 128,
+          Effect.tryPromise(() =>
+            cache.put(
+              cacheKey,
+              new Response(new Uint8Array(bytes), {
+                headers: {
+                  "cache-control": "public, max-age=31536000, immutable",
+                  "content-type": "application/json",
+                },
+              }),
+            ),
           ),
-        ).pipe(Effect.orElseSucceed(() => undefined));
+          ctx,
+        );
         telemetry.publishMs += Number((yield* Clock.currentTimeNanos) - publishedAt) / 1e6;
       }
       telemetry.totalMs = Number((yield* Clock.currentTimeNanos) - started) / 1e6;

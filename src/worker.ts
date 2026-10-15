@@ -75,6 +75,7 @@ import {
 } from "./protocol";
 import {
   range,
+  publishQueryCache,
   withDirectory,
   readTermCatalogs,
   addFrequencyPosting,
@@ -230,7 +231,7 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
       }
     }
     const response = await Effect.runPromise(
-      readTermProjections(props.value.ranges, encodedTerms, encodedFilters).pipe(
+      readTermProjections(props.value.ranges, encodedTerms, encodedFilters, this.ctx).pipe(
         Effect.flatMap(({ catalogs, telemetry }) =>
           Effect.gen(function* () {
             const entryEnded = yield* Clock.currentTimeNanos;
@@ -368,41 +369,6 @@ async function locate(ids: ReadonlyArray<string>, root: typeof Root.Type) {
 
 async function vectorId(epoch: string, id: string, sequence: number) {
   return sha256(`${epoch}\0${id}\0${sequence}`);
-}
-
-const pendingQueryPublications = new Map<string, number>();
-const queryPublicationBudget = { bytes: 0 };
-const MAX_QUERY_PUBLICATION_BYTES = 2 * 1024 * 1024;
-const MAX_QUERY_PUBLICATIONS = 16;
-
-function publishQueryCache(
-  identity: string,
-  charge: number,
-  publication: Effect.Effect<void, Cause.UnknownError>,
-  ctx: ExecutionContext | DurableObjectState,
-) {
-  if (
-    pendingQueryPublications.has(identity) ||
-    pendingQueryPublications.size >= MAX_QUERY_PUBLICATIONS ||
-    queryPublicationBudget.bytes + charge > MAX_QUERY_PUBLICATION_BYTES
-  )
-    return false;
-  pendingQueryPublications.set(identity, charge);
-  queryPublicationBudget.bytes += charge;
-  ctx.waitUntil(
-    Effect.runPromise(
-      publication.pipe(
-        Effect.ignore,
-        Effect.ensuring(
-          Effect.sync(() => {
-            pendingQueryPublications.delete(identity);
-            queryPublicationBudget.bytes -= charge;
-          }),
-        ),
-      ),
-    ),
-  );
-  return true;
 }
 
 async function textQuery(

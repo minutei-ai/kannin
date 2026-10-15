@@ -9,19 +9,19 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 ## Performance
 
-**1,000,000 documents · deployed Cloudflare · client in Brazil · edge reads with acknowledged sequence barrier**
+**1,000,000 documents · deployed Cloudflare · EWR/MIA responses · edge reads with acknowledged sequence barrier**
 
 | Concurrency | p50 ms |  p95 ms | Requests/s |
 | ----------: | -----: | ------: | ---------: |
-|           1 |  62.51 |  111.80 |      11.26 |
-|           4 |  63.97 |  864.83 |      25.18 |
-|          16 |  91.00 | 1170.34 |      36.88 |
+|           1 | 140.60 |  171.90 |       6.37 |
+|           4 | 142.76 |  230.65 |      23.06 |
+|          16 | 158.58 | 1047.94 |      45.25 |
 
-The latest deployed candidate preserved strong baseline rows, scores and sequence in all **384 standard load responses**, with GRU in their `CF-Ray` suffixes. Its maximum request took **2.16 s**. The Rust directory decoder reduced local median decoding time by **11.9–12.8%** by reusing a validated CRC; DF-proven sparse batching reduced a paired injected-delay workerd median by **19.9%** versus the preceding scheduler. Native sparse probes retained twelve posting ranges, with three later edge responses improving and the first regressing; this load run does not establish a uniform end-to-end native speedup. Earlier sixteen-rare-term probes preserved complete strong/edge equality but included a **7.04 s** edge query, with **5.22 s** preparing rankers and acquiring their directories. These phases reuse caches and do not establish independent concurrency scaling, peak memory or general Turbopuffer parity.
+The latest deployed candidate preserved strong baseline rows, scores and sequence in all **384 standard load responses**, with EWR/MIA in their `CF-Ray` suffixes. Its maximum request took **1.51 s**. Earlier runs used GRU; these region and cache differences prevent attributing the new timing changes to the latest code. The Rust directory decoder reduced local median decoding time by **11.9–12.8%** by reusing a validated CRC; DF-proven sparse batching reduced a paired injected-delay workerd median by **19.9%** versus the preceding scheduler. Earlier native sparse probes retained twelve posting ranges, with three later edge responses improving and the first regressing; this load run does not establish a uniform end-to-end native speedup. Earlier sixteen-rare-term probes preserved complete strong/edge equality but included a **7.04 s** edge query, with **5.22 s** preparing rankers and acquiring their directories. These phases reuse caches and do not establish independent concurrency scaling, peak memory or general Turbopuffer parity.
 
 Rust now preserves document-length correlation in disposable R2 score summaries. Six fresh strong plans over the unchanged 200-segment corpus ranked **3 segments instead of 200**, preserving complete rows and scores. After alternate-mode warmups, elapsed queries changed **6.17–7.61 seconds→0.29–2.06 seconds**, a **67–96%** reduction in those samples. The first alternate-mode warmup still took **5.10 seconds**. Cache loss recovers through canonical R2; cold catalog acquisition remains a bottleneck. [Measurements and limits](docs/performance.md#correlated-length-bounds-on-immutable-segments).
 
-Catalog acquisition now overlaps four R2 summary reads per window, with a shared body budget. A measured 16-summary strong request changed **2.67→1.51 seconds**, while its edge counterpart regressed **5.62→5.93 seconds** amid slow Cache API access. Snapshot cache lookups have a **250 ms** foreground budget; canonical edge snapshot acquisition has a shared **900 ms** budget before coordinator recovery. Shared text plans publish through native `waitUntil`, so optional cache writes no longer block row delivery. Small immutable ranges can recover from a slow cached binding through R2, with bounded concurrency and explicit fallback counters. [Experiment and cache tails](docs/performance.md#catalog-acquisition-and-snapshot-cache-wait).
+Catalog acquisition now overlaps four R2 summary reads per window, with a shared body budget. A measured 16-summary strong request changed **2.67→1.51 seconds**, while its edge counterpart regressed **5.62→5.93 seconds** amid slow Cache API access. Snapshot cache lookups have a **250 ms** foreground budget; canonical edge snapshot acquisition has a shared **900 ms** budget before coordinator recovery. Shared text plans and immutable catalog overview batches publish through native `waitUntil`, so these optional cache writes no longer block row delivery. Small immutable ranges can recover from a slow cached binding through R2, with bounded concurrency and explicit fallback counters. [Experiment and cache tails](docs/performance.md#catalog-acquisition-and-snapshot-cache-wait).
 
 An additional sixteen-rare-term edge query reached its 30-second lease limit and returned HTTP 504; an identical retry succeeded. Broad-query cold failures remain unresolved.
 
@@ -42,7 +42,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **199 Worker/tooling tests and 38 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **200 Worker/tooling tests and 38 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

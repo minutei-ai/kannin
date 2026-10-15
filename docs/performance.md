@@ -1757,3 +1757,62 @@ Before/after/repeated native loads on the million-document corpus completed 288 
 | Repeated after |          16 | 190.62 | 1319.52 |      21.84 |
 
 The first concurrency-sixteen median improvement did not repeat. Every repeated median was worse than the reference, while concurrency-one p95 improved. Cache/isolate/network placement was uncontrolled, and each phase has only 32 requests. These data do not establish an overall native latency gain. The repeated page counts are the distinct verified reduction; the README includes the latest latency values and limitations. Stable native tail latency, actual peak heap and fully indexed Turbopuffer parity remain outstanding.
+
+### Eligible field lengths in per-block score bounds
+
+Per-block upper bounds previously used physical minimum title/body lengths even when filters or tombstones excluded those shortest documents. Bounds now use eligible row minima within each term's row interval, clamped upward against the original physical minima. Both remain lower bounds on lengths of eligible postings; larger normalizing lengths cannot raise the conservative score bound. The clamp also preserves the original bound when eligible non-posting rows have shorter fields. A completely excluded interval contributes zero. Unrestricted masks retain physical bounds. The query-local result is used before page acquisition and during finish-time pruning; no canonical format, cache budget or persistent filter metadata changes.
+
+The native unit property verifies each bound remains above every tested eligible posting's actual score and below its original physical bound, across mixed fields, sparse terms, filters and tombstones. A sparse eligible-row WASM fixture retains the same top-k at 1/4/10/100 while selecting 2/8/20/32 pages from an original thirty-two. Existing independent scoring and revision/Unicode regressions passed.
+
+An initial gate and recovery run hit pre-existing five-second collection/catalog/Bloom test deadlines under host load exceeding 38 on 28 available CPUs. Timed-out callbacks also contaminated subsequent shared counters. No limits or assertions were relaxed. A separate alternating baseline/candidate collection diagnostic preserved all mark/delete counts and completed in 1.8–2.2 seconds after load subsided. The clean standard gate then passed 34 Rust and 148 Bun/workerd tests (182 total). The initial failed runs are not passing evidence or performance comparisons.
+
+Two complete workerd comparisons used 50,000 documents at 100/30/8 segments, fourteen alternating pairs of two queries and three excluded warmup pairs. The repeat reversed worker creation order. All 2,688 responses retained complete rows/scores and acknowledged sequence. Tests finished before these timing runs.
+
+| Segments | Case            | First before/after ms | Repeated before/after ms |
+| -------: | :-------------- | --------------------: | -----------------------: |
+|      100 | rare            |           5.95 / 3.93 |              4.35 / 4.02 |
+|      100 | common          |         12.01 / 10.28 |              9.77 / 9.13 |
+|      100 | filtered        |           9.14 / 9.45 |              9.33 / 8.24 |
+|      100 | edge-common     |         10.20 / 10.43 |              8.24 / 8.70 |
+|      100 | all             |           9.09 / 9.58 |              7.16 / 7.27 |
+|      100 | phrase          |         11.84 / 11.28 |              8.59 / 9.50 |
+|      100 | filtered-all    |         13.33 / 13.77 |            10.47 / 10.70 |
+|      100 | filtered-phrase |          11.07 / 9.83 |            10.83 / 10.42 |
+|       30 | rare            |           5.51 / 3.71 |              3.32 / 4.02 |
+|       30 | common          |           8.24 / 7.86 |              7.15 / 8.26 |
+|       30 | filtered        |           7.99 / 7.08 |             9.75 / 10.28 |
+|       30 | edge-common     |         10.38 / 10.92 |              8.42 / 7.93 |
+|       30 | all             |         10.74 / 10.83 |              8.21 / 9.16 |
+|       30 | phrase          |          9.47 / 10.49 |             10.88 / 9.01 |
+|       30 | filtered-all    |           9.07 / 7.02 |            11.09 / 11.85 |
+|       30 | filtered-phrase |           8.79 / 7.63 |            13.33 / 12.50 |
+|        8 | rare            |           2.63 / 3.95 |              4.76 / 2.83 |
+|        8 | common          |           9.48 / 9.99 |              8.57 / 8.90 |
+|        8 | filtered        |          21.03 / 9.60 |              9.63 / 8.70 |
+|        8 | edge-common     |           8.70 / 9.30 |              8.19 / 8.23 |
+|        8 | all             |         18.04 / 15.53 |              8.25 / 7.87 |
+|        8 | phrase          |         16.99 / 17.47 |            13.27 / 13.64 |
+|        8 | filtered-all    |         27.54 / 12.39 |            13.95 / 13.08 |
+|        8 | filtered-phrase |         24.61 / 21.54 |            16.69 / 15.97 |
+
+Filtered acquisitions changed 23→18 blocks at 100 segments, 62→20 at thirty and 141→39 at eight; corresponding all-mode counts were 46→36, 124→40 and 282→78. Filtered phrase counts were 46→36, 124→84 and 282→216. At eight segments, filtered any/all acquired 2,062/4,169 compressed bytes instead of 4,782/9,689; phrase acquired 8,516 instead of 9,689. Gap coalescing can still acquire skipped bytes. All counters include cache hits and do not establish fewer origin requests or a billing reduction.
+
+The large-layout filtered any/all median gains repeated at about 10%/6%, much less than the initial approximately 54%/55%. Thirty-segment any/all regressed about 5%/7% on repetition despite fewer pages. Unfiltered controls also varied. The repeat supports scoped page-work reduction; it does not prove uniform latency or native CPU gains. WASM grew from 703,966 to 704,730 bytes.
+
+The 5,183-document/300-query SciFact report remained byte-identical to the reference (SHA-256 `9dbe36ba7a85f61312f089c631c4b0dc134e6e876796921ae8206e270415cb28`). The Alchemy production deployment and unconditional Vectorize metadata migration completed successfully. Native before/after/repeated-after runs each checked 96 edge responses against strong rows/scores and acknowledged sequence 2,000 in the same read-only million-document, 200-segment corpus. All 288 responses matched.
+
+Filtered acquisition fell from 188 blocks/6,377 compressed bytes to 41 blocks/2,090 bytes in both after runs at every concurrency. Common acquisition remained 22 blocks/731 bytes. These are cache-inclusive acquired blocks/bytes, not origin-request or billing measurements.
+
+| Phase          | Concurrency | p50 ms |  p95 ms | Requests/s |
+| :------------- | ----------: | -----: | ------: | ---------: |
+| Before         |           1 |  67.89 |  209.41 |       9.63 |
+| Before         |           4 |  59.94 |  696.60 |      21.81 |
+| Before         |          16 | 160.03 | 1149.12 |      19.35 |
+| After          |           1 |  81.56 |  333.45 |       6.58 |
+| After          |           4 |  73.54 |  824.00 |      19.44 |
+| After          |          16 | 124.65 | 1229.83 |      20.64 |
+| Repeated after |           1 |  61.63 |  188.82 |      13.23 |
+| Repeated after |           4 |  68.48 |  448.31 |      23.03 |
+| Repeated after |          16 |  76.07 | 1466.11 |      19.99 |
+
+The repeated concurrency-sixteen median improved, while its p95 worsened to 1,466 ms. The first after run regressed concurrency-one/four medians. Placement, cache state and network conditions were uncontrolled, and each phase has only 32 samples. The reduced filtered page acquisition repeated; stable native tail-latency improvement, actual peak Worker memory and fully indexed Turbopuffer parity remain unproved. The README reports the latest repeated run.

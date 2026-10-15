@@ -759,3 +759,62 @@ test("seed ties retain top-k one and a kth row at the first eligible row of a pa
         expect(seeded.finish()).toBe(full.finish());
       }
 });
+
+test("eligible document lengths prune filtered pages while preserving sparse top-k", () => {
+  const docs = Array.from({ length: 16 }, (_, page) => [
+    {
+      id: String(page * 128).padStart(5, "0"),
+      text: `alpha beta ${"padding ".repeat(10 + 20 * (page % 2))}`,
+      attributes: { selected: true },
+    },
+    ...Array.from({ length: 127 }, (_document, row) => ({
+      id: String(page * 128 + row + 1).padStart(5, "0"),
+      text: "alpha beta",
+      attributes: { selected: false },
+    })),
+  ]).flat();
+  using segment = new Segment(JSON.stringify(docs));
+  const bytes = segment.bytes();
+  const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
+  const base = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
+  using directory = new Directory(bytes);
+  for (const [top_k, expected] of [
+    [1, 2],
+    [4, 8],
+    [10, 20],
+    [100, 32],
+  ] as const) {
+    const input = Schema.encodeSync(Schema.fromJsonString(RankingInput))({
+      text: "alpha beta",
+      mode: "all",
+      top_k,
+      dead: [],
+      filters: [{ field: "selected", op: "eq", value: true }],
+      statistics: {
+        documents: 2048,
+        title_length: 0,
+        body_length: header.total_body_length,
+        frequencies: { alpha: 2048, beta: 2048 },
+      },
+    });
+    using full = directory.ranker(input);
+    using pruned = directory.ranker(input);
+    const complete = Schema.decodeSync(Schema.fromJsonString(PostingSpans))(full.posting_spans());
+    const selected = Schema.decodeSync(Schema.fromJsonString(PostingSpans))(
+      pruned.posting_spans_seeded(),
+    );
+    expect(complete.reduce((count, span) => count + span.blocks.length, 0)).toBe(32);
+    expect(selected.reduce((count, span) => count + span.blocks.length, 0)).toBe(expected);
+    for (const [ranker, spans] of [
+      [full, complete],
+      [pruned, selected],
+    ] as const)
+      for (const span of spans)
+        for (const block of span.blocks)
+          ranker.add(
+            span.term,
+            bytes.subarray(base + block.data.offset, base + block.data.offset + block.data.length),
+          );
+    expect(pruned.finish()).toBe(full.finish());
+  }
+});

@@ -1290,6 +1290,7 @@ impl Search {
         terms: &[&String],
         scorers: &[TermScorer],
     ) -> Vec<Vec<(&BlockMeta, f64)>> {
+        let unrestricted = self.allowed.iter().all(|allowed| *allowed);
         terms
             .iter()
             .enumerate()
@@ -1300,15 +1301,31 @@ impl Search {
                     .into_iter()
                     .flat_map(|meta| meta.blocks.iter())
                     .map(|block| {
-                        (
-                            block,
+                        let minimum = if unrestricted {
+                            Some((block.min_title_length, block.min_body_length))
+                        } else {
+                            let rows = block.first as usize..=block.last as usize;
+                            self.header.documents[rows.clone()]
+                                .iter()
+                                .zip(&self.allowed[rows])
+                                .filter(|(_, allowed)| **allowed)
+                                .fold(None, |minimum, (document, _)| match minimum {
+                                    Some((title, body)) => Some((
+                                        u32::min(title, document.title_length),
+                                        u32::min(body, document.body_length),
+                                    )),
+                                    None => Some((document.title_length, document.body_length)),
+                                })
+                        };
+                        let score = minimum.map_or(0.0, |(title, body)| {
                             scorers[index].score(
                                 block.max_title_tf,
                                 block.max_body_tf,
-                                block.min_title_length,
-                                block.min_body_length,
-                            ),
-                        )
+                                block.min_title_length.max(title),
+                                block.min_body_length.max(body),
+                            )
+                        });
+                        (block, score)
                     })
                     .collect()
             })
@@ -3083,5 +3100,119 @@ mod dense_cutoff_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod eligible_bound_tests {
+    use super::{
+        Document, Filter, PostingLists, Search, Statistics, TermScorer, build, parse_header,
+    };
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn eligible_bounds_cover_actual_scores_without_loosening_physical_bounds()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let docs = (0..384)
+            .map(|row| Document {
+                id: format!("{row:05}"),
+                revision: 0,
+                title: "alpha ".repeat(row % 2 * (row % 4 + 1)),
+                text: format!(
+                    "{} {}",
+                    match row % 3 {
+                        0 => "alpha beta",
+                        1 => "alpha gamma",
+                        _ => "beta gamma",
+                    },
+                    "padding ".repeat(row % 2 * (row % 17 + 20))
+                ),
+                attributes: BTreeMap::from([("group".into(), json!(row % 2))]),
+                vector: None,
+            })
+            .collect();
+        let built = build(docs)?;
+        let (header, base) = parse_header(&built.bytes)?;
+        let statistics = Statistics {
+            documents: u64::try_from(header.documents.len())?,
+            title_length: header.total_title_length,
+            body_length: header.total_body_length,
+            frequencies: header
+                .terms
+                .iter()
+                .map(|(term, meta)| (term.clone(), u64::from(meta.df)))
+                .collect(),
+        };
+        for filters in [
+            Vec::new(),
+            vec![Filter {
+                field: "group".into(),
+                op: "eq".into(),
+                value: json!(1),
+            }],
+        ] {
+            for dead in [Vec::new(), (0..256).collect()] {
+                let mut search = Search::new(
+                    header.clone(),
+                    statistics.clone(),
+                    "alpha beta gamma",
+                    "any",
+                    10,
+                    &dead,
+                    &filters,
+                )?;
+                for (term, metadata) in &header.terms {
+                    if search.words.contains(term) {
+                        for block in &metadata.blocks {
+                            let start = base + block.data.offset as usize;
+                            search.add(
+                                term,
+                                &built.bytes[start..start + block.data.length as usize],
+                            )?;
+                        }
+                    }
+                }
+                let terms: Vec<_> = search.words.iter().collect();
+                let scorers: Vec<_> = terms
+                    .iter()
+                    .map(|term| TermScorer::new(&statistics, statistics.frequencies[*term]))
+                    .collect();
+                let bounds = search.block_bounds(&terms, &scorers);
+                let PostingLists::Frequencies(lists) = &search.lists else {
+                    return Err("Expected frequencies".into());
+                };
+                for (index, term) in terms.iter().enumerate() {
+                    for (block, bound) in &bounds[index] {
+                        let physical = scorers[index].score(
+                            block.max_title_tf,
+                            block.max_body_tf,
+                            block.min_title_length,
+                            block.min_body_length,
+                        );
+                        assert!(*bound <= physical + 1e-12);
+                        if !search.allowed[block.first as usize..=block.last as usize]
+                            .iter()
+                            .any(|allowed| *allowed)
+                        {
+                            assert_eq!(bound.to_bits(), 0.0_f64.to_bits());
+                        }
+                        for posting in lists[*term].iter().filter(|posting| {
+                            block.first <= posting.row && posting.row <= block.last
+                        }) {
+                            let document = &header.documents[posting.row as usize];
+                            let actual = scorers[index].score(
+                                posting.title,
+                                posting.body,
+                                document.title_length,
+                                document.body_length,
+                            );
+                            assert!(actual <= bound + 1e-12);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }

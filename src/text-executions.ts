@@ -21,6 +21,7 @@ export class TextExecutions {
     this.roots.set(root, queries);
     const pending = queries.get(identity);
     if (pending !== undefined) {
+      timings.append("server-timing", 'text_phase;desc="shared"');
       const started = Effect.runSync(Clock.currentTimeNanos);
       const rows = await pending;
       const ended = Effect.runSync(Clock.currentTimeNanos);

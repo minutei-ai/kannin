@@ -10,6 +10,7 @@ import {
   Schema,
   Semaphore,
 } from "effect";
+import type { Exit } from "effect";
 import type { Env } from "../alchemy.run";
 import {
   initSync,
@@ -381,6 +382,7 @@ async function textQuery(
 ) {
   const started = Effect.runSync(Clock.currentTimeNanos);
   if (input.kind === "vector") return [];
+  timings.append("server-timing", 'text_phase;desc="catalog"');
   const words = tokenize(input.text).split(" ").filter(Boolean);
   const terms = [...new Set(words)];
   if (terms.length > 64 || (input.match === "phrase" && words.length > 64))
@@ -604,6 +606,7 @@ async function textQuery(
     `text_plan;desc="${reuse.plan}", text_bound_hits;desc="${reuse.bounds}"`,
   );
   const dictionaryEnded = Effect.runSync(Clock.currentTimeNanos);
+  timings.append("server-timing", 'text_phase;desc="ranking"');
   timings.append("server-timing", `text_directory;dur=${Number(dictionaryEnded - started) / 1e6}`);
   const ranked: Array<{
     segment: (typeof Root.Type)["segments"][number];
@@ -920,6 +923,7 @@ async function textQuery(
     "server-timing",
     `text_score;dur=${Number(rankMetrics.score) / 1e6};desc="segments=${rankMetrics.segments}"`,
   );
+  timings.append("server-timing", 'text_phase;desc="documents"');
   const documentsStarted = Effect.runSync(Clock.currentTimeNanos);
   const hits = ranked.slice(0, input.topK);
   const windows = EffectArray.chunksOf(hits, 4).flatMap((window) => {
@@ -1194,11 +1198,11 @@ async function query(
   input: typeof Query.Type,
   manifest: typeof Root.Type,
   ctx: ExecutionContext | DurableObjectState,
+  timings: Headers,
   executions?: TextExecutions,
 ) {
   if (manifest.sequence < (input.minimumSequence ?? 0))
     throw new Rejected({ status: 409, message: "Requested sequence is not committed" });
-  const timings = new Headers();
   if (input.kind === "text") {
     const rows = await Match.value(executions).pipe(
       Match.when(undefined, () => textQuery(input, manifest, timings, ctx)),
@@ -1917,6 +1921,7 @@ export class SearchNamespace extends DurableObject<Env> {
         }),
       );
     this.namespace = namespace;
+    const queryTimings = new Headers();
     const program = Effect.gen({ self: this }, function* () {
       const started = yield* Clock.currentTimeNanos;
       const body = { text: "" };
@@ -1979,6 +1984,7 @@ export class SearchNamespace extends DurableObject<Env> {
                     input,
                     manifest,
                     this.ctx,
+                    queryTimings,
                     this.textExecutions,
                   );
                   response.headers.append(
@@ -2198,12 +2204,13 @@ export class SearchNamespace extends DurableObject<Env> {
           return Effect.succeed(
             Response.json(Schema.encodeSync(ErrorBody)({ error: error.message }), {
               status: error.status,
+              headers: queryTimings,
             }),
           );
         return Effect.succeed(
           Response.json(
             Schema.encodeSync(ErrorBody)({ error: "Storage or search backend unavailable" }),
-            { status: 503 },
+            { status: 503, headers: queryTimings },
           ),
         );
       }),
@@ -2267,6 +2274,10 @@ const snapshotMetrics = {
   snapshotCachePutBytes: 0,
   snapshotCachePutSkipped: 0,
 };
+const snapshotBodyReads = Semaphore.makeUnsafe(64);
+const SNAPSHOT_BODY_UNIT = 64 * 1024;
+const MAX_PENDING_SNAPSHOTS = 64;
+
 async function acquireSnapshot(
   ctx: ExecutionContext,
   env: Env,
@@ -2291,10 +2302,40 @@ async function acquireSnapshot(
     revalidated: false,
   };
   if ("body" in object) {
-    snapshotMetrics.snapshotR2BodyBytes += object.size;
-    const payload = new Uint8Array(await object.arrayBuffer());
-    selected.manifest = decodeRoot(new TextDecoder().decode(payload));
-    selected.payload = payload;
+    const receivedAt = Effect.runSync(Clock.currentTimeMillis);
+    if (receivedAt < observedAt || receivedAt - observedAt >= 1000) {
+      await Effect.runPromise(Effect.tryPromise(() => object.body.cancel()).pipe(Effect.ignore));
+      return undefined;
+    }
+    const units = Math.min(64, Math.max(1, Math.ceil((object.size * 4) / SNAPSHOT_BODY_UNIT)));
+    const admitted = await Effect.runPromise(
+      snapshotBodyReads.withPermitsIfAvailable(units)(
+        Effect.tryPromise(() => {
+          snapshotMetrics.snapshotR2BodyBytes += object.size;
+          return object.arrayBuffer();
+        }).pipe(
+          Effect.flatMap((body) => {
+            const payload = new Uint8Array(body);
+            return Schema.decodeEffect(Schema.fromJsonString(Root))(
+              new TextDecoder().decode(payload),
+            ).pipe(Effect.map((manifest) => ({ payload, manifest })));
+          }),
+          Effect.uninterruptible,
+        ),
+      ),
+    );
+    if (Option.isNone(admitted)) {
+      await Effect.runPromise(Effect.tryPromise(() => object.body.cancel()).pipe(Effect.ignore));
+      return {
+        snapshot: undefined,
+        revalidated: false,
+        r2Ms: Number(received - started) / 1e6,
+        bodyMs: 0,
+      };
+    }
+    const decoded = admitted.value;
+    selected.manifest = decoded.manifest;
+    selected.payload = decoded.payload;
   } else {
     if (previous === undefined || previous.etag !== object.etag)
       throw new Rejected({ status: 503, message: "Conditional R2 read has no matching snapshot" });
@@ -2308,6 +2349,14 @@ async function acquireSnapshot(
   const payload = selected.payload;
   if (payload === undefined)
     throw new Rejected({ status: 503, message: "R2 snapshot omitted its encoded manifest" });
+  const decodedAt = Effect.runSync(Clock.currentTimeMillis);
+  if (decodedAt < observedAt || decodedAt - observedAt >= 1000)
+    return {
+      snapshot,
+      revalidated: selected.revalidated,
+      r2Ms: Number(received - started) / 1e6,
+      bodyMs: Number(Effect.runSync(Clock.currentTimeNanos) - received) / 1e6,
+    };
   const header = snapshotFrameHeader(snapshot);
   const frameBytes = header.size + payload.byteLength;
   const lastAttempt = previous?.cacheAttemptedAt;
@@ -2361,7 +2410,15 @@ async function acquireSnapshot(
     bodyMs: Number(prepared - received) / 1e6,
   };
 }
-const pendingSnapshots = new Map<string, ReturnType<typeof acquireSnapshot>>();
+const pendingSnapshots = new Map<
+  string,
+  Promise<
+    Exit.Exit<
+      Option.Option<Awaited<ReturnType<typeof acquireSnapshot>>>,
+      Schema.SchemaError | Cause.UnknownError
+    >
+  >
+>();
 const refreshSnapshot = Effect.fn("raio.refreshSnapshot")(function* (
   ctx: ExecutionContext,
   env: Env,
@@ -2373,25 +2430,59 @@ const refreshSnapshot = Effect.fn("raio.refreshSnapshot")(function* (
 ) {
   const selected = { read: pendingSnapshots.get(cacheKey.href) };
   if (selected.read === undefined) {
+    if (pendingSnapshots.size >= MAX_PENDING_SNAPSHOTS) {
+      timings?.append("server-timing", "edge_snapshot_r2_admission");
+      return undefined;
+    }
     const now = yield* Clock.currentTimeMillis;
-    selected.read = acquireSnapshot(ctx, env, namespace, now, cacheKey, cache).finally(() =>
-      pendingSnapshots.delete(cacheKey.href),
+    const acquisition = acquireSnapshot(ctx, env, namespace, now, cacheKey, cache);
+    const bounded = yield* Effect.forkDetach(
+      Effect.tryPromise({
+        try: () => acquisition,
+        catch: (cause) => {
+          if (Schema.isSchemaError(cause)) return cause;
+          return new Cause.UnknownError(cause);
+        },
+      }).pipe(Effect.timeoutOption("900 millis")),
     );
-    pendingSnapshots.set(cacheKey.href, selected.read);
+    const completion = new Promise<
+      Exit.Exit<
+        Option.Option<Awaited<ReturnType<typeof acquireSnapshot>>>,
+        Schema.SchemaError | Cause.UnknownError
+      >
+    >((resolve) => bounded.addObserver(resolve));
+    selected.read = completion;
+    pendingSnapshots.set(cacheKey.href, completion);
+    ctx.waitUntil(
+      acquisition
+        .finally(() => {
+          if (pendingSnapshots.get(cacheKey.href) === completion)
+            pendingSnapshots.delete(cacheKey.href);
+        })
+        .then(
+          () => undefined,
+          () => undefined,
+        ),
+    );
   } else snapshotMetrics.snapshotSharedReads += 1;
-  const acquisition = selected.read;
-  const acquired = yield* Effect.tryPromise({
-    try: () => acquisition,
-    catch: (cause) => {
-      if (Schema.isSchemaError(cause)) return cause;
-      return new Cause.UnknownError(cause);
-    },
-  });
+  const read = selected.read;
+  const completed = yield* Effect.tryPromise(() => read);
+  if (completed._tag === "Failure") return yield* Effect.failCause(completed.cause);
+  const result = completed.value;
+  if (Option.isNone(result)) {
+    timings?.append("server-timing", "edge_snapshot_r2_timeout");
+    return undefined;
+  }
+  const acquired = result.value;
   if (acquired === undefined) return undefined;
   timings?.append("server-timing", `edge_snapshot_r2;dur=${acquired.r2Ms}`);
   timings?.append("server-timing", `edge_snapshot_body;dur=${acquired.bodyMs}`);
   if (acquired.revalidated) timings?.append("server-timing", "edge_snapshot_revalidated");
   const snapshot = acquired.snapshot;
+  if (snapshot === undefined) {
+    timings?.append("server-timing", "edge_snapshot_r2_body_admission");
+    return undefined;
+  }
   if (snapshot.manifest.sequence < minimumSequence) return undefined;
   const selectedAt = yield* Clock.currentTimeMillis;
   if (selectedAt < snapshot.observedAt || selectedAt - snapshot.observedAt >= 1000)
@@ -2647,6 +2738,7 @@ export default {
     const namespace = match[1];
     const operation = match[2];
     const snapshotTimings = new Headers();
+    const queryTimings = new Headers();
     const started = Effect.runSync(Clock.currentTimeNanos);
     const response = await Effect.runPromise(
       Effect.gen(function* () {
@@ -2672,7 +2764,7 @@ export default {
             const snapshotEnded = yield* Clock.currentTimeNanos;
             if (manifest !== undefined) {
               const evaluated = yield* Effect.tryPromise({
-                try: () => query(env, input, manifest, ctx),
+                try: () => query(env, input, manifest, ctx, queryTimings),
                 catch: (cause) => {
                   if (Schema.is(Rejected)(cause)) return cause;
                   return new Cause.UnknownError(cause);
@@ -2728,6 +2820,10 @@ export default {
     const ended = Effect.runSync(Clock.currentTimeNanos);
     const outgoing = new Response(response.body, response);
     outgoing.headers.set("cache-control", "private, no-store");
+    if (!response.ok) {
+      const partial = queryTimings.get("server-timing");
+      if (partial !== null) outgoing.headers.append("server-timing", partial);
+    }
     const snapshotTiming = snapshotTimings.get("server-timing");
     if (snapshotTiming !== null) outgoing.headers.append("server-timing", snapshotTiming);
     outgoing.headers.append("server-timing", `gateway;dur=${Number(ended - started) / 1e6}`);

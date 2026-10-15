@@ -1663,8 +1663,8 @@ pub fn bloom_filter_many<'a>(
 pub mod wasm {
     use super::{
         BlockMeta, BuiltSegment, Document, DocumentMeta, FILTER_CACHE_BYTES, Filter, Header,
-        MAX_BYTES, QueryTerms, Search, SelectedAttributes, Statistics, TermMeta, append,
-        bloom_build, bloom_filter_many, bm25, build, decode_page, document_terms, matches,
+        MAX_BYTES, QueryTerms, Search, SelectedAttributes, Statistics, TermMeta, TermScorer,
+        append, bloom_build, bloom_filter_many, build, decode_page, document_terms, matches,
         parse_header, validate_search_budget,
     };
     use serde::{Deserialize, Serialize};
@@ -1977,22 +1977,15 @@ pub mod wasm {
         }
     }
 
-    fn term_bound(
-        meta: &TermSummary,
-        statistics: &Statistics,
-        df: u64,
-        minimum: (u32, u32),
-    ) -> f64 {
+    fn term_bound(meta: &TermSummary, scorer: &TermScorer, minimum: (u32, u32)) -> f64 {
         meta.bounds
             .iter()
             .map(|&(title_tf, body_tf, title_length, body_length)| {
-                bm25(
+                scorer.score(
                     title_tf,
                     body_tf,
                     title_length.max(minimum.0),
                     body_length.max(minimum.1),
-                    statistics,
-                    df,
                 )
             })
             .fold(0.0, f64::max)
@@ -2014,6 +2007,7 @@ pub mod wasm {
         if catalogs.len() > 64 {
             return Err(JsValue::from_str("Term bound batch exceeds segment budget"));
         }
+        let mut scorers = BTreeMap::new();
         Ok(catalogs
             .iter()
             .map(|catalog| {
@@ -2024,12 +2018,13 @@ pub mod wasm {
                     .dictionary
                     .iter()
                     .map(|(term, meta)| {
-                        term_bound(
-                            meta,
-                            &statistics,
-                            statistics.frequencies.get(term).copied().unwrap_or(0),
-                            minimum,
-                        )
+                        let scorer = scorers.entry(term).or_insert_with(|| {
+                            TermScorer::new(
+                                &statistics,
+                                statistics.frequencies.get(term).copied().unwrap_or(0),
+                            )
+                        });
+                        term_bound(meta, scorer, minimum)
                     })
                     .sum()
             })

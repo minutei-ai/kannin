@@ -348,6 +348,34 @@ test("WASM term bounds preserve order, empty eligibility and batch limits", () =
   ).toThrow("Term bound batch exceeds segment budget");
 });
 
+test("WASM catalog bounds retain global frequencies and filtered length clamps", () => {
+  const statistics = {
+    documents: 100,
+    title_length: 100,
+    body_length: 1000,
+    frequencies: { alpha: 10, beta: 0, gamma: 101 },
+  };
+  const bounds = [
+    [1, 2, 1, 10],
+    [2, 3, 0, 5],
+  ];
+  const dictionary = Object.fromEntries(
+    ["alpha", "beta", "gamma", "missing"].map((term) => [term, { df: 10, bounds }]),
+  );
+  const catalogs = JSON.stringify([
+    { dictionary, minimum: [0, 0] },
+    { dictionary, minimum: [10, 100] },
+    { dictionary, minimum: null },
+    { dictionary: { missing: { df: 10, bounds } }, minimum: [0, 0] },
+  ]);
+  expect(Array.from(segment_term_bounds(JSON.stringify(statistics), catalogs))).toEqual([
+    4.708590140129787, 2.138753190125021, 0, 0,
+  ]);
+  expect(
+    Array.from(segment_term_bounds(JSON.stringify({ ...statistics, documents: 0 }), catalogs)),
+  ).toEqual([0, 0, 0, 0]);
+});
+
 test("retained Bloom batches own their bytes and preserve direct-reader validation", () => {
   const first = segment_bloom('["ação","日本語"]');
   const second = segment_bloom('["rust","café"]');

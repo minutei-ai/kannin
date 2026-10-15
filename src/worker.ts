@@ -1,4 +1,4 @@
-import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
+import { DurableObject, WorkerEntrypoint, env as workerEnv } from "cloudflare:workers";
 import {
   Array as EffectArray,
   Cause,
@@ -81,6 +81,8 @@ import {
   sha256,
   clearImmutableCache,
   cacheUsage,
+  segmentScoreBound,
+  rememberSegmentScoreBound,
 } from "./storage";
 
 import { vectorMetadata, vectorPrefilter } from "./vector-filters";
@@ -391,6 +393,18 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
     frequencies: Object.fromEntries(frequencies),
   };
   const encodedStatistics = Schema.encodeSync(Schema.fromJsonString(SearchStatistics))(statistics);
+  const selection = { digest: "" };
+  if (selected.length > 4)
+    selection.digest = await sha256(
+      encodeRankingInput({
+        text: input.text,
+        mode: input.match ?? "any",
+        top_k: 1,
+        dead: [],
+        filters: input.filters,
+        statistics,
+      }),
+    );
   const bounded = [];
   for (const offset of Array.from(
     { length: Math.ceil(catalog.length / 64) },
@@ -410,11 +424,18 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
         const bound = bounds[index];
         if (bound === undefined)
           throw new Rejected({ status: 503, message: "Term bound batch omitted a segment" });
+        const identity = `${workerEnv.STORAGE_CACHE_SCOPE}:${entry.segment.key}:${entry.segment.headerBytes}:${Schema.encodeSync(integers)(entry.segment.dead)}:${selection.digest}`;
+        const retained = { bound };
+        if (selection.digest !== "") {
+          const learned = segmentScoreBound(identity);
+          if (learned !== undefined) retained.bound = Math.min(bound, learned);
+        }
         return {
           segment: entry.segment,
           dictionary: entry.dictionary,
           minimum: entry.minimum,
-          bound,
+          bound: retained.bound,
+          identity,
         };
       }),
     );
@@ -493,7 +514,7 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
     const batches = await Effect.runPromise(
       Effect.forEach(
         eligible,
-        ({ segment }) => {
+        ({ segment, identity }) => {
           const dead = Schema.encodeSync(integers)(segment.dead);
           const prepareStarted = Effect.runSync(Clock.currentTimeNanos);
           return withDirectory(
@@ -638,6 +659,11 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
                     }
                     const scoreStarted = yield* Clock.currentTimeNanos;
                     const hits = yield* decodeSegmentHits(ranker.finish());
+                    if (selection.digest !== "") {
+                      const upper = { score: cutoff?.score ?? 0 };
+                      for (const hit of hits) upper.score = Math.max(upper.score, hit.score);
+                      rememberSegmentScoreBound(identity, upper.score);
+                    }
                     rankMetrics.score += (yield* Clock.currentTimeNanos) - scoreStarted;
                     rankMetrics.segments += 1;
                     return hits;

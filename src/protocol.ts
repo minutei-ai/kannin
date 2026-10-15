@@ -215,6 +215,8 @@ export const CacheMetrics = Schema.Struct({
   rangeCacheChargedBytes: Schema.Int,
   postingCacheBytes: Schema.Int,
   directoryCacheChargedBytes: Schema.Int,
+  scoreBoundCacheChargedBytes: Schema.Int,
+  scoreBoundCacheEntries: Schema.Int,
   encodedDirectoryCacheChargedBytes: Schema.Int,
   encodedDirectoryAdmissionChargedBytes: Schema.Int,
   encodedDirectoryCacheEntries: Schema.Int,

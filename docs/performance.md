@@ -2236,3 +2236,22 @@ Runtime `68bd17c` deployed as native version `c9233250-2725-449b-b4b8-37231644c2
 Two immediately consecutive rounds each queried eight terms and a phrase under strong and edge consistency. All eight responses preserved exact rows, scores and sequence. Strong eight-term latency was 5,852.18 then 5,217.79 ms; strong phrase latency was 5,147.95 then 6,382.38 ms. Edge latencies ranged from 5,494.56 to 6,141.42 ms. Coordinator counter snapshots around each strong query showed eight-term acquisitions falling from 431 / 30,657,870 bytes to 295 / 10,934,111 bytes, while phrase acquisitions remained 476 / 10,114,048 bytes in both rounds. The encoded cache retained 136 entries. These counters include acquired cached bodies, not independently measured origin or billed bytes. Retention reduced repeated acquisition without resolving multi-second dense ranking.
 
 Two earlier independent four-query runs also returned exact results, but each began with empty coordinator caches; they are not warm-repeat evidence. Their strong latencies ranged from 4,892.00 to 5,793.12 ms and edge latencies from 7,356.26 to 9,278.15 ms. The continuous rounds above avoid interpreting an idle coordinator's empty cache as an admission-policy failure. These samples do not establish concurrent dense-query reliability, peak memory or Turbopuffer parity. Current native Vectorize visibility validation remains pending as described above.
+
+## Learned conservative segment score bounds
+
+Dense repeated selections now retain a bounded score upper bound per immutable segment. The key includes physical bucket, immutable object/header identity, exact tombstones and a SHA-256 of the complete ranking selection and computed global statistics. Top-k is excluded by normalizing its encoded value to one. After each segment, the retained upper bound is the maximum of returned scores and the external cutoff that omitted posting pages. Using only returned scores would be unsafe: omitted rows may still score up to that cutoff. Later queries combine the learned bound with the catalog bound and preserve the original tolerance and ID tie ordering. They still acquire the current manifest and materialize current result rows. No HTTP result or root authority is memoized.
+
+Admission applies only when more than four segments are candidates. Its one-MiB charged LRU comes from the encoded-directory budget, leaving eighteen MiB of encoded frames, one MiB of directory history, twenty MiB decoded and twelve MiB ranges/frequency pages: the same fifty-two-MiB cache quota sum. Namespace rebuild clears learned entries; process eviction loses them. Neither these quotas nor the measurements establish total Worker peak memory.
+
+A red/green workerd case repeatedly ranked twelve segments before the change and one afterward with identical rows and scores. Other regressions compare top-k 1/10/100, filters, any/all/phrase, mutations and tombstones after a successful namespace cache rebuild. A separate 1,280-document reference uses three segments while the tested index uses eight, crossing posting-block boundaries; strong and edge results preserve IDs, scores, documents and each layout's expected revisions. Distinct selections fill and evict the bounded cache, then a successful rebuild verifies namespace removal.
+
+A paired alternating comparison used 50,000 documents, first with 100 segments then eight. Fourteen pairs each ran two queries per variant, with the first three pairs excluded from medians. All 224 responses retained exact rows, scores and sequence. These are warmed repeated selections, not cold requests:
+
+| Segments | Query       | Before median ms | After median ms |
+| -------: | ----------- | ---------------: | --------------: |
+|      100 | Eight terms |            87.31 |           19.10 |
+|      100 | Phrase      |           120.13 |           17.87 |
+|        8 | Eight terms |            57.97 |           26.75 |
+|        8 | Phrase      |           105.95 |           36.37 |
+
+The last measured 100-segment repetitions visited eight segments for eight terms and three for the phrase, versus all one hundred before. Eight-segment repetitions visited two segments for either query. This optimization does not establish improvement for new selections, expired processes, concurrent tails, native vector search or Turbopuffer parity.

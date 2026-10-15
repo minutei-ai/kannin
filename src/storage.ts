@@ -36,7 +36,10 @@ const budget = { bytes: 0, payloadBytes: 0 };
 const MAX_CACHE_BYTES = 12 * 1024 * 1024;
 const encodedDirectories = new Map<string, Uint8Array>();
 const encodedBudget = { bytes: 0 };
-const MAX_ENCODED_DIRECTORY_BYTES = 20 * 1024 * 1024;
+const MAX_ENCODED_DIRECTORY_BYTES = 19 * 1024 * 1024;
+const scoreBounds = new Map<string, number>();
+const scoreBoundBudget = { bytes: 0 };
+const MAX_SCORE_BOUND_BYTES = 1024 * 1024;
 const admissionCounts = new Map<string, number>();
 const admissionBudget = { bytes: 0, requests: 0 };
 const MAX_ADMISSION_BYTES = 1024 * 1024;
@@ -829,8 +832,41 @@ export const readDocuments = Effect.fn("raio.readDocuments")(function* (
   return documents;
 });
 
+export function segmentScoreBound(key: string) {
+  const bound = scoreBounds.get(key);
+  if (bound !== undefined) {
+    scoreBounds.delete(key);
+    scoreBounds.set(key, bound);
+  }
+  return bound;
+}
+
+export function rememberSegmentScoreBound(key: string, bound: number) {
+  const charge = key.length * 4 + 128;
+  if (charge > MAX_SCORE_BOUND_BYTES) return;
+  const prior = scoreBounds.get(key);
+  if (prior !== undefined) {
+    scoreBounds.delete(key);
+    scoreBounds.set(key, Math.min(prior, bound));
+    return;
+  }
+  while (scoreBoundBudget.bytes + charge > MAX_SCORE_BOUND_BYTES) {
+    const oldest = scoreBounds.keys().next().value;
+    if (oldest === undefined) break;
+    scoreBounds.delete(oldest);
+    scoreBoundBudget.bytes -= oldest.length * 4 + 128;
+  }
+  scoreBounds.set(key, bound);
+  scoreBoundBudget.bytes += charge;
+}
+
 export function clearImmutableCache(prefix: string) {
   const identity = `${env.STORAGE_CACHE_SCOPE}:${prefix}`;
+  for (const key of scoreBounds.keys())
+    if (key.startsWith(`${identity}/`)) {
+      scoreBounds.delete(key);
+      scoreBoundBudget.bytes -= key.length * 4 + 128;
+    }
   for (const [key, bytes] of overviewBuffers)
     if (key.startsWith(`${identity}/`)) {
       overviewBuffers.delete(key);
@@ -885,6 +921,8 @@ export function cacheUsage() {
     rangeCacheChargedBytes: budget.bytes,
     postingCacheBytes: frequencyBudget.bytes,
     directoryCacheChargedBytes: decodedBudget.bytes,
+    scoreBoundCacheChargedBytes: scoreBoundBudget.bytes,
+    scoreBoundCacheEntries: scoreBounds.size,
     encodedDirectoryCacheChargedBytes: encodedBudget.bytes + admissionBudget.bytes,
     encodedDirectoryAdmissionChargedBytes: admissionBudget.bytes,
     encodedDirectoryCacheEntries: encodedDirectories.size,

@@ -863,6 +863,7 @@ test("decoded frequency pages share the range budget and keep tombstones query-l
       ),
     ),
   );
+  expect((await request(worker, namespace, "query", textQuery("alpha"))).status).toBe(200);
   const first = Schema.decodeUnknownSync(QueryResult)(
     await (await request(worker, namespace, "query", textQuery("alpha beta"))).json(),
   );

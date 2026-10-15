@@ -238,14 +238,19 @@ export const withDirectory = Effect.fn("raio.withDirectory")(
     key: string,
     headerBytes: number,
     use: (directory: Directory) => Effect.Effect<A, E, R>,
+    permits?: Semaphore.Semaphore,
   ) =>
     Effect.acquireUseRelease(
-      Effect.tryPromise({
-        try: () => acquireDirectory(key, headerBytes),
-        catch: (cause) => {
-          if (Schema.is(Rejected)(cause)) return cause;
-          return new Cause.UnknownError(cause);
-        },
+      Effect.gen(function* () {
+        const acquire = Effect.tryPromise({
+          try: () => acquireDirectory(key, headerBytes),
+          catch: (cause) => {
+            if (Schema.is(Rejected)(cause)) return cause;
+            return new Cause.UnknownError(cause);
+          },
+        });
+        if (permits === undefined) return yield* acquire;
+        return yield* permits.withPermit(acquire);
       }),
       use,
       (directory) => Effect.sync(() => directory.free()),

@@ -439,27 +439,34 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
   };
   using plans = new DisposableStack();
   const compilation: { query: PreparedQuery | undefined } = { query: undefined };
-  for (const { segment, dictionary, minimum, bound } of prioritized) {
-    if (minimum === null) continue;
-    if (Object.keys(dictionary).length === 0) continue;
-    if (
-      (input.match === "all" || input.match === "phrase") &&
-      terms.some((term) => {
-        const metadata = dictionary[term];
-        return metadata === undefined || metadata.df <= (segment.removedFrequencies[term] ?? 0);
-      })
-    )
-      continue;
+  const rankIo = Semaphore.makeUnsafe(4);
+  const initialSegment = prioritized.slice(0, 1);
+  const rankingWindows = [initialSegment, ...EffectArray.chunksOf(prioritized.slice(1), 4)];
+  for (const rankingWindow of rankingWindows) {
     const cutoff = ranked[input.topK - 1];
-    if (ranked.length === input.topK) {
-      if (cutoff === undefined)
-        throw new Rejected({ status: 503, message: "Invalid ranking cutoff" });
+    const eligible = rankingWindow.filter(({ segment, dictionary, minimum, bound }) => {
+      if (minimum === null) return false;
+      if (Object.keys(dictionary).length === 0) return false;
       if (
-        bound + 1e-12 < cutoff.score ||
-        (bound === cutoff.score && segment.minimumId >= cutoff.id)
+        (input.match === "all" || input.match === "phrase") &&
+        terms.some((term) => {
+          const metadata = dictionary[term];
+          return metadata === undefined || metadata.df <= (segment.removedFrequencies[term] ?? 0);
+        })
       )
-        continue;
-    }
+        return false;
+      if (ranked.length === input.topK) {
+        if (cutoff === undefined)
+          throw new Rejected({ status: 503, message: "Invalid ranking cutoff" });
+        if (
+          bound + 1e-12 < cutoff.score ||
+          (bound === cutoff.score && segment.minimumId >= cutoff.id)
+        )
+          return false;
+      }
+      return true;
+    });
+    if (eligible.length === 0) continue;
     if (compilation.query === undefined)
       compilation.query = plans.use(
         new PreparedQuery(
@@ -474,149 +481,167 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
         ),
       );
     const prepared = compilation.query;
-    const dead = Schema.encodeSync(integers)(segment.dead);
-    const prepareStarted = Effect.runSync(Clock.currentTimeNanos);
-    const result = await Effect.runPromise(
-      withDirectory(segment.key, segment.headerBytes, (decoded) =>
-        Effect.acquireUseRelease(
-          Effect.sync(() => decoded.ranker_prepared(prepared, dead)),
-          (ranker) =>
-            Effect.gen(function* () {
-              rankMetrics.prepare += (yield* Clock.currentTimeNanos) - prepareStarted;
-              const encodedSpans = Match.value(cutoff).pipe(
-                Match.when(undefined, () => ranker.posting_spans_seeded()),
-                Match.orElse((hit) => ranker.posting_spans_after(hit.score, hit.id)),
-              );
-              const requested = yield* decodePostingSpans(encodedSpans);
-              const spans = yield* Effect.forEach(requested, (metadata) =>
-                Effect.gen(function* () {
-                  const first = metadata.blocks[0];
-                  if (first === undefined)
-                    return yield* new Rejected({ status: 503, message: "Empty posting directory" });
-                  const span = { end: first.data.offset };
-                  for (const block of metadata.blocks) {
-                    if (
-                      block.data.offset < span.end ||
-                      block.data.offset - span.end > 4096 ||
-                      block.data.length <= 0
-                    )
-                      return yield* new Rejected({
-                        status: 503,
-                        message: "Invalid posting span gap",
-                      });
-                    span.end = block.data.offset + block.data.length;
-                  }
-                  const start = segment.headerBytes + first.data.offset;
-                  const length = span.end - first.data.offset;
-                  if (
-                    start < segment.headerBytes ||
-                    start + length > segment.bytes ||
-                    length > 16777216
-                  )
-                    return yield* new Rejected({ status: 503, message: "Invalid posting range" });
-                  return {
-                    offset: first.data.offset,
-                    end: span.end,
-                    gaps: 0,
-                    postings: [{ metadata, offset: first.data.offset, length }],
-                  };
-                }),
-              );
-              const groups: typeof spans = [];
-              for (const span of spans) {
-                const previous = groups.at(-1);
-                if (
-                  previous !== undefined &&
-                  span.offset >= previous.end &&
-                  previous.gaps + span.offset - previous.end <= 4096 &&
-                  span.end - previous.offset <= 1048576
-                ) {
-                  previous.gaps += span.offset - previous.end;
-                  previous.end = span.end;
-                  previous.postings.push(...span.postings);
-                } else groups.push(span);
-              }
-              for (const offset of Array.from(
-                { length: Math.ceil(groups.length / 4) },
-                (_, index) => index * 4,
-              )) {
-                const window = groups.slice(offset, offset + 4);
-                const acquireStarted = yield* Clock.currentTimeNanos;
-                const acquiredGroups = yield* Effect.forEach(
-                  window,
-                  (group) =>
-                    Effect.gen(function* () {
-                      const bytes = yield* Effect.tryPromise({
-                        try: () =>
-                          range(
-                            segment.key,
-                            segment.headerBytes + group.offset,
-                            group.end - group.offset,
-                          ),
-                        catch: (cause) => {
-                          if (Schema.is(Rejected)(cause)) return cause;
-                          return new Cause.UnknownError(cause);
-                        },
-                      });
-                      return {
-                        bytes: bytes.byteLength,
-                        postings: group.postings.map((posting) => ({
-                          term: posting.metadata.term,
-                          metadata: posting.metadata,
-                          bytes: bytes.subarray(
-                            posting.offset - group.offset,
-                            posting.offset - group.offset + posting.length,
-                          ),
-                          offset: posting.offset,
-                        })),
-                      };
-                    }),
-                  { concurrency: 4 },
-                );
-                const loaded = acquiredGroups.flatMap((group) => group.postings);
-                const acquired = yield* Clock.currentTimeNanos;
-                rankMetrics.acquire += acquired - acquireStarted;
-                rankMetrics.spans += loaded.length;
-                rankMetrics.ranges += window.length;
-                rankMetrics.bytes += acquiredGroups.reduce(
-                  (total, group) => total + group.bytes,
-                  0,
-                );
-                rankMetrics.blocks += loaded.reduce(
-                  (total, posting) => total + posting.metadata.blocks.length,
-                  0,
-                );
-                for (const posting of loaded)
-                  for (const block of posting.metadata.blocks) {
-                    const start = block.data.offset - posting.offset;
-                    const bytes = posting.bytes.subarray(start, start + block.data.length);
-                    if (
-                      input.match === "phrase" ||
-                      (block.max_title_tf <= 1 && block.max_body_tf <= 1)
-                    )
-                      ranker.add(posting.term, bytes);
-                    else
-                      addFrequencyPosting(
-                        ranker,
-                        segment.key,
-                        posting.term,
-                        segment.headerBytes + block.data.offset,
-                        bytes,
+    const batches = await Effect.runPromise(
+      Effect.forEach(
+        eligible,
+        ({ segment }) => {
+          const dead = Schema.encodeSync(integers)(segment.dead);
+          const prepareStarted = Effect.runSync(Clock.currentTimeNanos);
+          return withDirectory(
+            segment.key,
+            segment.headerBytes,
+            (decoded) =>
+              Effect.acquireUseRelease(
+                Effect.sync(() => decoded.ranker_prepared(prepared, dead)),
+                (ranker) =>
+                  Effect.gen(function* () {
+                    rankMetrics.prepare += (yield* Clock.currentTimeNanos) - prepareStarted;
+                    const encodedSpans = Match.value(cutoff).pipe(
+                      Match.when(undefined, () => ranker.posting_spans_seeded()),
+                      Match.orElse((hit) => ranker.posting_spans_after(hit.score, hit.id)),
+                    );
+                    const requested = yield* decodePostingSpans(encodedSpans);
+                    const spans = yield* Effect.forEach(requested, (metadata) =>
+                      Effect.gen(function* () {
+                        const first = metadata.blocks[0];
+                        if (first === undefined)
+                          return yield* new Rejected({
+                            status: 503,
+                            message: "Empty posting directory",
+                          });
+                        const span = { end: first.data.offset };
+                        for (const block of metadata.blocks) {
+                          if (
+                            block.data.offset < span.end ||
+                            block.data.offset - span.end > 4096 ||
+                            block.data.length <= 0
+                          )
+                            return yield* new Rejected({
+                              status: 503,
+                              message: "Invalid posting span gap",
+                            });
+                          span.end = block.data.offset + block.data.length;
+                        }
+                        const start = segment.headerBytes + first.data.offset;
+                        const length = span.end - first.data.offset;
+                        if (
+                          start < segment.headerBytes ||
+                          start + length > segment.bytes ||
+                          length > 16777216
+                        )
+                          return yield* new Rejected({
+                            status: 503,
+                            message: "Invalid posting range",
+                          });
+                        return {
+                          offset: first.data.offset,
+                          end: span.end,
+                          gaps: 0,
+                          postings: [{ metadata, offset: first.data.offset, length }],
+                        };
+                      }),
+                    );
+                    const groups: typeof spans = [];
+                    for (const span of spans) {
+                      const previous = groups.at(-1);
+                      if (
+                        previous !== undefined &&
+                        span.offset >= previous.end &&
+                        previous.gaps + span.offset - previous.end <= 4096 &&
+                        span.end - previous.offset <= 1048576
+                      ) {
+                        previous.gaps += span.offset - previous.end;
+                        previous.end = span.end;
+                        previous.postings.push(...span.postings);
+                      } else groups.push(span);
+                    }
+                    for (const offset of Array.from(
+                      { length: Math.ceil(groups.length / 4) },
+                      (_, index) => index * 4,
+                    )) {
+                      const window = groups.slice(offset, offset + 4);
+                      const acquireStarted = yield* Clock.currentTimeNanos;
+                      const acquiredGroups = yield* Effect.forEach(
+                        window,
+                        (group) =>
+                          Effect.gen(function* () {
+                            const bytes = yield* rankIo.withPermit(
+                              Effect.tryPromise({
+                                try: () =>
+                                  range(
+                                    segment.key,
+                                    segment.headerBytes + group.offset,
+                                    group.end - group.offset,
+                                  ),
+                                catch: (cause) => {
+                                  if (Schema.is(Rejected)(cause)) return cause;
+                                  return new Cause.UnknownError(cause);
+                                },
+                              }),
+                            );
+                            return {
+                              bytes: bytes.byteLength,
+                              postings: group.postings.map((posting) => ({
+                                term: posting.metadata.term,
+                                metadata: posting.metadata,
+                                bytes: bytes.subarray(
+                                  posting.offset - group.offset,
+                                  posting.offset - group.offset + posting.length,
+                                ),
+                                offset: posting.offset,
+                              })),
+                            };
+                          }),
+                        { concurrency: 4 },
                       );
-                  }
-                rankMetrics.decode += (yield* Clock.currentTimeNanos) - acquired;
-              }
-              const scoreStarted = yield* Clock.currentTimeNanos;
-              const hits = yield* decodeSegmentHits(ranker.finish());
-              rankMetrics.score += (yield* Clock.currentTimeNanos) - scoreStarted;
-              rankMetrics.segments += 1;
-              return hits;
-            }),
-          (ranker) => Effect.sync(() => ranker.free()),
-        ),
+                      const loaded = acquiredGroups.flatMap((group) => group.postings);
+                      const acquired = yield* Clock.currentTimeNanos;
+                      rankMetrics.acquire += acquired - acquireStarted;
+                      rankMetrics.spans += loaded.length;
+                      rankMetrics.ranges += window.length;
+                      rankMetrics.bytes += acquiredGroups.reduce(
+                        (total, group) => total + group.bytes,
+                        0,
+                      );
+                      rankMetrics.blocks += loaded.reduce(
+                        (total, posting) => total + posting.metadata.blocks.length,
+                        0,
+                      );
+                      for (const posting of loaded)
+                        for (const block of posting.metadata.blocks) {
+                          const start = block.data.offset - posting.offset;
+                          const bytes = posting.bytes.subarray(start, start + block.data.length);
+                          if (
+                            input.match === "phrase" ||
+                            (block.max_title_tf <= 1 && block.max_body_tf <= 1)
+                          )
+                            ranker.add(posting.term, bytes);
+                          else
+                            addFrequencyPosting(
+                              ranker,
+                              segment.key,
+                              posting.term,
+                              segment.headerBytes + block.data.offset,
+                              bytes,
+                            );
+                        }
+                      rankMetrics.decode += (yield* Clock.currentTimeNanos) - acquired;
+                    }
+                    const scoreStarted = yield* Clock.currentTimeNanos;
+                    const hits = yield* decodeSegmentHits(ranker.finish());
+                    rankMetrics.score += (yield* Clock.currentTimeNanos) - scoreStarted;
+                    rankMetrics.segments += 1;
+                    return hits;
+                  }),
+                (ranker) => Effect.sync(() => ranker.free()),
+              ),
+            rankIo,
+          ).pipe(Effect.map((hits) => hits.map((hit) => ({ ...hit, segment }))));
+        },
+        { concurrency: 4 },
       ),
     );
-    for (const hit of result) ranked.push({ ...hit, segment });
+    ranked.push(...batches.flat());
     ranked.sort((a, b) => {
       if (a.score !== b.score) return b.score - a.score;
       if (a.id < b.id) return -1;

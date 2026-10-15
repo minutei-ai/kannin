@@ -9,15 +9,15 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 ## Performance
 
-**1,000,000 documents · deployed Cloudflare · EWR/MIA responses · edge reads with acknowledged sequence barrier**
+**1,000,000 documents · deployed Cloudflare · MIA responses · edge reads with acknowledged sequence barrier**
 
 | Concurrency | p50 ms |  p95 ms | Requests/s |
 | ----------: | -----: | ------: | ---------: |
-|           1 | 140.60 |  171.90 |       6.37 |
-|           4 | 142.76 |  230.65 |      23.06 |
-|          16 | 158.58 | 1047.94 |      45.25 |
+|           1 | 132.06 |  174.11 |       6.52 |
+|           4 | 132.95 |  185.30 |      24.76 |
+|          16 | 136.71 | 1148.76 |      39.33 |
 
-The latest deployed candidate preserved strong baseline rows, scores and sequence in all **384 standard load responses**, with EWR/MIA in their `CF-Ray` suffixes. Its maximum request took **1.51 s**. Earlier runs used GRU; these region and cache differences prevent attributing the new timing changes to the latest code. The Rust directory decoder reduced local median decoding time by **11.9–12.8%** by reusing a validated CRC; DF-proven sparse batching reduced a paired injected-delay workerd median by **19.9%** versus the preceding scheduler. Earlier native sparse probes retained twelve posting ranges, with three later edge responses improving and the first regressing; this load run does not establish a uniform end-to-end native speedup. Earlier sixteen-rare-term probes preserved complete strong/edge equality but included a **7.04 s** edge query, with **5.22 s** preparing rankers and acquiring their directories. These phases reuse caches and do not establish independent concurrency scaling, peak memory or general Turbopuffer parity.
+The latest deployed candidate preserved strong baseline rows, scores and sequence in all **384 standard load responses**, with MIA in their `CF-Ray` suffixes. Its maximum request took **1.99 s**. Earlier runs used EWR/MIA and GRU; these region and cache differences prevent attributing the new timing changes to the latest code. Local workerd measurements reduced dense seeded span-selection batch time by **65.7%** on a warmed repeated-length fixture; the warmed high-diversity filtered fixture was **1.6% slower**. Shorter warmup showed a larger regression in that fixture. These are CPU-phase measurements, not native end-to-end gains. Cold acquisition, peak memory and a fully indexed Turbopuffer comparison remain open. [Measurements and limits](docs/performance.md#reusing-dense-seed-scores-by-document-length).
 
 Rust now preserves document-length correlation in disposable R2 score summaries. Six fresh strong plans over the unchanged 200-segment corpus ranked **3 segments instead of 200**, preserving complete rows and scores. After alternate-mode warmups, elapsed queries changed **6.17–7.61 seconds→0.29–2.06 seconds**, a **67–96%** reduction in those samples. The first alternate-mode warmup still took **5.10 seconds**. Cache loss recovers through canonical R2; cold catalog acquisition remains a bottleneck. [Measurements and limits](docs/performance.md#correlated-length-bounds-on-immutable-segments).
 
@@ -42,7 +42,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **200 Worker/tooling tests and 38 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **200 Worker/tooling tests and 39 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

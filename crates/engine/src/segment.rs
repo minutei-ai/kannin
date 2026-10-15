@@ -1152,14 +1152,51 @@ impl Search {
         if dense.is_empty() || (self.mode == "all" && dense.len() != self.terms.order.len()) {
             return None;
         }
+        let mut lengths = [None; 16];
+        let mut distinct = 0;
+        for document in self.header.documents.iter().take(lengths.len()) {
+            let pair = (document.title_length, document.body_length);
+            if !lengths[..distinct].contains(&Some(pair)) {
+                lengths[distinct] = Some(pair);
+                distinct += 1;
+            }
+        }
+        if distinct <= 8 {
+            self.dense_cutoff_scores::<true>(&dense)
+        } else {
+            self.dense_cutoff_scores::<false>(&dense)
+        }
+    }
+
+    #[inline]
+    fn dense_cutoff_scores<const REUSE_LENGTHS: bool>(&self, dense: &[&TermScorer]) -> Option<Hit> {
         let mut heap: BinaryHeap<Hit> = BinaryHeap::with_capacity(self.top_k);
+        let mut minimum_scores = [None; 64];
         for (row, document) in self.header.documents.iter().enumerate() {
             if !self.allowed[row] {
                 continue;
             }
-            let score = dense.iter().fold(0.0, |score, scorer| {
-                score + scorer.minimum_score(document.title_length, document.body_length)
-            });
+            let compute = || {
+                dense.iter().fold(0.0, |score, scorer| {
+                    score + scorer.minimum_score(document.title_length, document.body_length)
+                })
+            };
+            let score = if REUSE_LENGTHS {
+                let identity =
+                    (u64::from(document.title_length) << 32) | u64::from(document.body_length);
+                let index = (identity.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 58) as usize;
+                let cached = &mut minimum_scores[index];
+                match *cached {
+                    Some((key, score)) if key == identity => score,
+                    _ => {
+                        let score = compute();
+                        *cached = Some((identity, score));
+                        score
+                    }
+                }
+            } else {
+                compute()
+            };
             if score <= 0.0 {
                 continue;
             }
@@ -3398,7 +3435,8 @@ mod attribute_projection_tests {
 
 #[cfg(test)]
 mod dense_cutoff_tests {
-    use super::{Statistics, TermScorer};
+    use super::{Document, Filter, Hit, Search, Statistics, TermScorer, build};
+    use serde_json::json;
     use std::collections::BTreeMap;
 
     #[test]
@@ -3424,6 +3462,91 @@ mod dense_cutoff_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn length_reuse_preserves_exhaustive_cutoffs_with_collisions_filters_and_deletions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for stride in [1, 8] {
+            let built = build(
+                (0..1024)
+                    .map(|row| Document {
+                        id: format!("{row:05}"),
+                        revision: 0,
+                        title: "alpha ".repeat(row / stride % 7),
+                        text: format!("alpha beta {}", "padding ".repeat(row / stride % 257)),
+                        attributes: BTreeMap::from([("group".into(), json!(row % 3))]),
+                        vector: None,
+                    })
+                    .collect(),
+            )?;
+            let header = std::rc::Rc::new(built.header);
+            let statistics = Statistics {
+                documents: u64::try_from(header.documents.len())?,
+                title_length: header.total_title_length,
+                body_length: header.total_body_length,
+                frequencies: header
+                    .terms
+                    .iter()
+                    .map(|(term, meta)| (term.clone(), u64::from(meta.df)))
+                    .collect(),
+            };
+            for mode in ["any", "all"] {
+                for top_k in [1, 10, 100] {
+                    for dead in [Vec::new(), (0..256).collect(), (0..1024).collect()] {
+                        for filters in [
+                            Vec::new(),
+                            vec![Filter {
+                                field: "group".into(),
+                                op: "eq".into(),
+                                value: json!(1),
+                            }],
+                        ] {
+                            let search = Search::new(
+                                header.clone(),
+                                statistics.clone(),
+                                "beta alpha beta",
+                                mode,
+                                top_k,
+                                &dead,
+                                &filters,
+                            )?;
+                            let mut exhaustive: Vec<_> = header
+                                .documents
+                                .iter()
+                                .enumerate()
+                                .filter(|(row, _)| search.allowed[*row])
+                                .map(|(row, document)| {
+                                    Ok::<_, Box<dyn std::error::Error>>(Hit {
+                                        row: u32::try_from(row)?,
+                                        score: search.terms.scorers.iter().fold(
+                                            0.0,
+                                            |score, scorer| {
+                                                score
+                                                    + scorer.minimum_score(
+                                                        document.title_length,
+                                                        document.body_length,
+                                                    )
+                                            },
+                                        ),
+                                    })
+                                })
+                                .collect::<Result<_, _>>()?;
+                            exhaustive.sort_by(|a, b| {
+                                b.score.total_cmp(&a.score).then_with(|| a.row.cmp(&b.row))
+                            });
+                            let expected = exhaustive.get(top_k - 1);
+                            let cutoff = search.dense_cutoff();
+                            assert_eq!(
+                                cutoff.as_ref().map(|hit| (hit.row, hit.score.to_bits())),
+                                expected.map(|hit| (hit.row, hit.score.to_bits()))
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 

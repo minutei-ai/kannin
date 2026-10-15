@@ -2741,3 +2741,32 @@ Deployment `717c8763-e198-45a1-a0d6-3550bde95c0f` completed through the minutei 
 The standard load preserved **384/384** strong-baseline row/score/sequence comparisons at one million documents and sequence 2000. Concurrency 1/4/16 p50 was **140.60/142.76/158.58 ms**, p95 **171.90/230.65/1,047.94 ms**, and throughput **6.37/23.06/45.25 requests/s**; maximum latency was **1.51 seconds**. Responses used EWR/MIA, rather than the preceding load's GRU. No canonical snapshot timeout occurred. These mixed-region runs do not demonstrate an end-to-end native speedup; the local completion-order regression establishes the removed cache-write dependency.
 
 A new twenty-term cold selector exercised two actual catalog origins, reading 23 R2 summaries (708,228 bytes) with four bodies at most per origin and zero directory fallback. The strong request took **3.79 seconds**; its subsequent edge response reused a shared plan and took **794.83 ms**, preserving complete rows and scores. These sequential cold/warm observations are not a before/after benchmark. Twelve additional native vector/hybrid queries also preserved **105 complete rows and scores** from the preceding deployment. The historical intermittent rare-query timeout, cold/network tails, peak heap, larger ANN quality and fully indexed Turbopuffer parity remain open.
+
+## Reusing dense seed scores by document length
+
+WASM phase measurements found prepared-ranker construction around one microsecond for a 5,000-document cached-filter fixture. Dense initial span selection cost substantially more: approximately 319 microseconds per call versus 87 microseconds for ordinary span listing in the initial series. The dense seed repeatedly evaluated the same minimum BM25 score for documents sharing title/body lengths.
+
+The Rust seed samples the first sixteen document length pairs. At most eight distinct pairs selects a fixed 64-slot, call-local score table; higher diversity selects the direct scorer through a const-generic specialization. The complete pair is checked on every table hit, so collisions recompute rather than share another document shape's score. Reused values retain the original ordered floating-point fold. The top-k heap, document-order tie breaking, filters and tombstones remain unchanged. The table does not persist across calls or alter canonical R2 data.
+
+Both WASM variants were loaded before a nine-pair comparison that alternated execution order. Each sample made 1,000 seeded-span calls on the same loaded ranker. Full canonical segment bytes, selected spans and complete final hits were identical across variants. The final local medians, expressed per call, were:
+
+| Documents / length distribution | Filter | Before µs | After µs | Change |
+| --- | --- | ---: | ---: | ---: |
+| 5,000 / eight pairs | none | 293.85 | 110.09 | −62.5% |
+| 5,000 / eight pairs | group equality, about 1% eligible | 76.02 | 76.02 | approximately unchanged |
+| 2,048 / many pairs | none | 113.89 | 115.60 | +1.5% |
+| 2,048 / many pairs | group equality, about 1% eligible | 33.09 | 32.72 | −1.1% |
+
+All nine unfiltered repeated-length pairs favored the candidate. The high-diversity overhead remains visible; this is a scoped CPU optimization, not a uniform workload speedup. An initial always-on table regressed the diverse fixture by about 4.5%; runtime miss counters and a second scanning loop did not remove that regression. The retained sample dispatch and compiler specialization avoid paying lookup costs on the measured diverse path, with sampling overhead still present. These local WASM results do not establish native end-to-end or Turbopuffer parity.
+
+A Rust regression independently sorts exhaustive minimum scores and compares the selected cutoff row and exact score bits. It covers both dispatch paths, repeated shapes, more shapes than slots, collisions, any/all modes, repeated query terms, top-k 1/10/100, filters and partial/complete deletion. Existing workerd and WASM checks continue comparing seeded top-k against full posting acquisition.
+
+The complete local gate passed **200 Worker/tooling tests and 39 Rust tests**, including 7,485 Bun assertions, formatting, strict Effect/Oxlint and patched TypeScript checks, plus native/WASM Clippy.
+
+Deployment `1ab436ab-6deb-499f-8a9d-324704c6706b` completed through the minutei profile. The unconditional vector migration acknowledged 398 submissions across 30 namespaces; no new visibility claim follows from those acknowledgements. Four native dense/phrase responses preserved complete row/score/sequence signatures from the preceding version. The baseline used MIA and the candidate probes GRU. Strong dense/phrase elapsed times changed **2,143.88/453.82→906.54/393.99 ms**, while edge times changed **1,478.26/916.74→2,534.35/1,248.01 ms**. Mixed geography and cache state prevent causal attribution.
+
+The standard load preserved **384/384** strong-baseline comparisons at one million documents and sequence 2000, with MIA throughout. Concurrency 1/4/16 p50 was **132.06/132.95/136.71 ms**, p95 **174.11/185.30/1,148.76 ms**, and throughput **6.52/24.76/39.33 requests/s**. Maximum latency was **1.99 seconds**. This does not establish an end-to-end native gain. Cold tails, the historical intermittent timeout, peak memory, large-corpus ANN quality and a fully indexed Turbopuffer comparison remain unresolved.
+
+A separate V8/workerd harness loaded the same before/after WASM artifacts and measured batches of 1,000 seeded-span calls through local HTTP. Both variants were started before alternating nine pairs; every returned span frame matched exactly. With 10,000 warmup calls per fixture, repeated-length/unfiltered median batch time changed **308.28→105.65 ms** (**65.7% less**, candidate faster in all nine pairs). Its filtered counterpart changed **75.66→73.03 ms**. Diverse-length unfiltered changed **111.21→111.46 ms** and filtered **33.33→33.86 ms** (**1.6% more**). HTTP batch timing includes response and runtime overhead; it is not per-invocation Cloudflare CPU billing.
+
+Warmup affected the result: the earlier workerd series with 1,000 warmup calls showed **321.92→134.85 ms** for repeated-length/unfiltered, but **36.24→45.47 ms** for the diverse filtered fixture, a **25.5% regression** in that series. The longer warmup reduced that regression; it does not prove uniformly faster cold execution or identify GC/JIT/network scheduling as its cause. Both series remain part of the evidence. The local deployment-build WASM artifact matches the measured candidate hash.

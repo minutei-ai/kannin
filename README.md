@@ -13,13 +13,13 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Concurrency | p50 ms | p95 ms | Requests/s |
 | ----------: | -----: | -----: | ---------: |
-|           1 |  54.26 | 192.22 |      11.35 |
-|           4 |  53.09 | 156.02 |      41.86 |
-|          16 |  69.45 | 750.37 |      59.54 |
+|           1 |  45.86 |  68.65 |      16.53 |
+|           4 |  48.88 | 146.54 |      43.85 |
+|          16 |  60.28 | 760.68 |      66.28 |
 
-Each 128-request phase covers rare, selective, common and filtered text queries. All **384 responses** matched strong rows/scores and sequence. An earlier four-read run measured p95 **69.65/131.95/563.59 ms** at concurrency one/four/sixteen; the latest run regressed. These bounded runs do not isolate cache, placement or network variation and do not establish concurrent reliability. Page pruning reduced native common-query acquisition from **178 to 22 blocks** and filtered acquisition from **188 to 41 blocks**, including cache hits. General Turbopuffer parity and peak memory remain unverified.
+Each 128-request phase covers rare, selective, common and filtered text queries. All **384 responses** matched strong rows/scores and sequence. The preceding run measured p95 **192.22/156.02/750.37 ms**: the latest tails improved at concurrency one/four and regressed slightly at sixteen. These bounded runs do not isolate cache, placement or network variation and do not establish concurrent reliability. Page pruning reduced native common-query acquisition from **178 to 22 blocks** and filtered acquisition from **188 to 41 blocks**, including cache hits. General Turbopuffer parity and peak memory remain unverified.
 
-Strong queries capture an immutable root under the coordinator lock, then run up to four at a time while writes continue. An earlier sixteen-request dense burst measured p50/p95 **455/1,047 ms**, with exact rows/scores. The latest cold-plan investigation still ranked 200 segments: three new selections per shape measured strong medians of **6.64 seconds** for eight terms and **6.33 seconds** for phrases. A six-read experiment reduced those medians slightly but worsened observed standard-load tails; four reads were restored. Cache, placement and network conditions vary. [Detailed measurements and rejected experiments](docs/performance.md#rejected-wider-cold-query-fanout).
+Strong queries capture an immutable root under the coordinator lock, then run up to four at a time while writes continue. The reader now admits at most **16 KiB of extra gap bytes per grouped range**, within its existing 1 MiB grouping cap. On a dense phrase, posting acquisitions fell **402→200**, transferring **17.3% more bytes** and preserving exact results. Three new-plan selections per shape measured strong medians of **5.96 seconds** for eight terms and **5.52 seconds** for phrases. The first phrase took **14.44 seconds**; four simultaneous new-plan requests reached **19.49 seconds**, and a later warm sixteen-request burst had p95 **1.27 seconds**. Cold and concurrent latency remain unresolved. [Measurements and limits](docs/performance.md#bounded-wider-posting-groups).
 
 The local million-document workload measured strong common/filtered p50 of **127/126 ms** across 2,000 uncompacted segments. These emulator results exclude native network latency. The repeated independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10** across 300 queries. The latest native Vectorize visibility probe remained empty through its bounded polling window; current provider-backed vector/hybrid validation remains pending.
 

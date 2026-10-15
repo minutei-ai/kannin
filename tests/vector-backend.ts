@@ -3,6 +3,7 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 const vectors = new Map<string, VectorizeVector>();
 const pending: VectorizeVector[] = [];
 const control = { fail: false, deferred: false, upsertCalls: 0, queryCalls: 0 };
+const queryGate = { url: "" };
 
 function metadataMatches(vector: VectorizeVector, filters: VectorizeVectorMetadataFilter) {
   return Object.entries(filters).every(([field, condition]) => {
@@ -59,6 +60,10 @@ export class VectorBackend extends WorkerEntrypoint {
   async query(values: number[], options: VectorizeQueryOptions) {
     control.queryCalls += 1;
     if (control.fail) throw new Error("Injected Vectorize failure");
+    if (queryGate.url !== "") {
+      const response = await fetch(queryGate.url);
+      if (!response.ok) throw new Error("Injected query gate failure");
+    }
     if (options.returnMetadata === "all" && (options.topK ?? 5) > 50)
       throw new Error("Vectorize topK with all metadata is limited to 50");
     const norm = Math.sqrt(values.reduce((sum, value) => sum + value * value, 0));
@@ -97,8 +102,10 @@ export class VectorBackend extends WorkerEntrypoint {
 }
 
 export default {
-  fetch(request: Request) {
+  async fetch(request: Request) {
     const operation = new URL(request.url).pathname;
+    if (operation === "/pause-query") queryGate.url = await request.text();
+    if (operation === "/release-query") queryGate.url = "";
     control.fail = operation === "/fail";
     control.deferred = operation === "/defer";
     if (operation === "/commit-reversed")

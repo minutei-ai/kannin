@@ -1182,6 +1182,8 @@ async function query(env: Env, input: typeof Query.Type, manifest: typeof Root.T
 
 export class SearchNamespace extends DurableObject<Env> {
   private readonly semaphore = Semaphore.makeUnsafe(1);
+  private readonly querySlots = Semaphore.makeUnsafe(4);
+  private readonly readers = new Map<symbol, typeof Root.Type>();
   private namespace: typeof NamespaceName.Type | undefined;
   private acknowledgedReceipt: typeof Receipt.Type | undefined;
   private current: { manifest: typeof Root.Type; etag: string | null } | undefined;
@@ -1636,6 +1638,15 @@ export class SearchNamespace extends DurableObject<Env> {
         message: "Active root exceeds collection reference budget",
       });
     const pinned = new Set(current.manifest.segments.map((segment) => segment.key));
+    for (const manifest of this.readers.values())
+      for (const segment of manifest.segments) {
+        pinned.add(segment.key);
+        if (pinned.size > 16384)
+          throw new Rejected({
+            status: 503,
+            message: "Reader references exceed collection memory budget",
+          });
+      }
     const counters = { scanned: 0, pinned: 0, marked: 0, deleted: 0, expiredSnapshots: 0 };
     const snapshots: R2ListOptions = { prefix: `${this.prefix}/vector-rebuild/`, limit: 100 };
     const checkpointBudget = { count: 0, bytes: 0 };
@@ -1855,132 +1866,195 @@ export class SearchNamespace extends DurableObject<Env> {
           ),
         );
       }
-      const delivered = yield* this.semaphore.withPermit(
-        Effect.gen({ self: this }, function* () {
-          if (operation === "write") {
-            const input = yield* Schema.decodeEffect(Schema.fromJsonString(Write), {
-              onExcessProperty: "error",
-            })(body.text).pipe(
-              Effect.mapError(
-                () => new Rejected({ status: 400, message: "Invalid write contract" }),
-              ),
-            );
-            return yield* Effect.tryPromise({
-              try: () => this.write(input, namespace),
-              catch: (cause) => {
-                if (Schema.is(Rejected)(cause)) return cause;
-                return new Cause.UnknownError(cause);
-              },
-            });
-          }
-          if (operation === "query") {
-            const input = yield* decodeQuery(body.text).pipe(
-              Effect.mapError(
-                () => new Rejected({ status: 400, message: "Invalid query contract" }),
-              ),
-            );
-            return yield* Effect.tryPromise({
-              try: async () => query(this.env, input, (await this.root()).manifest),
-              catch: (cause) => {
-                if (Schema.is(Rejected)(cause)) return cause;
-                return new Cause.UnknownError(cause);
-              },
-            });
-          }
-          if (operation === "vector-rebuild") {
-            const input = yield* Schema.decodeEffect(Schema.fromJsonString(VectorRebuild), {
-              onExcessProperty: "error",
-            })(body.text).pipe(
-              Effect.mapError(
-                () => new Rejected({ status: 400, message: "Invalid rebuild cursor" }),
-              ),
-            );
-            return yield* Effect.tryPromise({
-              try: () => this.rebuildVectors(input),
-              catch: (cause) => {
-                if (Schema.is(Rejected)(cause)) return cause;
-                return new Cause.UnknownError(cause);
-              },
-            });
-          }
-          if (operation === "collect") {
-            const input = yield* Schema.decodeEffect(Schema.fromJsonString(Collection), {
-              onExcessProperty: "error",
-            })(body.text).pipe(
-              Effect.mapError(
-                () => new Rejected({ status: 400, message: "Invalid collection cursor" }),
-              ),
-            );
-            return yield* Effect.tryPromise({
-              try: () => this.collect(input),
-              catch: (cause) => {
-                if (Schema.is(Rejected)(cause)) return cause;
-                return new Cause.UnknownError(cause);
-              },
-            });
-          }
-          if (operation === "metadata") {
-            const { manifest } = yield* Effect.tryPromise({
-              try: () => this.root(),
-              catch: (cause) => {
-                if (Schema.is(Rejected)(cause)) return cause;
-                return new Cause.UnknownError(cause);
-              },
-            });
-            return Response.json(
-              yield* Schema.encodeEffect(Metadata)({
-                sequence: manifest.sequence,
-                documents: manifest.documents,
-                segments: manifest.segments.length,
-                manifestEncodedBytes: new TextEncoder().encode(encodeRoot(manifest)).byteLength,
-                vectorOutbox: manifest.vectorJobs.length,
-                cache: cacheUsage(),
+      const result: { response: Response | undefined } = { response: undefined };
+      if (operation === "query") {
+        const input = yield* decodeQuery(body.text).pipe(
+          Effect.mapError(() => new Rejected({ status: 400, message: "Invalid query contract" })),
+        );
+        const queued = yield* Clock.currentTimeNanos;
+        result.response = yield* this.querySlots.withPermit(
+          Effect.acquireUseRelease(
+            this.semaphore.withPermit(
+              Effect.gen({ self: this }, function* () {
+                const admitted = yield* Clock.currentTimeNanos;
+                const current = yield* Effect.tryPromise({
+                  try: () => this.root(),
+                  catch: (cause) => {
+                    if (Schema.is(Rejected)(cause)) return cause;
+                    return new Cause.UnknownError(cause);
+                  },
+                });
+                const captured = yield* Clock.currentTimeNanos;
+                const lease = Symbol();
+                this.readers.set(lease, current.manifest);
+                return {
+                  lease,
+                  manifest: current.manifest,
+                  wait: Number(admitted - queued) / 1e6,
+                  root: Number(captured - admitted) / 1e6,
+                };
               }),
-            );
-          }
-          if (operation === "vector-sync")
-            return yield* Effect.tryPromise({
-              try: () => this.synchronizeVectors(),
-              catch: (cause) => {
-                if (Schema.is(Rejected)(cause)) return cause;
-                return new Cause.UnknownError(cause);
-              },
-            });
-          if (operation === "compact")
-            return yield* Effect.tryPromise({
-              try: () => this.compact(),
-              catch: (cause) => {
-                if (Schema.is(Rejected)(cause)) return cause;
-                return new Cause.UnknownError(cause);
-              },
-            });
-          if (operation === "internal-compact") {
-            const message = yield* Schema.decodeEffect(Schema.fromJsonString(IndexMessage), {
-              onExcessProperty: "error",
-            })(body.text);
-            if (message.namespace !== namespace)
-              return yield* new Rejected({
-                status: 400,
-                message: "Index job namespace mismatch",
+            ),
+            ({ manifest, wait, root }) =>
+              Effect.tryPromise({
+                try: async () => {
+                  const response = await query(this.env, input, manifest);
+                  response.headers.append(
+                    "server-timing",
+                    `query_wait;dur=${wait},query_root;dur=${root}`,
+                  );
+                  return response;
+                },
+                catch: (cause) => {
+                  if (Schema.is(Rejected)(cause)) return cause;
+                  return new Cause.UnknownError(cause);
+                },
+              }),
+            ({ lease }) =>
+              Effect.sync(() => {
+                this.readers.delete(lease);
+              }),
+          ),
+        );
+      } else
+        result.response = yield* this.semaphore.withPermit(
+          Effect.gen({ self: this }, function* () {
+            if (operation === "write") {
+              const input = yield* Schema.decodeEffect(Schema.fromJsonString(Write), {
+                onExcessProperty: "error",
+              })(body.text).pipe(
+                Effect.mapError(
+                  () => new Rejected({ status: 400, message: "Invalid write contract" }),
+                ),
+              );
+              return yield* Effect.tryPromise({
+                try: () => this.write(input, namespace),
+                catch: (cause) => {
+                  if (Schema.is(Rejected)(cause)) return cause;
+                  return new Cause.UnknownError(cause);
+                },
               });
-            const response = yield* Effect.tryPromise({
-              try: () => this.compact(),
-              catch: (cause) => {
-                if (Schema.is(Rejected)(cause)) return cause;
-                return new Cause.UnknownError(cause);
-              },
-            });
-            const outcome = yield* Effect.tryPromise({
-              try: () => response.clone().json(),
-              catch: (cause) => {
-                if (Schema.is(Rejected)(cause)) return cause;
-                return new Cause.UnknownError(cause);
-              },
-            });
-            const progress = yield* Schema.decodeUnknownEffect(
-              Schema.Struct({ compacted: Schema.Int }),
-            )(outcome);
-            if (progress.compacted > 1) {
+            }
+            if (operation === "vector-rebuild") {
+              const input = yield* Schema.decodeEffect(Schema.fromJsonString(VectorRebuild), {
+                onExcessProperty: "error",
+              })(body.text).pipe(
+                Effect.mapError(
+                  () => new Rejected({ status: 400, message: "Invalid rebuild cursor" }),
+                ),
+              );
+              return yield* Effect.tryPromise({
+                try: () => this.rebuildVectors(input),
+                catch: (cause) => {
+                  if (Schema.is(Rejected)(cause)) return cause;
+                  return new Cause.UnknownError(cause);
+                },
+              });
+            }
+            if (operation === "collect") {
+              const input = yield* Schema.decodeEffect(Schema.fromJsonString(Collection), {
+                onExcessProperty: "error",
+              })(body.text).pipe(
+                Effect.mapError(
+                  () => new Rejected({ status: 400, message: "Invalid collection cursor" }),
+                ),
+              );
+              return yield* Effect.tryPromise({
+                try: () => this.collect(input),
+                catch: (cause) => {
+                  if (Schema.is(Rejected)(cause)) return cause;
+                  return new Cause.UnknownError(cause);
+                },
+              });
+            }
+            if (operation === "metadata") {
+              const { manifest } = yield* Effect.tryPromise({
+                try: () => this.root(),
+                catch: (cause) => {
+                  if (Schema.is(Rejected)(cause)) return cause;
+                  return new Cause.UnknownError(cause);
+                },
+              });
+              return Response.json(
+                yield* Schema.encodeEffect(Metadata)({
+                  sequence: manifest.sequence,
+                  documents: manifest.documents,
+                  segments: manifest.segments.length,
+                  manifestEncodedBytes: new TextEncoder().encode(encodeRoot(manifest)).byteLength,
+                  vectorOutbox: manifest.vectorJobs.length,
+                  cache: cacheUsage(),
+                }),
+              );
+            }
+            if (operation === "vector-sync")
+              return yield* Effect.tryPromise({
+                try: () => this.synchronizeVectors(),
+                catch: (cause) => {
+                  if (Schema.is(Rejected)(cause)) return cause;
+                  return new Cause.UnknownError(cause);
+                },
+              });
+            if (operation === "compact")
+              return yield* Effect.tryPromise({
+                try: () => this.compact(),
+                catch: (cause) => {
+                  if (Schema.is(Rejected)(cause)) return cause;
+                  return new Cause.UnknownError(cause);
+                },
+              });
+            if (operation === "internal-compact") {
+              const message = yield* Schema.decodeEffect(Schema.fromJsonString(IndexMessage), {
+                onExcessProperty: "error",
+              })(body.text);
+              if (message.namespace !== namespace)
+                return yield* new Rejected({
+                  status: 400,
+                  message: "Index job namespace mismatch",
+                });
+              const response = yield* Effect.tryPromise({
+                try: () => this.compact(),
+                catch: (cause) => {
+                  if (Schema.is(Rejected)(cause)) return cause;
+                  return new Cause.UnknownError(cause);
+                },
+              });
+              const outcome = yield* Effect.tryPromise({
+                try: () => response.clone().json(),
+                catch: (cause) => {
+                  if (Schema.is(Rejected)(cause)) return cause;
+                  return new Cause.UnknownError(cause);
+                },
+              });
+              const progress = yield* Schema.decodeUnknownEffect(
+                Schema.Struct({ compacted: Schema.Int }),
+              )(outcome);
+              if (progress.compacted > 1) {
+                const current = yield* Effect.tryPromise({
+                  try: () => this.root(),
+                  catch: (cause) => {
+                    if (Schema.is(Rejected)(cause)) return cause;
+                    return new Cause.UnknownError(cause);
+                  },
+                });
+                yield* Effect.tryPromise({
+                  try: () => this.enqueueCompaction(namespace, current.manifest),
+                  catch: (cause) => {
+                    if (Schema.is(Rejected)(cause)) return cause;
+                    return new Cause.UnknownError(cause);
+                  },
+                });
+              }
+              return response;
+            }
+            if (operation === "internal-vector-sync") {
+              const message = yield* Schema.decodeEffect(Schema.fromJsonString(VectorMessage))(
+                body.text,
+              );
+              if (message.namespace !== namespace)
+                return yield* new Rejected({
+                  status: 400,
+                  message: "Vector job namespace mismatch",
+                });
               const current = yield* Effect.tryPromise({
                 try: () => this.root(),
                 catch: (cause) => {
@@ -1988,65 +2062,43 @@ export class SearchNamespace extends DurableObject<Env> {
                   return new Cause.UnknownError(cause);
                 },
               });
-              yield* Effect.tryPromise({
-                try: () => this.enqueueCompaction(namespace, current.manifest),
+              const job = current.manifest.vectorJobs.find(
+                (pending) => pending.sequence === message.sequence,
+              );
+              if (job !== undefined && job.log !== message.log)
+                return yield* new Rejected({ status: 400, message: "Vector job log mismatch" });
+              if (job === undefined) {
+                const completed = yield* Schema.encodeEffect(VectorSyncResult)({
+                  submitted: 0,
+                  visibility: "vectorize-eventual",
+                });
+                return Response.json(completed);
+              }
+              return yield* Effect.tryPromise({
+                try: () => this.synchronizeVectors(),
                 catch: (cause) => {
                   if (Schema.is(Rejected)(cause)) return cause;
                   return new Cause.UnknownError(cause);
                 },
               });
             }
-            return response;
-          }
-          if (operation === "internal-vector-sync") {
-            const message = yield* Schema.decodeEffect(Schema.fromJsonString(VectorMessage))(
-              body.text,
-            );
-            if (message.namespace !== namespace)
-              return yield* new Rejected({ status: 400, message: "Vector job namespace mismatch" });
-            const current = yield* Effect.tryPromise({
-              try: () => this.root(),
-              catch: (cause) => {
-                if (Schema.is(Rejected)(cause)) return cause;
-                return new Cause.UnknownError(cause);
-              },
-            });
-            const job = current.manifest.vectorJobs.find(
-              (pending) => pending.sequence === message.sequence,
-            );
-            if (job !== undefined && job.log !== message.log)
-              return yield* new Rejected({ status: 400, message: "Vector job log mismatch" });
-            if (job === undefined) {
-              const completed = yield* Schema.encodeEffect(VectorSyncResult)({
-                submitted: 0,
-                visibility: "vectorize-eventual",
+            if (operation === "rebuild") {
+              this.current = undefined;
+              this.acknowledgedReceipt = undefined;
+              clearImmutableCache(this.prefix);
+              const { manifest } = yield* Effect.tryPromise({
+                try: () => this.root(),
+                catch: (cause) => {
+                  if (Schema.is(Rejected)(cause)) return cause;
+                  return new Cause.UnknownError(cause);
+                },
               });
-              return Response.json(completed);
+              return Response.json({ sequence: manifest.sequence, rebuilt: true });
             }
-            return yield* Effect.tryPromise({
-              try: () => this.synchronizeVectors(),
-              catch: (cause) => {
-                if (Schema.is(Rejected)(cause)) return cause;
-                return new Cause.UnknownError(cause);
-              },
-            });
-          }
-          if (operation === "rebuild") {
-            this.current = undefined;
-            this.acknowledgedReceipt = undefined;
-            clearImmutableCache(this.prefix);
-            const { manifest } = yield* Effect.tryPromise({
-              try: () => this.root(),
-              catch: (cause) => {
-                if (Schema.is(Rejected)(cause)) return cause;
-                return new Cause.UnknownError(cause);
-              },
-            });
-            return Response.json({ sequence: manifest.sequence, rebuilt: true });
-          }
-          return yield* new Rejected({ status: 404, message: "Unknown operation" });
-        }),
-      );
+            return yield* new Rejected({ status: 404, message: "Unknown operation" });
+          }),
+        );
+      const delivered = result.response;
       const ended = yield* Clock.currentTimeNanos;
       delivered.headers.append("server-timing", `raio;dur=${Number(ended - started) / 1e6}`);
       return delivered;
@@ -2056,8 +2108,10 @@ export class SearchNamespace extends DurableObject<Env> {
         return Effect.logError("kannin.namespace", { namespace, operation, error });
       }),
       Effect.catch((error) => {
-        this.current = undefined;
-        this.acknowledgedReceipt = undefined;
+        if (operation !== "query") {
+          this.current = undefined;
+          this.acknowledgedReceipt = undefined;
+        }
         if (Schema.is(Rejected)(error))
           return Effect.succeed(
             Response.json(Schema.encodeSync(ErrorBody)({ error: error.message }), {

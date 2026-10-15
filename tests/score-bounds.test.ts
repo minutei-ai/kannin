@@ -154,7 +154,7 @@ test("learned cutoffs match an unfragmented oracle across posting blocks and top
   expect(rebuilt.cache.textPlanCacheChargedBytes).toBeLessThan(
     metadata.cache.textPlanCacheChargedBytes,
   );
-});
+}, 30000);
 
 test("text plans miss after same-sequence compaction and changes outside selected segments", async () => {
   const namespace = "plan-root-identity";

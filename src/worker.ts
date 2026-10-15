@@ -687,7 +687,7 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
                       if (
                         previous !== undefined &&
                         span.offset >= previous.end &&
-                        previous.gaps + span.offset - previous.end <= 4096 &&
+                        previous.gaps + span.offset - previous.end <= 16384 &&
                         span.end - previous.offset <= 1048576
                       ) {
                         previous.gaps += span.offset - previous.end;

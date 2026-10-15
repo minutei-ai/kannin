@@ -216,7 +216,7 @@ test("concurrent cold edge reads preserve posting order, scores and directory ow
 });
 
 test("large gaps between pruned term spans retain separate reads", async () => {
-  const text = `alpha ${Array.from({ length: 64 }, (_, index) => `noise${index}`).join(" ")} zeta`;
+  const text = `alpha ${Array.from({ length: 128 }, (_, index) => `noise${index}`).join(" ")} zeta`;
   await request(
     worker,
     "posting-ranges",
@@ -306,4 +306,69 @@ test("adjacent term spans share one range across acquisition windows", async () 
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
   expect(warm.rangeReads - after.rangeReads).toBe(0);
+});
+
+test("bounded wider gaps merge term reads without decoding unrequested postings", async () => {
+  const namespace = "bounded-posting-gaps";
+  const text = `alpha zeta ${Array.from({ length: 64 }, (_, index) => `noise${index}`).join(" ")}`;
+  expect(
+    (
+      await request(
+        worker,
+        namespace,
+        "write",
+        write(
+          Array.from({ length: 512 }, (_, index) => document(String(index).padStart(4, "0"), text)),
+        ),
+      )
+    ).status,
+  ).toBe(200);
+  const initial = await request(worker, namespace, "query", textQuery("alpha zeta", 10));
+  expect(initial.status).toBe(200);
+  expect(initial.headers.get("server-timing")).toContain('ranges=1"');
+  expect(initial.headers.get("server-timing")).toContain('desc="blocks=2"');
+  const reference = Schema.decodeUnknownSync(QueryResult)(await initial.json());
+  expect(reference.rows.map((row) => row.id)).toEqual(
+    Array.from({ length: 10 }, (_, index) => String(index).padStart(4, "0")),
+  );
+  for (const [match, blocks] of [
+    ["all", 2],
+    ["phrase", 8],
+  ] as const) {
+    const response = await request(worker, namespace, "query", {
+      ...textQuery("alpha zeta", 10),
+      match,
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("server-timing")).toContain('ranges=1"');
+    expect(response.headers.get("server-timing")).toContain(`desc="blocks=${blocks}"`);
+    const actual = Schema.decodeUnknownSync(QueryResult)(await response.json());
+    expect(actual.rows).toEqual(reference.rows);
+  }
+});
+
+test("several nearby term gaps share one total overfetch budget", async () => {
+  const namespace = "total-posting-gap-budget";
+  const noise = Array.from({ length: 64 }, (_, index) => `beta${index} theta${index}`).join(" ");
+  const text = `alpha mu zeta ${noise}`;
+  expect(
+    (
+      await request(
+        worker,
+        namespace,
+        "write",
+        write(
+          Array.from({ length: 512 }, (_, index) => document(String(index).padStart(4, "0"), text)),
+        ),
+      )
+    ).status,
+  ).toBe(200);
+  const response = await request(worker, namespace, "query", textQuery("alpha mu zeta", 10));
+  expect(response.status).toBe(200);
+  expect(response.headers.get("server-timing")).toContain('ranges=2"');
+  expect(response.headers.get("server-timing")).toContain('desc="blocks=3"');
+  const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+  expect(result.rows.map((row) => row.id)).toEqual(
+    Array.from({ length: 10 }, (_, index) => String(index).padStart(4, "0")),
+  );
 });

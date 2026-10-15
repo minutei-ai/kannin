@@ -2436,3 +2436,37 @@ Five candidate timings improved and one regressed. The restored first-use result
 Two isolated candidate standard loads each preserved all 384 comparisons against strong baselines. Their concurrency 1/4/16 p95 was 85.71/249.81/1,053.32 ms and 99.13/249.33/1,112.22 ms; throughput was 15.93/30.62/53.86 and 15.79/38.37/53.33 requests/s. The prior implementation's preceding run measured p95 80.68/120.32/730.03 ms and throughput 16.79/41.81/62.85. Those repeat tail regressions did not justify keeping the local-only optimization. Restoration preserved another 384 comparisons, with p50 48.15/54.15/71.50 ms, p95 136.61/139.83/913.28 ms and throughput 13.53/47.02/58.78 requests/s. Restoration improved candidate concurrency-four/sixteen tails but did not recover the earlier reference and worsened concurrency-one tails. These observations do not isolate the CRC change as the cause.
 
 An additional standard repeat overlapped a mixed sixteen-request dense burst. The standard responses remained exact; its latency figures are excluded from the comparisons above. The burst failed with HTTP 504, and its driver did not retain the response body or partial successes, leaving the cause unclassified. Later isolated strong/edge controls all matched their references, recovered shared plans with zero learned-bound memory hits and ranked three segments; metadata confirmed the corpus still had one million documents, 200 segments and sequence 2,000. A later isolated sixteen-request mixed dense burst passed every reference, with p50/p95/max 1,032.05/1,782.81/1,852.36 ms and 8.63 requests/s. These checks do not establish cold-burst reliability or Turbopuffer parity. The original first-use and concurrent-tail goals remain open; source performance gains must be demonstrated beyond a decoding microbenchmark.
+
+## Unique score envelopes in derived catalogs
+
+Term score catalogs now sort and deduplicate identical `(max_title_tf, max_body_tf, min_title_length, min_body_length)` tuples. The consumer takes their maximum score, so duplicate multiplicity and tuple order do not affect the bound. Canonical segment bytes, posting blocks, document frequencies and eligible filter minima retain their existing owners. Versioned derived catalog caches cut over together.
+
+The paired local comparison seeded the same 50,000 documents into independent original/candidate workers, measured both 100-segment and compacted eight-segment layouts, alternated implementation order and excluded the first pair from each median. Six genuinely distinct any-mode group selections and six phrase selections avoided normalized plan reuse between pairs. All 48 responses retained identical complete rows, revisions, scores and sequence.
+
+|       Layout | Query       | Original median ms | Unique-envelope median ms |
+| -----------: | :---------- | -----------------: | ------------------------: |
+| 100 segments | Eight terms |             238.71 |                    219.19 |
+| 100 segments | Phrase      |             475.38 |                    445.14 |
+|   8 segments | Eight terms |             147.34 |                    132.78 |
+|   8 segments | Phrase      |             129.92 |                    121.35 |
+
+Each median contains five samples per implementation. This emulator comparison does not include production network latency. On the 5,000-document repeated-field fixture, the projected term summary shrank from 3,512 to 353 JSON bytes. Packed all-term overviews changed only from 17,647 to 17,564 bytes because compression already removes much of the repetition. The paired WASM probe improved summary generation and 64-catalog bound evaluation, but overview projection regressed on the 500-document fixture and was approximately unchanged on larger fixtures. The optimization therefore does not imply uniformly faster directory operations or fewer canonical R2 bytes.
+
+The complete independent SciFact report was identical after the change: 5,183 documents, 300 queries, nDCG@10 0.6730619695232347, recall@10 0.7956666666666666 and MRR@10 0.641808201058201. The local gate passed 177 Worker/tooling tests and 36 Rust tests, including exact equality between full and deduplicated bounds across different global statistics and filter minima.
+
+The deployed million-document comparison used groups 69/70/71 and three new phrase selections, with the same corpus, 200 segments and sequence 2,000. Each measured query followed an alternate-mode warmup for its terms; every measurement required a text-plan miss. All six candidate responses matched the original complete rows, revisions and scores.
+
+| Query                         | Original ms | Unique-envelope ms |
+| :---------------------------- | ----------: | -----------------: |
+| Group 69 / eight terms        |    7,824.05 |           7,780.22 |
+| Durable-object-storage phrase |    6,756.24 |           6,302.17 |
+| Group 70 / eight terms        |    8,026.25 |           8,509.55 |
+| Object-storage-latency phrase |    7,107.43 |           5,673.72 |
+| Group 71 / eight terms        |    9,226.41 |           6,647.73 |
+| Repeated storage phrase       |    8,281.57 |           6,082.36 |
+
+Five elapsed samples improved and one regressed. Candidate directory intervals were 9–67 ms versus 24–452 ms originally, but cache retention, regional placement and network were not controlled. These are single samples per selection and do not isolate CPU gains or establish first-use latency improvements. New selections still ranked all 200 segments and remain multi-second.
+
+Two isolated post-deploy standard runs each preserved all 384 strong-baseline comparisons. The first measured concurrency 1/4/16 p50 61.30/60.69/76.21 ms, p95 105.21/689.15/969.58 ms and throughput 7.81/23.64/51.45 requests/s. The second measured p50 49.01/51.72/65.44 ms, p95 83.28/111.87/784.07 ms and throughput 18.42/49.33/58.99 requests/s. The second improved on the preceding restored run, while the first had a substantially worse concurrency-four tail; cache/placement/network variation remains unresolved.
+
+Between those isolated runs, two sequential edge selections were explicitly warmed and compared against their original strong references before a mixed strong/edge burst. Their first-use latency was 21,019.97/10,538.66 ms. The following sixteen-request burst preserved every complete reference and measured p50/p95/max 843.58/1,556.01/1,603.28 ms and 9.96 requests/s. The driver retains per-response status, timing and ray and waits for all outcomes; no HTTP error occurred in this burst. This warm success does not resolve the earlier unclassified 504 or establish cold-burst reliability. Native Vectorize visibility and general Turbopuffer parity remain separate unverified gates.

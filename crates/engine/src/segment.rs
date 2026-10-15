@@ -1723,6 +1723,23 @@ pub mod wasm {
     use std::rc::Rc;
     use wasm_bindgen::prelude::*;
 
+    fn summary_bounds(blocks: &[BlockMeta]) -> Vec<(u32, u32, u32, u32)> {
+        let mut bounds: Vec<_> = blocks
+            .iter()
+            .map(|block| {
+                (
+                    block.max_title_tf,
+                    block.max_body_tf,
+                    block.min_title_length,
+                    block.min_body_length,
+                )
+            })
+            .collect();
+        bounds.sort_unstable();
+        bounds.dedup();
+        bounds
+    }
+
     #[derive(Serialize, Deserialize)]
     struct TermSummary {
         df: u32,
@@ -1733,18 +1750,7 @@ pub mod wasm {
         fn from(meta: &TermMeta) -> Self {
             Self {
                 df: meta.df,
-                bounds: meta
-                    .blocks
-                    .iter()
-                    .map(|block| {
-                        (
-                            block.max_title_tf,
-                            block.max_body_tf,
-                            block.min_title_length,
-                            block.min_body_length,
-                        )
-                    })
-                    .collect(),
+                bounds: summary_bounds(&meta.blocks),
             }
         }
     }
@@ -1760,14 +1766,7 @@ pub mod wasm {
 
     impl Serialize for OverviewBounds<'_> {
         fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            serializer.collect_seq(self.0.iter().map(|block| {
-                (
-                    block.max_title_tf,
-                    block.max_body_tf,
-                    block.min_title_length,
-                    block.min_body_length,
-                )
-            }))
+            serializer.collect_seq(summary_bounds(self.0))
         }
     }
 

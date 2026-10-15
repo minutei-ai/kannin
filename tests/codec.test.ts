@@ -912,3 +912,81 @@ test("compressed directories validate payload and frame checksums independently"
   damaged[12] = checksum ^ 1;
   expect(() => Directory.compressed(damaged, length)).toThrow();
 });
+
+test("compact term envelopes preserve full-block maxima and filter minima exactly", () => {
+  using segment = new Segment(
+    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(
+      Array.from({ length: 768 }, (_, index) => ({
+        id: String(index).padStart(4, "0"),
+        revision: 1,
+        title: "alpha ".repeat((index % 4) + (Math.floor(index / 128) % 3)),
+        text: `alpha beta ${"gamma ".repeat(1 + (index % 8))}`,
+        attributes: { group: index % 3 },
+      })),
+    ),
+  );
+  using directory = new Directory(segment.bytes());
+  const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
+  const terms = ["alpha", "beta", "gamma"];
+  const encodedTerms = JSON.stringify(terms);
+  const compact = Schema.decodeSync(Schema.fromJsonString(TermSummaries))(
+    directory.summary(encodedTerms),
+  );
+  const full = Object.fromEntries(
+    terms.map((term) => {
+      const metadata = header.terms[term];
+      if (metadata === undefined) throw new Error("Missing fixture term");
+      return [
+        term,
+        {
+          df: metadata.df,
+          bounds: metadata.blocks.map((block) => [
+            block.max_title_tf,
+            block.max_body_tf,
+            block.min_title_length,
+            block.min_body_length,
+          ]),
+        },
+      ] as const;
+    }),
+  );
+  for (const [term, metadata] of Object.entries(compact)) {
+    const original = full[term];
+    if (original === undefined) throw new Error("Missing original term summary");
+    expect(metadata.df).toBe(original.df);
+    expect(metadata.bounds).toHaveLength(3);
+  }
+  for (const documents of [768, 1536, 4096])
+    for (const minimum of [null, [0, 0], [2, 6]]) {
+      const statistics = JSON.stringify({
+        documents,
+        title_length: header.total_title_length + 1,
+        body_length: header.total_body_length * 2 + 1,
+        frequencies: Object.fromEntries(terms.map((term) => [term, 768])),
+      });
+      const bounds = Array.from(
+        segment_term_bounds(
+          statistics,
+          JSON.stringify([
+            { dictionary: full, minimum },
+            { dictionary: compact, minimum },
+          ]),
+        ),
+      );
+      expect(bounds[0]).toBe(bounds[1]);
+    }
+  for (const filters of [
+    [],
+    [{ field: "group", op: "eq", value: 1 }],
+    [{ field: "group", op: "eq", value: 99 }],
+  ]) {
+    const encodedFilters = JSON.stringify(filters);
+    const projected = Schema.decodeSync(Schema.fromJsonString(TermCatalog))(
+      segment_overview_project(directory.overview(), encodedTerms, encodedFilters),
+    );
+    expect(projected.dictionary).toEqual(compact);
+    expect(projected.minimum).toEqual(
+      Schema.decodeSync(Schema.fromJsonString(EligibleMinimum))(directory.minimum(encodedFilters)),
+    );
+  }
+});

@@ -184,7 +184,7 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
     if (
       request.method !== "GET" ||
       props._tag === "Failure" ||
-      url.pathname !== "/catalog-v4" ||
+      url.pathname !== "/catalog-v5" ||
       props.value.bucket !== this.env.STORAGE_CACHE_SCOPE
     )
       return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });
@@ -206,7 +206,7 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
       await sha256(`${encodedTerms}\0${this.ctx.props.filters}`),
     );
     const cache = await Effect.runPromise(
-      Effect.tryPromise(() => caches.open("raio-terms-v4")).pipe(
+      Effect.tryPromise(() => caches.open("raio-terms-v5")).pipe(
         Effect.orElseSucceed(() => undefined),
       ),
     );

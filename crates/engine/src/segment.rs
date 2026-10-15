@@ -694,6 +694,22 @@ pub fn parse_header(bytes: &[u8]) -> Result<(Header, usize), String> {
 
 const DIRECTORY_MAGIC: &[u8; 8] = b"RAIODIR1";
 
+fn directory_declared_checksum(bytes: &[u8]) -> Result<u32, String> {
+    let prefix = bytes.get(..16).ok_or("Truncated directory prefix")?;
+    let payload_checksum = u32::from_le_bytes(
+        prefix[12..16]
+            .try_into()
+            .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
+    );
+    let mut checksum = crc32fast::Hasher::new();
+    checksum.update(prefix);
+    checksum.combine(&crc32fast::Hasher::new_with_initial_len(
+        payload_checksum,
+        u64::try_from(bytes.len() - 16).map_err(|cause| cause.to_string())?,
+    ));
+    Ok(checksum.finalize())
+}
+
 #[doc = "# Errors\nRejects invalid or incomplete canonical headers and directory size limits."]
 pub fn compress_directory(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let (_, length) = parse_header(bytes)?;
@@ -708,7 +724,7 @@ pub fn compress_directory(bytes: &[u8]) -> Result<Vec<u8>, String> {
             .map_err(|cause| cause.to_string())?
             .to_le_bytes(),
     );
-    encoded.extend_from_slice(&crc32fast::hash(bytes).to_le_bytes());
+    encoded.extend_from_slice(&directory_declared_checksum(bytes)?.to_le_bytes());
     encoded.extend_from_slice(&compressed);
     Ok(encoded)
 }
@@ -733,7 +749,7 @@ pub fn parse_compressed_directory(bytes: &[u8], expected: usize) -> Result<Heade
     );
     let decoded = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&bytes[16..], length)
         .map_err(|cause| cause.to_string())?;
-    if decoded.len() != length || crc32fast::hash(&decoded) != checksum {
+    if decoded.len() != length || directory_declared_checksum(&decoded)? != checksum {
         return Err("Compressed directory integrity check failed".into());
     }
     let (header, header_bytes) = parse_header(&decoded)?;

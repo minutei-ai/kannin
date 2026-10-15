@@ -12,6 +12,7 @@ import {
   segment_overview_project,
   Segment,
   Directory,
+  directory_compress,
   BloomBatch,
   PreparedQuery,
   FrequencyPage,
@@ -876,4 +877,38 @@ test("eligible document lengths prune filtered pages while preserving sparse top
           );
     expect(pruned.finish()).toBe(full.finish());
   }
+});
+
+test("compressed directory CRC composition still validates payload and frame checksums", () => {
+  using segment = new Segment(
+    JSON.stringify(
+      Array.from({ length: 128 }, (_, index) => ({
+        id: String(index).padStart(4, "0"),
+        text: "alpha beta",
+        attributes: { state: "initial" },
+      })),
+    ),
+  );
+  const bytes = segment.bytes();
+  const length = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
+  const header = bytes.slice(0, length);
+  const encoded = directory_compress(header);
+  expect(new DataView(encoded.buffer, encoded.byteOffset).getUint32(12, true)).toBe(crc32(header));
+  const marker = new TextEncoder().encode('"state":"initial"');
+  const position = header.findIndex((_, index) =>
+    marker.every((value, offset) => header[index + offset] === value),
+  );
+  expect(position).toBeGreaterThanOrEqual(16);
+  header[position + '"state":"'.length] = "j".charCodeAt(0);
+  const compressed = deflateSync(header);
+  const forged = new Uint8Array(16 + compressed.byteLength);
+  forged.set(encoded.subarray(0, 16));
+  forged.set(compressed, 16);
+  expect(() => Directory.compressed(forged, length)).toThrow();
+  expect(() => new Directory(header)).toThrow();
+  const damaged = encoded.slice();
+  const checksum = damaged[12];
+  if (checksum === undefined) throw new Error("Missing directory checksum");
+  damaged[12] = checksum ^ 1;
+  expect(() => Directory.compressed(damaged, length)).toThrow();
 });

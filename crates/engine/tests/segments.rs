@@ -628,6 +628,10 @@ fn compressed_directories_preserve_headers_and_reject_frame_corruption()
     let encoded = segment::compress_directory(&built.bytes[..length])?;
     let decoded = segment::parse_compressed_directory(&encoded, length)?;
     assert_eq!(
+        &encoded[12..16],
+        &crc32fast::hash(&built.bytes[..length]).to_le_bytes()
+    );
+    assert_eq!(
         serde_json::to_value(original)?,
         serde_json::to_value(decoded)?
     );
@@ -652,6 +656,24 @@ fn compressed_directories_preserve_headers_and_reject_frame_corruption()
         3,
     ));
     assert!(segment::parse_compressed_directory(&forged, length).is_err());
+
+    let mut invalid_payload = built.bytes[..length].to_vec();
+    let field = b"\"total_body_length\":";
+    let value = invalid_payload
+        .windows(field.len())
+        .position(|bytes| bytes == field)
+        .ok_or("Missing body length")?
+        + field.len();
+    let digit = invalid_payload
+        .get_mut(value)
+        .ok_or("Missing length digit")?;
+    *digit = if *digit == b'9' { b'8' } else { b'9' };
+    let mut forged_payload = encoded[..16].to_vec();
+    forged_payload.extend_from_slice(&miniz_oxide::deflate::compress_to_vec_zlib(
+        &invalid_payload,
+        3,
+    ));
+    assert!(segment::parse_compressed_directory(&forged_payload, length).is_err());
     let mut oversized = encoded.clone();
     oversized[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(segment::parse_compressed_directory(&oversized, u32::MAX as usize).is_err());

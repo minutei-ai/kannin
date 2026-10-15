@@ -440,8 +440,10 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
   using plans = new DisposableStack();
   const compilation: { query: PreparedQuery | undefined } = { query: undefined };
   const rankIo = Semaphore.makeUnsafe(4);
-  const initialSegment = prioritized.slice(0, 1);
-  const rankingWindows = [initialSegment, ...EffectArray.chunksOf(prioritized.slice(1), 4)];
+  const rankingWindows = [
+    ...EffectArray.chunksOf(prioritized.slice(0, 4), 1),
+    ...EffectArray.chunksOf(prioritized.slice(4), 4),
+  ];
   for (const rankingWindow of rankingWindows) {
     const cutoff = ranked[input.topK - 1];
     const eligible = rankingWindow.filter(({ segment, dictionary, minimum, bound }) => {

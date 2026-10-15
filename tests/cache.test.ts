@@ -4,6 +4,7 @@ import { Response } from "miniflare";
 import { createHash } from "node:crypto";
 import { Root, QueryResult, Metadata, Health, TermProjectionProps } from "../src/protocol";
 import { document, request, startWorker, textQuery, write } from "./harness";
+import { corpus } from "../tooling/corpus";
 
 const worker = await startWorker();
 afterAll(() => worker.dispose());
@@ -981,4 +982,30 @@ test("parallel segment ranking matches an unfragmented index across revisions an
         expect(actual.rows).toEqual(expected.rows);
         expect(actual.sequence).toBe(10);
       }
+});
+
+test("the sequential ranking prefix preserves common-query pruning before parallel fanout", async () => {
+  const namespace = "parallel-priority-prefix";
+  for (const offset of Array.from({ length: 20 }, (_, index) => index * 500))
+    expect((await request(worker, namespace, "write", write(corpus(offset, 10000)))).status).toBe(
+      200,
+    );
+  const response = await request(worker, namespace, "query", textQuery("cloudflare rust"));
+  expect(response.status).toBe(200);
+  const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+  expect(result.sequence).toBe(20);
+  expect(result.rows.map((row) => row.id)).toEqual([
+    "0",
+    "1000",
+    "1008",
+    "1016",
+    "1024",
+    "1032",
+    "104",
+    "1040",
+    "1048",
+    "1056",
+  ]);
+  expect(response.headers.get("server-timing")).toContain("blocks=10");
+  expect(response.headers.get("server-timing")).toContain("segments=2");
 });

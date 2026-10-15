@@ -1,3 +1,4 @@
+import { TextExecutions } from "./text-executions";
 import { DurableObject, WorkerEntrypoint, env as workerEnv } from "cloudflare:workers";
 import {
   Array as EffectArray,
@@ -1142,12 +1143,22 @@ async function vectorQuery(
   return rows;
 }
 
-async function query(env: Env, input: typeof Query.Type, manifest: typeof Root.Type) {
+async function query(
+  env: Env,
+  input: typeof Query.Type,
+  manifest: typeof Root.Type,
+  executions?: TextExecutions,
+) {
   if (manifest.sequence < (input.minimumSequence ?? 0))
     throw new Rejected({ status: 409, message: "Requested sequence is not committed" });
   const timings = new Headers();
   if (input.kind === "text") {
-    const rows = await textQuery(input, manifest, timings);
+    const rows = await Match.value(executions).pipe(
+      Match.when(undefined, () => textQuery(input, manifest, timings)),
+      Match.orElse((active) =>
+        active.evaluate(manifest, input, timings, () => textQuery(input, manifest, timings)),
+      ),
+    );
     return Response.json(
       encodeQueryResult({
         rows,
@@ -1189,6 +1200,7 @@ export class SearchNamespace extends DurableObject<Env> {
   private readonly semaphore = Semaphore.makeUnsafe(1);
   private readonly querySlots = Semaphore.makeUnsafe(4);
   private readonly readers = new Map<symbol, typeof Root.Type>();
+  private readonly textExecutions = new TextExecutions();
   private namespace: typeof NamespaceName.Type | undefined;
   private acknowledgedReceipt: typeof Receipt.Type | undefined;
   private current: { manifest: typeof Root.Type; etag: string | null } | undefined;
@@ -1903,7 +1915,7 @@ export class SearchNamespace extends DurableObject<Env> {
             ({ manifest, wait, root }) =>
               Effect.tryPromise({
                 try: async () => {
-                  const response = await query(this.env, input, manifest);
+                  const response = await query(this.env, input, manifest, this.textExecutions);
                   response.headers.append(
                     "server-timing",
                     `query_wait;dur=${wait},query_root;dur=${root}`,

@@ -13,11 +13,11 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Concurrency | p50 ms |  p95 ms | Requests/s |
 | ----------: | -----: | ------: | ---------: |
-|           1 |  62.84 |  202.14 |       8.74 |
-|           4 |  84.30 | 1268.26 |      14.28 |
-|          16 |  94.79 | 1553.28 |      35.23 |
+|           1 |  54.27 |  162.80 |      13.25 |
+|           4 |  57.19 |  540.36 |      32.25 |
+|          16 |  73.57 | 1104.04 |      45.83 |
 
-The latest deployed candidate preserved strong baseline rows, scores and sequence in all **384 standard load responses**, with GRU in their `CF-Ray` suffixes. Its maximum request took **2.09 s**. The Rust directory decoder reduced local median decoding time by **11.9–12.8%** by reusing a validated CRC; sparse ranking windows also reduced an injected-delay workerd median by **27.4%**. Native sparse probes retained twelve posting ranges, with three later edge responses improving and the first regressing; this load run does not establish a uniform end-to-end native speedup. Earlier sixteen-rare-term probes preserved complete strong/edge equality but included a **7.04 s** edge query, with **5.22 s** preparing rankers and acquiring their directories. These phases reuse caches and do not establish independent concurrency scaling, peak memory or general Turbopuffer parity.
+The latest deployed candidate preserved strong baseline rows, scores and sequence in all **384 standard load responses**, with GRU in their `CF-Ray` suffixes. Its maximum request took **1.84 s**. The Rust directory decoder reduced local median decoding time by **11.9–12.8%** by reusing a validated CRC; DF-proven sparse batching reduced a paired injected-delay workerd median by **19.9%** versus the preceding scheduler. Native sparse probes retained twelve posting ranges, with three later edge responses improving and the first regressing; this load run does not establish a uniform end-to-end native speedup. Earlier sixteen-rare-term probes preserved complete strong/edge equality but included a **7.04 s** edge query, with **5.22 s** preparing rankers and acquiring their directories. These phases reuse caches and do not establish independent concurrency scaling, peak memory or general Turbopuffer parity.
 
 Rust now preserves document-length correlation in disposable R2 score summaries. Six fresh strong plans over the unchanged 200-segment corpus ranked **3 segments instead of 200**, preserving complete rows and scores. After alternate-mode warmups, elapsed queries changed **6.17–7.61 seconds→0.29–2.06 seconds**, a **67–96%** reduction in those samples. The first alternate-mode warmup still took **5.10 seconds**. Cache loss recovers through canonical R2; cold catalog acquisition remains a bottleneck. [Measurements and limits](docs/performance.md#correlated-length-bounds-on-immutable-segments).
 
@@ -42,7 +42,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **197 Worker/tooling tests and 38 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **198 Worker/tooling tests and 38 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

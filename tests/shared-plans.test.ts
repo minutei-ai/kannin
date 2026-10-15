@@ -15,6 +15,101 @@ initSync({
   ),
 });
 
+test("shared match ceilings preserve unions, intersections and excluded filters", async () => {
+  const worker = await startWorker();
+  await using cleanup = new AsyncDisposableStack();
+  cleanup.defer(() => worker.dispose());
+  const namespace = "plan-match-ceilings";
+  for (const index of Array.from({ length: 8 }, (_, row) => row))
+    expect(
+      (
+        await request(
+          worker,
+          namespace,
+          "write",
+          write([
+            document(`${index}-a`, "alpha", { group: 0 }),
+            document(`${index}-b`, "beta", { group: 1 }),
+            document(`${index}-c`, "constructor", { group: 2 }),
+          ]),
+        )
+      ).status,
+    ).toBe(200);
+  const object = await (
+    await worker.getR2Bucket("STORAGE")
+  ).get(`namespaces/${namespace}/root.json`);
+  if (object === null) throw new Error("Missing fixture manifest");
+  const root = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
+  const first = root.segments[0];
+  if (first === undefined) throw new Error("Missing fixture segment");
+  const cache = await (await worker.getCaches()).open("kannin-text-plans-v1");
+  for (const sample of [
+    { text: "alpha beta", mode: "any", filters: [], maximum: 2, rows: 16 },
+    { text: "alpha beta", mode: "all", filters: [], maximum: 1, rows: 0 },
+    { text: "alpha beta", mode: "phrase", filters: [], maximum: 1, rows: 0 },
+    { text: "alpha alpha", mode: "phrase", filters: [], maximum: 1, rows: 0 },
+    { text: "constructor", mode: "any", filters: [], maximum: 1, rows: 8 },
+    {
+      text: "alpha beta",
+      mode: "any",
+      filters: [{ field: "group", op: "eq", value: 99 }],
+      maximum: 0,
+      rows: 0,
+    },
+  ] as const) {
+    const response = await request(worker, namespace, "query", {
+      ...textQuery(sample.text, 20, [...sample.filters]),
+      match: sample.mode,
+    });
+    expect(response.status).toBe(200);
+    const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+    expect(result.sequence).toBe(8);
+    expect(result.rows).toHaveLength(sample.rows);
+    const identity = Schema.encodeSync(Schema.fromJsonString(TextPlanIdentity))({
+      text: sample.text,
+      mode: sample.mode,
+      filters: sample.filters,
+      documents: root.documents,
+      titleLength: root.titleLength,
+      bodyLength: root.bodyLength,
+      segments: root.segments,
+    });
+    const key = `raio-test:${first.key}/plan:${createHash("sha256").update(identity).digest("hex")}`;
+    const cacheKey = new URL("https://raio-cache.internal/text-plans-v1");
+    cacheKey.searchParams.set("identity", key);
+    cacheKey.searchParams.set("version", "kannin-local-test-version");
+    const stored = { frame: await cache.match(cacheKey) };
+    for (const attempt of Array.from({ length: 100 }, (_, index) => index)) {
+      if (stored.frame !== undefined) break;
+      if (attempt === 99) throw new Error("Plan publication did not settle");
+      await Effect.runPromise(Effect.sleep("10 millis"));
+      stored.frame = await cache.match(cacheKey);
+    }
+    const frame = stored.frame;
+    if (frame === undefined) throw new Error("Missing published plan");
+    const shared = Schema.decodeSync(Schema.fromJsonString(SharedTextPlan))(
+      unpack(new Uint8Array(await frame.arrayBuffer())),
+    );
+    expect(shared.plan.segments.map((segment) => segment.maximumMatches)).toEqual(
+      Array.from({ length: 8 }, () => sample.maximum),
+    );
+  }
+  const damaged = { ...root, segments: [...root.segments] };
+  damaged.segments[0] = { ...first, count: 0 };
+  await (
+    await worker.getR2Bucket("STORAGE")
+  ).put(
+    `namespaces/${namespace}/root.json`,
+    Schema.encodeSync(Schema.fromJsonString(Root))(damaged),
+  );
+  const rejected = await request(worker, namespace, "query", {
+    ...textQuery("alpha beta", 20),
+    consistency: "edge-eventual",
+    minimumSequence: 8,
+  });
+  expect(rejected.status).toBe(503);
+});
+
 test("shared tightened plans survive fresh workerd instances and reject corrupt or mismatched frames", async () => {
   const persistence = await mkdtemp(join(tmpdir(), "kannin-shared-plan-"));
   const active = { worker: await startWorker(persistence) };
@@ -85,6 +180,9 @@ test("shared tightened plans survive fresh workerd instances and reject corrupt 
   expect(shared.identity).toBe(key);
   expect(shared.version).toBe("kannin-local-test-version");
   expect(shared.plan.segments).toHaveLength(12);
+  expect(shared.plan.segments.map((planned) => planned.maximumMatches)).toEqual(
+    Array.from({ length: 12 }, () => 24),
+  );
   await active.worker.dispose();
   active.worker = await startWorker(persistence);
   const blocked = await request(active.worker, namespace, "query", {
@@ -111,6 +209,8 @@ test("shared tightened plans survive fresh workerd instances and reject corrupt 
     "count",
     "statistics",
     "negative-bound",
+    "negative-matches",
+    "fractional-matches",
   ]) {
     const encoded = { value: bytes };
     if (fault === "checksum") {
@@ -129,7 +229,13 @@ test("shared tightened plans survive fresh workerd instances and reject corrupt 
       if (fault === "count") candidate.plan.segments.pop();
       if (fault === "statistics")
         candidate.plan.statistics = { ...candidate.plan.statistics, documents: 0 };
-      if (fault === "negative-bound") candidate.plan.segments[0] = { eligible: true, bound: -1 };
+      const storedSegment = candidate.plan.segments[0];
+      if (storedSegment === undefined) throw new Error("Missing fixture segment");
+      if (fault === "negative-bound") candidate.plan.segments[0] = { ...storedSegment, bound: -1 };
+      if (fault === "negative-matches")
+        candidate.plan.segments[0] = { ...storedSegment, maximumMatches: -1 };
+      if (fault === "fractional-matches")
+        candidate.plan.segments[0] = { ...storedSegment, maximumMatches: 0.5 };
       encoded.value = new Uint8Array(pack(JSON.stringify(candidate)));
     }
     const nativeCache = await (await active.worker.getCaches()).open("kannin-text-plans-v1");

@@ -55,7 +55,7 @@ test("sparse ranking overlaps reads before top-k fills within the existing four-
     response.headers.get("x-fixture-starts"),
   );
   expect(starts).toHaveLength(16);
-  expect(starts.slice(1, 4)).toEqual([1, 1, 1]);
+  expect(starts.slice(0, 4)).toEqual([0, 0, 0, 0]);
   expect(starts.slice(4, 8)).toEqual([4, 4, 4, 4]);
   expect(response.headers.get("x-fixture-peak")).toBe("4");
   for (const segment of [0, 1, 2, 3, 4]) {
@@ -134,4 +134,47 @@ test("sparse ranking overlaps reads before top-k fills within the existing four-
       finalSlot.headers.get("x-fixture-starts"),
     ),
   ).toHaveLength(20);
+  const deleted = Array.from({ length: 8 }, (_, index) => `deleted-${index}`);
+  for (const index of Array.from({ length: 8 }, (_, row) => row))
+    expect(
+      (
+        await request(
+          worker,
+          "window-deleted",
+          "write",
+          write([
+            document(`deleted-${index}`, "alpha beta"),
+            document(`retained-${index}`, "gamma"),
+          ]),
+        )
+      ).status,
+    ).toBe(200);
+  expect((await request(worker, "window-deleted", "write", write([], deleted))).status).toBe(200);
+  const removed = await request(worker, "window-deleted", "query", textQuery("alpha beta", 10));
+  expect(removed.status).toBe(200);
+  expect(Schema.decodeUnknownSync(QueryResult)(await removed.json()).rows).toEqual([]);
+  expect(removed.headers.get("x-fixture-starts")).toBe("[]");
+  expect(removed.headers.get("server-timing")).toContain('desc="segments=0"');
+  for (const index of [0, 1, 2, 3])
+    expect(
+      (
+        await request(
+          worker,
+          "window-exact-ceiling",
+          "write",
+          write([document(String(index), "alpha beta")]),
+        )
+      ).status,
+    ).toBe(200);
+  const exact = await request(worker, "window-exact-ceiling", "query", textQuery("alpha beta", 4));
+  expect(exact.status).toBe(200);
+  expect(
+    Schema.decodeUnknownSync(QueryResult)(await exact.json()).rows.map((row) => row.id),
+  ).toEqual(["0", "1", "2", "3"]);
+  const exactStarts = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Array(Schema.Int)))(
+    exact.headers.get("x-fixture-starts"),
+  );
+  expect(exactStarts).toHaveLength(8);
+  expect(exactStarts.slice(0, 4)).toEqual([0, 0, 0, 0]);
+  expect(exact.headers.get("x-fixture-peak")).toBe("4");
 }, 15000);

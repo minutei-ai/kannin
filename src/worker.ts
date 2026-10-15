@@ -545,21 +545,23 @@ async function textQuery(
           const bound = bounds[index];
           if (bound === undefined)
             throw new Rejected({ status: 503, message: "Term bound batch omitted a segment" });
-          const eligibility = {
-            value: entry.minimum !== null && Object.keys(entry.dictionary).length > 0,
-          };
-          if (
-            (input.match === "all" || input.match === "phrase") &&
-            terms.some((term) => {
-              const metadata = entry.dictionary[term];
-              return (
-                metadata === undefined ||
-                metadata.df <= (entry.segment.removedFrequencies[term] ?? 0)
-              );
-            })
-          )
-            eligibility.value = false;
-          return { bound, eligible: eligibility.value };
+          const liveCount = entry.segment.count - entry.segment.dead.length;
+          if (liveCount < 0)
+            throw new Rejected({ status: 503, message: "Invalid live segment cardinality" });
+          const dictionary = new Map(Object.entries(entry.dictionary));
+          const removed = new Map(Object.entries(entry.segment.removedFrequencies));
+          const matches = { maximum: liveCount, union: 0 };
+          for (const term of terms) {
+            const frequency = (dictionary.get(term)?.df ?? 0) - (removed.get(term) ?? 0);
+            if (frequency < 0 || frequency > liveCount)
+              throw new Rejected({ status: 503, message: "Invalid live term cardinality" });
+            matches.maximum = Math.min(matches.maximum, frequency);
+            matches.union += frequency;
+          }
+          if (input.match !== "all" && input.match !== "phrase")
+            matches.maximum = Math.min(liveCount, matches.union);
+          if (entry.minimum === null) matches.maximum = 0;
+          return { bound, eligible: matches.maximum > 0, maximumMatches: matches.maximum };
         }),
       );
     }
@@ -593,7 +595,14 @@ async function textQuery(
         reuse.bounds += 1;
       }
     }
-    return { segment, index, eligible: planned.eligible, bound: retained.bound, identity };
+    return {
+      segment,
+      index,
+      eligible: planned.eligible,
+      maximumMatches: planned.maximumMatches,
+      bound: retained.bound,
+      identity,
+    };
   });
   const prioritized = bounded.sort((left, right) => {
     if (left.bound !== right.bound) return right.bound - left.bound;
@@ -632,7 +641,14 @@ async function textQuery(
   const scheduling = { offset: 0, matches: 0 };
   while (scheduling.offset < prioritized.length) {
     const capacity = rankingConcurrency - (scheduling.offset % rankingConcurrency);
+    const rankingWindow = prioritized.slice(scheduling.offset, scheduling.offset + capacity);
+    const maximumMatches = rankingWindow.reduce((count, entry) => count + entry.maximumMatches, 0);
     const width = Match.value(scheduling.offset).pipe(
+      Match.when(
+        () =>
+          scheduling.offset < rankingConcurrency && ranked.length + maximumMatches <= input.topK,
+        () => capacity,
+      ),
       Match.when(0, () => 1),
       Match.when(
         () => ranked.length < input.topK && scheduling.matches > 0,
@@ -644,7 +660,7 @@ async function textQuery(
       ),
       Match.orElse(() => capacity),
     );
-    const rankingWindow = prioritized.slice(scheduling.offset, scheduling.offset + width);
+    rankingWindow.splice(width);
     scheduling.offset += rankingWindow.length;
     const cutoff = ranked[input.topK - 1];
     const eligible = rankingWindow.filter(({ segment, eligible: allowed, bound }) => {
@@ -859,7 +875,7 @@ async function textQuery(
       const upper = segmentScoreBound(entry.identity);
       const original = plan.segments[entry.index];
       if (upper !== undefined && original !== undefined && upper < original.bound) {
-        tightened[entry.index] = { bound: upper, eligible: original.eligible };
+        tightened[entry.index] = { ...original, bound: upper };
         publication.improved = true;
       }
     }

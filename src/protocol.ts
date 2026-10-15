@@ -395,6 +395,7 @@ export const TextPlanIdentity = Schema.Struct({
     Schema.Struct({
       key: Root.fields.segments.value.fields.key,
       headerBytes: Root.fields.segments.value.fields.headerBytes,
+      count: Root.fields.segments.value.fields.count,
       dead: Root.fields.segments.value.fields.dead,
       removedFrequencies: Root.fields.segments.value.fields.removedFrequencies,
     }),
@@ -406,6 +407,7 @@ export const TextPlan = Schema.Struct({
     Schema.Struct({
       bound: Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0)),
       eligible: Schema.Boolean,
+      maximumMatches: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
     }),
   ),
 });

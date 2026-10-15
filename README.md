@@ -13,11 +13,11 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Concurrency | p50 ms | p95 ms | Requests/s |
 | ----------: | -----: | -----: | ---------: |
-|           1 |  48.70 |  80.68 |      16.79 |
-|           4 |  50.62 | 120.32 |      41.81 |
-|          16 |  62.91 | 730.03 |      62.85 |
+|           1 |  48.15 | 136.61 |      13.53 |
+|           4 |  54.15 | 139.83 |      47.02 |
+|          16 |  71.50 | 913.28 |      58.78 |
 
-Each 128-request phase covers rare, selective, common and filtered text queries. All **384 responses** matched strong rows/scores and sequence. The preceding run measured p95 **68.65/146.54/760.68 ms**: the latest tail regressed at concurrency one and improved at four/sixteen. These bounded runs do not isolate cache, placement or network variation and do not establish concurrent reliability. Page pruning reduced native common-query acquisition from **178 to 22 blocks** and filtered acquisition from **188 to 41 blocks**, including cache hits. General Turbopuffer parity and peak memory remain unverified.
+Each 128-request phase covers rare, selective, common and filtered text queries. All **384 responses** matched strong rows/scores and sequence. The earlier semantic-reuse run measured p95 **80.68/120.32/730.03 ms**; the latest restored run had worse tails in all three phases. These bounded runs do not isolate cache, placement or network variation and do not establish concurrent reliability. Page pruning reduced native common-query acquisition from **178 to 22 blocks** and filtered acquisition from **188 to 41 blocks**, including cache hits. General Turbopuffer parity and peak memory remain unverified.
 
 Strong queries capture an immutable root under the coordinator lock, then run up to four at a time while writes continue. Plans now reuse Rust-normalized query selections: any/all sort and deduplicate tokens; phrases preserve order and repetitions. Four strong case/accent/order/spacing variations changed **6.1–8.0 seconds→207–313 ms**, preserving complete rows/scores and ranking **three segments instead of 200**. Equivalent edge variations measured **74–321 ms**. First strong selections still took **7.24/6.31 seconds**. A sixteen-request burst had p95 **1.52 seconds**; a separate 96-request mixed load after 32 warmups had p50/p95 **347/778 ms**. These gains cover equivalent selections; genuinely new selections and concurrent tails remain unresolved. [Measurements and limits](docs/performance.md#semantic-query-plan-identities).
 

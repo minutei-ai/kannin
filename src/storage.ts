@@ -7,8 +7,10 @@ import {
   segment_document,
   segment_bloom,
   BloomBatch,
+  FrequencyPage,
   segment_overview_project,
 } from "../dist/wasm/raio_engine";
+import type { Ranker } from "../dist/wasm/raio_engine";
 import type { DataRange, TermProjectionRange, Root } from "./protocol";
 import {
   StoredDocument,
@@ -25,6 +27,9 @@ import {
 } from "./protocol";
 
 const buffers = new Map<string, Uint8Array>();
+const frequencyPages = new Map<string, { page: FrequencyPage; bytes: number }>();
+const frequencyBudget = { bytes: 0 };
+const cacheOrder = new Map<string, "range" | "frequency">();
 const pendingRanges = new Map<string, Promise<Uint8Array>>();
 const MAX_PENDING_RANGES = 64;
 const budget = { bytes: 0 };
@@ -66,19 +71,67 @@ const bloomBudget = { bytes: 0 };
 const strings = Schema.fromJsonString(Schema.Array(Schema.String));
 const encodeStrings = Schema.encodeSync(strings);
 
+function evictFor(bytes: number) {
+  while (budget.bytes + frequencyBudget.bytes + bytes > MAX_CACHE_BYTES) {
+    const oldest = cacheOrder.entries().next().value;
+    if (oldest === undefined) break;
+    cacheOrder.delete(oldest[0]);
+    const key = oldest[0].slice(2);
+    if (oldest[1] === "range") {
+      const prior = buffers.get(key);
+      if (prior !== undefined) budget.bytes -= prior.byteLength;
+      buffers.delete(key);
+    } else {
+      const prior = frequencyPages.get(key);
+      if (prior !== undefined) {
+        frequencyBudget.bytes -= prior.bytes;
+        prior.page.free();
+      }
+      frequencyPages.delete(key);
+    }
+  }
+}
+
 function remember(key: string, bytes: Uint8Array) {
   const previous = buffers.get(key);
   if (previous !== undefined) budget.bytes -= previous.byteLength;
   buffers.delete(key);
+  cacheOrder.delete(`r:${key}`);
   if (bytes.byteLength > MAX_CACHE_BYTES) return;
+  evictFor(bytes.byteLength);
   buffers.set(key, bytes);
+  cacheOrder.set(`r:${key}`, "range");
   budget.bytes += bytes.byteLength;
-  while (budget.bytes > MAX_CACHE_BYTES) {
-    const oldest = buffers.entries().next().value;
-    if (oldest === undefined) break;
-    buffers.delete(oldest[0]);
-    budget.bytes -= oldest[1].byteLength;
+}
+
+export function addFrequencyPosting(
+  ranker: Ranker,
+  key: string,
+  term: string,
+  offset: number,
+  bytes: Uint8Array,
+) {
+  const identity = `${env.STORAGE_CACHE_SCOPE}:${key}/${offset}/${bytes.byteLength}`;
+  const cached = frequencyPages.get(identity);
+  if (cached !== undefined) {
+    cacheOrder.delete(`p:${identity}`);
+    cacheOrder.set(`p:${identity}`, "frequency");
+    ranker.add_frequency(term, cached.page);
+    return;
   }
+  const page = new FrequencyPage(bytes);
+  const charge = page.heap_bytes() + new TextEncoder().encode(identity).byteLength * 4 + 192;
+  if (charge > MAX_CACHE_BYTES) {
+    using cleanup = new DisposableStack();
+    cleanup.use(page);
+    ranker.add_frequency(term, page);
+    return;
+  }
+  evictFor(charge);
+  frequencyPages.set(identity, { page, bytes: charge });
+  cacheOrder.set(`p:${identity}`, "frequency");
+  frequencyBudget.bytes += charge;
+  ranker.add_frequency(term, page);
 }
 
 export async function range(key: string, offset: number, length: number) {
@@ -88,6 +141,8 @@ export async function range(key: string, offset: number, length: number) {
     reads.rangeCacheHits += 1;
     buffers.delete(cacheKey);
     buffers.set(cacheKey, cached);
+    cacheOrder.delete(`r:${cacheKey}`);
+    cacheOrder.set(`r:${cacheKey}`, "range");
     return cached;
   }
   const pending = pendingRanges.get(cacheKey);
@@ -683,7 +738,15 @@ export function clearImmutableCache(prefix: string) {
   for (const [key, bytes] of buffers)
     if (key.startsWith(`${identity}/`)) {
       buffers.delete(key);
+      cacheOrder.delete(`r:${key}`);
       budget.bytes -= bytes.byteLength;
+    }
+  for (const [key, entry] of frequencyPages)
+    if (key.startsWith(`${identity}/`)) {
+      frequencyPages.delete(key);
+      cacheOrder.delete(`p:${key}`);
+      frequencyBudget.bytes -= entry.bytes;
+      entry.page.free();
     }
   for (const [key, entry] of bloomBatches)
     if (key.startsWith(`${env.STORAGE_CACHE_SCOPE}:`) && entry.prefix.startsWith(`${prefix}/`)) {
@@ -702,6 +765,7 @@ export function clearImmutableCache(prefix: string) {
 export function cacheUsage() {
   return {
     rangeCacheBytes: budget.bytes,
+    postingCacheBytes: frequencyBudget.bytes,
     directoryCacheChargedBytes: decodedBudget.bytes,
     bloomCacheBytes: bloomBudget.bytes,
     termCacheBytes: termBudget.bytes,

@@ -70,6 +70,7 @@ import {
   range,
   withDirectory,
   readTermCatalogs,
+  addFrequencyPosting,
   readTermProjections,
   buildSegment,
   bloom,
@@ -540,10 +541,20 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
                 for (const posting of loaded)
                   for (const block of posting.metadata.blocks) {
                     const start = block.data.offset - posting.offset;
-                    ranker.add(
-                      posting.term,
-                      posting.bytes.subarray(start, start + block.data.length),
-                    );
+                    const bytes = posting.bytes.subarray(start, start + block.data.length);
+                    if (
+                      input.match === "phrase" ||
+                      (block.max_title_tf <= 1 && block.max_body_tf <= 1)
+                    )
+                      ranker.add(posting.term, bytes);
+                    else
+                      addFrequencyPosting(
+                        ranker,
+                        segment.key,
+                        posting.term,
+                        segment.headerBytes + block.data.offset,
+                        bytes,
+                      );
                   }
                 rankMetrics.decode += (yield* Clock.currentTimeNanos) - acquired;
               }

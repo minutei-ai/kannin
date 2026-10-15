@@ -1558,3 +1558,29 @@ The completed repeat preserved another 240 responses: short-query median 18.77�
 Native deployment and the Vectorize metadata migration succeeded. The complete 300-query SciFact report stayed byte-identical to the earlier validated report. The first post-deploy standard load completed 96 exact results at the acknowledged sequence. Native DisposableStack lifetime ran successfully, independently of local workerd coverage. Before/after p50 at concurrency 1/4/16 was 78.35/68.37/320.58 versus 73.34/98.06/303.94 ms; p95 was 513.71/1426.98/1687.96 versus 387.81/1065.50/1313.61 ms. Placement/cache state was uncontrolled; lower tails in one run do not establish an isolated preparation effect.
 
 The repeated native load preserved another 96 exact responses, bringing before/after/repeat coverage to 288. Repeated p50 at concurrency 1/4/16 was 61.92/76.02/226.05 ms, p95 231.01/1001.88/1246.32 ms and throughput 8.38/12.04/22.37 requests/s. All three p95 values improved against this reference in both candidate loads, while concurrency-four medians remained worse. These are uncontrolled native observations, not a causal or universal speedup claim. The latest repeated values are shown in the README. Stable tail latency, actual peak memory and indexed Turbopuffer parity remain unverified.
+
+### Retained decoded frequency pages
+
+Repeated any/all queries previously decompressed and scanned every position varint again. Immutable FrequencyPage handles now retain checked row/frequency/final-position data for pages whose conservative title/body frequency bound exceeds one. Phrase and single-occurrence pages retain the original decoder. Every attachment validates current header position bounds, row order, filters and tombstones. Raw bytes and decoded pages share the existing 12 MiB LRU; eviction frees native handles. The cache does not skip compressed range acquisition or cache query results.
+
+Two alternating local workerd comparisons each checked 420 complete rows/scores over 5,000-document fixtures, fourteen pairs of three queries with three warmup pairs excluded. With 128 repeated occurrences, any medians changed 8.20→6.97 ms and 7.75→6.24 ms; all changed 9.19→8.53 ms and 7.31→5.40 ms. Low-frequency any controls changed 8.73→8.75 ms and 7.41→9.82 ms; all changed 5.98→6.22 ms and 10.23→10.13 ms. Unchanged phrase controls also moved, so these results establish a scoped repeated-decoding benefit rather than uniform whole-query improvement. The initial prototype cached single-occurrence pages too and was rejected after a 9.5% low-frequency any regression.
+
+The separate warm WASM pipeline comparison included fresh ranker construction, filters, tombstones and scoring, with sixteen alternating pairs of four operations and four warmup pairs excluded. Across eighty retained pages, high-frequency any/all medians changed 12.36/12.21→0.173/0.170 ms initially and 16.44/12.19→0.214/0.168 ms on repetition. Page payload charge was 283,200 bytes, excluding JavaScript cache metadata added by the storage owner. Candidate timings exclude cold page construction; they do not establish native CPU savings.
+
+The full gate passed 31 Rust and 141 Bun/workerd tests. Coverage includes any/all equivalence across filters/tombstones, phrase rejection, reversed blocks, invalid positions on excluded rows, CRC failures, namespace rebuild and a full 12 MiB raw range evicting decoded handles within the shared budget. Charged cache bytes do not establish actual peak heap.
+
+Native Alchemy deployment and its unconditional Vectorize metadata migration succeeded. The complete 300-query SciFact report was byte-identical to the preceding baseline, retaining every reported identifier and quality metric. Before/after/repeated loads preserved 288 exact strong-baseline rows/scores/sequence checks on the million-document namespace at sequence 2,000.
+
+| Run            | Concurrency | p50 ms |  p95 ms | Requests/s |
+| :------------- | ----------: | -----: | ------: | ---------: |
+| Before         |           1 |  88.15 |  169.62 |       9.99 |
+| Before         |           4 | 129.17 |  906.42 |      12.81 |
+| Before         |          16 | 313.52 | 1717.18 |      13.36 |
+| After          |           1 | 102.14 |  787.23 |       5.16 |
+| After          |           4 |  86.89 | 1128.65 |      13.67 |
+| After          |          16 | 237.99 | 1535.30 |      20.17 |
+| Repeated after |           1 |  70.05 |  253.75 |       8.43 |
+| Repeated after |           4 |  75.54 |  852.19 |      16.34 |
+| Repeated after |          16 | 252.17 | 1316.89 |      14.23 |
+
+Concurrency-four/sixteen medians improved in both candidate loads, while concurrency-one tails worsened. Cache/isolate/network placement was uncontrolled; this is not causal evidence of a general native speedup. A separate health request returned the new postingCacheBytes diagnostic but landed in an empty isolate, with zero cached bytes; it does not prove native cache residency or peak memory. The README shows the repeated load. Stable native tail latency, actual peak heap and indexed Turbopuffer parity remain outstanding.

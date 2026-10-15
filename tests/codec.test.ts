@@ -14,6 +14,7 @@ import {
   Directory,
   BloomBatch,
   PreparedQuery,
+  FrequencyPage,
 } from "../dist/wasm/raio_engine";
 import {
   StoredDocument,
@@ -426,4 +427,84 @@ test("prepared queries reject shared tombstones and preserve query-budget failur
     { ...input, mode: "phrase", text: "alpha ".repeat(65) },
   ])
     expect(() => new PreparedQuery(JSON.stringify(invalid))).toThrow();
+});
+
+test("retained frequency pages preserve dynamic masks, block ordering and positional bounds", () => {
+  const segment = new Segment(
+    JSON.stringify(
+      Array.from({ length: 260 }, (_, index) => ({
+        id: String(index).padStart(3, "0"),
+        text: "alpha beta alpha",
+        attributes: { group: index % 2 },
+      })),
+    ),
+  );
+  const bytes = segment.bytes();
+  const directory = new Directory(bytes);
+  const base = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
+  const input = {
+    text: "alpha beta",
+    mode: "any",
+    top_k: 10,
+    dead: [],
+    filters: [],
+    statistics: {
+      documents: 260,
+      title_length: 0,
+      body_length: 780,
+      frequencies: { alpha: 260, beta: 260 },
+    },
+  };
+  const probe = directory.ranker(JSON.stringify(input));
+  const spans = Schema.decodeSync(Schema.fromJsonString(PostingSpans))(probe.posting_spans());
+  const pages = spans.flatMap((span) =>
+    span.blocks.map((block) => {
+      const data = bytes.subarray(
+        base + block.data.offset,
+        base + block.data.offset + block.data.length,
+      );
+      return { term: span.term, bytes: data, page: new FrequencyPage(data) };
+    }),
+  );
+  probe.free();
+  for (const mode of ["any", "all"])
+    for (const dead of [[], [0, 1, 2]])
+      for (const filters of [[], [{ field: "group", op: "eq", value: 1 }]]) {
+        const query = JSON.stringify({ ...input, mode, dead, filters });
+        const legacy = directory.ranker(query);
+        const cached = directory.ranker(query);
+        for (const entry of pages) {
+          legacy.add(entry.term, entry.bytes);
+          cached.add_frequency(entry.term, entry.page);
+        }
+        expect(cached.finish()).toBe(legacy.finish());
+        legacy.free();
+        cached.free();
+      }
+  const first = pages[0];
+  if (first === undefined) throw new Error("Missing page");
+  const ranker = directory.ranker(JSON.stringify(input));
+  ranker.add_frequency(first.term, first.page);
+  expect(() => ranker.add_frequency(first.term, first.page)).toThrow("out of order");
+  ranker.free();
+  const positional = directory.ranker(JSON.stringify({ ...input, mode: "phrase" }));
+  expect(() => positional.add_frequency(first.term, first.page)).toThrow("any/all mode");
+  positional.free();
+  const data = new Uint8Array([1, 0, 0, 1, 99]);
+  const compressed = deflateSync(data);
+  const frame = new Uint8Array(8 + compressed.length);
+  new DataView(frame.buffer).setUint32(0, data.length, true);
+  new DataView(frame.buffer).setUint32(4, crc32(data), true);
+  frame.set(compressed, 8);
+  const invalidPosition = new FrequencyPage(frame);
+  const hidden = directory.ranker(JSON.stringify({ ...input, dead: [0] }));
+  expect(() => hidden.add_frequency("alpha", invalidPosition)).toThrow("Invalid token position");
+  hidden.free();
+  invalidPosition.free();
+  const broken = first.bytes.slice();
+  broken[4] = (broken[4] ?? 0) ^ 1;
+  expect(() => new FrequencyPage(broken)).toThrow();
+  for (const entry of pages) entry.page.free();
+  directory.free();
+  segment.free();
 });

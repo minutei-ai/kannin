@@ -212,6 +212,7 @@ export const WriteResult = Schema.Struct({
 export const ErrorBody = Schema.Struct({ error: Schema.String });
 export const CacheMetrics = Schema.Struct({
   rangeCacheBytes: Schema.Int,
+  postingCacheBytes: Schema.Int,
   directoryCacheChargedBytes: Schema.Int,
   bloomCacheBytes: Schema.Int,
   termCacheBytes: Schema.Int,

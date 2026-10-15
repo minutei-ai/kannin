@@ -84,3 +84,25 @@ test("a failed shared acquisition is removed before retrying canonical storage",
   expect(recovered.reads).toBe(1);
   expect(recovered.distinctBodies).toBe(1);
 });
+
+test("a full range evicts decoded posting handles within the shared twelve-MiB budget", async () => {
+  const key = "namespaces/range-shared-budget/segments/data.rsix";
+  const bucket = await worker.getR2Bucket("STORAGE");
+  await bucket.put(key, new Uint8Array(12 * 1024 * 1024).fill(7));
+  const response = await fetch(await worker.ready, {
+    method: "POST",
+    headers: { authorization: "Bearer local-test-token", "content-type": "application/json" },
+    body: Schema.encodeSync(Schema.fromJsonString(RangeProbeInput))({
+      key,
+      offset: 0,
+      length: 12 * 1024 * 1024,
+      count: 1,
+      preloadFrequency: true,
+    }),
+  });
+  const result = Schema.decodeUnknownSync(RangeProbeResult)(await response.json());
+  expect(result.postingBefore).toBeGreaterThan(0);
+  expect(result.postingAfter).toBe(0);
+  expect(result.rangeAfter).toBe(12 * 1024 * 1024);
+  expect(result.successes).toBe(1);
+});

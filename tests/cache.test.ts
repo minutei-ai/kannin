@@ -850,3 +850,62 @@ test("document Bloom windows preserve newest revisions across partial sixty-four
   expect(metadata.documents).toBe(127);
   expect(metadata.cache.bloomCacheBytes).toBeLessThanOrEqual(4 * 1024 * 1024);
 });
+
+test("decoded frequency pages share the range budget and keep tombstones query-local", async () => {
+  const namespace = "frequency-page-lifecycle";
+  await request(
+    worker,
+    namespace,
+    "write",
+    write(
+      Array.from({ length: 300 }, (_, index) =>
+        document(String(index).padStart(3, "0"), "alpha beta ".repeat(20), { group: index % 2 }),
+      ),
+    ),
+  );
+  const first = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", textQuery("alpha beta"))).json(),
+  );
+  const warm = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", textQuery("alpha beta"))).json(),
+  );
+  expect(warm.rows).toEqual(first.rows);
+  const metadata = Schema.decodeUnknownSync(Metadata)(
+    await (await request(worker, namespace, "metadata")).json(),
+  );
+  expect(metadata.cache.postingCacheBytes).toBeGreaterThan(0);
+  expect(metadata.cache.rangeCacheBytes + metadata.cache.postingCacheBytes).toBeLessThanOrEqual(
+    12 * 1024 * 1024,
+  );
+  await request(
+    worker,
+    namespace,
+    "write",
+    write([document("000", "gamma", { group: 0 })], ["001"]),
+  );
+  const changed = Schema.decodeUnknownSync(QueryResult)(
+    await (
+      await request(
+        worker,
+        namespace,
+        "query",
+        textQuery("alpha beta", 10, [{ field: "group", op: "eq", value: 1 }]),
+      )
+    ).json(),
+  );
+  expect(changed.rows.map((row) => row.id)).toEqual(
+    Array.from({ length: 10 }, (_, index) => String(index * 2 + 3).padStart(3, "0")),
+  );
+  await request(worker, namespace, "rebuild", {});
+  const rebuilt = Schema.decodeUnknownSync(QueryResult)(
+    await (
+      await request(
+        worker,
+        namespace,
+        "query",
+        textQuery("alpha beta", 10, [{ field: "group", op: "eq", value: 1 }]),
+      )
+    ).json(),
+  );
+  expect(rebuilt.rows).toEqual(changed.rows);
+});

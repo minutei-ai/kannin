@@ -430,10 +430,17 @@ pub fn decode_postings(bytes: &[u8]) -> Result<Vec<Posting>, String> {
     })
 }
 
+#[derive(Clone)]
 struct FrequencyPosting {
     row: u32,
     title: u32,
     body: u32,
+}
+
+struct DecodedFrequencyPosting {
+    posting: FrequencyPosting,
+    title_last: Option<u32>,
+    body_last: Option<u32>,
 }
 
 enum PostingLists {
@@ -1051,27 +1058,48 @@ impl Search {
                     }
                 }
             }
-            PostingLists::Frequencies(lists) => {
-                let postings = decode_posting_rows::<false, _>(bytes, |row, title, body| {
-                    (
-                        FrequencyPosting {
+            PostingLists::Frequencies(_) => {
+                let rows = decode_posting_rows::<false, _>(bytes, |row, title, body| {
+                    DecodedFrequencyPosting {
+                        posting: FrequencyPosting {
                             row,
                             title: title.count,
                             body: body.count,
                         },
-                        title.last,
-                        body.last,
-                    )
-                })?;
-                let list = lists.entry(term.into()).or_default();
-                let previous = self.last_decoded_rows.entry(term.into()).or_default();
-                for (posting, title, body) in postings {
-                    validate_posting(&self.header, posting.row, title, body, *previous)?;
-                    *previous = Some(posting.row);
-                    if self.allowed[posting.row as usize] {
-                        list.push(posting);
+                        title_last: title.last,
+                        body_last: body.last,
                     }
-                }
+                })?;
+                self.add_frequency_page(term, &rows)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn add_frequency_page(
+        &mut self,
+        term: &str,
+        rows: &[DecodedFrequencyPosting],
+    ) -> Result<(), String> {
+        if !self.words.iter().any(|word| word == term) {
+            return Err("Unrequested posting term".into());
+        }
+        let PostingLists::Frequencies(lists) = &mut self.lists else {
+            return Err("Frequency page requires any/all mode".into());
+        };
+        let list = lists.entry(term.into()).or_default();
+        let previous = self.last_decoded_rows.entry(term.into()).or_default();
+        for row in rows {
+            validate_posting(
+                &self.header,
+                row.posting.row,
+                row.title_last,
+                row.body_last,
+                *previous,
+            )?;
+            *previous = Some(row.posting.row);
+            if self.allowed[row.posting.row as usize] {
+                list.push(row.posting.clone());
             }
         }
         Ok(())
@@ -2198,6 +2226,39 @@ pub mod wasm {
     }
 
     #[wasm_bindgen]
+    pub struct FrequencyPage {
+        rows: Box<[super::DecodedFrequencyPosting]>,
+    }
+
+    #[wasm_bindgen]
+    impl FrequencyPage {
+        #[wasm_bindgen(constructor)]
+        #[doc = "# Errors\nRejects corrupt pages, invalid varints, row/position ordering, or trailing bytes."]
+        pub fn new(bytes: &[u8]) -> Result<Self, JsValue> {
+            let rows = super::decode_posting_rows::<false, _>(bytes, |row, title, body| {
+                super::DecodedFrequencyPosting {
+                    posting: super::FrequencyPosting {
+                        row,
+                        title: title.count,
+                        body: body.count,
+                    },
+                    title_last: title.last,
+                    body_last: body.last,
+                }
+            })
+            .map_err(|cause| JsValue::from_str(&cause))?;
+            Ok(Self {
+                rows: rows.into_boxed_slice(),
+            })
+        }
+
+        #[must_use]
+        pub fn heap_bytes(&self) -> usize {
+            self.rows.len() * size_of::<super::DecodedFrequencyPosting>() + size_of::<Self>() + 32
+        }
+    }
+
+    #[wasm_bindgen]
     pub struct Ranker {
         search: Search,
     }
@@ -2247,6 +2308,13 @@ pub mod wasm {
             serde_json::to_string(&self.search.posting_spans())
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))
         }
+        #[doc = "# Errors\nRejects unrequested terms, positional mode, invalid rows/positions, or unordered blocks."]
+        pub fn add_frequency(&mut self, term: &str, page: &FrequencyPage) -> Result<(), JsValue> {
+            self.search
+                .add_frequency_page(term, &page.rows)
+                .map_err(|cause| JsValue::from_str(&cause))
+        }
+
         #[doc = "# Errors\nRejects invalid requested terms, pages, rows, positions, or block ordering."]
         pub fn add(&mut self, term: &str, bytes: &[u8]) -> Result<(), JsValue> {
             self.search

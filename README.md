@@ -13,11 +13,11 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Concurrency | p50 ms |  p95 ms | Requests/s |
 | ----------: | -----: | ------: | ---------: |
-|           1 |  61.92 |  231.01 |       8.38 |
-|           4 |  76.02 | 1001.88 |      12.04 |
-|          16 | 226.05 | 1246.32 |      22.37 |
+|           1 |  70.05 |  253.75 |       8.43 |
+|           4 |  75.54 |  852.19 |      16.34 |
+|          16 | 252.17 | 1316.89 |      14.23 |
 
-The latest 32-request phases cover rare, selective, common and filtered text queries; all **96 responses** matched strong rows/scores and sequence. Native latency varies across runs, with uncontrolled cache/isolate/network placement. A controlled local 32-segment comparison improved complete short/long query medians by **10–12%** after preparing shared ranking input once per request. Other scoped Rust/cache gains, controls and regressions are documented below; they do not prove uniform native latency. Peak memory and general Turbopuffer parity remain unverified.
+The latest 32-request phases cover rare, selective, common and filtered text queries; all **96 responses** matched strong rows/scores and sequence. Native latency varies across runs, with uncontrolled cache/isolate/network placement. A controlled local 32-segment comparison improved complete short/long query medians by **10–12%** after preparing shared ranking input once per request. A separate repeated-frequency fixture improved local any/all medians by 15–20% and 7–26% across two runs after retaining decoded posting pages; single-occurrence controls varied, including a regression. Other scoped Rust/cache gains, controls and regressions are documented below; they do not prove uniform native latency. Peak memory and general Turbopuffer parity remain unverified.
 
 The local million-document workload measured strong common/filtered p50 of **127/126 ms** across 2,000 uncompacted segments. These emulator results exclude native network latency. The repeated independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10** across 300 queries. Eight native vector/hybrid fixture cases also retained exact rows and scores.
 
@@ -36,7 +36,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **116 Worker/tooling tests and 18 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **141 Worker/tooling tests and 31 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

@@ -1,4 +1,4 @@
-import { Cause, Clock, Effect, Match, Schema, Semaphore } from "effect";
+import { Cause, Clock, Effect, Match, Option, Schema, Semaphore } from "effect";
 import { env, exports } from "cloudflare:workers";
 import {
   Segment,
@@ -36,6 +36,9 @@ const frequencyBudget = { bytes: 0 };
 const cacheOrder = new Map<string, "range" | "frequency">();
 const pendingRanges = new Map<string, Promise<Uint8Array>>();
 const MAX_PENDING_RANGES = 64;
+const SMALL_RANGE_LIMIT = 64 * 1024;
+const SMALL_RANGE_BODY_UNIT = 64 * 1024;
+const smallRangeReads = Semaphore.makeUnsafe(64);
 const budget = { bytes: 0, payloadBytes: 0 };
 const MAX_CACHE_BYTES = 12 * 1024 * 1024;
 const encodedDirectories = new Map<string, Uint8Array>();
@@ -82,6 +85,9 @@ const reads = {
   termWorkerCacheHits: 0,
   termCacheApiHits: 0,
   rangeReads: 0,
+  rangeCacheTimeouts: 0,
+  rangeR2FallbackReads: 0,
+  rangeR2FallbackBytes: 0,
   rangeBytes: 0,
   rangeCacheHits: 0,
   directoryCacheHits: 0,
@@ -271,21 +277,62 @@ export async function range(
     url.searchParams.set("offset", String(input.offset));
     url.searchParams.set("length", String(input.length));
     const props = Schema.encodeSync(SegmentCacheProps)({ bucket: env.STORAGE_CACHE_SCOPE });
-    const response = await exports.Segments({ props }).fetch(url);
-    const status = response.headers.get("cf-cache-status");
-    if (status === "HIT") reads.workerCacheHits += 1;
-    else if (status === "MISS") reads.workerCacheMisses += 1;
-    if (status !== "HIT" && response.headers.get("x-raio-cache") === "api-hit")
-      reads.cacheApiHits += 1;
     reads.rangeReads += 1;
-    if (!response.ok)
-      throw new Rejected({
-        status: 503,
-        message: "Committed R2 segment unavailable",
-        upstreamStatus: response.status,
-        upstreamRay: response.headers.get("cf-ray"),
-      });
-    const bytes = new Uint8Array(await response.arrayBuffer());
+    const cachedRead = Effect.tryPromise({
+      try: async (signal) => {
+        const response = await exports.Segments({ props }).fetch(url, { signal });
+        const status = response.headers.get("cf-cache-status");
+        if (status === "HIT") reads.workerCacheHits += 1;
+        else if (status === "MISS") reads.workerCacheMisses += 1;
+        if (status !== "HIT" && response.headers.get("x-raio-cache") === "api-hit")
+          reads.cacheApiHits += 1;
+        if (!response.ok)
+          throw new Rejected({
+            status: 503,
+            message: "Committed R2 segment unavailable",
+            upstreamStatus: response.status,
+            upstreamRay: response.headers.get("cf-ray"),
+          });
+        return new Uint8Array(await response.arrayBuffer());
+      },
+      catch: (cause) => {
+        if (Schema.is(Rejected)(cause)) return cause;
+        return new Cause.UnknownError(cause);
+      },
+    });
+    const bytes = await Effect.runPromise(
+      Match.value(compressedDirectory || length > SMALL_RANGE_LIMIT).pipe(
+        Match.when(true, () => cachedRead),
+        Match.orElse(() =>
+          smallRangeReads.withPermits(Math.max(1, Math.ceil((length * 4) / SMALL_RANGE_BODY_UNIT)))(
+            Effect.gen(function* () {
+              const acquired = yield* cachedRead.pipe(Effect.timeoutOption("250 millis"));
+              if (Option.isSome(acquired)) return acquired.value;
+              reads.rangeCacheTimeouts += 1;
+              reads.rangeR2FallbackReads += 1;
+              return yield* Effect.acquireUseRelease(
+                Effect.tryPromise(() => env.STORAGE.get(key, { range: { offset, length } })),
+                (object) =>
+                  Effect.gen(function* () {
+                    if (object === null)
+                      return yield* new Rejected({
+                        status: 503,
+                        message: "Committed R2 segment unavailable",
+                      });
+                    const body = yield* Effect.tryPromise(() => object.arrayBuffer());
+                    reads.rangeR2FallbackBytes += body.byteLength;
+                    return new Uint8Array(body);
+                  }),
+                (object) => {
+                  if (object === null || object.bodyUsed) return Effect.void;
+                  return Effect.tryPromise(() => object.body.cancel()).pipe(Effect.ignore);
+                },
+              ).pipe(Effect.uninterruptible);
+            }),
+          ),
+        ),
+      ),
+    );
     reads.rangeBytes += bytes.byteLength;
     if (!compressedDirectory && bytes.byteLength !== length)
       throw new Rejected({ status: 503, message: "R2 range returned a truncated segment" });

@@ -175,6 +175,52 @@ test("strong is the default and edge reads evaluate the same BM25 snapshot", asy
   expect(edge.sequence).toBe(strong.sequence);
 });
 
+test("recent unchanged snapshot publications coalesce without hiding changes or cache eviction", async () => {
+  const namespace = "publication-interval";
+  await request(worker, namespace, "write", write([document("a", "original content")]));
+  const input = { ...textQuery("original"), consistency: "edge-eventual", minimumSequence: 1 };
+  expect((await request(worker, namespace, "query", input)).status).toBe(200);
+  const before = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  for (const _iteration of Array.from({ length: 8 }, (_, index) => index))
+    expect(
+      (await request(worker, namespace, "query", { ...input, minimumSequence: 2 })).status,
+    ).toBe(409);
+  const grouped = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(grouped.snapshotRevalidations - before.snapshotRevalidations).toBe(8);
+  expect(grouped.snapshotR2BodyBytes - before.snapshotR2BodyBytes).toBe(0);
+  expect(grouped.snapshotCachePutAttempts - before.snapshotCachePutAttempts).toBeLessThan(8);
+  expect(grouped.snapshotCachePutSkipped - before.snapshotCachePutSkipped).toBeGreaterThan(0);
+  const cache = await (await worker.getCaches()).open("raio-snapshots-v2");
+  const key = `https://raio-cache.internal/snapshots/${namespace}?bucket=raio-test`;
+  await cache.delete(key);
+  expect((await request(worker, namespace, "query", input)).status).toBe(200);
+  await Effect.runPromise(Effect.sleep(550));
+  expect((await request(worker, namespace, "query", { ...input, minimumSequence: 2 })).status).toBe(
+    409,
+  );
+  const restored = await cache.match(key);
+  if (restored === undefined) throw new Error("Missing republished snapshot");
+  expect(
+    Effect.runSync(readSnapshotFrame(await restored.arrayBuffer())).snapshot.manifest.sequence,
+  ).toBe(1);
+  await request(worker, namespace, "write", write([document("a", "changed content")]));
+  const changed = await request(worker, namespace, "query", {
+    ...textQuery("changed"),
+    consistency: "edge-eventual",
+    minimumSequence: 2,
+  });
+  expect(changed.status).toBe(200);
+  const published = await cache.match(key);
+  if (published === undefined) throw new Error("Missing changed snapshot");
+  expect(
+    Effect.runSync(readSnapshotFrame(await published.arrayBuffer())).snapshot.manifest.sequence,
+  ).toBe(2);
+});
+
 test("expired warm snapshots revalidate unchanged R2 content without transferring its body", async () => {
   const namespace = "etag-unchanged";
   await request(worker, namespace, "write", write([document("a", "unchanged content")]));

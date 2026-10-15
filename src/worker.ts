@@ -84,7 +84,7 @@ import {
 
 import { vectorMetadata, vectorPrefilter } from "./vector-filters";
 
-import { snapshotFrame, readSnapshotFrame } from "./snapshot";
+import { snapshotFrameHeader, readSnapshotFrame } from "./snapshot";
 
 const wasm = initSync({ module });
 const SNAPSHOT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -1814,10 +1814,12 @@ const warmSnapshots = new Map<
     payload: Uint8Array<ArrayBuffer>;
     bytes: number;
     etag: R2Object["etag"] | undefined;
+    cacheAttemptedAt: number | undefined;
   }
 >();
 const warmSnapshotBudget = { bytes: 0 };
 const MAX_WARM_SNAPSHOT_BYTES = 24 * 1024 * 1024;
+const SNAPSHOT_PUBLICATION_INTERVAL_MS = 500;
 
 function rememberSnapshot(
   key: string,
@@ -1825,13 +1827,14 @@ function rememberSnapshot(
   payload: Uint8Array<ArrayBuffer>,
   frameBytes: number,
   etag?: R2Object["etag"],
+  cacheAttemptedAt?: number,
 ) {
   const prior = warmSnapshots.get(key);
   if (prior !== undefined) warmSnapshotBudget.bytes -= prior.bytes;
   warmSnapshots.delete(key);
   const bytes = Math.max(frameBytes, payload.buffer.byteLength) * 4;
   if (bytes > MAX_WARM_SNAPSHOT_BYTES) return;
-  warmSnapshots.set(key, { snapshot, payload, bytes, etag });
+  warmSnapshots.set(key, { snapshot, payload, bytes, etag, cacheAttemptedAt });
   warmSnapshotBudget.bytes += bytes;
   while (warmSnapshotBudget.bytes > MAX_WARM_SNAPSHOT_BYTES) {
     const oldest = warmSnapshots.entries().next().value;
@@ -1848,6 +1851,9 @@ const snapshotMetrics = {
   snapshotSharedReads: 0,
   snapshotCacheDecodes: 0,
   snapshotCacheRejected: 0,
+  snapshotCachePutAttempts: 0,
+  snapshotCachePutBytes: 0,
+  snapshotCachePutSkipped: 0,
 };
 async function acquireSnapshot(
   ctx: ExecutionContext,
@@ -1892,10 +1898,34 @@ async function acquireSnapshot(
   const payload = selected.payload;
   if (payload === undefined)
     throw new Rejected({ status: 503, message: "R2 snapshot omitted its encoded manifest" });
-  const encoded = snapshotFrame(snapshot, payload);
+  const header = snapshotFrameHeader(snapshot);
+  const frameBytes = header.size + payload.byteLength;
+  const lastAttempt = previous?.cacheAttemptedAt;
+  const publish =
+    !selected.revalidated ||
+    lastAttempt === undefined ||
+    observedAt < lastAttempt ||
+    observedAt - lastAttempt >= SNAPSHOT_PUBLICATION_INTERVAL_MS;
+  const publication = { attemptedAt: lastAttempt };
+  if (!selected.revalidated) publication.attemptedAt = undefined;
+  if (cache !== undefined && publish) publication.attemptedAt = observedAt;
+  const encoded = Match.value(cache !== undefined && publish).pipe(
+    Match.when(true, () => new Blob([header, payload], { type: "application/octet-stream" })),
+    Match.orElse(() => undefined),
+  );
   const prepared = Effect.runSync(Clock.currentTimeNanos);
-  rememberSnapshot(cacheKey.href, snapshot, payload, encoded.size, object.etag);
-  if (cache !== undefined) {
+  rememberSnapshot(
+    cacheKey.href,
+    snapshot,
+    payload,
+    frameBytes,
+    object.etag,
+    publication.attemptedAt,
+  );
+  if (cache !== undefined && !publish) snapshotMetrics.snapshotCachePutSkipped += 1;
+  if (cache !== undefined && encoded !== undefined) {
+    snapshotMetrics.snapshotCachePutAttempts += 1;
+    snapshotMetrics.snapshotCachePutBytes += encoded.size;
     ctx.waitUntil(
       cache
         .put(

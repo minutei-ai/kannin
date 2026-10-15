@@ -5,7 +5,7 @@ import type { Snapshot } from "./protocol";
 
 const magic = new TextEncoder().encode("KANSNP02");
 
-export function snapshotFrame(snapshot: typeof Snapshot.Type, payload: Uint8Array<ArrayBuffer>) {
+export function snapshotFrameHeader(snapshot: typeof Snapshot.Type) {
   const metadata = new TextEncoder().encode(
     Schema.encodeSync(Schema.fromJsonString(SnapshotFrameMetadata))({
       observedAt: snapshot.observedAt,
@@ -15,7 +15,11 @@ export function snapshotFrame(snapshot: typeof Snapshot.Type, payload: Uint8Arra
   const prefix = new Uint8Array(12);
   prefix.set(magic);
   new DataView(prefix.buffer).setUint32(8, metadata.byteLength, true);
-  return new Blob([prefix, metadata, payload], { type: "application/octet-stream" });
+  return new Blob([prefix, metadata], { type: "application/octet-stream" });
+}
+
+export function snapshotFrame(snapshot: typeof Snapshot.Type, payload: Uint8Array<ArrayBuffer>) {
+  return new Blob([snapshotFrameHeader(snapshot), payload], { type: "application/octet-stream" });
 }
 
 export const readSnapshotFrame = Effect.fn("kannin.readSnapshotFrame")(function* (

@@ -1948,3 +1948,45 @@ The fixed-length variant used the installed native FixedLengthStream and cancell
 A follow-up probe attempted to include observable publication completion by reading the cache observation header after each request. It emitted results but terminated with `ERR_INVALID_STATE: Writer is not bound to a WritableStream` and connection resets during cleanup. That run is excluded from passing performance evidence; it did not establish completed-publication savings or classify a production defect. All writes were to disposable local fixtures. No native deployment or production mutation occurred in these experiments.
 
 The retained implementation remains the original validated byte payload plus Blob frame. The next publication investigation should address how often the full manifest body must be republished, rather than infer complete-path gains from cheaper frame construction alone. Freshness and minimumSequence remain mandatory; no cache lease was extended.
+
+### Grouped publication of unchanged snapshots
+
+The retained Blob framing now groups Cache API publication attempts for unchanged R2 ETags within 500 ms. Revalidation itself is unchanged: every acquisition still checks canonical R2, updates only the memory snapshot with its original before-read observation, and enforces the reader's one-second age and minimumSequence. Changed content, the first attempt and clock rollback publish immediately. A small framed header determines the same byte charge; skipped attempts avoid constructing the full payload Blob. The last-attempt timestamp shares the existing bounded warm entry and disappears on eviction. No canonical format or cache namespace changes.
+
+An older cached frame retains its original observation time; skipping publication does not extend its lease. Cache eviction, unavailability or a failed attempt may cause another isolate to miss and fetch from R2 before the next attempt. This is a tradeoff in publication frequency, not guaranteed savings for every cold-reader workload. New health fields count attempts, frame bytes offered and skips per isolate; they are not confirmed stores, network transfer or billing measurements.
+
+The clean full gate passed 34 Rust and 150 Bun/workerd tests (184 total), with 2,587 Bun assertions. A regression checks grouped unchanged revalidations, continued future-sequence rejection, unchanged-body transfer avoidance, cache eviction/republication and immediate changed-content publication. Existing expired/future ages, body/metadata mismatches, canonical recovery, authentication and independent sequence-barrier tests remain active. Rust/WASM is byte-identical to the previous runtime, SHA-256 `511392d1524482d2f37922d4715123e6c500be9e80da0a9fe6daa37a15b69c9c`; no new ranking implementation or quality result is claimed.
+
+Two local workerd comparisons used small and roughly 5 MiB valid synthetic manifests. Each variant had 28 forced unchanged-ETag acquisitions per size; all 224 total future-barrier responses remained 409, with acknowledged primers retaining exact rows/scores. Original cached payload bytes remained exact. Four warmup pairs were excluded from 28 alternating pairs; the repeat reversed worker creation order. Both variants made 28 R2 reads/revalidations per size and transferred zero R2 body bytes. The baseline adds only publication counters to the previous source.
+
+| Payload | First before/after ms | Repeated before/after ms | First puts before/after | Repeated puts before/after |
+| :------ | --------------------: | -----------------------: | ----------------------: | -------------------------: |
+| small   |          10.74 / 9.87 |              7.16 / 5.37 |                  28 / 1 |                     28 / 0 |
+| large   |         20.14 / 15.38 |            20.50 / 14.01 |                  28 / 2 |                     28 / 1 |
+
+Large-frame bytes offered fell from 146,822,648 to 10,487,332 in the first run and 5,243,666 in the repeat. These probes force invalid future barriers to isolate revalidation; their median improvements do not establish general search latency gains.
+
+Two further comparisons issued eight concurrent acknowledged-sequence queries per variant, 24 alternating burst pairs per size, four excluded warmup pairs and 125 ms cadence outside timing. Both completed 1,536 total queries with exact rows/scores and sequence one. The repeat reversed worker creation order.
+
+| Payload | First burst before/after ms | Repeated burst before/after ms | First puts before/after | Repeated puts before/after |
+| :------ | --------------------------: | -----------------------------: | ----------------------: | -------------------------: |
+| small   |               32.30 / 32.61 |                  31.98 / 32.75 |                  13 / 6 |                     13 / 6 |
+| large   |               32.49 / 31.81 |                  28.43 / 26.42 |                  13 / 5 |                     13 / 5 |
+
+Both steady large-frame runs offered 26,218,330 bytes instead of 68,167,658. Candidate revalidations were eleven versus thirteen reference revalidations due to timing/cadence, not a changed R2-read policy; five of those eleven candidate acquisitions published. The small control regressed about 1% initially and 2% on repetition. Large burst medians improved about 2% initially and 7% on repetition. The repeated result is fewer full-frame publications; it does not prove uniform query gains, native CPU/billing savings or measured peak heap.
+
+Alchemy production deployment and the unconditional Vectorize metadata migration completed. Three native runs used 128 requests at each concurrency in the unchanged read-only million-document, 200-segment corpus. All 1,152 edge responses matched strong rows/scores and acknowledged sequence 2,000. Common/filtered acquisitions remained 22/41 blocks and 731/2,090 compressed bytes.
+
+| Phase          | Concurrency | p50 ms | p95 ms | Requests/s |
+| :------------- | ----------: | -----: | -----: | ---------: |
+| Before         |           1 |  61.08 | 261.60 |      11.22 |
+| Before         |           4 |  63.59 | 546.12 |      27.53 |
+| Before         |          16 |  68.75 | 910.88 |      58.24 |
+| After          |           1 |  51.09 | 101.20 |      14.97 |
+| After          |           4 |  51.82 | 163.52 |      39.92 |
+| After          |          16 |  62.80 | 939.05 |      54.03 |
+| Repeated after |           1 |  49.74 | 232.31 |      11.99 |
+| Repeated after |           4 |  58.80 | 306.03 |      37.64 |
+| Repeated after |          16 |  64.76 | 675.37 |      72.12 |
+
+Repeated medians and p95 improved against the reference, but the first after concurrency-sixteen p95 worsened slightly. Placement, cache/isolate state and client/network conditions were uncontrolled; these operational observations do not establish causal native latency gains. A sampled GRU isolate after the first after run reported 39 R2 acquisitions, 37 revalidations, 21 publication attempts, 18 skips and 114,427,299 offered frame bytes, with a 5,448,863-byte retained payload and 21,795,676 charged bytes. This proves the suppression path executed natively in that isolate; it is not aggregate usage or a before/after billing comparison. Stable native tails, actual peak Worker heap and fully indexed Turbopuffer parity remain outstanding. The README reports the latest repeated phases.

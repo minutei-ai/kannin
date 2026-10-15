@@ -215,10 +215,36 @@ test("concurrent cold edge reads preserve posting order, scores and directory ow
   expect(strong.rows).toEqual(reference.rows);
 });
 
-test("common terms load contiguous posting blocks with one range read per term", async () => {
+test("large gaps between pruned term spans retain separate reads", async () => {
+  const text = `alpha ${Array.from({ length: 64 }, (_, index) => `noise${index}`).join(" ")} zeta`;
   await request(
     worker,
     "posting-ranges",
+    "write",
+    write(
+      Array.from({ length: 512 }, (_, index) => document(String(index).padStart(4, "0"), text)),
+    ),
+  );
+  const before = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  const response = await request(worker, "posting-ranges", "query", textQuery("alpha zeta", 10));
+  expect(response.status).toBe(200);
+  const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+  expect(result.rows.map((row) => row.id)).toEqual(
+    Array.from({ length: 10 }, (_, index) => String(index).padStart(4, "0")),
+  );
+  const after = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(after.rangeReads - before.rangeReads).toBe(6);
+});
+
+test("nearby pruned term spans share a bounded range without decoding gap blocks", async () => {
+  const namespace = "nearby-pruned-postings";
+  await request(
+    worker,
+    namespace,
     "write",
     write(
       Array.from({ length: 512 }, (_, index) =>
@@ -229,19 +255,55 @@ test("common terms load contiguous posting blocks with one range read per term",
   const before = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  const response = await request(
-    worker,
-    "posting-ranges",
-    "query",
-    textQuery("coalesced postings", 10),
-  );
+  const response = await request(worker, namespace, "query", {
+    ...textQuery("coalesced postings", 10),
+    match: "all",
+  });
   expect(response.status).toBe(200);
   const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
   expect(result.rows.map((row) => row.id)).toEqual(
     Array.from({ length: 10 }, (_, index) => String(index).padStart(4, "0")),
   );
+  const timing = response.headers.get("server-timing");
+  expect(timing).toContain('desc="blocks=2"');
+  expect(timing).toContain('ranges=1"');
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(6);
+  expect(after.rangeReads - before.rangeReads).toBe(5);
+});
+
+test("adjacent term spans share one range across acquisition windows", async () => {
+  const namespace = "adjacent-posting-terms";
+  const text = "alpha beta delta epsilon gamma omega";
+  await request(
+    worker,
+    namespace,
+    "write",
+    write(Array.from({ length: 80 }, (_, index) => document(String(index).padStart(4, "0"), text))),
+  );
+  const before = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  const initial = await request(worker, namespace, "query", textQuery(text, 10));
+  expect(initial.headers.get("server-timing")).toContain('ranges=1"');
+  const reference = Schema.decodeUnknownSync(QueryResult)(await initial.json());
+  expect(reference.rows.map((row) => row.id)).toEqual(
+    Array.from({ length: 10 }, (_, index) => String(index).padStart(4, "0")),
+  );
+  const after = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(after.rangeReads - before.rangeReads).toBe(5);
+  for (const match of ["all", "phrase"] as const) {
+    const result = Schema.decodeUnknownSync(QueryResult)(
+      await (await request(worker, namespace, "query", { ...textQuery(text, 10), match })).json(),
+    );
+    expect(result.rows).toEqual(reference.rows);
+    expect(result.sequence).toBe(reference.sequence);
+  }
+  const warm = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(warm.rangeReads - after.rangeReads).toBe(0);
 });

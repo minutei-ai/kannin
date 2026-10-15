@@ -172,7 +172,12 @@ export async function range(key: string, offset: number, length: number) {
       reads.cacheApiHits += 1;
     reads.rangeReads += 1;
     if (!response.ok)
-      throw new Rejected({ status: 503, message: "Committed R2 segment unavailable" });
+      throw new Rejected({
+        status: 503,
+        message: "Committed R2 segment unavailable",
+        upstreamStatus: response.status,
+        upstreamRay: response.headers.get("cf-ray"),
+      });
     const bytes = new Uint8Array(await response.arrayBuffer());
     reads.rangeBytes += bytes.byteLength;
     if (bytes.byteLength !== length)

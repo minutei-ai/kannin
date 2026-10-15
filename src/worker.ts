@@ -432,6 +432,7 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
     decode: 0n,
     score: 0n,
     spans: 0,
+    ranges: 0,
     blocks: 0,
     bytes: 0,
     segments: 0,
@@ -487,62 +488,98 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
                 Match.orElse((hit) => ranker.posting_spans_after(hit.score, hit.id)),
               );
               const requested = yield* decodePostingSpans(encodedSpans);
+              const spans = yield* Effect.forEach(requested, (metadata) =>
+                Effect.gen(function* () {
+                  const first = metadata.blocks[0];
+                  if (first === undefined)
+                    return yield* new Rejected({ status: 503, message: "Empty posting directory" });
+                  const span = { end: first.data.offset };
+                  for (const block of metadata.blocks) {
+                    if (
+                      block.data.offset < span.end ||
+                      block.data.offset - span.end > 4096 ||
+                      block.data.length <= 0
+                    )
+                      return yield* new Rejected({
+                        status: 503,
+                        message: "Invalid posting span gap",
+                      });
+                    span.end = block.data.offset + block.data.length;
+                  }
+                  const start = segment.headerBytes + first.data.offset;
+                  const length = span.end - first.data.offset;
+                  if (
+                    start < segment.headerBytes ||
+                    start + length > segment.bytes ||
+                    length > 16777216
+                  )
+                    return yield* new Rejected({ status: 503, message: "Invalid posting range" });
+                  return {
+                    offset: first.data.offset,
+                    end: span.end,
+                    gaps: 0,
+                    postings: [{ metadata, offset: first.data.offset, length }],
+                  };
+                }),
+              );
+              const groups: typeof spans = [];
+              for (const span of spans) {
+                const previous = groups.at(-1);
+                if (
+                  previous !== undefined &&
+                  span.offset >= previous.end &&
+                  previous.gaps + span.offset - previous.end <= 4096 &&
+                  span.end - previous.offset <= 1048576
+                ) {
+                  previous.gaps += span.offset - previous.end;
+                  previous.end = span.end;
+                  previous.postings.push(...span.postings);
+                } else groups.push(span);
+              }
               for (const offset of Array.from(
-                { length: Math.ceil(requested.length / 4) },
+                { length: Math.ceil(groups.length / 4) },
                 (_, index) => index * 4,
               )) {
-                const window = requested.slice(offset, offset + 4);
+                const window = groups.slice(offset, offset + 4);
                 const acquireStarted = yield* Clock.currentTimeNanos;
-                const loaded = yield* Effect.forEach(
+                const acquiredGroups = yield* Effect.forEach(
                   window,
-                  (metadata) =>
+                  (group) =>
                     Effect.gen(function* () {
-                      const first = metadata.blocks[0];
-                      if (first === undefined)
-                        return yield* new Rejected({
-                          status: 503,
-                          message: "Empty posting directory",
-                        });
-                      const span = { end: first.data.offset };
-                      for (const block of metadata.blocks) {
-                        if (
-                          block.data.offset < span.end ||
-                          block.data.offset - span.end > 4096 ||
-                          block.data.length <= 0
-                        )
-                          return yield* new Rejected({
-                            status: 503,
-                            message: "Invalid posting span gap",
-                          });
-                        span.end = block.data.offset + block.data.length;
-                      }
-                      const start = segment.headerBytes + first.data.offset;
-                      const length = span.end - first.data.offset;
-                      if (
-                        start < segment.headerBytes ||
-                        start + length > segment.bytes ||
-                        length > 16777216
-                      )
-                        return yield* new Rejected({
-                          status: 503,
-                          message: "Invalid posting range",
-                        });
                       const bytes = yield* Effect.tryPromise({
-                        try: () => range(segment.key, start, length),
+                        try: () =>
+                          range(
+                            segment.key,
+                            segment.headerBytes + group.offset,
+                            group.end - group.offset,
+                          ),
                         catch: (cause) => {
                           if (Schema.is(Rejected)(cause)) return cause;
                           return new Cause.UnknownError(cause);
                         },
                       });
-                      return { term: metadata.term, metadata, bytes, offset: first.data.offset };
+                      return {
+                        bytes: bytes.byteLength,
+                        postings: group.postings.map((posting) => ({
+                          term: posting.metadata.term,
+                          metadata: posting.metadata,
+                          bytes: bytes.subarray(
+                            posting.offset - group.offset,
+                            posting.offset - group.offset + posting.length,
+                          ),
+                          offset: posting.offset,
+                        })),
+                      };
                     }),
                   { concurrency: 4 },
                 );
+                const loaded = acquiredGroups.flatMap((group) => group.postings);
                 const acquired = yield* Clock.currentTimeNanos;
                 rankMetrics.acquire += acquired - acquireStarted;
                 rankMetrics.spans += loaded.length;
-                rankMetrics.bytes += loaded.reduce(
-                  (total, posting) => total + posting.bytes.byteLength,
+                rankMetrics.ranges += window.length;
+                rankMetrics.bytes += acquiredGroups.reduce(
+                  (total, group) => total + group.bytes,
                   0,
                 );
                 rankMetrics.blocks += loaded.reduce(
@@ -593,7 +630,7 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
   timings.append("server-timing", `text_rank_prepare;dur=${Number(rankMetrics.prepare) / 1e6}`);
   timings.append(
     "server-timing",
-    `text_posting_acquire;dur=${Number(rankMetrics.acquire) / 1e6};desc="spans=${rankMetrics.spans} bytes=${rankMetrics.bytes}"`,
+    `text_posting_acquire;dur=${Number(rankMetrics.acquire) / 1e6};desc="spans=${rankMetrics.spans} bytes=${rankMetrics.bytes} ranges=${rankMetrics.ranges}"`,
   );
   timings.append(
     "server-timing",

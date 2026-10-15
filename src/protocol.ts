@@ -378,6 +378,8 @@ export const SegmentCacheProps = Schema.Struct({ bucket: TermProjectionProps.fie
 export class Rejected extends Schema.TaggedError<Rejected>()("Rejected", {
   status: Schema.Int,
   message: Schema.String,
+  upstreamStatus: Schema.optional(Schema.Int),
+  upstreamRay: Schema.optional(Schema.NullOr(Schema.String)),
 }) {}
 
 export const VectorSelection = Schema.Struct({

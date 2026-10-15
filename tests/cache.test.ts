@@ -175,7 +175,7 @@ test("concurrent cold edge queries share immutable range acquisition", async () 
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(6);
+  expect(after.rangeReads - before.rangeReads).toBe(5);
 });
 
 test("term projection batches preserve global frequencies and filter eligibility at their boundary", async () => {
@@ -445,8 +445,8 @@ for (const match of ["all", "phrase"] as const)
     const after = Schema.decodeUnknownSync(Health)(
       await (await fetch(new URL("/health", await worker.ready))).json(),
     );
-    if (match === "all") expect(after.rangeReads - before.rangeReads).toBe(33);
-    else expect(after.rangeReads - before.rangeReads).toBe(32);
+    if (match === "all") expect(after.rangeReads - before.rangeReads).toBe(32);
+    else expect(after.rangeReads - before.rangeReads).toBe(31);
     const any = Schema.decodeUnknownSync(QueryResult)(
       await (
         await request(worker, namespace, "query", textQuery("cloudflare rust cloudflare", 100))
@@ -529,7 +529,7 @@ test("immutable query catalogs survive directory eviction without reloading irre
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(4);
+  expect(after.rangeReads - before.rangeReads).toBe(3);
 });
 
 test("cached term bounds prune uncompetitive segments after directory eviction", async () => {
@@ -561,7 +561,7 @@ test("cached term bounds prune uncompetitive segments after directory eviction",
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(4);
+  expect(after.rangeReads - before.rangeReads).toBe(3);
 });
 
 test("term projections keep phrase order, filter eligibility and revisions query scoped", async () => {
@@ -653,7 +653,7 @@ test("segment priority finds the equal-score winner before reading lower-priorit
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(19);
+  expect(after.rangeReads - before.rangeReads).toBe(18);
 });
 
 test("filtered score projections prune headers after directory eviction", async () => {
@@ -684,7 +684,7 @@ test("filtered score projections prune headers after directory eviction", async 
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(4);
+  expect(after.rangeReads - before.rangeReads).toBe(3);
 });
 
 test("ineligible segments still contribute namespace-wide frequencies", async () => {

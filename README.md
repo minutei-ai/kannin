@@ -11,17 +11,17 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 **1,000,000 documents · deployed Cloudflare · client in Brazil · edge reads with acknowledged sequence barrier**
 
-| Concurrency | p50 ms |  p95 ms | Requests/s |
-| ----------: | -----: | ------: | ---------: |
-|           1 |  48.31 |  100.72 |      14.65 |
-|           4 |  61.04 |  290.98 |      38.85 |
-|          16 |  72.46 | 1330.75 |      39.84 |
+| Concurrency | p50 ms | p95 ms | Requests/s |
+| ----------: | -----: | -----: | ---------: |
+|           1 |  54.44 | 218.26 |      11.62 |
+|           4 |  58.28 | 354.24 |      24.61 |
+|          16 |  81.39 | 996.86 |      17.92 |
 
-Two sequential load runs preserved strong baseline rows, scores and sequence in all **768 responses**. The table shows the repeat. The first run had p50 **198/152/162 ms**, p95 **785/1,550/1,497 ms** and a **19.32-second** request, mostly acquiring catalogs, postings and documents. Snapshot cache waits stayed below **300 ms** across both runs, with 26 timeout recoveries through R2. These phases reuse caches and do not establish independent concurrency scaling, peak memory or general Turbopuffer parity.
+Two sequential load runs preserved strong baseline rows, scores and sequence in all **768 responses**. The table shows the repeat. The first run had p50 **66/63/88 ms** and p95 **459/804/982 ms**. The slowest request across both runs took **6.05 seconds**, mostly acquiring postings and documents. Snapshot Cache API intervals reached **465 ms** despite the nominal 250 ms budget; timer scheduling is not a hard real-time guarantee. These phases reuse caches and do not establish independent concurrency scaling, peak memory or general Turbopuffer parity.
 
 Rust now preserves document-length correlation in disposable R2 score summaries. Six fresh strong plans over the unchanged 200-segment corpus ranked **3 segments instead of 200**, preserving complete rows and scores. After alternate-mode warmups, elapsed queries changed **6.17–7.61 seconds→0.29–2.06 seconds**, a **67–96%** reduction in those samples. The first alternate-mode warmup still took **5.10 seconds**. Cache loss recovers through canonical R2; cold catalog acquisition remains a bottleneck. [Measurements and limits](docs/performance.md#correlated-length-bounds-on-immutable-segments).
 
-Catalog acquisition now overlaps four R2 summary reads per window, with a shared body budget. A measured 16-summary strong request changed **2.67→1.51 seconds**, while its edge counterpart regressed **5.62→5.93 seconds** amid slow Cache API access. Snapshot cache lookups now have a **250 ms** foreground budget before canonical R2 recovery. [Experiment and cache tails](docs/performance.md#catalog-acquisition-and-snapshot-cache-wait).
+Catalog acquisition now overlaps four R2 summary reads per window, with a shared body budget. A measured 16-summary strong request changed **2.67→1.51 seconds**, while its edge counterpart regressed **5.62→5.93 seconds** amid slow Cache API access. Snapshot cache lookups now have a **250 ms** foreground budget before canonical R2 recovery. Shared text plans publish through native `waitUntil`, so optional cache writes no longer block row delivery. [Experiment and cache tails](docs/performance.md#catalog-acquisition-and-snapshot-cache-wait).
 
 Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10**, with the complete 300-query report unchanged. The latest native Vectorize visibility probe remained empty through its bounded polling window; provider-backed vector/hybrid validation remains pending.
 
@@ -40,7 +40,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **190 Worker/tooling tests and 38 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **191 Worker/tooling tests and 38 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

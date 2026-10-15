@@ -368,7 +368,17 @@ async function vectorId(epoch: string, id: string, sequence: number) {
   return sha256(`${epoch}\0${id}\0${sequence}`);
 }
 
-async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timings: Headers) {
+const pendingPlanPublications = new Map<string, number>();
+const planPublicationBudget = { bytes: 0 };
+const MAX_PLAN_PUBLICATION_BYTES = 2 * 1024 * 1024;
+const MAX_PLAN_PUBLICATIONS = 16;
+
+async function textQuery(
+  input: typeof Query.Type,
+  root: typeof Root.Type,
+  timings: Headers,
+  ctx: ExecutionContext | DurableObjectState,
+) {
   const started = Effect.runSync(Clock.currentTimeNanos);
   if (input.kind === "vector") return [];
   const words = tokenize(input.text).split(" ").filter(Boolean);
@@ -847,40 +857,51 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
       if (new TextEncoder().encode(encoded).byteLength <= 1024 * 1024) {
         const packed = pack(encoded);
         if (packed.byteLength <= 256 * 1024) {
-          if (shared.cache === undefined)
-            shared.cache = await Effect.runPromise(
-              Effect.tryPromise(() => caches.open("kannin-text-plans-v1")).pipe(
-                Effect.orElseSucceed(() => undefined),
-              ),
-            );
-          if (shared.cache !== undefined) {
-            const cache = shared.cache;
-            const cacheKey = shared.key;
-            const putStarted = Effect.runSync(Clock.currentTimeNanos);
-            const published = await Effect.runPromise(
-              Effect.tryPromise(() =>
-                cache.put(
-                  cacheKey,
-                  new Response(new Uint8Array(packed), {
-                    headers: {
-                      "cache-control": "public, max-age=3600",
-                      "content-type": "application/octet-stream",
-                      "content-length": String(packed.byteLength),
-                    },
-                  }),
+          const cacheKey = shared.key;
+          const identity = cacheKey.href;
+          const charge = packed.byteLength * 4 + identity.length * 4 + 128;
+          if (
+            !pendingPlanPublications.has(identity) &&
+            pendingPlanPublications.size < MAX_PLAN_PUBLICATIONS &&
+            planPublicationBudget.bytes + charge <= MAX_PLAN_PUBLICATION_BYTES
+          ) {
+            pendingPlanPublications.set(identity, charge);
+            planPublicationBudget.bytes += charge;
+            const retainedCache = shared.cache;
+            ctx.waitUntil(
+              Effect.runPromise(
+                Effect.gen(function* () {
+                  const cache = yield* Match.value(retainedCache).pipe(
+                    Match.when(undefined, () =>
+                      Effect.tryPromise(() => caches.open("kannin-text-plans-v1")),
+                    ),
+                    Match.orElse((opened) => Effect.succeed(opened)),
+                  );
+                  yield* Effect.tryPromise(() =>
+                    cache.put(
+                      cacheKey,
+                      new Response(new Uint8Array(packed), {
+                        headers: {
+                          "cache-control": "public, max-age=3600",
+                          "content-type": "application/octet-stream",
+                          "content-length": String(packed.byteLength),
+                        },
+                      }),
+                    ),
+                  );
+                }).pipe(
+                  Effect.ignore,
+                  Effect.ensuring(
+                    Effect.sync(() => {
+                      pendingPlanPublications.delete(identity);
+                      planPublicationBudget.bytes -= charge;
+                    }),
+                  ),
                 ),
-              ).pipe(
-                Effect.as(true),
-                Effect.orElseSucceed(() => false),
               ),
             );
-            const putEnded = Effect.runSync(Clock.currentTimeNanos);
-            timings.append(
-              "server-timing",
-              `text_plan_put;dur=${Number(putEnded - putStarted) / 1e6}`,
-            );
-            if (published) timings.append("server-timing", "text_plan_published");
-          }
+            timings.append("server-timing", "text_plan_publish_scheduled");
+          } else timings.append("server-timing", "text_plan_publish_skipped");
         }
       }
     }
@@ -899,6 +920,7 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
     "server-timing",
     `text_score;dur=${Number(rankMetrics.score) / 1e6};desc="segments=${rankMetrics.segments}"`,
   );
+  const documentsStarted = Effect.runSync(Clock.currentTimeNanos);
   const hits = ranked.slice(0, input.topK);
   const windows = EffectArray.chunksOf(hits, 4).flatMap((window) => {
     const first = window[0];
@@ -974,7 +996,7 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
   const documentsEnded = Effect.runSync(Clock.currentTimeNanos);
   timings.append(
     "server-timing",
-    `text_documents;dur=${Number(documentsEnded - rankingEnded) / 1e6}`,
+    `text_documents;dur=${Number(documentsEnded - documentsStarted) / 1e6}`,
   );
   return rows;
 }
@@ -1171,6 +1193,7 @@ async function query(
   env: Env,
   input: typeof Query.Type,
   manifest: typeof Root.Type,
+  ctx: ExecutionContext | DurableObjectState,
   executions?: TextExecutions,
 ) {
   if (manifest.sequence < (input.minimumSequence ?? 0))
@@ -1178,9 +1201,9 @@ async function query(
   const timings = new Headers();
   if (input.kind === "text") {
     const rows = await Match.value(executions).pipe(
-      Match.when(undefined, () => textQuery(input, manifest, timings)),
+      Match.when(undefined, () => textQuery(input, manifest, timings, ctx)),
       Match.orElse((active) =>
-        active.evaluate(manifest, input, timings, () => textQuery(input, manifest, timings)),
+        active.evaluate(manifest, input, timings, () => textQuery(input, manifest, timings, ctx)),
       ),
     );
     return Response.json(
@@ -1193,7 +1216,7 @@ async function query(
     );
   }
   const [text, vectors] = await Promise.all([
-    textQuery(input, manifest, timings),
+    textQuery(input, manifest, timings, ctx),
     vectorQuery(env, input, manifest, timings),
   ]);
   const scores = new Map<string, typeof Row.Type>();
@@ -1951,7 +1974,13 @@ export class SearchNamespace extends DurableObject<Env> {
             ({ manifest, wait, root }) =>
               Effect.tryPromise({
                 try: async () => {
-                  const response = await query(this.env, input, manifest, this.textExecutions);
+                  const response = await query(
+                    this.env,
+                    input,
+                    manifest,
+                    this.ctx,
+                    this.textExecutions,
+                  );
                   response.headers.append(
                     "server-timing",
                     `query_wait;dur=${wait},query_root;dur=${root}`,
@@ -2643,7 +2672,7 @@ export default {
             const snapshotEnded = yield* Clock.currentTimeNanos;
             if (manifest !== undefined) {
               const evaluated = yield* Effect.tryPromise({
-                try: () => query(env, input, manifest),
+                try: () => query(env, input, manifest, ctx),
                 catch: (cause) => {
                   if (Schema.is(Rejected)(cause)) return cause;
                   return new Cause.UnknownError(cause);

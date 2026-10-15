@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { Schema } from "effect";
+import { Effect, Schema } from "effect";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -48,7 +48,7 @@ test("shared tightened plans survive fresh workerd instances and reject corrupt 
   const expected = Schema.decodeUnknownSync(QueryResult)(await first.json());
   expect(first.headers.get("server-timing")).toContain('text_plan;desc="miss"');
   expect(first.headers.get("server-timing")).toContain('desc="segments=12"');
-  expect(first.headers.get("server-timing")).toContain("text_plan_published");
+  expect(first.headers.get("server-timing")).toContain("text_plan_publish_scheduled");
   const object = await (
     await active.worker.getR2Bucket("STORAGE")
   ).get(`namespaces/${namespace}/root.json`);
@@ -70,7 +70,14 @@ test("shared tightened plans survive fresh workerd instances and reject corrupt 
   cacheKey.searchParams.set("identity", key);
   cacheKey.searchParams.set("version", "kannin-local-test-version");
   const cache = await (await active.worker.getCaches()).open("kannin-text-plans-v1");
-  const frame = await cache.match(cacheKey);
+  const stored = { frame: await cache.match(cacheKey) };
+  for (const attempt of Array.from({ length: 100 }, (_, index) => index)) {
+    if (stored.frame !== undefined) break;
+    if (attempt === 99) throw new Error("Plan publication did not settle");
+    await Effect.runPromise(Effect.sleep("10 millis"));
+    stored.frame = await cache.match(cacheKey);
+  }
+  const frame = stored.frame;
   expect(frame).toBeDefined();
   if (frame === undefined) throw new Error("Missing published plan");
   const bytes = new Uint8Array(await frame.arrayBuffer());

@@ -581,3 +581,32 @@ fn intersections_match_exhaustive_membership_and_phrase_positions()
     );
     Ok(())
 }
+
+#[test]
+fn cutoff_posting_spans_preserve_gap_budgets() -> Result<(), Box<dyn std::error::Error>> {
+    let docs = (0..384)
+        .map(|index| {
+            let text = if (128..256).contains(&index) {
+                format!("alpha {}", "padding ".repeat(1000))
+            } else {
+                "alpha".into()
+            };
+            document(format!("{index:05}"), text)
+        })
+        .collect();
+    let built = segment::build(docs)?;
+    let statistics = statistics(&built.header);
+    let cutoff = segment::bm25(0, 1, 0, 1, &statistics, 384) * 0.9;
+    for gap in [4096, 4097] {
+        let mut header = built.header.clone();
+        let metadata = header.terms.get_mut("alpha").ok_or("Missing term")?;
+        metadata.blocks[0].data.offset = 0;
+        metadata.blocks[0].data.length = 10;
+        metadata.blocks[2].data.offset = 10 + gap;
+        let selected = Search::new(header, statistics.clone(), "alpha", "any", 10, &[], &[])?;
+        let spans = selected.posting_spans_after(cutoff, "")?;
+        assert_eq!(spans.len(), if gap == 4096 { 1 } else { 2 });
+        assert_eq!(spans.iter().map(|span| span.blocks.len()).sum::<usize>(), 2);
+    }
+    Ok(())
+}

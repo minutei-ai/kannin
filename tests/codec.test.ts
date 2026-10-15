@@ -25,6 +25,8 @@ import {
   TermCatalog,
   TermSummaries,
   EligibleMinimum,
+  RankingInput,
+  SegmentHits,
 } from "../src/protocol";
 
 initSync({
@@ -507,4 +509,137 @@ test("retained frequency pages preserve dynamic masks, block ordering and positi
   for (const entry of pages) entry.page.free();
   directory.free();
   segment.free();
+});
+
+test("cutoff posting pages preserve every competitive hit across modes, masks and Unicode ties", () => {
+  const documents = ["😀 alpha beta", "\uE000 beta gamma", "a alpha alpha padding beta"].flatMap(
+    (text, group) =>
+      Array.from({ length: 512 }, (_, index) => ({
+        id: `${text}-${String(index).padStart(4, "0")}`,
+        revision: 1,
+        title: "alpha ".repeat(index % 2),
+        text: `${text} ${"padding ".repeat(index % 17)}`,
+        attributes: { group },
+      })),
+  );
+  using segment = new Segment(
+    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(documents),
+  );
+  const bytes = segment.bytes();
+  const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
+  const base = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
+  using directory = new Directory(bytes);
+  for (const mode of ["any", "all", "phrase"] as const)
+    for (const text of ["alpha beta", "alpha alpha"])
+      for (const dead of [[], [0, 128, 512, 1024]])
+        for (const filters of [[], [{ field: "group", op: "eq", value: 1 }]] as const) {
+          const input = Schema.encodeSync(Schema.fromJsonString(RankingInput))({
+            text,
+            mode,
+            top_k: 100,
+            dead,
+            filters,
+            statistics: {
+              documents: documents.length,
+              title_length: header.total_title_length,
+              body_length: header.total_body_length,
+              frequencies: Object.fromEntries(
+                Object.entries(header.terms).map(([term, metadata]) => [term, metadata.df]),
+              ),
+            },
+          });
+          using full = directory.ranker(input);
+          for (const span of Schema.decodeSync(Schema.fromJsonString(PostingSpans))(
+            full.posting_spans(),
+          ))
+            for (const block of span.blocks)
+              full.add(
+                span.term,
+                bytes.subarray(
+                  base + block.data.offset,
+                  base + block.data.offset + block.data.length,
+                ),
+              );
+          const expected = Schema.decodeSync(Schema.fromJsonString(SegmentHits))(full.finish());
+          for (const score of [
+            0.00001,
+            ...expected.slice(0, 2).flatMap((hit) => [hit.score, hit.score * 2]),
+          ])
+            for (const id of ["", "a", "😀", "\uE000", "\uFFFF"]) {
+              using pruned = directory.ranker(input);
+              for (const span of Schema.decodeSync(Schema.fromJsonString(PostingSpans))(
+                pruned.posting_spans_after(score, id),
+              ))
+                for (const block of span.blocks)
+                  pruned.add(
+                    span.term,
+                    bytes.subarray(
+                      base + block.data.offset,
+                      base + block.data.offset + block.data.length,
+                    ),
+                  );
+              const actual = Schema.decodeSync(Schema.fromJsonString(SegmentHits))(pruned.finish());
+              expect(
+                actual.filter((hit) => hit.score > score || (hit.score === score && hit.id < id)),
+              ).toEqual(
+                expected.filter((hit) => hit.score > score || (hit.score === score && hit.id < id)),
+              );
+            }
+          for (const score of [0, -1, Number.NaN, Number.POSITIVE_INFINITY])
+            expect(() => full.posting_spans_after(score, "a")).toThrow("Invalid ranking cutoff");
+        }
+});
+
+test("cutoff equality uses UTF-16 identifiers before discarding tied pages", () => {
+  using segment = new Segment(
+    JSON.stringify(
+      ["a", "😀", "\uE000"].flatMap((prefix) =>
+        Array.from({ length: 128 }, (_, index) => ({
+          id: `${prefix}-${String(index).padStart(4, "0")}`,
+          text: "alpha beta",
+          attributes: {},
+        })),
+      ),
+    ),
+  );
+  const bytes = segment.bytes();
+  const base = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
+  using directory = new Directory(bytes);
+  using ranker = directory.ranker(
+    Schema.encodeSync(Schema.fromJsonString(RankingInput))({
+      text: "alpha beta",
+      mode: "any",
+      top_k: 100,
+      dead: [],
+      filters: [],
+      statistics: {
+        documents: 384,
+        title_length: 0,
+        body_length: 768,
+        frequencies: { alpha: 384, beta: 384 },
+      },
+    }),
+  );
+  const complete = ranker.posting_spans();
+  for (const span of Schema.decodeSync(Schema.fromJsonString(PostingSpans))(complete))
+    for (const block of span.blocks)
+      ranker.add(
+        span.term,
+        bytes.subarray(base + block.data.offset, base + block.data.offset + block.data.length),
+      );
+  const cutoff = Schema.decodeSync(Schema.fromJsonString(SegmentHits))(ranker.finish())[0];
+  if (cutoff === undefined) throw new Error("Missing cutoff");
+  expect(ranker.posting_spans_after(cutoff.score, "")).toBe("[]");
+  expect(ranker.posting_spans_after(cutoff.score + 1e-13, "")).toBe(complete);
+  expect(ranker.posting_spans_after(cutoff.score + 1e-11, "")).toBe("[]");
+  expect(ranker.posting_spans_after(cutoff.score, "\uFFFF")).toBe(complete);
+  const spans = Schema.decodeSync(Schema.fromJsonString(PostingSpans))(
+    ranker.posting_spans_after(cutoff.score, "😀"),
+  );
+  expect(spans).toHaveLength(2);
+  for (const span of spans) {
+    expect(span.blocks).toHaveLength(1);
+    expect(span.blocks[0].first).toBe(0);
+    expect(span.blocks[0].last).toBe(127);
+  }
 });

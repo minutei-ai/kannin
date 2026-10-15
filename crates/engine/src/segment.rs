@@ -955,6 +955,66 @@ fn validate_search_budget(words: &[String], mode: &str, top_k: usize) -> Result<
 impl Search {
     #[must_use]
     pub fn posting_spans(&self) -> Vec<PostingSpan<'_>> {
+        self.posting_spans_matching(|_| true)
+    }
+
+    #[doc = "# Errors\nRejects non-positive or non-finite cutoff scores."]
+    pub fn posting_spans_after(
+        &self,
+        score: f64,
+        id: &str,
+    ) -> Result<Vec<PostingSpan<'_>>, String> {
+        if !score.is_finite() || score <= 0.0 {
+            return Err("Invalid ranking cutoff".into());
+        }
+        let terms: Vec<_> = self
+            .words
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let scorers: Vec<_> = terms
+            .iter()
+            .map(|term| {
+                TermScorer::new(
+                    &self.statistics,
+                    self.statistics.frequencies.get(*term).copied().unwrap_or(0),
+                )
+            })
+            .collect();
+        let bounds = self.block_bounds(&terms, &scorers);
+        Ok(self.posting_spans_matching(|candidate| {
+            let bound = bounds.iter().fold(0.0, |total, blocks| {
+                let first = blocks.partition_point(|(block, _)| block.last < candidate.first);
+                total
+                    + blocks[first..]
+                        .iter()
+                        .take_while(|(block, _)| block.first <= candidate.last)
+                        .fold(0.0_f64, |maximum, (_, value)| maximum.max(*value))
+            });
+            if bound + 1e-12 < score {
+                return false;
+            }
+            if bound.total_cmp(&score) != Ordering::Equal {
+                return true;
+            }
+            self.allowed[candidate.first as usize..=candidate.last as usize]
+                .iter()
+                .position(|allowed| *allowed)
+                .is_some_and(|offset| {
+                    self.header.documents[candidate.first as usize + offset]
+                        .id
+                        .encode_utf16()
+                        .cmp(id.encode_utf16())
+                        == Ordering::Less
+                })
+        }))
+    }
+
+    fn posting_spans_matching(
+        &self,
+        competitive: impl Fn(&BlockMeta) -> bool,
+    ) -> Vec<PostingSpan<'_>> {
         let unrestricted = self.allowed.iter().all(|allowed| *allowed);
         let terms: BTreeSet<_> = self.words.iter().collect();
         let mut spans: Vec<PostingSpan<'_>> = Vec::new();
@@ -964,10 +1024,11 @@ impl Search {
             };
             let mut blocks: Vec<&BlockMeta> = Vec::new();
             for block in &metadata.blocks {
-                if unrestricted
+                if (unrestricted
                     || self.allowed[block.first as usize..=block.last as usize]
                         .iter()
-                        .any(|allowed| *allowed)
+                        .any(|allowed| *allowed))
+                    && competitive(block)
                 {
                     if blocks.last().is_some_and(|previous| {
                         u64::from(block.data.offset)
@@ -2308,6 +2369,15 @@ pub mod wasm {
             serde_json::to_string(&self.search.posting_spans())
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))
         }
+        #[doc = "# Errors\nRejects invalid cutoffs or posting span serialization errors."]
+        pub fn posting_spans_after(&self, score: f64, id: &str) -> Result<String, JsValue> {
+            let spans = self
+                .search
+                .posting_spans_after(score, id)
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            serde_json::to_string(&spans).map_err(|cause| JsValue::from_str(&cause.to_string()))
+        }
+
         #[doc = "# Errors\nRejects unrequested terms, positional mode, invalid rows/positions, or unordered blocks."]
         pub fn add_frequency(&mut self, term: &str, page: &FrequencyPage) -> Result<(), JsValue> {
             self.search

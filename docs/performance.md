@@ -1663,3 +1663,46 @@ In the repeated run's first measured common query, scoring visited three/two/two
 Reaching 30 segments required ten compactions, reindexing 40,000 document versions into 20,992,712 newly written segment bytes plus 3,012,413 manifest bytes. Reaching eight required six additional compactions, reindexing another 42,000 versions into 22,009,851 segment bytes plus 1,644,530 manifest bytes. Repeated elapsed compaction totals were 11.24 and 10.92 seconds. These counts exclude ingestion, caches, retained old segments and collection; they do not estimate a Cloudflare bill. Manifest size decreased only from 322,722 to 283,639 to 271,443 bytes, since Bloom payloads still represent the corpus.
 
 The automatic compaction policy remains unchanged: the measured selective-query gains did not justify claiming that a lower segment threshold uniformly speeds search or lowers cost. Only disposable local namespaces were modified; the owned native million-document corpus and deployed runtime were untouched by this experiment.
+
+### Global-cutoff posting page pruning before acquisition
+
+Once prior segments fill global top-k, Rust now bounds each requested posting page before acquisition. It sums, in sorted term order, the maximum conservative score of every term block overlapping the candidate row interval. Non-negative term scoring makes this an upper bound on complete rows, including any-mode rows that match only some terms. A page is omitted only below the existing strict-score tolerance, or on exact score equality when its first filter/tombstone-eligible UTF-16 identifier cannot beat the cutoff. Competitive rows retain all contributing pages; incomplete loser scores cannot outrank that global cutoff. Phrase matching, live global statistics, score arithmetic and final merging are unchanged. No cut is available for the first scored segment.
+
+The shared span builder still bounds excluded byte gaps to 4 KiB and acquisitions to the segment/16 MiB limit, with windows of four. New gaps may split spans. A retained span can still include bounded skipped bytes, so omission does not imply every skipped byte avoids acquisition. All loaded pages keep their CRC, varint, position and row-order checks. No cache budget, canonical format or public HTTP input changes.
+
+Two complete workerd comparisons used the same deterministic 50,000 documents at 100/30/8 segments, fourteen alternating pairs of two requests per case and three excluded warmup pairs. The repeat created the candidate Worker first to vary runtime creation order; reported columns remain baseline/candidate. All 1,344 responses retained complete rows/scores and acknowledged sequence across layouts and variants.
+
+| Segments | Case            | First before/after ms | Repeated before/after ms |
+| -------: | :-------------- | --------------------: | -----------------------: |
+|      100 | Rare strong     |           4.44 / 4.88 |              3.83 / 3.88 |
+|      100 | Common strong   |         14.74 / 13.56 |            16.74 / 13.83 |
+|      100 | Filtered strong |         11.75 / 11.37 |            13.13 / 15.26 |
+|      100 | Common edge     |         11.68 / 12.27 |            20.71 / 20.08 |
+|       30 | Rare strong     |           5.90 / 4.80 |              4.06 / 3.70 |
+|       30 | Common strong   |         14.89 / 13.09 |             12.51 / 9.96 |
+|       30 | Filtered strong |         10.25 / 11.99 |              7.71 / 8.37 |
+|       30 | Common edge     |         15.47 / 13.38 |             10.26 / 9.86 |
+|        8 | Rare strong     |           4.65 / 3.23 |              3.49 / 3.49 |
+|        8 | Common strong   |         13.26 / 10.80 |            15.08 / 11.15 |
+|        8 | Filtered strong |         10.09 / 11.48 |            11.36 / 10.84 |
+|        8 | Common edge     |         13.98 / 12.99 |            13.94 / 12.28 |
+
+Common queries at 30 segments acquired 74 rather than 128 blocks and 2,519 rather than 4,372 compressed bytes; at eight segments they acquired 168 rather than 284 blocks and 5,764 rather than 9,758 bytes. The 100-segment common and filtered cases retained their original block counts. These counters include cache hits and are not an R2 billing meter. The repeated large-segment strong common gains were approximately 20–26%, while filtered controls included regressions. Placement/scheduling and changed WASM code layout also affect timing; this establishes scoped page-work reduction rather than a uniform latency improvement.
+
+The complete gate passed 32 Rust and 145 Bun/workerd tests (177 total), with strict lint/typecheck and both Clippy targets. Differential WASM tests compare every competitive returned hit across modes, repeated words, masks, tombstones and Unicode identifiers; a uniform-score fixture exercises exact UTF-16 equality cuts and both sides of the score tolerance. A native Rust fixture verifies new gap splitting at 4,096/4,097 bytes. The workerd regression returns the same winners in any/all/phrase while acquiring twelve instead of twenty-four posting pages. The complete 300-query SciFact report was byte-identical to the validated baseline, retaining every identifier and quality metric. Secret scanning passed. Native Alchemy deployment and the unconditional Vectorize metadata migration succeeded.
+
+Before/after/repeated native loads on the million-document corpus completed 288 exact strong-baseline rows/scores/sequence checks at sequence 2,000. Every common-case observation acquired 178 instead of 378 blocks and 6,097 instead of 12,990 compressed bytes: approximately 53% less measured page acquisition work. Filtered queries retained 188 blocks and 6,377 bytes. Counts include cache hits; span count remained six/three respectively, so no reduction in origin requests, billing or native CPU is inferred from them.
+
+| Run            | Concurrency | p50 ms |  p95 ms | Requests/s |
+| :------------- | ----------: | -----: | ------: | ---------: |
+| Before         |           1 |  83.82 |  325.78 |       6.17 |
+| Before         |           4 |  84.12 |  936.43 |      16.82 |
+| Before         |          16 | 197.49 | 1489.25 |      18.73 |
+| After          |           1 |  80.29 |  315.98 |       6.71 |
+| After          |           4 |  88.74 |  989.54 |      13.57 |
+| After          |          16 | 157.04 | 1498.73 |      16.17 |
+| Repeated after |           1 |  69.38 |  256.27 |       8.52 |
+| Repeated after |           4 |  57.59 |  234.16 |      32.39 |
+| Repeated after |          16 | 140.26 | 1066.76 |      22.33 |
+
+The repeated load improved all medians/tails against this reference, but the initial candidate worsened concurrency-four median/tail and concurrency-sixteen tail. Cache/isolate/network placement was uncontrolled; stable native latency and causal CPU attribution remain unproved. Page acquisition reduction is separately observed in every phase. The README shows the repeated values. Peak Worker heap, fully indexed Turbopuffer parity and general ANN/hybrid recall remain separate outstanding gates.

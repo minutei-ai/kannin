@@ -440,8 +440,8 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
       })
     )
       continue;
+    const cutoff = ranked[input.topK - 1];
     if (ranked.length === input.topK) {
-      const cutoff = ranked[ranked.length - 1];
       if (cutoff === undefined)
         throw new Rejected({ status: 503, message: "Invalid ranking cutoff" });
       if (
@@ -473,8 +473,12 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
           (ranker) =>
             Effect.gen(function* () {
               rankMetrics.prepare += (yield* Clock.currentTimeNanos) - prepareStarted;
+              const encodedSpans = Match.value(cutoff).pipe(
+                Match.when(undefined, () => ranker.posting_spans()),
+                Match.orElse((hit) => ranker.posting_spans_after(hit.score, hit.id)),
+              );
               const requested = yield* Schema.decodeEffect(Schema.fromJsonString(PostingSpans))(
-                ranker.posting_spans(),
+                encodedSpans,
               );
               for (const offset of Array.from(
                 { length: Math.ceil(requested.length / 4) },

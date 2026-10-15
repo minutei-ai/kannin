@@ -910,3 +910,36 @@ test("decoded frequency pages share the range budget and keep tombstones query-l
   );
   expect(rebuilt.rows).toEqual(changed.rows);
 });
+
+test("a prior segment cutoff rejects noncompetitive posting pages before acquisition", async () => {
+  const namespace = "cutoff-posting-pages";
+  for (const [index, prefix] of ["a", "c", "d"].entries()) {
+    const rows = Array.from({ length: 499 }, (_, row) =>
+      document(`${prefix}${String(row).padStart(4, "0")}`, "alpha beta"),
+    );
+    if (index === 0)
+      rows.splice(
+        0,
+        10,
+        ...Array.from({ length: 10 }, (_, row) =>
+          document(`a${String(row).padStart(4, "0")}`, "alpha beta ".repeat(8)),
+        ),
+      );
+    rows.push(
+      document(`${prefix}z`, `${"alpha beta ".repeat(64 - index * 16)}${"padding ".repeat(5000)}`),
+    );
+    expect((await request(worker, namespace, "write", write(rows))).status).toBe(200);
+  }
+  for (const match of ["any", "all", "phrase"] as const) {
+    const response = await request(worker, namespace, "query", {
+      ...textQuery("alpha beta"),
+      match,
+    });
+    expect(response.status).toBe(200);
+    const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+    expect(result.rows.map((row) => row.id)).toEqual(
+      Array.from({ length: 10 }, (_, row) => `a${String(row).padStart(4, "0")}`),
+    );
+    expect(response.headers.get("server-timing")).toContain("blocks=12");
+  }
+});

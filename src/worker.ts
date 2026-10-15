@@ -155,6 +155,15 @@ const decodeRoot = Schema.decodeSync(Schema.fromJsonString(Root));
 const encodeRoot = Schema.encodeSync(Schema.fromJsonString(Root));
 const decodeLog = Schema.decodeSync(Schema.fromJsonString(Log));
 const encodeLog = Schema.encodeSync(Schema.fromJsonString(Log));
+const decodeQuery = Schema.decodeEffect(Schema.fromJsonString(Query), {
+  onExcessProperty: "error",
+});
+const encodeQueryResult = Schema.encodeSync(QueryResult);
+const decodePostingSpans = Schema.decodeEffect(Schema.fromJsonString(PostingSpans));
+const decodeSegmentHits = Schema.decodeEffect(Schema.fromJsonString(SegmentHits));
+const encodeRankingInput = Schema.encodeSync(Schema.fromJsonString(RankingInput));
+const isNamespaceName = Schema.is(NamespaceName);
+const isOperation = Schema.is(Operation);
 export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Encoded> {
   override async fetch(request: Request) {
     const props = Schema.decodeExit(TermProjectionProps)(this.ctx.props);
@@ -453,7 +462,7 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
     if (compilation.query === undefined)
       compilation.query = plans.use(
         new PreparedQuery(
-          Schema.encodeSync(Schema.fromJsonString(RankingInput))({
+          encodeRankingInput({
             text: input.text,
             mode: input.match ?? "any",
             top_k: input.topK,
@@ -477,9 +486,7 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
                 Match.when(undefined, () => ranker.posting_spans_seeded()),
                 Match.orElse((hit) => ranker.posting_spans_after(hit.score, hit.id)),
               );
-              const requested = yield* Schema.decodeEffect(Schema.fromJsonString(PostingSpans))(
-                encodedSpans,
-              );
+              const requested = yield* decodePostingSpans(encodedSpans);
               for (const offset of Array.from(
                 { length: Math.ceil(requested.length / 4) },
                 (_, index) => index * 4,
@@ -563,9 +570,7 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
                 rankMetrics.decode += (yield* Clock.currentTimeNanos) - acquired;
               }
               const scoreStarted = yield* Clock.currentTimeNanos;
-              const hits = yield* Schema.decodeEffect(Schema.fromJsonString(SegmentHits))(
-                ranker.finish(),
-              );
+              const hits = yield* decodeSegmentHits(ranker.finish());
               rankMetrics.score += (yield* Clock.currentTimeNanos) - scoreStarted;
               rankMetrics.segments += 1;
               return hits;
@@ -873,7 +878,7 @@ async function query(env: Env, input: typeof Query.Type, manifest: typeof Root.T
   if (input.kind === "text") {
     const rows = await textQuery(input, manifest, timings);
     return Response.json(
-      Schema.encodeSync(QueryResult)({
+      encodeQueryResult({
         rows,
         sequence: manifest.sequence,
         consistency: input.consistency ?? "strong",
@@ -900,7 +905,7 @@ async function query(env: Env, input: typeof Query.Type, manifest: typeof Root.T
     })
     .slice(0, input.topK);
   return Response.json(
-    Schema.encodeSync(QueryResult)({
+    encodeQueryResult({
       rows,
       sequence: manifest.sequence,
       consistency: "vectorize-eventual",
@@ -1546,7 +1551,7 @@ export class SearchNamespace extends DurableObject<Env> {
     const parts = new URL(request.url).pathname.split("/");
     const operation = parts.at(-1);
     const namespace = parts[3];
-    if (!Schema.is(NamespaceName)(namespace))
+    if (!isNamespaceName(namespace))
       return Promise.resolve(
         Response.json(Schema.encodeSync(ErrorBody)({ error: "Invalid namespace" }), {
           status: 400,
@@ -1603,9 +1608,7 @@ export class SearchNamespace extends DurableObject<Env> {
             });
           }
           if (operation === "query") {
-            const input = yield* Schema.decodeEffect(Schema.fromJsonString(Query), {
-              onExcessProperty: "error",
-            })(body.text).pipe(
+            const input = yield* decodeQuery(body.text).pipe(
               Effect.mapError(
                 () => new Rejected({ status: 400, message: "Invalid query contract" }),
               ),
@@ -1881,9 +1884,7 @@ async function acquireSnapshot(
   if ("body" in object) {
     snapshotMetrics.snapshotR2BodyBytes += object.size;
     const payload = new Uint8Array(await object.arrayBuffer());
-    selected.manifest = Schema.decodeSync(Schema.fromJsonString(Root))(
-      new TextDecoder().decode(payload),
-    );
+    selected.manifest = decodeRoot(new TextDecoder().decode(payload));
     selected.payload = payload;
   } else {
     if (previous === undefined || previous.etag !== object.etag)
@@ -2178,7 +2179,7 @@ export default {
       });
     }
     const match = /^\/v1\/namespaces\/([^/]+)\/([^/]+)$/.exec(url.pathname);
-    if (match === null || !Schema.is(NamespaceName)(match[1]) || !Schema.is(Operation)(match[2]))
+    if (match === null || !isNamespaceName(match[1]) || !isOperation(match[2]))
       return Response.json(Schema.encodeSync(ErrorBody)({ error: "Unknown route" }), {
         status: 404,
       });
@@ -2204,9 +2205,7 @@ export default {
       Effect.gen(function* () {
         if (operation === "query") {
           const body = yield* readBody(request.clone());
-          const input = yield* Schema.decodeEffect(Schema.fromJsonString(Query), {
-            onExcessProperty: "error",
-          })(body).pipe(
+          const input = yield* decodeQuery(body).pipe(
             Effect.mapError(() => new Rejected({ status: 400, message: "Invalid query contract" })),
           );
           if (input.consistency === "edge-eventual") {

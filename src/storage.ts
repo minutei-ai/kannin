@@ -70,6 +70,16 @@ const bloomBatches = new Map<string, { batch: BloomBatch; bytes: number; prefix:
 const bloomBudget = { bytes: 0 };
 const strings = Schema.fromJsonString(Schema.Array(Schema.String));
 const encodeStrings = Schema.encodeSync(strings);
+const decodeTermCatalog = Schema.decodeEffect(Schema.fromJsonString(TermCatalog));
+const overviewBatchJson = Schema.fromJsonString(OverviewBatch);
+const decodeOverviewBatch = Schema.decodeEffect(overviewBatchJson);
+const encodeOverviewBatch = Schema.encodeEffect(overviewBatchJson);
+const decodeTermSummaries = Schema.decodeEffect(Schema.fromJsonString(TermSummaries));
+const decodeEligibleMinimum = Schema.decodeEffect(Schema.fromJsonString(EligibleMinimum));
+const decodeTermCatalogBatch = Schema.decodeEffect(Schema.fromJsonString(TermCatalogBatch));
+const storedDocumentJson = Schema.fromJsonString(StoredDocument);
+const decodeStoredDocument = Schema.decodeSync(storedDocumentJson);
+const decodeStoredDocumentEffect = Schema.decodeEffect(storedDocumentJson);
 
 function evictFor(bytes: number) {
   while (budget.bytes + frequencyBudget.bytes + bytes > MAX_CACHE_BYTES) {
@@ -266,7 +276,7 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
         const catalog = yield* Effect.try(() =>
           segment_overview_project(bytes, terms, filters),
         ).pipe(
-          Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(TermCatalog))),
+          Effect.flatMap(decodeTermCatalog),
           Effect.orElseSucceed(() => undefined),
         );
         if (catalog === undefined) {
@@ -298,7 +308,7 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
         );
         if (cached !== undefined) {
           const candidate = yield* Effect.tryPromise(() => cached.text()).pipe(
-            Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(OverviewBatch))),
+            Effect.flatMap(decodeOverviewBatch),
             Effect.orElseSucceed(() => undefined),
           );
           if (candidate !== undefined && candidate.length === ranges.length) {
@@ -306,7 +316,7 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
               candidate,
               (bytes) =>
                 Effect.try(() => segment_overview_project(bytes, terms, filters)).pipe(
-                  Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(TermCatalog))),
+                  Effect.flatMap(decodeTermCatalog),
                 ),
               { concurrency: 1 },
             ).pipe(Effect.orElseSucceed(() => undefined));
@@ -343,10 +353,10 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
           const projection = yield* withDirectory(input.key, input.headerBytes, (directory) =>
             Effect.gen(function* () {
               const dictionary = yield* Effect.try(() => directory.summary(terms)).pipe(
-                Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(TermSummaries))),
+                Effect.flatMap(decodeTermSummaries),
               );
               const minimum = yield* Effect.try(() => directory.minimum(filters)).pipe(
-                Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(EligibleMinimum))),
+                Effect.flatMap(decodeEligibleMinimum),
               );
               const bytes = yield* Effect.try(() => directory.overview()).pipe(
                 Effect.orElseSucceed(() => undefined),
@@ -374,7 +384,7 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
         if (admission.enabled) sources.push(bytes);
       }
       if (cache !== undefined && admission.enabled) {
-        const encoded = yield* Schema.encodeEffect(Schema.fromJsonString(OverviewBatch))(sources);
+        const encoded = yield* encodeOverviewBatch(sources);
         yield* Effect.tryPromise(() =>
           cache.put(
             cacheKey,
@@ -494,9 +504,7 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
                   status: 503,
                   message: "Immutable term catalog unavailable",
                 });
-              const catalogs = yield* Schema.decodeEffect(Schema.fromJsonString(TermCatalogBatch))(
-                text,
-              );
+              const catalogs = yield* decodeTermCatalogBatch(text);
               if (catalogs.length !== group.entries.length)
                 return yield* new Rejected({
                   status: 503,
@@ -654,7 +662,7 @@ export async function readDocument(
   if (payload !== undefined) page.bytes = payload.subarray(data.offset, data.offset + data.length);
   else page.bytes = await range(key, offset, data.length);
   const bytes = page.bytes;
-  return Schema.decodeSync(Schema.fromJsonString(StoredDocument))(segment_document(bytes));
+  return decodeStoredDocument(segment_document(bytes));
 }
 
 export const readDocuments = Effect.fn("raio.readDocuments")(function* (
@@ -711,7 +719,7 @@ export const readDocuments = Effect.fn("raio.readDocuments")(function* (
         try: () => segment_document(frame),
         catch: (cause) => new Cause.UnknownError(cause),
       });
-      const document = yield* Schema.decodeEffect(Schema.fromJsonString(StoredDocument))(encoded);
+      const document = yield* decodeStoredDocumentEffect(encoded);
       remember(
         `${env.STORAGE_CACHE_SCOPE}:${key}/${headerBytes + page.offset}/${page.length}`,
         frame,

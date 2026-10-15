@@ -777,3 +777,76 @@ test("cached negative filter eligibility avoids all directory and posting reads"
   );
   expect(changed.rows.map((row) => row.id)).toEqual(["a"]);
 });
+
+test("retained Bloom candidates stay bounded across root updates and namespace rebuilds", async () => {
+  const namespace = "retained-bloom-lifecycle";
+  await request(worker, namespace, "write", write([document("a", "alpha"), document("b", "beta")]));
+  const input = { ...textQuery("alpha"), consistency: "edge-eventual", minimumSequence: 1 };
+  for (const _iteration of [0, 1, 2]) {
+    const result = Schema.decodeUnknownSync(QueryResult)(
+      await (await request(worker, namespace, "query", input)).json(),
+    );
+    expect(result.rows.map((row) => row.id)).toEqual(["a"]);
+  }
+  await request(
+    worker,
+    namespace,
+    "write",
+    write([document("a", "gamma"), document("c", "alpha")], ["b"]),
+  );
+  const updated = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", { ...input, minimumSequence: 2 })).json(),
+  );
+  expect(updated.rows.map((row) => row.id)).toEqual(["c"]);
+  await request(worker, namespace, "rebuild", {});
+  const rebuilt = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", { ...input, minimumSequence: 2 })).json(),
+  );
+  expect(rebuilt.rows).toEqual(updated.rows);
+  const health = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(health.bloomCacheBytes).toBeLessThanOrEqual(4 * 1024 * 1024);
+});
+
+test("document Bloom windows preserve newest revisions across partial sixty-four-segment boundaries", async () => {
+  const namespace = "document-bloom-boundaries";
+  for (const index of Array.from({ length: 130 }, (_, ordinal) => ordinal))
+    await request(
+      worker,
+      namespace,
+      "write",
+      write([document(String(index).padStart(3, "0"), "source common", { group: index })]),
+    );
+  await request(
+    worker,
+    namespace,
+    "write",
+    write(
+      [0, 64, 129].map((index) =>
+        document(String(index).padStart(3, "0"), "replacement common", { group: index }),
+      ),
+      ["001", "065", "128"],
+    ),
+  );
+  const replacements = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", textQuery("replacement"))).json(),
+  );
+  expect(replacements.rows.map((row) => row.id)).toEqual(["000", "064", "129"]);
+  const retired = Schema.decodeUnknownSync(QueryResult)(
+    await (
+      await request(
+        worker,
+        namespace,
+        "query",
+        textQuery("source", 10, [{ field: "group", op: "in", value: [0, 1, 64, 65, 128, 129] }]),
+      )
+    ).json(),
+  );
+  expect(retired.rows).toEqual([]);
+  const metadata = Schema.decodeUnknownSync(Metadata)(
+    await (await request(worker, namespace, "metadata")).json(),
+  );
+  expect(metadata.documents).toBe(127);
+  expect(metadata.cache.bloomCacheBytes).toBeLessThanOrEqual(4 * 1024 * 1024);
+});

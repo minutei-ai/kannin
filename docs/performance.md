@@ -1509,3 +1509,38 @@ Native deployment and the Vectorize metadata migration succeeded. The complete 3
 | Absent filter     |            396.57 |             565.98 |           1028.49 |            1453.25 |
 
 Every warmed case's client latency worsened in this post-deploy observation, including the absent-filter case where no heap scoring occurs. Placement/cache state was uncontrolled, and the data does not establish an isolated heap-induced regression or a whole-query gain. The local scorer/pipeline improvements remain distinct evidence. A subsequent standard rare/selective/common/filtered load completed 96 exact responses at concurrency 1/4/16: p50 94.71/76.49/366.60 ms, p95 384.56/1121.28/1523.95 ms and throughput 4.75/12.50/16.99 requests/s. Those latest standard values appear in the README. Stable native whole-query latency and actual peak-memory attribution remain outstanding; snapshot/Bloom acquisition and lifecycle work remain important investigation targets.
+
+### Retained Rust Bloom batches
+
+The earlier path cached decoded bitsets in JavaScript but repacked them and transferred their bytes into WASM on every query. Immutable BloomBatch handles now own packed bytes/offsets inside Rust. The same membership reader, hashes, offset checks and false-positive behavior apply. A charged 4 MiB LRU includes retained bytes, native layout, cache-key/prefix strings and entry overhead. Physical bucket, field and ordered immutable segment keys identify each batch. Manifest replacement does not lose unchanged-segment reuse; eviction/rebuild frees handles. Oversized batches use scoped temporary ownership. Canonical R2 and private snapshot formats are unchanged.
+
+The initial manifest-object-identity prototype was rejected: a reused large bitmap across new manifests incurred a 362.41 ms first-query median versus 35.14 ms for the prior content cache. The retained implementation uses immutable segment identity instead. Document lookup now walks aligned sixty-four-segment windows newest first, preserving per-window reverse order and partial newest-window handling. The final gate passed 31 Rust and 136 Bun/workerd tests, including retained byte ownership/invalid framing, root updates/rebuild and replacement/deletion across 130 segments.
+
+A local WASM comparison used six fixtures: 1/64 bitsets at 8/10,000/40,000 bytes each, twenty-five alternating pairs of forty repetitions and five excluded warmup pairs. Membership output was identical in every repetition. With 64 ten-thousand-byte bitsets, repeated-call median fell from 0.08466 to 0.02635 ms; with 64 forty-thousand-byte bitsets it fell from 0.22344 to 0.02185 ms. These measurements exclude cold construction and demonstrate avoided host transfer, not whole-query or native CPU savings.
+
+Two local workerd comparisons exercised small and 2 MiB synthetic bitmaps with ten alternating baseline/candidate pairs, two excluded warmup pairs and sixteen-query bursts after rehydrating the same canonical point-in-time manifest through Cache API. Large fixtures varied their final bitmap byte across pairs to ensure true initial misses; selected document membership stayed positive. The frame rehydration preserves original observation-age enforcement and creates new decoded manifest objects. All 1,440 queries preserved complete rows/scores and acknowledged sequence, and charged Bloom memory stayed within 4 MiB.
+
+| Fixture | First before/after burst ms | Repeated before/after burst ms | First before/after initial query ms | Repeated before/after initial query ms |
+| :------ | --------------------------: | -----------------------------: | ----------------------------------: | -------------------------------------: |
+| Small   |               59.05 / 53.64 |                  55.08 / 57.17 |                       28.88 / 24.53 |                          39.84 / 31.09 |
+| Large   |               53.21 / 40.52 |                  52.70 / 37.11 |                     305.84 / 284.04 |                        283.49 / 284.29 |
+
+The large rehydrated-burst gain repeated at 23.9% and 29.6%; its initial-query repetition was near neutral. The small burst regressed 3.8% in the repetition. This is scoped local evidence, not a uniform latency improvement or actual peak-memory proof.
+
+Native deployment and the Vectorize metadata migration succeeded. The 300-query SciFact report remained byte-identical to the prior validated report. Before/after/repeated native loads completed 288 exact strong-baseline comparisons on the million-document corpus at sequence 2,000.
+
+| Run            | Concurrency | p50 ms |  p95 ms | Requests/s |
+| :------------- | ----------: | -----: | ------: | ---------: |
+| Before         |           1 |  76.84 |  306.54 |       5.48 |
+| Before         |           4 | 101.67 | 1504.83 |       9.97 |
+| Before         |          16 | 346.19 | 1323.97 |      13.37 |
+| After          |           1 | 109.64 |  535.03 |       4.88 |
+| After          |           4 |  88.68 |  944.95 |      15.23 |
+| After          |          16 | 130.32 | 1558.23 |      16.66 |
+| Repeated after |           1 |  86.44 |  193.78 |       9.80 |
+| Repeated after |           4 |  87.74 |  908.45 |      14.17 |
+| Repeated after |          16 | 223.05 | 1708.32 |      15.69 |
+
+Concurrency-four medians/tails and concurrency-sixteen medians improved in both candidate loads, but concurrency-one medians and concurrency-sixteen tails regressed. Placement/cache state was uncontrolled. The retained implementation removes demonstrated transfer/repacking work; it does not establish a universal native latency improvement. A native health observation charged 2,146,752 Bloom bytes and 21,795,676 snapshot bytes, with 5,448,863 retained snapshot payload bytes. These are separate bounded cache charges, not actual peak memory.
+
+An additional native Vectorize fixture wrote 130 documents individually, with three identical vectors. It did not observe all expected identifiers within forty visibility probes; cleanup acknowledged deletion and metadata confirmed zero live documents. Native compaction reduced this namespace to 32 segments, so it does not establish native 130-segment boundary coverage. A separate three-document fixture used distinct cosine vectors and explicit synchronization, then verified the three expected identifiers and each group filter against real Vectorize. Unfiltered readiness occurred at probe nineteen, and filtered readiness required retries. All temporary documents were removed and zero live documents confirmed. The API documents [asynchronous Vectorize upserts](https://developers.cloudflare.com/vectorize/reference/client-api/); these observations establish neither a general visibility deadline nor ANN recall. The local 130-segment test separately covers exact revision/deletion boundaries.

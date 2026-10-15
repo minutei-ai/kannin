@@ -12,6 +12,7 @@ import {
   segment_overview_project,
   Segment,
   Directory,
+  BloomBatch,
 } from "../dist/wasm/raio_engine";
 import {
   StoredDocument,
@@ -312,4 +313,28 @@ test("WASM term bounds preserve order, empty eligibility and batch limits", () =
       JSON.stringify(Array.from({ length: 65 }, () => ({ dictionary, minimum: null }))),
     ),
   ).toThrow("Term bound batch exceeds segment budget");
+});
+
+test("retained Bloom batches own their bytes and preserve direct-reader validation", () => {
+  const first = segment_bloom('["ação","日本語"]');
+  const second = segment_bloom('["rust","café"]');
+  const bytes = new Uint8Array([...first, ...second]);
+  const offsets = new Uint32Array([0, first.length, bytes.length, bytes.length]);
+  const batch = new BloomBatch(bytes, offsets);
+  expect(batch.heap_bytes()).toBeGreaterThanOrEqual(bytes.length + offsets.byteLength);
+  for (const values of ['["ação","日本語","rust","café"]', '["absent"]', "[]"])
+    expect(batch.filter(values)).toBe(segment_bloom_filter_many(bytes, offsets, values));
+  bytes.fill(0);
+  offsets.fill(0);
+  expect(JSON.parse(batch.filter('["ação","rust"]'))).toEqual([["ação"], ["rust"], []]);
+  expect(() => batch.filter("[1]")).toThrow();
+  expect(JSON.parse(batch.filter('["café"]'))).toEqual([[], ["café"], []]);
+  batch.free();
+  for (const invalid of [
+    new Uint32Array([]),
+    new Uint32Array([1, 0]),
+    new Uint32Array([0, 1]),
+    new Uint32Array(66),
+  ])
+    expect(() => new BloomBatch(new Uint8Array(0), invalid)).toThrow();
 });

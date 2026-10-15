@@ -6,10 +6,10 @@ import {
   Directory,
   segment_document,
   segment_bloom,
-  segment_bloom_filter_many,
+  BloomBatch,
   segment_overview_project,
 } from "../dist/wasm/raio_engine";
-import type { DataRange, TermProjectionRange } from "./protocol";
+import type { DataRange, TermProjectionRange, Root } from "./protocol";
 import {
   StoredDocument,
   SegmentHeader,
@@ -61,7 +61,7 @@ const reads = {
   workerCacheMisses: 0,
   cacheApiHits: 0,
 };
-const bloomBuffers = new Map<string, Uint8Array>();
+const bloomBatches = new Map<string, { batch: BloomBatch; bytes: number; prefix: string }>();
 const bloomBudget = { bytes: 0 };
 const strings = Schema.fromJsonString(Schema.Array(Schema.String));
 const encodeStrings = Schema.encodeSync(strings);
@@ -501,31 +501,37 @@ export function bloom(values: ReadonlyArray<string>) {
   return btoa(Array.from(bytes, (byte) => String.fromCharCode(byte)).join(""));
 }
 
-export function bloomCandidates(encoded: ReadonlyArray<string>, values: ReadonlyArray<string>) {
+export function bloomCandidates(
+  segments: Readonly<typeof Root.Type.segments>,
+  values: ReadonlyArray<string>,
+  field: "termBloom" | "documentBloom",
+  start = 0,
+  count = segments.length,
+) {
   const input = encodeStrings(values);
   const selected = [];
   for (const offset of Array.from(
-    { length: Math.ceil(encoded.length / 64) },
-    (_, index) => index * 64,
+    { length: Math.ceil(Math.min(count, segments.length - start) / 64) },
+    (_, index) => start + index * 64,
   )) {
-    const bitsets = encoded.slice(offset, offset + 64).map((value) => {
-      const cached = bloomBuffers.get(value);
-      if (cached !== undefined) {
-        bloomBuffers.delete(value);
-        bloomBuffers.set(value, cached);
-        return cached;
-      }
-      const bytes = Uint8Array.from(atob(value), (character) => character.charCodeAt(0));
-      bloomBuffers.set(value, bytes);
-      bloomBudget.bytes += bytes.byteLength;
-      while (bloomBudget.bytes > 4 * 1024 * 1024) {
-        const oldest = bloomBuffers.entries().next().value;
-        if (oldest === undefined) break;
-        bloomBuffers.delete(oldest[0]);
-        bloomBudget.bytes -= oldest[1].byteLength;
-      }
-      return bytes;
-    });
+    const window = segments.slice(offset, Math.min(offset + 64, start + count));
+    const first = window[0];
+    if (first === undefined) throw new Rejected({ status: 503, message: "Empty Bloom batch" });
+    const key = `${env.STORAGE_CACHE_SCOPE}:${field}:${encodeStrings(window.map((segment) => segment.key))}`;
+    const cached = bloomBatches.get(key);
+    if (cached !== undefined) {
+      bloomBatches.delete(key);
+      bloomBatches.set(key, cached);
+      selected.push(
+        ...Schema.decodeSync(Schema.fromJsonString(Schema.Array(Schema.Array(Schema.String))))(
+          cached.batch.filter(input),
+        ),
+      );
+      continue;
+    }
+    const bitsets = window.map((segment) =>
+      Uint8Array.from(atob(segment[field]), (character) => character.charCodeAt(0)),
+    );
     const packed = new Uint8Array(bitsets.reduce((total, bytes) => total + bytes.byteLength, 0));
     const offsets = new Uint32Array(bitsets.length + 1);
     const layout = { offset: 0 };
@@ -535,11 +541,46 @@ export function bloomCandidates(encoded: ReadonlyArray<string>, values: Readonly
       layout.offset += bytes.byteLength;
     }
     offsets[bitsets.length] = layout.offset;
-    selected.push(
-      ...Schema.decodeSync(Schema.fromJsonString(Schema.Array(Schema.Array(Schema.String))))(
-        segment_bloom_filter_many(packed, offsets, input),
-      ),
-    );
+    const batch = new BloomBatch(packed, offsets);
+    const bytes =
+      batch.heap_bytes() +
+      (new TextEncoder().encode(key).byteLength + new TextEncoder().encode(first.key).byteLength) *
+        4 +
+      128;
+    if (bytes <= 4 * 1024 * 1024) {
+      while (bloomBudget.bytes + bytes > 4 * 1024 * 1024) {
+        const oldest = bloomBatches.entries().next().value;
+        if (oldest === undefined) break;
+        bloomBatches.delete(oldest[0]);
+        bloomBudget.bytes -= oldest[1].bytes;
+        oldest[1].batch.free();
+      }
+      bloomBatches.set(key, { batch, bytes, prefix: first.key });
+      bloomBudget.bytes += bytes;
+    }
+    if (bytes > 4 * 1024 * 1024) {
+      selected.push(
+        ...Effect.runSync(
+          Effect.acquireUseRelease(
+            Effect.succeed(batch),
+            (borrowed) =>
+              Effect.sync(() => borrowed.filter(input)).pipe(
+                Effect.flatMap(
+                  Schema.decodeEffect(
+                    Schema.fromJsonString(Schema.Array(Schema.Array(Schema.String))),
+                  ),
+                ),
+              ),
+            (borrowed) => Effect.sync(() => borrowed.free()),
+          ),
+        ),
+      );
+    } else
+      selected.push(
+        ...Schema.decodeSync(Schema.fromJsonString(Schema.Array(Schema.Array(Schema.String))))(
+          batch.filter(input),
+        ),
+      );
   }
   return selected;
 }
@@ -643,6 +684,12 @@ export function clearImmutableCache(prefix: string) {
     if (key.startsWith(`${identity}/`)) {
       buffers.delete(key);
       budget.bytes -= bytes.byteLength;
+    }
+  for (const [key, entry] of bloomBatches)
+    if (key.startsWith(`${env.STORAGE_CACHE_SCOPE}:`) && entry.prefix.startsWith(`${prefix}/`)) {
+      bloomBatches.delete(key);
+      bloomBudget.bytes -= entry.bytes;
+      entry.batch.free();
     }
   for (const [key, entry] of directories)
     if (key.startsWith(`${identity}/`)) {

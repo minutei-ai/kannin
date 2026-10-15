@@ -281,18 +281,20 @@ const readBody = Effect.fn("raio.readBody")(function* (request: Pick<Request, "h
 
 async function locate(ids: ReadonlyArray<string>, root: typeof Root.Type) {
   const found = new Map<string, typeof Located.Type>();
-  const ordered = root.segments.toReversed();
   for (const offset of Array.from(
-    { length: Math.ceil(ordered.length / 64) },
-    (_, index) => index * 64,
+    { length: Math.ceil(root.segments.length / 64) },
+    (_, index) => (Math.ceil(root.segments.length / 64) - index - 1) * 64,
   )) {
-    const segments = ordered.slice(offset, offset + 64);
+    const segments = root.segments.slice(offset, offset + 64).toReversed();
     const remaining = ids.filter((id) => !found.has(id));
     if (remaining.length === 0) break;
     const matches = bloomCandidates(
-      segments.map((segment) => segment.documentBloom),
+      root.segments,
       remaining,
-    );
+      "documentBloom",
+      offset,
+      64,
+    ).toReversed();
     for (const [index, segment] of segments.entries()) {
       const selected = matches[index];
       if (selected === undefined)
@@ -329,10 +331,7 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
   if (terms.length > 64 || (input.match === "phrase" && words.length > 64))
     throw new Rejected({ status: 400, message: "Query exceeds 64 normalized terms" });
   if (terms.length === 0 || root.documents === 0) return [];
-  const bloomMatches = bloomCandidates(
-    root.segments.map((segment) => segment.termBloom),
-    terms,
-  );
+  const bloomMatches = bloomCandidates(root.segments, terms, "termBloom");
   const candidates = root.segments.map((segment, index) => {
     const selected = bloomMatches[index];
     if (selected === undefined)

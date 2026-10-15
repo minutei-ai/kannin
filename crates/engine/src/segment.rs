@@ -2126,6 +2126,39 @@ pub mod wasm {
     }
 
     #[wasm_bindgen]
+    pub struct BloomBatch {
+        bytes: Box<[u8]>,
+        offsets: Box<[u32]>,
+    }
+
+    #[wasm_bindgen]
+    impl BloomBatch {
+        #[wasm_bindgen(constructor)]
+        #[doc = "# Errors\nRejects oversized batches or invalid offset framing."]
+        pub fn new(bytes: Vec<u8>, offsets: Vec<u32>) -> Result<Self, JsValue> {
+            bloom_filter_many(&bytes, &offsets, &[]).map_err(|cause| JsValue::from_str(&cause))?;
+            Ok(Self {
+                bytes: bytes.into_boxed_slice(),
+                offsets: offsets.into_boxed_slice(),
+            })
+        }
+
+        #[must_use]
+        pub fn heap_bytes(&self) -> usize {
+            self.bytes.len() + self.offsets.len() * size_of::<u32>() + size_of::<Self>() + 32
+        }
+
+        #[doc = "# Errors\nRejects invalid values or result serialization errors."]
+        pub fn filter(&self, values: &str) -> Result<String, JsValue> {
+            let values: Vec<String> = serde_json::from_str(values)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            let selected = bloom_filter_many(&self.bytes, &self.offsets, &values)
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            serde_json::to_string(&selected).map_err(|cause| JsValue::from_str(&cause.to_string()))
+        }
+    }
+
+    #[wasm_bindgen]
     pub struct Ranker {
         search: Search,
     }

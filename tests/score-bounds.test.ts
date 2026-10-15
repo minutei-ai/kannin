@@ -27,6 +27,9 @@ test("learned segment bounds prune dense repeats without caching result rows", a
   const cold = await request(worker, namespace, "query", input);
   const expected = Schema.decodeUnknownSync(QueryResult)(await cold.json());
   expect(cold.headers.get("server-timing")).toContain('desc="segments=12"');
+  const before = Schema.decodeUnknownSync(Metadata)(
+    await (await request(worker, namespace, "metadata")).json(),
+  );
   const warm = await request(worker, namespace, "query", input);
   expect(Schema.decodeUnknownSync(QueryResult)(await warm.json())).toEqual(expected);
   expect(warm.headers.get("server-timing")).toContain('desc="segments=1"');
@@ -34,6 +37,9 @@ test("learned segment bounds prune dense repeats without caching result rows", a
     await (await request(worker, namespace, "metadata")).json(),
   );
   expect(metadata.cache.scoreBoundCacheEntries).toBeGreaterThanOrEqual(12);
+  expect(metadata.cache.textPlanCacheHits - before.cache.textPlanCacheHits).toBe(1);
+  expect(metadata.cache.termRequests - before.cache.termRequests).toBe(0);
+  expect(metadata.cache.textPlanCacheChargedBytes).toBeLessThanOrEqual(1024 * 1024);
   expect(metadata.cache.scoreBoundCacheChargedBytes).toBeLessThanOrEqual(1024 * 1024);
   for (const topK of [1, 10, 100]) {
     const query = textQuery(input.text, topK);
@@ -137,6 +143,7 @@ test("learned cutoffs match an unfragmented oracle across posting blocks and top
   );
   expect(metadata.cache.scoreBoundCacheChargedBytes).toBeLessThanOrEqual(1024 * 1024);
   expect(metadata.cache.scoreBoundCacheEntries).toBeLessThan(256 * 8);
+  expect(metadata.cache.textPlanCacheChargedBytes).toBeLessThanOrEqual(1024 * 1024);
   expect((await request(worker, "bound-blocks", "rebuild", {})).status).toBe(200);
   const rebuilt = Schema.decodeUnknownSync(Metadata)(
     await (await request(worker, "bound-blocks", "metadata")).json(),
@@ -144,4 +151,117 @@ test("learned cutoffs match an unfragmented oracle across posting blocks and top
   expect(rebuilt.cache.scoreBoundCacheChargedBytes).toBeLessThan(
     metadata.cache.scoreBoundCacheChargedBytes,
   );
+  expect(rebuilt.cache.textPlanCacheChargedBytes).toBeLessThan(
+    metadata.cache.textPlanCacheChargedBytes,
+  );
 });
+
+test("text plans miss after same-sequence compaction and changes outside selected segments", async () => {
+  const namespace = "plan-root-identity";
+  for (const index of Array.from({ length: 16 }, (_, row) => row))
+    expect(
+      (
+        await request(
+          worker,
+          namespace,
+          "write",
+          write([document(String(index).padStart(2, "0"), "alpha beta alpha beta")]),
+        )
+      ).status,
+    ).toBe(200);
+  const query = textQuery("alpha beta", 100);
+  const initial = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", query)).json(),
+  );
+  const before = Schema.decodeUnknownSync(Metadata)(
+    await (await request(worker, namespace, "metadata")).json(),
+  );
+  expect((await request(worker, namespace, "compact", {})).status).toBe(200);
+  const compacted = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", query)).json(),
+  );
+  const after = Schema.decodeUnknownSync(Metadata)(
+    await (await request(worker, namespace, "metadata")).json(),
+  );
+  expect(compacted).toEqual(initial);
+  expect(after.sequence).toBe(before.sequence);
+  expect(after.segments).toBeGreaterThan(4);
+  expect(after.cache.textPlanCacheHits).toBe(before.cache.textPlanCacheHits);
+  expect(after.cache.textPlanCacheEntries).toBe(before.cache.textPlanCacheEntries + 1);
+  expect(
+    (await request(worker, namespace, "write", write([document("other", "unrelated words")])))
+      .status,
+  ).toBe(200);
+  const changed = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", query)).json(),
+  );
+  const changedMetadata = Schema.decodeUnknownSync(Metadata)(
+    await (await request(worker, namespace, "metadata")).json(),
+  );
+  expect(changed.rows.map((row) => row.id)).toEqual(initial.rows.map((row) => row.id));
+  expect(changed.rows[0]?.score).not.toBe(initial.rows[0]?.score);
+  expect(changedMetadata.cache.textPlanCacheHits).toBe(after.cache.textPlanCacheHits);
+  expect((await request(worker, namespace, "rebuild", {})).status).toBe(200);
+  const fresh = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", query)).json(),
+  );
+  expect(fresh).toEqual(changed);
+  const seeded = Schema.decodeUnknownSync(Metadata)(
+    await (await request(worker, namespace, "metadata")).json(),
+  );
+  const larger = await request(worker, namespace, "query", textQuery("alpha beta", 10));
+  expect(larger.status).toBe(200);
+  const reused = Schema.decodeUnknownSync(Metadata)(
+    await (await request(worker, namespace, "metadata")).json(),
+  );
+  expect(reused.cache.textPlanCacheHits - seeded.cache.textPlanCacheHits).toBe(1);
+  expect(reused.cache.termRequests).toBe(seeded.cache.termRequests);
+  const blocked = await request(worker, namespace, "query", {
+    ...query,
+    minimumSequence: fresh.sequence + 1,
+  });
+  expect(blocked.status).toBe(409);
+});
+
+test("text plan eviction stays within its byte quota and recomputes exact rows", async () => {
+  const namespace = "text-plan-eviction";
+  const text = Array.from({ length: 64 }, (_, index) => `term${index}`).join(" ");
+  for (const index of Array.from({ length: 16 }, (_, row) => row))
+    expect(
+      (
+        await request(
+          worker,
+          namespace,
+          "write",
+          write([document(String(index).padStart(2, "0"), text)]),
+        )
+      ).status,
+    ).toBe(200);
+  const expected = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", textQuery(text))).json(),
+  );
+  for (const variation of Array.from({ length: 256 }, (_, index) => index + 1)) {
+    const response = await request(
+      worker,
+      namespace,
+      "query",
+      textQuery(`${text}${" ".repeat(variation)}`),
+    );
+    expect(response.status).toBe(200);
+    const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+    expect(result).toEqual(expected);
+  }
+  const filled = Schema.decodeUnknownSync(Metadata)(
+    await (await request(worker, namespace, "metadata")).json(),
+  );
+  expect(filled.cache.textPlanCacheChargedBytes).toBeLessThanOrEqual(1024 * 1024);
+  expect(filled.cache.textPlanCacheEntries).toBeLessThan(256);
+  const recomputed = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", textQuery(text))).json(),
+  );
+  expect(recomputed).toEqual(expected);
+  const final = Schema.decodeUnknownSync(Metadata)(
+    await (await request(worker, namespace, "metadata")).json(),
+  );
+  expect(final.cache.textPlanCacheHits).toBe(filled.cache.textPlanCacheHits);
+}, 15000);

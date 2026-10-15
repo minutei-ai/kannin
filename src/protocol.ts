@@ -217,6 +217,9 @@ export const CacheMetrics = Schema.Struct({
   directoryCacheChargedBytes: Schema.Int,
   scoreBoundCacheChargedBytes: Schema.Int,
   scoreBoundCacheEntries: Schema.Int,
+  textPlanCacheChargedBytes: Schema.Int,
+  textPlanCacheEntries: Schema.Int,
+  textPlanCacheHits: Schema.Int,
   encodedDirectoryCacheChargedBytes: Schema.Int,
   encodedDirectoryAdmissionChargedBytes: Schema.Int,
   encodedDirectoryCacheEntries: Schema.Int,
@@ -350,6 +353,26 @@ export const RankingInput = Schema.Struct({
   dead: Schema.Array(Schema.Int),
   filters: Schema.Array(Filter),
   statistics: SearchStatistics,
+});
+export const TextPlanIdentity = Schema.Struct({
+  text: RankingInput.fields.text,
+  mode: RankingInput.fields.mode,
+  filters: RankingInput.fields.filters,
+  documents: Root.fields.documents,
+  titleLength: Root.fields.titleLength,
+  bodyLength: Root.fields.bodyLength,
+  segments: Schema.Array(
+    Schema.Struct({
+      key: Root.fields.segments.value.fields.key,
+      headerBytes: Root.fields.segments.value.fields.headerBytes,
+      dead: Root.fields.segments.value.fields.dead,
+      removedFrequencies: Root.fields.segments.value.fields.removedFrequencies,
+    }),
+  ),
+});
+export const TextPlan = Schema.Struct({
+  statistics: SearchStatistics,
+  segments: Schema.Array(Schema.Struct({ bound: Schema.Finite, eligible: Schema.Boolean })),
 });
 export const SegmentHits = Schema.Array(
   Schema.Struct({ row: Schema.Int, id: Id, score: Schema.Finite }),

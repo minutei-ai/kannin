@@ -269,7 +269,8 @@ test("term projection batches preserve global frequencies and filter eligibility
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
   expect(warm.termRequests - changed.termRequests).toBe(0);
-  expect(warm.termMemoryHits - changed.termMemoryHits).toBe(129);
+  expect(warm.termMemoryHits - changed.termMemoryHits).toBe(0);
+  expect(warm.textPlanCacheHits - changed.textPlanCacheHits).toBe(1);
 });
 
 test("mixed catalog misses preserve selectors, global frequencies and cached halves", async () => {

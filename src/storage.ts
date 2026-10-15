@@ -24,6 +24,7 @@ import {
   TermProjectionProps,
   SegmentCacheProps,
   Rejected,
+  TextPlan,
 } from "./protocol";
 
 const buffers = new Map<string, Uint8Array>();
@@ -36,7 +37,10 @@ const budget = { bytes: 0, payloadBytes: 0 };
 const MAX_CACHE_BYTES = 12 * 1024 * 1024;
 const encodedDirectories = new Map<string, Uint8Array>();
 const encodedBudget = { bytes: 0 };
-const MAX_ENCODED_DIRECTORY_BYTES = 19 * 1024 * 1024;
+const MAX_ENCODED_DIRECTORY_BYTES = 18 * 1024 * 1024;
+const textPlans = new Map<string, { plan: typeof TextPlan.Type; bytes: number }>();
+const textPlanBudget = { bytes: 0 };
+const MAX_TEXT_PLAN_BYTES = 1024 * 1024;
 const scoreBounds = new Map<string, number>();
 const scoreBoundBudget = { bytes: 0 };
 const MAX_SCORE_BOUND_BYTES = 1024 * 1024;
@@ -73,6 +77,7 @@ const reads = {
   rangeCacheHits: 0,
   directoryCacheHits: 0,
   encodedDirectoryCacheHits: 0,
+  textPlanCacheHits: 0,
   workerCacheHits: 0,
   workerCacheMisses: 0,
   cacheApiHits: 0,
@@ -832,6 +837,36 @@ export const readDocuments = Effect.fn("raio.readDocuments")(function* (
   return documents;
 });
 
+export function textPlan(key: string) {
+  const entry = textPlans.get(key);
+  if (entry !== undefined) {
+    textPlans.delete(key);
+    textPlans.set(key, entry);
+    reads.textPlanCacheHits += 1;
+    return entry.plan;
+  }
+  return undefined;
+}
+
+export function rememberTextPlan(key: string, plan: typeof TextPlan.Type) {
+  const encoded = Schema.encodeSync(Schema.fromJsonString(TextPlan))(plan);
+  const bytes = encoded.length * 4 + key.length * 4 + 128;
+  const previous = textPlans.get(key);
+  if (previous !== undefined) {
+    textPlans.delete(key);
+    textPlanBudget.bytes -= previous.bytes;
+  }
+  if (bytes > MAX_TEXT_PLAN_BYTES) return;
+  while (textPlanBudget.bytes + bytes > MAX_TEXT_PLAN_BYTES) {
+    const oldest = textPlans.entries().next().value;
+    if (oldest === undefined) break;
+    textPlans.delete(oldest[0]);
+    textPlanBudget.bytes -= oldest[1].bytes;
+  }
+  textPlans.set(key, { plan, bytes });
+  textPlanBudget.bytes += bytes;
+}
+
 export function segmentScoreBound(key: string) {
   const bound = scoreBounds.get(key);
   if (bound !== undefined) {
@@ -862,6 +897,11 @@ export function rememberSegmentScoreBound(key: string, bound: number) {
 
 export function clearImmutableCache(prefix: string) {
   const identity = `${env.STORAGE_CACHE_SCOPE}:${prefix}`;
+  for (const [key, entry] of textPlans)
+    if (key.startsWith(`${identity}/`)) {
+      textPlans.delete(key);
+      textPlanBudget.bytes -= entry.bytes;
+    }
   for (const key of scoreBounds.keys())
     if (key.startsWith(`${identity}/`)) {
       scoreBounds.delete(key);
@@ -923,6 +963,8 @@ export function cacheUsage() {
     directoryCacheChargedBytes: decodedBudget.bytes,
     scoreBoundCacheChargedBytes: scoreBoundBudget.bytes,
     scoreBoundCacheEntries: scoreBounds.size,
+    textPlanCacheChargedBytes: textPlanBudget.bytes,
+    textPlanCacheEntries: textPlans.size,
     encodedDirectoryCacheChargedBytes: encodedBudget.bytes + admissionBudget.bytes,
     encodedDirectoryAdmissionChargedBytes: admissionBudget.bytes,
     encodedDirectoryCacheEntries: encodedDirectories.size,

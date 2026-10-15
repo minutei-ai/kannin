@@ -22,7 +22,7 @@ import {
   directory_compress,
 } from "../dist/wasm/raio_engine";
 import module from "raio:wasm";
-import type { Row, Snapshot } from "./protocol";
+import type { Row, Snapshot, TextPlan } from "./protocol";
 import {
   Attributes,
   Filter,
@@ -48,6 +48,7 @@ import {
   LocatedDocument,
   RankingInput,
   SearchStatistics,
+  TextPlanIdentity,
   Write,
   WriteResult,
   VectorMessage,
@@ -83,6 +84,8 @@ import {
   cacheUsage,
   segmentScoreBound,
   rememberSegmentScoreBound,
+  textPlan,
+  rememberTextPlan,
 } from "./storage";
 
 import { vectorMetadata, vectorPrefilter } from "./vector-filters";
@@ -366,33 +369,96 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
   const selected = candidates
     .filter((candidate) => candidate.terms.length > 0)
     .map((candidate) => candidate.segment);
-  const projectionTerms = Schema.encodeSync(TermProjectionProps.fields.terms)(terms.toSorted());
-  const encodedFilters = Schema.encodeSync(TermProjectionProps.fields.filters)(input.filters);
-  const projections = await Effect.runPromise(
-    readTermCatalogs(selected, projectionTerms, encodedFilters),
-  );
-  const catalog = selected.map((segment, index) => {
-    const projection = projections[index];
-    if (projection === undefined)
-      throw new Rejected({ status: 503, message: "Term projection batch omitted a segment" });
-    return { segment, dictionary: projection.dictionary, minimum: projection.minimum };
-  });
-  const frequencies = new Map<string, number>();
-  for (const { segment, dictionary } of catalog) {
-    const removedFrequencies = new Map(Object.entries(segment.removedFrequencies));
-    for (const [term, metadata] of Object.entries(dictionary))
-      frequencies.set(
-        term,
-        (frequencies.get(term) ?? 0) + metadata.df - (removedFrequencies.get(term) ?? 0),
-      );
-  }
-  const statistics = {
-    documents: root.documents,
-    title_length: root.titleLength,
-    body_length: root.bodyLength,
-    frequencies: Object.fromEntries(frequencies),
+  const planning: { key: string | undefined; value: typeof TextPlan.Type | undefined } = {
+    key: undefined,
+    value: undefined,
   };
-  const encodedStatistics = Schema.encodeSync(Schema.fromJsonString(SearchStatistics))(statistics);
+  const firstSelected = selected[0];
+  if (selected.length > 4 && firstSelected !== undefined) {
+    const identity = Schema.encodeSync(Schema.fromJsonString(TextPlanIdentity))({
+      text: input.text,
+      mode: input.match ?? "any",
+      filters: input.filters,
+      documents: root.documents,
+      titleLength: root.titleLength,
+      bodyLength: root.bodyLength,
+      segments: selected,
+    });
+    planning.key = `${workerEnv.STORAGE_CACHE_SCOPE}:${firstSelected.key}/plan:${await sha256(identity)}`;
+    planning.value = textPlan(planning.key);
+  }
+  if (planning.value === undefined) {
+    const projectionTerms = Schema.encodeSync(TermProjectionProps.fields.terms)(terms.toSorted());
+    const encodedFilters = Schema.encodeSync(TermProjectionProps.fields.filters)(input.filters);
+    const projections = await Effect.runPromise(
+      readTermCatalogs(selected, projectionTerms, encodedFilters),
+    );
+    const catalog = selected.map((segment, index) => {
+      const projection = projections[index];
+      if (projection === undefined)
+        throw new Rejected({ status: 503, message: "Term projection batch omitted a segment" });
+      return { segment, dictionary: projection.dictionary, minimum: projection.minimum };
+    });
+    const frequencies = new Map<string, number>();
+    for (const { segment, dictionary } of catalog) {
+      const removedFrequencies = new Map(Object.entries(segment.removedFrequencies));
+      for (const [term, metadata] of Object.entries(dictionary))
+        frequencies.set(
+          term,
+          (frequencies.get(term) ?? 0) + metadata.df - (removedFrequencies.get(term) ?? 0),
+        );
+    }
+    const statistics = {
+      documents: root.documents,
+      title_length: root.titleLength,
+      body_length: root.bodyLength,
+      frequencies: Object.fromEntries(frequencies),
+    };
+    const encodedStatistics = Schema.encodeSync(Schema.fromJsonString(SearchStatistics))(
+      statistics,
+    );
+    const segments = [];
+    for (const offset of Array.from(
+      { length: Math.ceil(catalog.length / 64) },
+      (_, index) => index * 64,
+    )) {
+      const window = catalog.slice(offset, offset + 64);
+      const encoded = Schema.encodeSync(Schema.fromJsonString(Schema.Array(TermCatalog)))(
+        window.map((entry) => ({ dictionary: entry.dictionary, minimum: entry.minimum })),
+      );
+      const bounds = Schema.decodeSync(Schema.Array(Schema.Finite))(
+        Array.from(segment_term_bounds(encodedStatistics, encoded)),
+      );
+      if (bounds.length !== window.length)
+        throw new Rejected({ status: 503, message: "Term bound batch omitted a segment" });
+      segments.push(
+        ...window.map((entry, index) => {
+          const bound = bounds[index];
+          if (bound === undefined)
+            throw new Rejected({ status: 503, message: "Term bound batch omitted a segment" });
+          const eligibility = {
+            value: entry.minimum !== null && Object.keys(entry.dictionary).length > 0,
+          };
+          if (
+            (input.match === "all" || input.match === "phrase") &&
+            terms.some((term) => {
+              const metadata = entry.dictionary[term];
+              return (
+                metadata === undefined ||
+                metadata.df <= (entry.segment.removedFrequencies[term] ?? 0)
+              );
+            })
+          )
+            eligibility.value = false;
+          return { bound, eligible: eligibility.value };
+        }),
+      );
+    }
+    planning.value = { statistics, segments };
+    if (planning.key !== undefined) rememberTextPlan(planning.key, planning.value);
+  }
+  const plan = planning.value;
+  const statistics = plan.statistics;
   const selection = { digest: "" };
   if (selected.length > 4)
     selection.digest = await sha256(
@@ -405,41 +471,18 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
         statistics,
       }),
     );
-  const bounded = [];
-  for (const offset of Array.from(
-    { length: Math.ceil(catalog.length / 64) },
-    (_, index) => index * 64,
-  )) {
-    const window = catalog.slice(offset, offset + 64);
-    const encoded = Schema.encodeSync(Schema.fromJsonString(Schema.Array(TermCatalog)))(
-      window.map((entry) => ({ dictionary: entry.dictionary, minimum: entry.minimum })),
-    );
-    const bounds = Schema.decodeSync(Schema.Array(Schema.Finite))(
-      Array.from(segment_term_bounds(encodedStatistics, encoded)),
-    );
-    if (bounds.length !== window.length)
-      throw new Rejected({ status: 503, message: "Term bound batch omitted a segment" });
-    bounded.push(
-      ...window.map((entry, index) => {
-        const bound = bounds[index];
-        if (bound === undefined)
-          throw new Rejected({ status: 503, message: "Term bound batch omitted a segment" });
-        const identity = `${workerEnv.STORAGE_CACHE_SCOPE}:${entry.segment.key}:${entry.segment.headerBytes}:${Schema.encodeSync(integers)(entry.segment.dead)}:${selection.digest}`;
-        const retained = { bound };
-        if (selection.digest !== "") {
-          const learned = segmentScoreBound(identity);
-          if (learned !== undefined) retained.bound = Math.min(bound, learned);
-        }
-        return {
-          segment: entry.segment,
-          dictionary: entry.dictionary,
-          minimum: entry.minimum,
-          bound: retained.bound,
-          identity,
-        };
-      }),
-    );
-  }
+  const bounded = selected.map((segment, index) => {
+    const planned = plan.segments[index];
+    if (planned === undefined)
+      throw new Rejected({ status: 503, message: "Text plan omitted a segment" });
+    const identity = `${workerEnv.STORAGE_CACHE_SCOPE}:${segment.key}:${segment.headerBytes}:${Schema.encodeSync(integers)(segment.dead)}:${selection.digest}`;
+    const retained = { bound: planned.bound };
+    if (selection.digest !== "") {
+      const learned = segmentScoreBound(identity);
+      if (learned !== undefined) retained.bound = Math.min(planned.bound, learned);
+    }
+    return { segment, eligible: planned.eligible, bound: retained.bound, identity };
+  });
   const prioritized = bounded.sort((left, right) => {
     if (left.bound !== right.bound) return right.bound - left.bound;
     if (left.segment.minimumId < right.segment.minimumId) return -1;
@@ -474,17 +517,8 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
   ];
   for (const rankingWindow of rankingWindows) {
     const cutoff = ranked[input.topK - 1];
-    const eligible = rankingWindow.filter(({ segment, dictionary, minimum, bound }) => {
-      if (minimum === null) return false;
-      if (Object.keys(dictionary).length === 0) return false;
-      if (
-        (input.match === "all" || input.match === "phrase") &&
-        terms.some((term) => {
-          const metadata = dictionary[term];
-          return metadata === undefined || metadata.df <= (segment.removedFrequencies[term] ?? 0);
-        })
-      )
-        return false;
+    const eligible = rankingWindow.filter(({ segment, eligible: allowed, bound }) => {
+      if (!allowed) return false;
       if (ranked.length === input.topK) {
         if (cutoff === undefined)
           throw new Rejected({ status: 503, message: "Invalid ranking cutoff" });

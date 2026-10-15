@@ -585,7 +585,7 @@ async function textQuery(input: typeof Query.Type, root: typeof Root.Type, timin
   };
   using plans = new DisposableStack();
   const compilation: { query: PreparedQuery | undefined } = { query: undefined };
-  const rankingConcurrency = 6;
+  const rankingConcurrency = 4;
   const rankIo = Semaphore.makeUnsafe(rankingConcurrency);
   const rankingWindows = [
     ...EffectArray.chunksOf(prioritized.slice(0, 4), 1),

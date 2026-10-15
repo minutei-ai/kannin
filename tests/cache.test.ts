@@ -80,7 +80,7 @@ test("contiguous top-k pages share bounded reads and retain individual memory ca
   expect(cold.rows).toEqual(smaller.rows);
 });
 
-test("native Cache API retains immutable ranges after the memory cache is discarded", async () => {
+test("native Cache API retains compressed canonical directories after memory eviction", async () => {
   await request(worker, "cached", "write", write([document("a", "original cached content")]));
   const initial = await request(worker, "cached", "query", textQuery("original"));
   expect(initial.status).toBe(200);
@@ -92,7 +92,7 @@ test("native Cache API retains immutable ranges after the memory cache is discar
   if (segment === undefined) throw new Error("Missing committed segment");
   const caches = await worker.getCaches();
   const cache = await caches.open("raio-segments-v1");
-  const key = new URL("https://raio-cache.internal/range");
+  const key = new URL("https://raio-cache.internal/directory-v1");
   key.searchParams.set("key", segment.key);
   key.searchParams.set("offset", "0");
   key.searchParams.set("length", String(segment.headerBytes));
@@ -100,7 +100,19 @@ test("native Cache API retains immutable ranges after the memory cache is discar
   const cached = await cache.match(key);
   expect(cached).toBeDefined();
   if (cached === undefined) return;
-  expect((await cached.arrayBuffer()).byteLength).toBe(segment.headerBytes);
+  const encoded = new Uint8Array(await cached.arrayBuffer());
+  expect(encoded.byteLength).toBeLessThan(segment.headerBytes);
+  expect(new TextDecoder().decode(encoded.subarray(0, 8))).toBe("RAIODIR1");
+  expect(new DataView(encoded.buffer, encoded.byteOffset).getUint32(8, true)).toBe(
+    segment.headerBytes,
+  );
+  const canonical = await bucket.get(segment.key, {
+    range: { offset: 0, length: segment.headerBytes },
+  });
+  if (canonical === null) throw new Error("Missing canonical header");
+  expect(
+    new TextDecoder().decode(new Uint8Array(await canonical.arrayBuffer()).subarray(0, 8)),
+  ).toBe("RAIOSEG1");
   await request(worker, "cached", "rebuild", {});
   expect((await request(worker, "cached", "query", textQuery("original"))).status).toBe(200);
   const metadata = Schema.decodeUnknownSync(Metadata)(
@@ -131,7 +143,7 @@ test("cached old segments cannot resurrect updated or deleted documents", async 
 });
 
 test("the authenticated gateway never exposes immutable cache entrypoints", async () => {
-  for (const path of ["/range", "/catalog-v4"]) {
+  for (const path of ["/range", "/directory-v1", "/catalog-v4"]) {
     const url = new URL(path, await worker.ready);
     const anonymous = await fetch(url);
     expect(anonymous.status).toBe(401);

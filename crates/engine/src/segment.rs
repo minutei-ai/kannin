@@ -692,6 +692,57 @@ pub fn parse_header(bytes: &[u8]) -> Result<(Header, usize), String> {
     Ok((header, 16 + length))
 }
 
+const DIRECTORY_MAGIC: &[u8; 8] = b"RAIODIR1";
+
+#[doc = "# Errors\nRejects invalid or incomplete canonical headers and directory size limits."]
+pub fn compress_directory(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let (_, length) = parse_header(bytes)?;
+    if length != bytes.len() || length > MAX_BYTES {
+        return Err("Directory must contain exactly one complete header".into());
+    }
+    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(bytes, 3);
+    let mut encoded = Vec::with_capacity(16 + compressed.len());
+    encoded.extend_from_slice(DIRECTORY_MAGIC);
+    encoded.extend_from_slice(
+        &u32::try_from(length)
+            .map_err(|cause| cause.to_string())?
+            .to_le_bytes(),
+    );
+    encoded.extend_from_slice(&crc32fast::hash(bytes).to_le_bytes());
+    encoded.extend_from_slice(&compressed);
+    Ok(encoded)
+}
+
+#[doc = "# Errors\nRejects framing, size, compression, checksum, expected length and canonical header violations."]
+pub fn parse_compressed_directory(bytes: &[u8], expected: usize) -> Result<Header, String> {
+    if bytes.len() < 16 || &bytes[..8] != DIRECTORY_MAGIC || bytes.len() > MAX_BYTES + 8192 {
+        return Err("Invalid compressed directory frame".into());
+    }
+    let length = u32::from_le_bytes(
+        bytes[8..12]
+            .try_into()
+            .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
+    ) as usize;
+    if !(16..=MAX_BYTES).contains(&length) || length != expected {
+        return Err("Invalid compressed directory length".into());
+    }
+    let checksum = u32::from_le_bytes(
+        bytes[12..16]
+            .try_into()
+            .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
+    );
+    let decoded = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&bytes[16..], length)
+        .map_err(|cause| cause.to_string())?;
+    if decoded.len() != length || crc32fast::hash(&decoded) != checksum {
+        return Err("Compressed directory integrity check failed".into());
+    }
+    let (header, header_bytes) = parse_header(&decoded)?;
+    if header_bytes != length {
+        return Err("Compressed directory contains trailing bytes".into());
+    }
+    Ok(header)
+}
+
 #[derive(Clone, Deserialize)]
 pub struct Statistics {
     pub documents: u64,
@@ -2032,6 +2083,12 @@ pub mod wasm {
     }
 
     #[wasm_bindgen]
+    #[doc = "# Errors\nRejects invalid canonical headers or size limits."]
+    pub fn directory_compress(bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
+        super::compress_directory(bytes).map_err(|cause| JsValue::from_str(&cause))
+    }
+
+    #[wasm_bindgen]
     pub struct Segment {
         built: BuiltSegment,
     }
@@ -2069,6 +2126,15 @@ pub mod wasm {
         #[doc = "# Errors\nRejects invalid input serialization or segment framing, size, and integrity constraints."]
         pub fn new(bytes: &[u8]) -> Result<Self, JsValue> {
             let (header, _) = parse_header(bytes).map_err(|cause| JsValue::from_str(&cause))?;
+            Ok(Self {
+                header: Rc::new(header),
+            })
+        }
+
+        #[doc = "# Errors\nRejects invalid compressed frames or canonical headers and mismatched expected lengths."]
+        pub fn compressed(bytes: &[u8], expected: u32) -> Result<Self, JsValue> {
+            let header = super::parse_compressed_directory(bytes, expected as usize)
+                .map_err(|cause| JsValue::from_str(&cause))?;
             Ok(Self {
                 header: Rc::new(header),
             })

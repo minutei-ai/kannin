@@ -1,4 +1,4 @@
-import { Cause, Effect, Schema } from "effect";
+import { Cause, Effect, Match, Schema } from "effect";
 import type { Semaphore } from "effect";
 import { env, exports } from "cloudflare:workers";
 import {
@@ -144,8 +144,21 @@ export function addFrequencyPosting(
   ranker.add_frequency(term, page);
 }
 
-export async function range(key: string, offset: number, length: number) {
-  const cacheKey = `${env.STORAGE_CACHE_SCOPE}:${key}/${offset}/${length}`;
+export async function range(
+  key: string,
+  offset: number,
+  length: number,
+  compressedDirectory = false,
+) {
+  const resource = Match.value(compressedDirectory).pipe(
+    Match.when(true, () => "directory-v1"),
+    Match.orElse(() => "range"),
+  );
+  const rawIdentity = `${env.STORAGE_CACHE_SCOPE}:${key}/${offset}/${length}`;
+  const cacheKey = Match.value(compressedDirectory).pipe(
+    Match.when(true, () => `${rawIdentity}/directory-v1`),
+    Match.orElse(() => rawIdentity),
+  );
   const cached = buffers.get(cacheKey);
   if (cached !== undefined) {
     reads.rangeCacheHits += 1;
@@ -159,7 +172,7 @@ export async function range(key: string, offset: number, length: number) {
   if (pending !== undefined) return pending;
   const acquisition = (async () => {
     const input = Schema.encodeSync(SegmentRange)({ key, offset, length });
-    const url = new URL("https://segments.internal/range");
+    const url = new URL(`https://segments.internal/${resource}`);
     url.searchParams.set("key", input.key);
     url.searchParams.set("offset", String(input.offset));
     url.searchParams.set("length", String(input.length));
@@ -180,7 +193,7 @@ export async function range(key: string, offset: number, length: number) {
       });
     const bytes = new Uint8Array(await response.arrayBuffer());
     reads.rangeBytes += bytes.byteLength;
-    if (bytes.byteLength !== length)
+    if (!compressedDirectory && bytes.byteLength !== length)
       throw new Rejected({ status: 503, message: "R2 range returned a truncated segment" });
     remember(cacheKey, bytes);
     return bytes;
@@ -209,10 +222,10 @@ async function acquireDirectory(key: string, headerBytes: number) {
     directories.set(identity, cached);
     return cached.directory.retain();
   }
-  const bytes = await range(key, 0, headerBytes);
+  const bytes = await range(key, 0, headerBytes, true);
   const concurrent = directories.get(identity);
   if (concurrent !== undefined) return concurrent.directory.retain();
-  const decoded = new Directory(bytes);
+  const decoded = Directory.compressed(bytes, headerBytes);
   const entry = { directory: decoded, bytes: decoded.heap_bytes() };
   if (entry.bytes > MAX_DECODED_BYTES) {
     decoded.free();

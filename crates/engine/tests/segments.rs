@@ -610,3 +610,80 @@ fn cutoff_posting_spans_preserve_gap_budgets() -> Result<(), Box<dyn std::error:
     }
     Ok(())
 }
+
+#[test]
+fn compressed_directories_preserve_headers_and_reject_frame_corruption()
+-> Result<(), Box<dyn std::error::Error>> {
+    let built = segment::build(
+        (0..100)
+            .map(|index| {
+                document(
+                    format!("id{index:04}"),
+                    format!("rust storage unique{index}"),
+                )
+            })
+            .collect(),
+    )?;
+    let (original, length) = segment::parse_header(&built.bytes)?;
+    let encoded = segment::compress_directory(&built.bytes[..length])?;
+    let decoded = segment::parse_compressed_directory(&encoded, length)?;
+    assert_eq!(
+        serde_json::to_value(original)?,
+        serde_json::to_value(decoded)?
+    );
+    assert!(encoded.len() < length);
+    assert!(segment::compress_directory(&built.bytes).is_err());
+    assert!(segment::parse_compressed_directory(&encoded, length + 1).is_err());
+    for end in 0..encoded.len() {
+        assert!(segment::parse_compressed_directory(&encoded[..end], length).is_err());
+    }
+    for index in [0, 8, 12, 16, encoded.len() - 1] {
+        let mut damaged = encoded.clone();
+        damaged[index] ^= 1;
+        assert!(segment::parse_compressed_directory(&damaged, length).is_err());
+    }
+    let mut invalid_header = built.bytes[..length].to_vec();
+    invalid_header[15] ^= 1;
+    let mut forged = b"RAIODIR1".to_vec();
+    forged.extend_from_slice(&u32::try_from(length)?.to_le_bytes());
+    forged.extend_from_slice(&crc32fast::hash(&invalid_header).to_le_bytes());
+    forged.extend_from_slice(&miniz_oxide::deflate::compress_to_vec_zlib(
+        &invalid_header,
+        3,
+    ));
+    assert!(segment::parse_compressed_directory(&forged, length).is_err());
+    let mut oversized = encoded.clone();
+    oversized[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(segment::parse_compressed_directory(&oversized, u32::MAX as usize).is_err());
+    let mut undersized = encoded;
+    undersized[8..12].copy_from_slice(&16_u32.to_le_bytes());
+    assert!(segment::parse_compressed_directory(&undersized, 16).is_err());
+    Ok(())
+}
+
+#[test]
+fn compressed_directories_exceed_the_separate_mutation_log_budget()
+-> Result<(), Box<dyn std::error::Error>> {
+    let documents = (0..260)
+        .map(|index| {
+            let mut doc = document(format!("large{index:04}"), "rust");
+            doc.attributes.insert(
+                "context".into(),
+                serde_json::Value::String("x".repeat(8192)),
+            );
+            doc
+        })
+        .collect();
+    let built = segment::build(documents)?;
+    let (_, length) = segment::parse_header(&built.bytes)?;
+    assert!(length > raio_engine::MAX_LOG_BYTES);
+    let compressed = segment::compress_directory(&built.bytes[..length])?;
+    let decoded = segment::parse_compressed_directory(&compressed, length)?;
+    assert_eq!(decoded.documents.len(), 260);
+    assert_eq!(decoded.documents[0].id, "large0000");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(decoded.documents[0].attributes.get())?["context"],
+        "x".repeat(8192)
+    );
+    Ok(())
+}

@@ -19,6 +19,7 @@ import {
   segment_filter,
   segment_term_bounds,
   PreparedQuery,
+  directory_compress,
 } from "../dist/wasm/raio_engine";
 import module from "raio:wasm";
 import type { Row, Snapshot } from "./protocol";
@@ -103,7 +104,9 @@ export class Segments extends WorkerEntrypoint<Env, typeof SegmentCacheProps.Typ
       decoded._tag === "Failure" ||
       request.method !== "GET" ||
       props._tag === "Failure" ||
-      props.value.bucket !== this.env.STORAGE_CACHE_SCOPE
+      props.value.bucket !== this.env.STORAGE_CACHE_SCOPE ||
+      (url.pathname !== "/range" && url.pathname !== "/directory-v1") ||
+      (url.pathname === "/directory-v1" && decoded.value.offset !== 0)
     )
       return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });
     const input = decoded.value;
@@ -134,11 +137,15 @@ export class Segments extends WorkerEntrypoint<Env, typeof SegmentCacheProps.Typ
     const bytes = await object.arrayBuffer();
     if (bytes.byteLength !== input.length)
       return new Response(null, { status: 503, headers: { "cache-control": "no-store" } });
-    const response = new Response(bytes, {
+    const encoded = Match.value(url.pathname).pipe(
+      Match.when("/directory-v1", () => directory_compress(new Uint8Array(bytes)).slice()),
+      Match.orElse(() => bytes),
+    );
+    const response = new Response(encoded, {
       headers: {
         "content-type": "application/octet-stream",
         "cache-control": "public, max-age=31536000, immutable",
-        "content-length": String(bytes.byteLength),
+        "content-length": String(encoded.byteLength),
         etag: object.httpEtag,
       },
     });

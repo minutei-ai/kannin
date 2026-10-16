@@ -865,8 +865,8 @@ impl TermScorer {
         let Some(idf) = self.idf else {
             return 0.0;
         };
-        let tf = contribution(tf_title, len_title, self.title_average)
-            .mul_add(2.0, contribution(tf_body, len_body, self.body_average));
+        let title = contribution(tf_title, len_title, self.title_average);
+        let tf = title + title + contribution(tf_body, len_body, self.body_average);
         idf * tf * 2.2 / (tf + 1.2)
     }
 }
@@ -3019,7 +3019,60 @@ mod filter_cache_tests {
 
 #[cfg(test)]
 mod numeric_contract_tests {
-    use super::{bloom_build, bloom_contains, count_as_f64};
+    use super::{Statistics, TermScorer, bloom_build, bloom_contains, contribution, count_as_f64};
+
+    #[test]
+    fn title_weight_preserves_fused_scores_at_numeric_boundaries() {
+        let totals = [
+            0,
+            1,
+            2,
+            u64::from(u32::MAX),
+            9_007_199_254_740_993,
+            u64::MAX,
+        ];
+        let counts = [0, 1, 2, 127, u32::MAX];
+        for documents in totals {
+            for total in totals {
+                let statistics = Statistics {
+                    documents,
+                    title_length: total,
+                    body_length: u64::MAX - total,
+                    frequencies: std::collections::BTreeMap::new(),
+                };
+                for df in [0, 1, documents, documents.saturating_add(1)] {
+                    let scorer = TermScorer::new(&statistics, df);
+                    for title in counts {
+                        for body in counts {
+                            for title_length in counts {
+                                for body_length in counts {
+                                    let expected = scorer.idf.map_or(0.0, |idf| {
+                                        let tf =
+                                            contribution(title, title_length, scorer.title_average)
+                                                .mul_add(
+                                                    2.0,
+                                                    contribution(
+                                                        body,
+                                                        body_length,
+                                                        scorer.body_average,
+                                                    ),
+                                                );
+                                        idf * tf * 2.2 / (tf + 1.2)
+                                    });
+                                    assert_eq!(
+                                        scorer
+                                            .score(title, body, title_length, body_length)
+                                            .to_bits(),
+                                        expected.to_bits()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn statistic_conversion_rounds_full_width_counts_without_truncation() {

@@ -3104,3 +3104,30 @@ A native pre-deploy reference and two post-deploy loads each checked 128 request
 | After, repeat |          16 |  52.20 | 420.89 |     100.65 |
 
 Before/first/repeat maxima were 678.31/817.24/727.19 ms. Both post-deploy runs improved p95, while concurrency-one/four medians worsened slightly and repeat concurrency-four throughput fell below the pre-deploy reference. These cache-sensitive short runs do not isolate the Rust change or measure sustained capacity. Strong remote coordination, broad cold-tail reliability, peak whole-Worker heap, large-corpus ANN quality and Turbopuffer parity remain unresolved.
+
+## BM25 title-weight doubling
+
+The refreshed workerd sampling profile attributed about 35% of hot any-term ranking samples to attaching retained frequency pages and 40% to finalization. These are instrumented kernel samples, not whole-query CPU percentages. Two preliminary candidates were rejected. Moving the validated page's last-row update outside its copy loop gave only 1–7% gains in large synthetic cases and regressed the representative phrase control by 7.7%. A zero-title-frequency scoring branch gave inconsistent results across repeated body-only and mixed-title fixtures. Neither candidate was deployed.
+
+The scorer now replaces the title contribution's fused multiply-add by `title + title + body`. The fixed title weight is exactly two. With the existing u32 frequencies/lengths, u64 statistics and positive-document-count guard, contributions are finite and nonnegative, bounded far away from floating-point overflow and nonzero underflow. Doubling therefore introduces no intermediate rounding; the subsequent addition retains the fused formula's result. This is specific to the existing title weight, not permission to reassociate arbitrary scoring arithmetic.
+
+A numerical regression compares the complete result bits with the preceding fused formula for 90,000 combinations of frequencies, lengths, document counts, total lengths and document frequencies, including zero, invalid frequencies, the f64 integer-precision boundary and u32/u64 maxima. The existing codec regressions also retain their full exact-result comparisons. Production scoring parameters and canonical bytes are unchanged.
+
+Each paired workerd ranking measurement used the existing 5,000-document corpus, twenty rankings per request, twenty-five alternating pairs and five discarded warmup pairs. Body-only documents retain the benchmark corpus's varying lengths and term frequencies. The mixed fixture adds a title containing four selected terms to alternate documents. Complete serialized rankings matched the preceding engine in every run.
+
+| Fixture      | Run | Mode   | Baseline batch p50 ms | Candidate batch p50 ms | Baseline batch p95 ms | Candidate batch p95 ms |
+| :----------- | :-- | :----- | --------------------: | ---------------------: | --------------------: | ---------------------: |
+| Body only    | 1   | any    |                13.766 |                 13.351 |                14.420 |                 14.357 |
+| Body only    | 1   | phrase |               178.729 |                193.898 |               305.310 |                339.827 |
+| Body only    | 2   | any    |                13.466 |                 13.209 |                13.710 |                 13.755 |
+| Body only    | 2   | phrase |               174.668 |                180.289 |               200.616 |                229.988 |
+| Mixed titles | 1   | any    |                27.602 |                 25.732 |                29.916 |                 28.254 |
+| Mixed titles | 1   | phrase |               202.062 |                182.925 |               313.188 |                306.601 |
+| Mixed titles | 2   | any    |                14.728 |                 13.657 |                15.496 |                 14.439 |
+| Mixed titles | 2   | phrase |               189.289 |                172.313 |               198.370 |                180.544 |
+
+Mixed-title batch medians improved 6.8–7.3% for any and 9.0–9.5% for phrase across the two runs. Body-only any improved 1.9–3.0%, while body-only phrase regressed 3.2–8.5%. The separate 720-request any/all/phrase matrix preserved every encoded ranking across 1/16/128/5,000 documents, filters and tombstones; its timings were mixed. Two complete-Worker comparisons over 4,096 documents and eight segments preserved all 768 complete rows/scores/sequence checks. Case medians ranged from a 9.9% improvement to a 27.1% regression in the first run, and from a 12.7% improvement to a 7.9% regression in the repeat. These runs do not establish a consistent end-to-end speedup. The generated production WASM shrank by 100 bytes, from 782,550 to 782,450.
+
+The complete local gate passed 228 Worker/tooling and 42 Rust tests, 7,822 Bun assertions, formatting, TypeScript/Effect lint and types, and native/WASM Clippy. The production WASM reconstructed by that gate exactly matched the measured artifact.
+
+The independent SciFact rerun retained the entire preceding 300-query report, including all returned IDs and metrics: nDCG@10 0.6730619695232347, recall@10 0.7956666666666666 and MRR@10 0.641808201058201.

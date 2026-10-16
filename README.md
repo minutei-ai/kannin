@@ -11,13 +11,13 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 **1,000,000 documents · deployed Cloudflare · GRU ingress · warmed edge repeat with acknowledged sequence barrier**
 
-| Concurrency | p50 ms |  p95 ms | Requests/s |
-| ----------: | -----: | ------: | ---------: |
-|           1 |  59.08 |  262.48 |       9.43 |
-|           4 |  70.86 |  191.76 |      30.60 |
-|          16 |  73.72 | 1196.75 |      41.68 |
+| Concurrency | p50 ms | p95 ms | Requests/s |
+| ----------: | -----: | -----: | ---------: |
+|           1 |  50.28 | 192.27 |      11.27 |
+|           4 |  51.84 | 153.98 |      40.93 |
+|          16 |  64.50 | 920.45 |      46.92 |
 
-The warmed repeat preserved strong baseline rows, scores and sequence in all **384 responses**, with GRU ingress; its maximum request took **1.96 s**. The first run on the same version had a concurrency-one p50 of **209.68 ms**, with snapshot acquisition falling back to the coordinator in all 128 requests. These results remain sensitive to cache state and native I/O delays. [Full measurements](docs/performance.md#carrying-document-ranges-through-the-rust-ranker).
+The latest repeat preserved strong baseline rows, scores and sequence in all **384 responses**, with GRU ingress; its maximum request took **1.52 s**. The first run after deployment had p50 **50.87/52.34/68.17 ms** at concurrency 1/4/16. The preceding version had a concurrency-one p50 of **195.66 ms** and coordinator fallback in 126 of 128 requests. No fallback occurred in either new run, but the observed health sample did not exercise late retention: cache state and native I/O prevent attributing the latency difference to the new optimization. [Full measurements](docs/performance.md#retaining-late-canonical-snapshots-for-revalidation).
 
 Rust now carries document ranges directly through ranking. Six deployed queries returning fifty scattered documents changed from **3.12 to 1.75 seconds median**, about **44% lower**, with complete rows/scores preserved and directory reloads changing **50→0**. Both versions used GRU ingress, process-memory resets and warmed immutable sources. This is a measured workload gain, not general performance parity. [Method and limits](docs/performance.md#carrying-document-ranges-through-the-rust-ranker).
 
@@ -46,7 +46,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **207 Worker/tooling tests and 39 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **223 Worker/tooling tests and 39 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

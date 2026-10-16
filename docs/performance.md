@@ -2877,3 +2877,27 @@ The first standard load preserved **384/384** responses but regressed: concurren
 A same-version repeat, prompted by that unresolved regression, preserved another **384/384** responses. Concurrency 1/4/16 p50 was **59.08/70.86/73.72 ms**, p95 **262.48/191.76/1,196.75 ms**, and throughput **9.43/30.60/41.68 requests/s**; maximum latency was **1.96 seconds**, all GRU. Concurrency one and four had zero snapshot fallbacks; sixteen had six. The README labels this warmed repeat and retains the first-run limitation. Neither run establishes a universal speedup or resolves native snapshot-acquisition tails.
 
 Twelve native ANN/hybrid checks preserved **105 complete rows and scores** from the existing three 100-vector fixtures. A GRU health sample observed 12,386,304 WASM bytes in its selected isolate; this is not peak Worker heap or attribution to the tested coordinator. No canonical corpus writes, infrastructure configuration changes or Turbopuffer reingestion were performed for this change. Cold-root acquisition, peak memory, larger ANN quality and comparable end-to-end parity remain open.
+
+## Retaining late canonical snapshots for revalidation
+
+Commit `cf3377b` retains fully validated late canonical R2 payloads and their native ETags as expired candidates in the existing 24 MiB snapshot budget. A later conditional canonical read must confirm their version before they can serve queries or publish to Cache API. The original observation time, sub-second selection limit, minimum-sequence check, 900 ms shared foreground acquisition budget and body-admission lifetime remain in force. Oversized late headers cancel without consuming their body; invalid bodies are never retained. This can spend an additional late body read, and does not eliminate the first timeout.
+
+The complete local gate passed 223 Worker/tooling tests (7,745 assertions) and 39 Rust tests, including delayed headers/bodies, changed sequences, invalid bodies, memory admission and conditional revalidation without a second download. Alchemy deployed with the `minutei` profile and completed its vector metadata migration. Native provider reads confirmed version `b910f087-d683-409f-8bc5-388c273279f1` at 100%, unchanged R2 binding/lifecycle rules and unchanged empty placement settings.
+
+Each run below used the same million-document, 200-segment corpus at sequence 2,000, four query shapes, 128 requests per concurrency and complete row/score/sequence comparisons with fresh strong baselines. All 1,152 measured responses matched and entered through GRU. Runs are sequential observations, not alternating controlled attribution.
+
+| Run           | Concurrency | p50 ms |  p95 ms | Requests/s | Coordinator fallbacks |
+| :------------ | ----------: | -----: | ------: | ---------: | --------------------: |
+| Before        |           1 | 195.66 | 1095.88 |       3.16 |                   126 |
+| Before        |           4 |  77.50 |  839.52 |      20.55 |                     7 |
+| Before        |          16 |  83.00 | 1134.15 |      42.61 |                     0 |
+| After, first  |           1 |  50.87 |   82.92 |      16.39 |                     0 |
+| After, first  |           4 |  52.34 |  641.54 |      28.76 |                     0 |
+| After, first  |          16 |  68.17 | 1074.99 |      42.88 |                     0 |
+| After, repeat |           1 |  50.28 |  192.27 |      11.27 |                     0 |
+| After, repeat |           4 |  51.84 |  153.98 |      40.93 |                     0 |
+| After, repeat |          16 |  64.50 |  920.45 |      46.92 |                     0 |
+
+The first and repeated after runs had maximum requests of 1.52 seconds. The selected post-load health response retained 5,448,863 payload bytes with 21,795,676 charged bytes, three canonical reads and two revalidations, but zero late retentions. This isolate sample cannot establish that the new branch caused the observed speedup or that other isolates never used it. The new behavior has controlled local evidence; native latency remains sensitive to cache state. Concurrent snapshot acquisition and ranking preparation still have slow tails. Native clocks do not measure synchronous CPU time reliably.
+
+Twelve native Vectorize/hybrid queries over the three existing 100-vector fixtures preserved all 105 complete rows and scores relative to the previous deployment. This is small-fixture parity, not large-corpus ANN recall or Turbopuffer performance parity.

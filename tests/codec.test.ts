@@ -1210,3 +1210,53 @@ test("oversized field projections retain the original minimum fallback", () => {
     Schema.decodeSync(Schema.fromJsonString(EligibleMinimum))(largeDirectory.minimum(largeFilters)),
   );
 });
+
+test("indexed eligibility predicates preserve field order, duplicates and every scalar operator", () => {
+  using segment = new Segment(
+    JSON.stringify(
+      Array.from({ length: 12 }, (_, index) => ({
+        id: String(index),
+        revision: 1,
+        title: "alpha ".repeat(index % 3),
+        text: "alpha ".repeat(1 + (index % 4)),
+        attributes: { year: index, group: index % 2, flag: index % 3 === 0 },
+      })),
+    ),
+  );
+  using directory = new Directory(segment.bytes());
+  const encodeFilters = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Filter)));
+  const cases = Schema.decodeSync(Schema.Array(Schema.Array(Filter)))([
+    [{ field: "year", op: "eq", value: 4 }],
+    [{ field: "year", op: "ne", value: 4 }],
+    [{ field: "year", op: "gt", value: 4 }],
+    [{ field: "year", op: "gte", value: 4 }],
+    [{ field: "year", op: "lt", value: 4 }],
+    [{ field: "year", op: "lte", value: 4 }],
+    [{ field: "year", op: "in", value: [0, 3, 6] }],
+    [{ field: "absent", op: "exists", value: false }],
+    [
+      { field: "year", op: "gt", value: 2 },
+      { field: "group", op: "eq", value: 1 },
+      { field: "year", op: "lt", value: 8 },
+      { field: "flag", op: "eq", value: true },
+    ],
+    [
+      { field: "year", op: "gt", value: 2 },
+      { field: "year", op: "lt", value: 2 },
+    ],
+  ]);
+  for (const filters of cases) {
+    const encodedFilters = encodeFilters(filters);
+    const projected = Schema.decodeSync(Schema.fromJsonString(ProjectedTermCatalog))(
+      segment_overview_project(directory.overview(), '["alpha"]', encodedFilters),
+    );
+    if (projected.eligibility === null) throw new Error("Missing eligibility projection");
+    const encoded = Schema.encodeSync(Schema.fromJsonString(EligibilityProjection))(
+      projected.eligibility,
+    );
+    using query = new EligibilityQuery(encodedFilters);
+    using reversed = new EligibilityQuery(encodeFilters(filters.toReversed()));
+    expect(query.minimum(encoded)).toBe(directory.minimum(encodedFilters));
+    expect(reversed.minimum(encoded)).toBe(query.minimum(encoded));
+  }
+});

@@ -3529,3 +3529,18 @@ Production deployed source `975c461` as version `58d8443c-9261-4a5d-a22a-bdd62ab
 Each selector has twelve measured responses after two excluded warmup rounds; nearest-rank p95 is therefore the maximum. Filters change values each round while preserving eligibility. Eight-term queries had zero catalog RPCs in both cohorts. Their latency increased, so this does not establish a universal improvement or isolate the effect of Smart Placement. Network, isolate/cache residency and placement were uncontrolled between cohorts. The complete 300-query SciFact report remained identical to the preceding reference. Cold broad acquisition, whole-Worker heap and large-scale ANN recall remain unproven.
 
 Sixteen additional rare/dense native text checks across strong and edge consistency preserved complete baseline results. Twelve Vectorize/hybrid checks preserved all 105 baseline rows and scores across three fixtures. These checks establish regression coverage for those fixtures, not large-scale ANN quality.
+
+## Avoiding repeated field-model conversions
+
+The preceding field-model cache retained decoded models. Every hit ran the Effect encoder again, including JSON-scalar validation for every cell, before Rust parsed the model and rebuilt a field-name map per group. The L1 now retains the validated encoded JSON from admission. Rust resolves predicate field indices once per query and evaluates scalar vectors through the same matcher used by document filtering. This adds no native retained handles, changes no persisted or transport format and preserves the four-MiB cache owner. String encoding is included in the existing conservative admission charge.
+
+An alternating workerd comparison ran 350 query pairs over 10,000 documents in 200 segments. Four-field predicates combined a changing always-matching year bound with group, boolean and string predicates. Every complete result and sequence 200 matched; both variants made 25 initial catalog RPCs and reused subsequent values.
+
+| Local workerd                          | p50 ms | p95 ms | Catalog RPCs |
+| -------------------------------------- | -----: | -----: | -----------: |
+| Before                                 |  46.57 |  58.39 |           25 |
+| Encoded admission + indexed predicates |  38.31 |  50.05 |           25 |
+
+The candidate was faster in 309 of 350 pairs, with p50 about 18% lower. This measures the combined TypeScript/Rust change in local workerd, not the Rust portion independently or native network latency. A codec regression compares all scalar operators, reordered predicates, repeated predicates on one field and contradictory predicates against canonical directory minima. The native baseline for this experiment was captured with Smart Placement already enabled and `remote-MIA` observed.
+
+The local gate passed 261 Worker/tooling tests (9,130 assertions), 42 Rust tests, strict TypeScript/Effect lint and types, and both native/WASM Clippy targets. The paired fixture charged 751,936 bytes before and 801,536 bytes after in the term L1: escaped string encoding increases conservative admission charge while retaining the same four-MiB quota. These counters do not measure whole-Worker heap.

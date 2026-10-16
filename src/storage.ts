@@ -117,7 +117,7 @@ const MAX_DECODED_CACHE_BYTES = 20 * 1024 * 1024;
 const CachedTermCatalog = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("projection"), projection: TermProjection }),
   Schema.Struct({ kind: Schema.Literal("minimum"), minimum: EligibleMinimum }),
-  Schema.Struct({ kind: Schema.Literal("eligibility"), eligibility: EligibilityProjection }),
+  Schema.Struct({ kind: Schema.Literal("eligibility"), eligibility: Schema.String }),
 ]);
 const encodeCachedTermCatalog = Schema.encodeSync(Schema.fromJsonString(CachedTermCatalog));
 const termCatalogs = new Map<string, { value: typeof CachedTermCatalog.Type; bytes: number }>();
@@ -1255,9 +1255,7 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
                     if (cached?.value.kind === "eligibility") {
                       const eligibility = cached.value.eligibility;
                       const projected = yield* Effect.try(() =>
-                        decodeEligibilityMinimum(
-                          eligibilityQuery.minimum(encodeEligibility(eligibility)),
-                        ),
+                        decodeEligibilityMinimum(eligibilityQuery.minimum(eligibility)),
                       ).pipe(Effect.option);
                       if (Option.isSome(projected)) minimumValue.value = projected.value;
                       if (termCatalogs.get(eligibilityIdentity) === cached) {
@@ -1415,15 +1413,19 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
                 }
                 if (entry.minimum === undefined) {
                   entry.minimum = catalog.minimum;
-                  if (
-                    catalog.eligibility !== null &&
-                    encodeEligibilityFields(catalog.eligibility.fields) === fieldSelector &&
-                    new TextEncoder().encode(encodeEligibility(catalog.eligibility)).byteLength <=
-                      4096
-                  )
+                  const eligibility = Option.fromNullishOr(catalog.eligibility).pipe(
+                    Option.filter(
+                      (model) => encodeEligibilityFields(model.fields) === fieldSelector,
+                    ),
+                    Option.map(encodeEligibility),
+                    Option.filter(
+                      (encoded) => new TextEncoder().encode(encoded).byteLength <= 4096,
+                    ),
+                  );
+                  if (Option.isSome(eligibility))
                     rememberTermCatalog(entry.eligibilityIdentity, {
                       kind: "eligibility",
-                      eligibility: catalog.eligibility,
+                      eligibility: eligibility.value,
                     });
                   else
                     rememberTermCatalog(entry.minimumIdentity, {

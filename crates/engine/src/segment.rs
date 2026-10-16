@@ -965,30 +965,32 @@ pub fn matches(
     filters: &[Filter],
 ) -> Result<bool, String> {
     for filter in filters {
-        let actual = attributes.get(&filter.field);
-        let equal = actual == Some(&filter.value);
-        let matched = match filter.op.as_str() {
-            "eq" => equal,
-            "ne" => !equal,
-            "exists" => {
-                actual.is_some() == filter.value.as_bool().ok_or("Invalid exists filter")?
-            }
-            "in" => actual.is_some_and(|value| {
-                filter
-                    .value
-                    .as_array()
-                    .is_some_and(|items| items.contains(value))
-            }),
-            "gt" | "gte" | "lt" | "lte" => {
-                actual.is_some_and(|value| compare_number(value, &filter.value, &filter.op))
-            }
-            _ => return Err("Unknown filter operation".into()),
-        };
-        if !matched {
+        if !filter.matches(attributes.get(&filter.field))? {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+impl Filter {
+    fn matches(&self, actual: Option<&serde_json::Value>) -> Result<bool, String> {
+        let equal = actual == Some(&self.value);
+        let matched = match self.op.as_str() {
+            "eq" => equal,
+            "ne" => !equal,
+            "exists" => actual.is_some() == self.value.as_bool().ok_or("Invalid exists filter")?,
+            "in" => actual.is_some_and(|value| {
+                self.value
+                    .as_array()
+                    .is_some_and(|items| items.contains(value))
+            }),
+            "gt" | "gte" | "lt" | "lte" => {
+                actual.is_some_and(|value| compare_number(value, &self.value, &self.op))
+            }
+            _ => return Err("Unknown filter operation".into()),
+        };
+        Ok(matched)
+    }
 }
 
 #[derive(Clone, Serialize, Debug)]
@@ -2054,6 +2056,7 @@ pub mod wasm {
     pub struct EligibilityQuery {
         filters: Vec<Filter>,
         fields: Vec<String>,
+        field_indices: Vec<usize>,
     }
 
     #[wasm_bindgen]
@@ -2071,8 +2074,20 @@ pub mod wasm {
                 .map(|filter| filter.field.clone())
                 .collect::<BTreeSet<_>>()
                 .into_iter()
-                .collect();
-            Ok(Self { filters, fields })
+                .collect::<Vec<_>>();
+            let field_indices = filters
+                .iter()
+                .map(|filter| {
+                    fields.binary_search(&filter.field).map_err(|index| {
+                        JsValue::from_str(&format!("Eligibility omitted filter field at {index}"))
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            Ok(Self {
+                filters,
+                fields,
+                field_indices,
+            })
         }
 
         #[doc = "# Errors\nRejects oversized, malformed or differently scoped eligibility projections."]
@@ -2093,18 +2108,36 @@ pub mod wasm {
                 if values.len() != self.fields.len() || values.iter().any(|value| value.len() > 1) {
                     return Err(JsValue::from_str("Eligibility projection omitted a field"));
                 }
-                let mut attributes = BTreeMap::new();
-                for (field, values) in self.fields.iter().zip(values) {
-                    if let Some(value) = values.into_iter().next() {
-                        let value: serde_json::Value = serde_json::from_str(&value)
-                            .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
-                        if value.is_array() || value.is_object() {
-                            return Err(JsValue::from_str("Eligibility value must be scalar"));
-                        }
-                        attributes.insert(field.clone(), value);
+                let attributes = values
+                    .into_iter()
+                    .map(|values| {
+                        values
+                            .into_iter()
+                            .next()
+                            .map(|value| {
+                                let value: serde_json::Value = serde_json::from_str(&value)
+                                    .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+                                if value.is_array() || value.is_object() {
+                                    return Err(JsValue::from_str(
+                                        "Eligibility value must be scalar",
+                                    ));
+                                }
+                                Ok(value)
+                            })
+                            .transpose()
+                    })
+                    .collect::<Result<Vec<_>, JsValue>>()?;
+                let mut matched = true;
+                for (filter, index) in self.filters.iter().zip(&self.field_indices) {
+                    if !filter
+                        .matches(attributes[*index].as_ref())
+                        .map_err(|cause| JsValue::from_str(&cause))?
+                    {
+                        matched = false;
+                        break;
                     }
                 }
-                if matches(&attributes, &self.filters).map_err(|cause| JsValue::from_str(&cause))? {
+                if matched {
                     minimum = Some(match minimum {
                         Some((a, b)) => (title.min(a), body.min(b)),
                         None => (title, body),

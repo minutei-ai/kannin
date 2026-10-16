@@ -38,7 +38,7 @@ Reusing validated R2 directories reduced local workerd directory-acquisition p50
 
 Decoded-directory admission now retains useful headers within the existing **20 MiB** budget. A repeated one-million-document Cloudflare cohort reduced strong-query median **472 → 350 ms** for sixteen terms and **650 → 552 ms** for sixty-four, preserving all 168 complete responses across cohorts. [Measurements and tradeoffs](docs/performance.md#retaining-useful-decoded-directories-within-the-worker-budget).
 
-Compact directory frames reduced first-query local medians with empty Worker caches from **1,357 → 1,145 ms** for sixteen rare terms and **2,419 → 2,151 ms** for sixty-four. All 48 complete responses matched. This uses three fresh workerd processes per variant/selector with an existing R2 dataset; it does not establish fully cold Cloudflare R2 latency. [Cold-read method and limits](docs/performance.md#compact-directory-frames-for-the-first-read).
+Compact directory frames reduced first-query local medians with empty Worker caches from **1,273 → 1,103 ms** for sixteen rare terms and **2,483 → 2,033 ms** for sixty-four. All 48 complete responses matched. This uses three fresh workerd processes per variant/selector with an existing R2 dataset; it does not establish fully cold Cloudflare R2 latency. [Cold-read method and limits](docs/performance.md#compact-directory-frames-for-the-first-read).
 
 Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10**, with the entire 300-query report unchanged. Twelve native Vectorize/hybrid checks preserved 105 complete rows and scores across three 100-vector fixtures; large-corpus ANN recall remains unmeasured.
 

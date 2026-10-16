@@ -20,6 +20,7 @@ const state = {
   rejectedWrites: 0,
   canonicalReads: 0,
   directoryParses: 0,
+  corruptDirectory: false,
 };
 const parseDirectory = Directory.compressed.bind(Directory);
 Object.defineProperty(Directory, "compressed", {
@@ -58,6 +59,15 @@ export class Segments extends CachedSegments {
     await Effect.runPromise(Effect.sleep(state.cacheDelay));
     const response = await super.fetch(request);
     state.cacheCompleted += 1;
+    if (
+      state.corruptDirectory &&
+      response.ok &&
+      new URL(request.url).pathname === "/directory-v2"
+    ) {
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      new DataView(bytes.buffer, bytes.byteOffset).setUint32(12, 0xffffffff, true);
+      return new Response(bytes, response);
+    }
     return response;
   }
 }
@@ -117,6 +127,12 @@ async function probe(request: Request, env: Env) {
   }
   if (new URL(request.url).pathname === "/cache-failure") {
     state.failDirectoryCache = true;
+    return new Response(null, { status: 204 });
+  }
+  if (new URL(request.url).pathname === "/corrupt-directory") {
+    state.corruptDirectory = true;
+    state.cacheDelay = 0;
+    state.failDirectoryWrites = true;
     return new Response(null, { status: 204 });
   }
   if (new URL(request.url).pathname === "/cache-write-failure") {
@@ -184,7 +200,9 @@ async function probe(request: Request, env: Env) {
     url.searchParams.set("offset", String(input.offset));
     url.searchParams.set("length", String(input.length));
     url.searchParams.set("direct-origin", "1");
-    return exports.Segments({ props: { bucket: env.STORAGE_CACHE_SCOPE } }).fetch(url);
+    return exports
+      .Segments({ props: { bucket: env.STORAGE_CACHE_SCOPE, format: "compact-json-v2" } })
+      .fetch(url);
   }
   const before = cacheUsage();
   return Effect.runPromise(

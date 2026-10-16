@@ -129,6 +129,7 @@ export class Segments extends WorkerEntrypoint<Env, typeof SegmentCacheProps.Typ
     const cacheKey = new URL(request.url);
     cacheKey.hostname = "raio-cache.internal";
     cacheKey.searchParams.set("bucket", this.env.STORAGE_CACHE_SCOPE);
+    cacheKey.searchParams.set("format", props.value.format);
     const cache = await Effect.runPromise(
       Effect.tryPromise(() => caches.open("raio-segments-v1")).pipe(
         Effect.orElseSucceed(() => undefined),

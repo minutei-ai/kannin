@@ -112,7 +112,10 @@ const admissionCounts = new Map<string, number>();
 const admissionBudget = { bytes: 0, requests: 0 };
 const MAX_ADMISSION_BYTES = 1024 * 1024;
 const directories = new Map<string, { directory: Directory; bytes: number; headerBytes: number }>();
-const activeDirectories = new Map<string, { readers: number; directory: Directory | undefined }>();
+const activeDirectories = new Map<
+  string,
+  { readers: number; directory: Directory | undefined; fingerprint: ArrayBuffer | undefined }
+>();
 const decodedBudget = { bytes: 0 };
 const MAX_DECODED_BYTES = 40 * 1024 * 1024;
 const MAX_DECODED_CACHE_BYTES = 20 * 1024 * 1024;
@@ -312,11 +315,18 @@ export function addFrequencyPosting(
   ranker.add_frequency(term, page);
 }
 
-function rememberDirectory(identity: string, headerBytes: number, directory: Directory) {
+function rememberDirectory(
+  identity: string,
+  headerBytes: number,
+  directory: Directory,
+  fingerprint?: ArrayBuffer,
+) {
   const bytes = directory.heap_bytes();
   const active = activeDirectories.get(`${identity}/0/${headerBytes}/directory-v2`);
-  if (active !== undefined && active.directory === undefined && bytes <= MAX_DECODED_BYTES)
+  if (active !== undefined && active.directory === undefined && bytes <= MAX_DECODED_BYTES) {
     active.directory = directory.retain();
+    active.fingerprint = fingerprint;
+  }
   if (directories.has(identity)) return;
   if (bytes > MAX_DECODED_CACHE_BYTES) return;
   const frequency = admissionCounts.get(`${identity}/0/${headerBytes}/directory-v2`) ?? 1;
@@ -364,9 +374,12 @@ export const readDirectoryFrame = Effect.fn("kannin.readDirectoryFrame")(
           }
           const bytes = new Uint8Array(yield* Effect.tryPromise(() => object.arrayBuffer()));
           reads.directoryR2CacheBytes += bytes.byteLength;
+          const fingerprint = yield* Effect.tryPromise(() =>
+            crypto.subtle.digest("SHA-256", bytes),
+          );
           const checked = yield* Effect.try(() => {
             using directory = Directory.compressed(bytes, length);
-            rememberDirectory(`${env.STORAGE_CACHE_SCOPE}:${key}`, length, directory);
+            rememberDirectory(`${env.STORAGE_CACHE_SCOPE}:${key}`, length, directory, fingerprint);
             return bytes;
           }).pipe(Effect.option);
           if (Option.isSome(checked)) reads.directoryR2CacheHits += 1;
@@ -460,7 +473,10 @@ export async function range(
     url.searchParams.set("key", input.key);
     url.searchParams.set("offset", String(input.offset));
     url.searchParams.set("length", String(input.length));
-    const props = Schema.encodeSync(SegmentCacheProps)({ bucket: env.STORAGE_CACHE_SCOPE });
+    const props = Schema.encodeSync(SegmentCacheProps)({
+      bucket: env.STORAGE_CACHE_SCOPE,
+      format: "compact-json-v2",
+    });
     reads.rangeReads += 1;
     const cachedRead = Effect.tryPromise({
       try: async (signal) => {
@@ -479,7 +495,29 @@ export async function range(
             upstreamStatus: response.status,
             upstreamRay: response.headers.get("cf-ray"),
           });
-        return new Uint8Array(await response.arrayBuffer());
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        signal.throwIfAborted();
+        if (compressedDirectory) {
+          const fingerprint = await crypto.subtle.digest("SHA-256", bytes);
+          signal.throwIfAborted();
+          const active = activeDirectories.get(cacheKey);
+          const known = active?.fingerprint;
+          const digest = new Uint8Array(fingerprint);
+          if (
+            known === undefined ||
+            !new Uint8Array(known).every((byte, index) => byte === digest[index])
+          ) {
+            using directory = Directory.compressed(bytes, length);
+            if (active !== undefined)
+              rememberDirectory(
+                `${env.STORAGE_CACHE_SCOPE}:${key}`,
+                length,
+                directory,
+                fingerprint,
+              );
+          }
+        }
+        return bytes;
       },
       catch: (cause) => {
         if (Schema.is(Rejected)(cause)) return cause;
@@ -534,7 +572,7 @@ export async function range(
       Match.value(compressedDirectory).pipe(
         Match.when(true, () => {
           if (length > MAX_DIRECTORY_FALLBACK_LENGTH) return cachedRead;
-          return Effect.raceFirst(
+          return Effect.race(
             cachedRead,
             Effect.gen(function* () {
               yield* Effect.sleep("250 millis");
@@ -561,10 +599,14 @@ export async function range(
                   ),
                 }),
               );
-              return yield* Option.match(recovered, {
-                onNone: () => Effect.never,
-                onSome: Effect.succeed,
-              });
+              return yield* Effect.fromOption(
+                recovered,
+                () =>
+                  new Rejected({
+                    status: 503,
+                    message: "Directory recovery admission unavailable",
+                  }),
+              );
             }),
           );
         }),
@@ -651,7 +693,7 @@ export const withDirectory = Effect.fn("raio.withDirectory")(
           existing.readers += 1;
           return { identity, active: existing };
         }
-        const active = { readers: 1, directory: undefined };
+        const active = { readers: 1, directory: undefined, fingerprint: undefined };
         if (activeDirectories.size < MAX_PENDING_RANGES) activeDirectories.set(identity, active);
         return { identity, active };
       }),

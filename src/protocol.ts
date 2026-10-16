@@ -522,7 +522,10 @@ export const OverviewFrameMetadata = Schema.Struct({
     Schema.isBetween({ minimum: 1, maximum: 512 * 1024 }),
   ),
 });
-export const SegmentCacheProps = Schema.Struct({ bucket: TermProjectionProps.fields.bucket });
+export const SegmentCacheProps = Schema.Struct({
+  bucket: TermProjectionProps.fields.bucket,
+  format: Schema.Literal("compact-json-v2"),
+});
 export const NativeRankingInput = Schema.Struct({
   bucket: SegmentCacheProps.fields.bucket,
   query: Schema.Struct({

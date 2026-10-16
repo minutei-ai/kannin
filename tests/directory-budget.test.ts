@@ -94,6 +94,7 @@ async function cacheFrame(
   cacheKey.searchParams.set("offset", "0");
   cacheKey.searchParams.set("length", String(headerBytes));
   cacheKey.searchParams.set("bucket", "raio-test");
+  cacheKey.searchParams.set("format", "compact-json-v2");
   await (
     await (await worker.getCaches()).open("raio-segments-v1")
   ).put(
@@ -210,6 +211,44 @@ test("invalid R2 directory frames recover canonical data and repair disposable a
     }
   }
 }, 15000);
+
+test("malformed native directory responses recover through bounded canonical reads", async () => {
+  await using active = await fixture();
+  const worker = active.worker;
+  const key = "namespaces/directory-native-corrupt/segments/header.rsix";
+  await (await worker.getR2Bucket("STORAGE")).put(key, canonical);
+  expect((await fetch(new URL("/corrupt-directory", await worker.ready))).status).toBe(204);
+  const body = Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
+    key,
+    offset: 0,
+    length,
+    count: 8,
+  });
+  const response = await fetch(await worker.ready, { method: "POST", body });
+  expect(response.status).toBe(200);
+  expect(new Uint8Array(await response.arrayBuffer())).toEqual(frame);
+  expect(response.headers.get("x-fallbacks")).toBe("1");
+  expect(response.headers.get("x-fallback-bytes")).toBe(String(length));
+  using expected = Directory.compressed(frame, length);
+  const decoded = await fetch(new URL("/decoded", await worker.ready), { method: "POST", body });
+  expect(decoded.status).toBe(200);
+  expect(await decoded.text()).toBe(expected.terms('["unique3711"]'));
+  const repeated = await fetch(await worker.ready, { method: "POST", body });
+  expect(repeated.status).toBe(200);
+  expect(new Uint8Array(await repeated.arrayBuffer())).toEqual(frame);
+  expect(repeated.headers.get("x-fallbacks")).toBe("0");
+  const missing = await fetch(await worker.ready, {
+    method: "POST",
+    body: Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
+      key: "namespaces/directory-native-corrupt/segments/missing.rsix",
+      offset: 0,
+      length,
+      count: 1,
+    }),
+    signal: AbortSignal.timeout(5000),
+  });
+  expect(missing.status).toBe(503);
+});
 
 test("unavailable R2 directory cache preserves canonical recovery", async () => {
   await using active = await fixture();
@@ -492,6 +531,28 @@ for (const name of ["headers", "body"])
     expect(state.headers.get("x-r2-active")).toBe("0");
   }, 15000);
 
+test("a failed R2 backstop preserves a pending valid cached directory", async () => {
+  await using active = await fixture();
+  const worker = active.worker;
+  expect((await fetch(new URL("/race", await worker.ready))).status).toBe(204);
+  const key = "namespaces/directory-cache-survives/segments/header.rsix";
+  await cacheFrame(worker, key, length, frame);
+  const response = await fetch(await worker.ready, {
+    method: "POST",
+    body: Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
+      key,
+      offset: 0,
+      length,
+      count: 8,
+    }),
+  });
+  expect(response.status).toBe(200);
+  expect(new Uint8Array(await response.arrayBuffer())).toEqual(frame);
+  expect(response.headers.get("x-fallbacks")).toBe("1");
+  const state = await fetch(new URL("/state", await worker.ready));
+  expect(state.headers.get("x-r2-active")).toBe("0");
+});
+
 test("directory recovery serializes distinct R2 bodies and releases failed admissions", async () => {
   await using active = await fixture();
   const worker = active.worker;
@@ -527,7 +588,6 @@ test("directory recovery serializes distinct R2 bodies and releases failed admis
   expect(state.headers.get("x-r2-peak")).toBe("1");
   expect(state.headers.get("x-r2-active")).toBe("0");
   const broken = "namespaces/directory-budget/segments/broken.rsix";
-  await cacheFrame(worker, broken, length, frame);
   const input = Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
     key: broken,
     offset: 0,

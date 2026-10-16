@@ -97,6 +97,7 @@ test("native Cache API retains compressed canonical directories after memory evi
   key.searchParams.set("offset", "0");
   key.searchParams.set("length", String(segment.headerBytes));
   key.searchParams.set("bucket", "raio-test");
+  key.searchParams.set("format", "compact-json-v2");
   const cached = await cache.match(key);
   expect(cached).toBeDefined();
   if (cached === undefined) return;

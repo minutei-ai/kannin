@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { Health, QueryResult } from "../src/protocol";
 import { document, request, startWorker, textQuery, write } from "./harness";
 
-test("expired R2 acquisition recovers through the coordinator without restarting its budget", async () => {
+async function fixture() {
   const artifacts = await mkdtemp(join(tmpdir(), "kannin-root-budget-"));
   await using cleanup = new AsyncDisposableStack();
   cleanup.defer(() => rm(artifacts, { recursive: true, force: true }));
@@ -39,6 +39,175 @@ test("expired R2 acquisition recovers through the coordinator without restarting
   cleanup.defer(async () => {
     await worker.dispose();
   });
+  const lifetime = cleanup.move();
+  return { worker, [Symbol.asyncDispose]: () => lifetime.disposeAsync() };
+}
+
+for (const mode of ["arm", "headers"])
+  test(`late R2 ${mode} retain only a conditional revalidation candidate`, async () => {
+    await using active = await fixture();
+    const worker = active.worker;
+    const namespace = `late-root-${mode}`;
+    expect(
+      (await request(worker, namespace, "write", write([document("a", "alpha old")]))).status,
+    ).toBe(200);
+    expect((await fetch(new URL(`/fixture/${mode}`, await worker.ready))).status).toBe(204);
+    const first = await request(worker, namespace, "query", {
+      ...textQuery("alpha"),
+      consistency: "edge-eventual",
+      minimumSequence: 1,
+    });
+    expect(first.status).toBe(200);
+    expect(first.headers.get("server-timing")).toContain("edge_snapshot_r2_timeout");
+    expect(first.headers.get("server-timing")).toContain("edge_snapshot_fallback");
+    for (const attempt of Array.from({ length: 100 }, (_, index) => index)) {
+      const state = await fetch(new URL("/fixture/state", await worker.ready));
+      if (state.headers.get("x-fixture-completed") === "1") break;
+      if (attempt === 99) throw new Error("Late root body did not settle");
+      await Effect.runPromise(Effect.sleep("20 millis"));
+    }
+    const retained = Schema.decodeUnknownSync(Health)(
+      await (await fetch(new URL("/health", await worker.ready))).json(),
+    );
+    expect(retained.snapshotMemoryChargedBytes).toBeGreaterThan(0);
+    expect(retained.snapshotMemoryChargedBytes).toBeLessThanOrEqual(24 * 1024 * 1024);
+    expect(retained.snapshotCachePutAttempts).toBe(0);
+    expect(retained.snapshotLateRetentions).toBe(1);
+    const confirmed = await request(worker, namespace, "query", {
+      ...textQuery("alpha"),
+      consistency: "edge-eventual",
+      minimumSequence: 1,
+    });
+    expect(confirmed.status).toBe(200);
+    expect(confirmed.headers.get("server-timing")).toContain("edge_snapshot_revalidated");
+    expect(confirmed.headers.get("server-timing")).not.toContain("edge_snapshot_fallback");
+    expect(Schema.decodeUnknownSync(QueryResult)(await confirmed.json()).rows[0]?.text).toBe(
+      "alpha old",
+    );
+    const state = await fetch(new URL("/fixture/state", await worker.ready));
+    expect(state.headers.get("x-fixture-started")).toBe("1");
+    expect(state.headers.get("x-fixture-conditionals")).toBe("1");
+  }, 15000);
+
+test("a late retained root cannot satisfy a later sequence without canonical confirmation", async () => {
+  await using active = await fixture();
+  const worker = active.worker;
+  const namespace = "late-root-changed";
+  expect(
+    (await request(worker, namespace, "write", write([document("a", "alpha old")]))).status,
+  ).toBe(200);
+  await fetch(new URL("/fixture/arm", await worker.ready));
+  const initial = await request(worker, namespace, "query", {
+    ...textQuery("alpha"),
+    consistency: "edge-eventual",
+  });
+  expect(initial.status).toBe(200);
+  for (const attempt of Array.from({ length: 100 }, (_, index) => index)) {
+    const state = await fetch(new URL("/fixture/state", await worker.ready));
+    if (state.headers.get("x-fixture-completed") === "1") break;
+    if (attempt === 99) throw new Error("Late root body did not settle");
+    await Effect.runPromise(Effect.sleep("20 millis"));
+  }
+  expect(
+    (await request(worker, namespace, "write", write([document("a", "alpha new")]))).status,
+  ).toBe(200);
+  await fetch(new URL("/fixture/disarm", await worker.ready));
+  const changed = await request(worker, namespace, "query", {
+    ...textQuery("alpha"),
+    consistency: "edge-eventual",
+    minimumSequence: 2,
+  });
+  expect(changed.status).toBe(200);
+  const result = Schema.decodeUnknownSync(QueryResult)(await changed.json());
+  expect(result.sequence).toBe(2);
+  expect(result.rows[0]?.text).toBe("alpha new");
+  expect(changed.headers.get("server-timing")).not.toContain("edge_snapshot_revalidated");
+  const state = await fetch(new URL("/fixture/state", await worker.ready));
+  expect(state.headers.get("x-fixture-conditionals")).toBe("1");
+  expect(
+    (
+      await request(worker, namespace, "query", {
+        ...textQuery("alpha"),
+        consistency: "edge-eventual",
+        minimumSequence: 3,
+      })
+    ).status,
+  ).toBe(409);
+}, 15000);
+
+test("invalid late root bodies never become revalidation candidates", async () => {
+  await using active = await fixture();
+  const worker = active.worker;
+  const namespace = "late-root-invalid";
+  expect(
+    (await request(worker, namespace, "write", write([document("a", "alpha safe")]))).status,
+  ).toBe(200);
+  await fetch(new URL("/fixture/corrupt", await worker.ready));
+  const first = await request(worker, namespace, "query", {
+    ...textQuery("alpha"),
+    consistency: "edge-eventual",
+  });
+  expect(first.status).toBe(200);
+  for (const attempt of Array.from({ length: 100 }, (_, index) => index)) {
+    const state = await fetch(new URL("/fixture/state", await worker.ready));
+    if (state.headers.get("x-fixture-completed") === "1") break;
+    if (attempt === 99) throw new Error("Invalid body did not settle");
+    await Effect.runPromise(Effect.sleep("20 millis"));
+  }
+  const health = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(health.snapshotMemoryChargedBytes).toBe(0);
+  expect(health.snapshotLateRetentions).toBe(0);
+  expect(health.snapshotCachePutAttempts).toBe(0);
+  await fetch(new URL("/fixture/disarm", await worker.ready));
+  const next = await request(worker, namespace, "query", {
+    ...textQuery("alpha"),
+    consistency: "edge-eventual",
+  });
+  expect(next.status).toBe(200);
+  expect(Schema.decodeUnknownSync(QueryResult)(await next.json()).rows[0]?.text).toBe("alpha safe");
+  expect(
+    (await fetch(new URL("/fixture/state", await worker.ready))).headers.get(
+      "x-fixture-conditionals",
+    ),
+  ).toBe("0");
+}, 15000);
+
+test("late oversized root headers cancel without consuming or retaining their body", async () => {
+  await using active = await fixture();
+  const worker = active.worker;
+  const namespace = "late-root-oversized";
+  expect(
+    (await request(worker, namespace, "write", write([document("a", "alpha safe")]))).status,
+  ).toBe(200);
+  await fetch(new URL("/fixture/oversized", await worker.ready));
+  const response = await request(worker, namespace, "query", {
+    ...textQuery("alpha"),
+    consistency: "edge-eventual",
+  });
+  expect(response.status).toBe(200);
+  expect(response.headers.get("server-timing")).toContain("edge_snapshot_r2_timeout");
+  for (const attempt of Array.from({ length: 100 }, (_, index) => index)) {
+    const state = await fetch(new URL("/fixture/state", await worker.ready));
+    if (state.headers.get("x-fixture-cancelled") === "1") {
+      expect(state.headers.get("x-fixture-started")).toBe("0");
+      break;
+    }
+    if (attempt === 99) throw new Error("Oversized root body was not cancelled");
+    await Effect.runPromise(Effect.sleep("20 millis"));
+  }
+  const health = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(health.snapshotMemoryChargedBytes).toBe(0);
+  expect(health.snapshotLateRetentions).toBe(0);
+  expect(health.snapshotCachePutAttempts).toBe(0);
+}, 15000);
+
+test("expired R2 acquisition recovers through the coordinator without restarting its budget", async () => {
+  await using active = await fixture();
+  const worker = active.worker;
   const namespace = "root-budget";
   expect(
     (await request(worker, namespace, "write", write([document("a", "alpha old")]))).status,
@@ -130,6 +299,7 @@ test("expired R2 acquisition recovers through the coordinator without restarting
   const health = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(health.snapshotMemoryChargedBytes).toBe(0);
+  expect(health.snapshotMemoryChargedBytes).toBeGreaterThan(0);
+  expect(health.snapshotMemoryChargedBytes).toBeLessThanOrEqual(24 * 1024 * 1024);
   expect(health.snapshotCachePutAttempts).toBe(0);
 }, 15000);

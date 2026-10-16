@@ -2279,6 +2279,8 @@ function rememberSnapshot(
   etag?: R2Object["etag"],
   cacheAttemptedAt?: number,
 ) {
+  const bytes = Math.max(frameBytes, payload.buffer.byteLength) * 4;
+  if (bytes > MAX_WARM_SNAPSHOT_BYTES) return false;
   const prior = warmSnapshots.get(key);
   if (
     prior !== undefined &&
@@ -2286,11 +2288,9 @@ function rememberSnapshot(
       (prior.snapshot.manifest.sequence === snapshot.manifest.sequence &&
         prior.snapshot.observedAt > snapshot.observedAt))
   )
-    return;
+    return false;
   if (prior !== undefined) warmSnapshotBudget.bytes -= prior.bytes;
   warmSnapshots.delete(key);
-  const bytes = Math.max(frameBytes, payload.buffer.byteLength) * 4;
-  if (bytes > MAX_WARM_SNAPSHOT_BYTES) return;
   warmSnapshots.set(key, { snapshot, payload, bytes, etag, cacheAttemptedAt });
   warmSnapshotBudget.bytes += bytes;
   while (warmSnapshotBudget.bytes > MAX_WARM_SNAPSHOT_BYTES) {
@@ -2299,12 +2299,14 @@ function rememberSnapshot(
     warmSnapshots.delete(oldest[0]);
     warmSnapshotBudget.bytes -= oldest[1].bytes;
   }
+  return true;
 }
 
 const snapshotMetrics = {
   snapshotR2Reads: 0,
   snapshotR2BodyBytes: 0,
   snapshotRevalidations: 0,
+  snapshotLateRetentions: 0,
   snapshotSharedReads: 0,
   snapshotCacheDecodes: 0,
   snapshotCacheRejected: 0,
@@ -2341,7 +2343,10 @@ async function acquireSnapshot(
   };
   if ("body" in object) {
     const receivedAt = Effect.runSync(Clock.currentTimeMillis);
-    if (receivedAt < observedAt || receivedAt - observedAt >= 1000) {
+    if (
+      receivedAt < observedAt ||
+      (receivedAt - observedAt >= 1000 && object.size * 4 >= MAX_WARM_SNAPSHOT_BYTES)
+    ) {
       await Effect.runPromise(Effect.tryPromise(() => object.body.cancel()).pipe(Effect.ignore));
       return undefined;
     }
@@ -2388,13 +2393,25 @@ async function acquireSnapshot(
   if (payload === undefined)
     throw new Rejected({ status: 503, message: "R2 snapshot omitted its encoded manifest" });
   const decodedAt = Effect.runSync(Clock.currentTimeMillis);
-  if (decodedAt < observedAt || decodedAt - observedAt >= 1000)
+  if (decodedAt < observedAt || decodedAt - observedAt >= 1000) {
+    if (
+      decodedAt >= observedAt &&
+      rememberSnapshot(
+        cacheKey.href,
+        snapshot,
+        payload,
+        snapshotFrameHeader(snapshot).size + payload.byteLength,
+        object.etag,
+      )
+    )
+      snapshotMetrics.snapshotLateRetentions += 1;
     return {
       snapshot,
       revalidated: selected.revalidated,
       r2Ms: Number(received - started) / 1e6,
       bodyMs: Number(Effect.runSync(Clock.currentTimeNanos) - received) / 1e6,
     };
+  }
   const header = snapshotFrameHeader(snapshot);
   const frameBytes = header.size + payload.byteLength;
   const lastAttempt = previous?.cacheAttemptedAt;

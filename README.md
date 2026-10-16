@@ -13,11 +13,11 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Concurrency | p50 ms | p95 ms | Requests/s |
 | ----------: | -----: | -----: | ---------: |
-|           1 |  45.55 |  62.79 |      18.36 |
-|           4 |  49.86 | 318.35 |      44.82 |
-|          16 |  62.19 | 487.09 |      92.77 |
+|           1 |  51.70 | 136.69 |      14.26 |
+|           4 |  53.89 | 291.66 |      42.04 |
+|          16 |  61.75 | 468.78 |      90.26 |
 
-A post-deploy run checked **384 responses** against strong baseline rows, scores and sequence, with 128 requests per concurrency. All entered through GRU without snapshot coordinator fallback. A separate 64-query probe with fresh selectors preserved complete pre-deploy results. These are cache-sensitive workload observations, not sustained-capacity guarantees. Edge freshness is weaker than strong consistency.
+A post-deploy run checked **384 responses** against strong baseline rows, scores and sequence, with 128 requests per concurrency. All entered through GRU without snapshot coordinator fallback. Two 16-query probes with fresh selectors preserved complete pre-deploy results. These are cache-sensitive workload observations, not sustained-capacity guarantees. Edge freshness is weaker than strong consistency.
 
 Catalog reads refill four concurrent tasks, project resident overviews before selector-cache lookup and recover Cache API misses through packed R2 batches before individual summaries. A controlled local R2-delay experiment reduced complete-query median from 1,724 to 821 ms; this is not a native Cloudflare speedup claim. Optional shared-plan lookups recover through catalog acquisition after a nominal 250 ms cache budget. Rust builds term dictionaries in bulk, reuses posting validation against exact retained headers and avoids software fused arithmetic for the fixed BM25 title weight. Isolated workerd gains and regressions are [documented](docs/performance.md); repeated complete-Worker measurements did not establish consistent end-to-end gains.
 

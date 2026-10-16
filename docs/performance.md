@@ -3305,3 +3305,38 @@ Sixteen alternating pairs completed successfully; excluding the first two pairs 
 Native catalog intervals ranged from 5,200–5,431 ms and 188–214 ms; complete client times ranged from 5,737.56–5,976.87 ms and 1,072.87–1,508.91 ms. The client includes the uncached canonical root read, response handling and digest; those are outside the reported catalog interval. Native clocks do not establish exclusive CPU or wall time. The candidate combines grouping and compression, reducing summary read count by 93.5% and transferred summary bytes by 78.7%; the experiment does not isolate their individual timing contributions. Preparation cost, cache-miss fallback, production publication/admission behavior, concurrent queries, complete ranking and whole-Worker peak heap still need integration evidence. These results do not establish a complete-search speedup or Turbopuffer parity.
 
 Cleanup deleted all thirteen owned objects and verified the temporary prefix empty. Alchemy destroyed the probe, with removal confirmed by native `WorkerNotFound`. Production remained at version `13f58d58-f1e0-4652-af04-caebb672a971`, 100%, with its R2 binding and lifecycle rules unchanged. The production reader still uses its existing per-segment R2 path; grouped-frame integration is pending.
+
+## Packed overview backstop integration
+
+Source `6c03e72` integrated the packed R2 backstop and deployed through minutei as native version `96b67537-0a09-4cb2-b477-11440a59b3ab`, 100%, retaining the R2 binding and lifecycle rules. Memory and the v5 overview Cache API precede R2 batch acquisition. The v5 API envelope and packed R2 representation share one Schema containing bucket, ordered physical references and complete overviews. Groups of at least eight sources use derived `cache/correlated-batches-v1/<first-source-key>/<ordered-range-digest>` objects. A valid persisted hit promotes into memory and schedules Cache API publication. Cold individual reads can schedule both tiers through the existing sixteen-operation/two-MiB publication owner; capacity and failures affect reuse only. First misses add an R2 lookup and can add a background write, so cold creation is not free and publication is not guaranteed.
+
+The optional R2 source has a nominal one-second shared outcome, a sixteen-source admission table retained until actual native settlement, encoded/decoded limits of 512 KiB and weighted body admission shared with individual overview reads. Timed-out readers retain native body resources until settlement, skip late decode, cancel unused bodies and recover through the original individual/canonical paths. New tests cover absent, corrupt, oversized, understated, wrong-bucket and wrong-order frames; header/body delays; original-deadline joins; sixteen-source overflow/recovery; publication failure/recovery; same-key coalescing; Cache API promotion; and saturated body admission across invocations.
+
+A seventeen-search stress test initially stalled with the previous queued small-range semaphore. Replacing only that range-admission operation with native nonqueued permits and one-millisecond timer retries completed the same test in 6.62 seconds; it then passed in the full gate. This preserves the four-MiB charge, same-range sharing, cache-read budget and original wait-for-capacity behavior. It does not establish a general semaphore-library defect or sustained capacity.
+
+The local gate passed **253 Worker/tooling tests with 8,654 assertions and 42 Rust tests**, including formatting, strict Effect/Oxlint, Effect tsgo and native/WASM Clippy. The complete 300-query SciFact report matched the previous report, including nDCG@10 0.6730619695232347, recall@10 0.7956666666666666 and MRR@10 0.641808201058201.
+
+On the fixed million-document corpus at sequence 2,000, two sixteen-query post-deploy probes matched every pre-deploy row, score and sequence. Fresh equivalent filters forced new text plans while underlying caches remained reusable. The first post-deploy rare64 edge response reused three R2 batches and the dense72 edge response reused ten; the repeated cohort also exercised persisted hits and Cache API promotion. No R2 batch lookup timeouts occurred in these probes. First-pass client timings were:
+
+| Selector / mode         | Before ms | First after ms | Fresh-selector repeat ms |
+| ----------------------- | --------: | -------------: | -----------------------: |
+| rare16 / strong         |   1308.20 |        1550.44 |                  1146.01 |
+| rare16 / edge-eventual  |   1163.81 |        1864.59 |                   951.68 |
+| rare64 / strong         |   1171.54 |        1348.07 |                  1007.86 |
+| rare64 / edge-eventual  |   1570.73 |        2388.40 |                  1051.82 |
+| dense72 / strong        |    999.85 |        1552.33 |                  1015.96 |
+| dense72 / edge-eventual |   1455.46 |        2002.53 |                  1285.00 |
+| dense43 / strong        |    789.61 |         740.63 |                   959.01 |
+| dense43 / edge-eventual |   1703.52 |        1667.27 |                  1619.27 |
+
+The first post-deploy pass was slower in six of these eight cases; repeated results were mixed. The Cache API format changed and first misses populated derived batches, while placement/network/cache conditions were uncontrolled. These complete-search observations do not reproduce the isolated prototype's timing ratio or establish a uniform native speedup.
+
+A further native edge load checked 384 responses against newly acquired complete strong baselines, all GRU, with no snapshot coordinator fallback:
+
+| Concurrency | p50 ms | p95 ms | Requests/s |
+| ----------: | -----: | -----: | ---------: |
+|           1 |  51.70 | 136.69 |      14.26 |
+|           4 |  53.89 | 291.66 |      42.04 |
+|          16 |  61.75 | 468.78 |      90.26 |
+
+The maximum was 915.53 ms. Twelve native Vectorize/hybrid checks preserved 105 complete rows and scores across three existing 100-vector fixtures. Large-corpus ANN recall, whole-Worker peak heap, broad cold-tail reliability and comparable Turbopuffer parity remain open. The grouped R2 path is deployed, but its acquisition reduction must not be presented as an equivalent complete-search speedup.

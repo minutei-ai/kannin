@@ -741,133 +741,128 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
       }
       if (telemetry.overviewCacheMs === 0)
         telemetry.overviewCacheMs = Number((yield* Clock.currentTimeNanos) - cacheStarted) / 1e6;
-      const catalogs = [];
-      const sources = [];
+      const sources: Array<(typeof OverviewBatch.Type)[number]> = [];
       const admission = { bytes: 0, enabled: true };
       const r2Activity = { count: 0 };
-      for (const start of Array.from(
-        { length: Math.ceil(ranges.length / 4) },
-        (_, index) => index * 4,
-      )) {
-        const window = ranges.slice(start, start + 4);
-        const prefetched = yield* Effect.forEach(
-          window,
-          (input, offset) =>
-            Effect.gen(function* () {
-              if (hits.some((hit) => hit.index === start + offset)) return undefined;
-              reads.correlatedReads += 1;
-              telemetry.r2Reads += 1;
-              r2Activity.count += 1;
-              telemetry.r2Peak = Math.max(telemetry.r2Peak, r2Activity.count);
-              const r2Started = yield* Clock.currentTimeNanos;
-              const cached = yield* Effect.acquireUseRelease(
-                Effect.tryPromise(() => env.STORAGE.get(`cache/correlated-v2/${input.key}`)),
-                (object) =>
-                  Effect.gen(function* () {
-                    if (object === null || object.size > 2 * 1024 * 1024) return undefined;
-                    const units = Math.min(
-                      MAX_OVERVIEW_BODY_UNITS,
-                      Math.max(1, Math.ceil((object.size * 4) / OVERVIEW_BODY_UNIT)),
-                    );
-                    return yield* overviewBodyReads.withPermits(units)(
-                      Effect.gen(function* () {
-                        const encoded = yield* Effect.tryPromise(() => object.text());
-                        telemetry.r2Bytes += object.size;
-                        reads.correlatedBytes += object.size;
-                        const decodedAt = yield* Clock.currentTimeNanos;
-                        const decoded = yield* decodeCorrelatedOverview(encoded);
-                        telemetry.projectMs +=
-                          Number((yield* Clock.currentTimeNanos) - decodedAt) / 1e6;
-                        return decoded;
-                      }).pipe(Effect.uninterruptible),
-                    );
-                  }),
-                (object) => {
-                  if (object === null || object.bodyUsed) return Effect.void;
-                  return Effect.tryPromise(() => object.body.cancel()).pipe(Effect.ignore);
-                },
-              ).pipe(
-                Effect.ensuring(
-                  Effect.gen(function* () {
-                    telemetry.r2Ms += Number((yield* Clock.currentTimeNanos) - r2Started) / 1e6;
-                    r2Activity.count -= 1;
-                  }),
-                ),
-              );
-              if (cached === undefined) return undefined;
-              if (
-                cached.bucket !== env.STORAGE_CACHE_SCOPE ||
-                cached.source.key !== input.key ||
-                cached.source.headerBytes !== input.headerBytes
-              )
-                return undefined;
-              return cached.overview;
-            }).pipe(Effect.orElseSucceed(() => undefined)),
-          { concurrency: 4 },
-        );
-        for (const [offset, input] of window.entries()) {
-          const index = start + offset;
-          const identity = `${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}`;
-          const hit = hits.find((entry) => entry.index === index);
-          const selected = { bytes: hit?.bytes, catalog: hit?.catalog };
-          if (selected.bytes === undefined || selected.catalog === undefined) {
-            const derived = yield* Effect.gen(function* () {
-              const bytes = prefetched[offset];
-              if (bytes === undefined) return undefined;
-              const projectedAt = yield* Clock.currentTimeNanos;
-              const catalog = yield* Effect.try(() =>
-                segment_overview_project(bytes, terms, filters),
-              ).pipe(Effect.flatMap(decodeTermCatalog));
-              telemetry.projectMs += Number((yield* Clock.currentTimeNanos) - projectedAt) / 1e6;
-              if (catalog.partitions === null) return undefined;
-              telemetry.r2Hits += 1;
-              reads.correlatedHits += 1;
-              return { bytes, catalog };
-            }).pipe(Effect.orElseSucceed(() => undefined));
-            const fallbackStarted = yield* Clock.currentTimeNanos;
-            const projection =
-              derived ??
-              (yield* withDirectory(input.key, input.headerBytes, (directory) =>
-                Effect.gen(function* () {
-                  telemetry.fallbackDirectories += 1;
-                  const dictionary = yield* Effect.try(() => directory.summary(terms)).pipe(
-                    Effect.flatMap(decodeTermSummaries),
-                  );
-                  const minimum = yield* Effect.try(() => directory.minimum(filters)).pipe(
-                    Effect.flatMap(decodeEligibleMinimum),
-                  );
-                  const bytes = yield* Effect.try(() => directory.overview()).pipe(
-                    Effect.orElseSucceed(() => undefined),
-                  );
-                  return { bytes, catalog: { dictionary, minimum, partitions: null } };
-                }),
-              ));
-            if (derived === undefined)
-              telemetry.fallbackMs +=
-                Number((yield* Clock.currentTimeNanos) - fallbackStarted) / 1e6;
-            selected.bytes = projection.bytes;
-            selected.catalog = projection.catalog;
-            if (derived === undefined && projection.bytes !== undefined) reads.overviewBuilds += 1;
-          } else {
-            reads.overviewMemoryHits += 1;
-            telemetry.memoryHits += 1;
-          }
-          const bytes = selected.bytes;
-          catalogs.push(selected.catalog);
-          if (bytes === undefined) {
-            admission.enabled = false;
-            sources.length = 0;
-            continue;
-          }
-          rememberOverview(identity, bytes);
-          admission.bytes += bytes.byteLength;
-          if (admission.bytes > 3 * 1024 * 1024) {
-            admission.enabled = false;
-            sources.length = 0;
-          }
-          if (admission.enabled) sources.push(bytes);
-        }
-      }
+      const fallbackReads = Semaphore.makeUnsafe(1);
+      const catalogs = yield* Effect.forEach(
+        ranges,
+        (input, index) =>
+          Effect.gen(function* () {
+            const identity = `${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}`;
+            const hit = hits.find((entry) => entry.index === index);
+            const selected = { bytes: hit?.bytes, catalog: hit?.catalog };
+            if (selected.bytes === undefined || selected.catalog === undefined) {
+              const prefetched = yield* Effect.gen(function* () {
+                reads.correlatedReads += 1;
+                telemetry.r2Reads += 1;
+                r2Activity.count += 1;
+                telemetry.r2Peak = Math.max(telemetry.r2Peak, r2Activity.count);
+                const r2Started = yield* Clock.currentTimeNanos;
+                const cached = yield* Effect.acquireUseRelease(
+                  Effect.tryPromise(() => env.STORAGE.get(`cache/correlated-v2/${input.key}`)),
+                  (object) =>
+                    Effect.gen(function* () {
+                      if (object === null || object.size > 2 * 1024 * 1024) return undefined;
+                      const units = Math.min(
+                        MAX_OVERVIEW_BODY_UNITS,
+                        Math.max(1, Math.ceil((object.size * 4) / OVERVIEW_BODY_UNIT)),
+                      );
+                      return yield* overviewBodyReads.withPermits(units)(
+                        Effect.gen(function* () {
+                          const encoded = yield* Effect.tryPromise(() => object.text());
+                          telemetry.r2Bytes += object.size;
+                          reads.correlatedBytes += object.size;
+                          const decodedAt = yield* Clock.currentTimeNanos;
+                          const decoded = yield* decodeCorrelatedOverview(encoded);
+                          telemetry.projectMs +=
+                            Number((yield* Clock.currentTimeNanos) - decodedAt) / 1e6;
+                          return decoded;
+                        }).pipe(Effect.uninterruptible),
+                      );
+                    }),
+                  (object) => {
+                    if (object === null || object.bodyUsed) return Effect.void;
+                    return Effect.tryPromise(() => object.body.cancel()).pipe(Effect.ignore);
+                  },
+                ).pipe(
+                  Effect.ensuring(
+                    Effect.gen(function* () {
+                      telemetry.r2Ms += Number((yield* Clock.currentTimeNanos) - r2Started) / 1e6;
+                      r2Activity.count -= 1;
+                    }),
+                  ),
+                );
+                if (cached === undefined) return undefined;
+                if (
+                  cached.bucket !== env.STORAGE_CACHE_SCOPE ||
+                  cached.source.key !== input.key ||
+                  cached.source.headerBytes !== input.headerBytes
+                )
+                  return undefined;
+                return cached.overview;
+              }).pipe(Effect.orElseSucceed(() => undefined));
+              const derived = yield* Effect.gen(function* () {
+                const bytes = prefetched;
+                if (bytes === undefined) return undefined;
+                const projectedAt = yield* Clock.currentTimeNanos;
+                const catalog = yield* Effect.try(() =>
+                  segment_overview_project(bytes, terms, filters),
+                ).pipe(Effect.flatMap(decodeTermCatalog));
+                telemetry.projectMs += Number((yield* Clock.currentTimeNanos) - projectedAt) / 1e6;
+                if (catalog.partitions === null) return undefined;
+                telemetry.r2Hits += 1;
+                reads.correlatedHits += 1;
+                return { bytes, catalog };
+              }).pipe(Effect.orElseSucceed(() => undefined));
+              const fallbackStarted = yield* Clock.currentTimeNanos;
+              const projection =
+                derived ??
+                (yield* fallbackReads.withPermits(1)(
+                  withDirectory(input.key, input.headerBytes, (directory) =>
+                    Effect.gen(function* () {
+                      telemetry.fallbackDirectories += 1;
+                      const dictionary = yield* Effect.try(() => directory.summary(terms)).pipe(
+                        Effect.flatMap(decodeTermSummaries),
+                      );
+                      const minimum = yield* Effect.try(() => directory.minimum(filters)).pipe(
+                        Effect.flatMap(decodeEligibleMinimum),
+                      );
+                      const bytes = yield* Effect.try(() => directory.overview()).pipe(
+                        Effect.orElseSucceed(() => undefined),
+                      );
+                      return { bytes, catalog: { dictionary, minimum, partitions: null } };
+                    }),
+                  ),
+                ));
+              if (derived === undefined)
+                telemetry.fallbackMs +=
+                  Number((yield* Clock.currentTimeNanos) - fallbackStarted) / 1e6;
+              selected.bytes = projection.bytes;
+              selected.catalog = projection.catalog;
+              if (derived === undefined && projection.bytes !== undefined)
+                reads.overviewBuilds += 1;
+            } else {
+              reads.overviewMemoryHits += 1;
+              telemetry.memoryHits += 1;
+            }
+            const bytes = selected.bytes;
+            if (bytes === undefined) {
+              admission.enabled = false;
+              sources.length = 0;
+              return selected.catalog;
+            }
+            rememberOverview(identity, bytes);
+            admission.bytes += bytes.byteLength;
+            if (admission.bytes > 3 * 1024 * 1024) {
+              admission.enabled = false;
+              sources.length = 0;
+            }
+            if (admission.enabled) sources[index] = bytes;
+            return selected.catalog;
+          }),
+        { concurrency: 4 },
+      );
       if (cache !== undefined && admission.enabled) {
         const publishedAt = yield* Clock.currentTimeNanos;
         const encoded = yield* encodeOverviewBatch(sources);

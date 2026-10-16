@@ -237,7 +237,7 @@ impl Reader {
                     "Source response exceeds range budget",
                 )));
             }
-            let mut bytes = Vec::new();
+            let mut bytes = Vec::with_capacity(maximum);
             while let Some(chunk) = response.chunk().await? {
                 metrics.borrow_mut().source_bytes += u64::try_from(chunk.len())
                     .map_err(|error| Error::Invalid(error.to_string()))?;

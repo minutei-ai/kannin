@@ -1469,6 +1469,34 @@ impl Search {
         Ok(())
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn add_validated_frequency_page(
+        &mut self,
+        term: &str,
+        rows: &[DecodedFrequencyPosting],
+    ) -> Result<(), String> {
+        if !self.words.iter().any(|word| word == term) {
+            return Err("Unrequested posting term".into());
+        }
+        let PostingLists::Frequencies(lists) = &mut self.lists else {
+            return Err("Frequency page requires any/all mode".into());
+        };
+        let list = lists.entry(term.into()).or_default();
+        let previous = self.last_decoded_rows.entry(term.into()).or_default();
+        if let Some(first) = rows.first()
+            && previous.is_some_and(|previous| previous >= first.posting.row)
+        {
+            return Err("Posting blocks out of order".into());
+        }
+        for row in rows {
+            *previous = Some(row.posting.row);
+            if self.allowed[row.posting.row as usize] {
+                list.push(row.posting.clone());
+            }
+        }
+        Ok(())
+    }
+
     fn phrase<T: PostingRow>(postings: &[Option<&T>], order: &[usize]) -> bool {
         let Some(first) = order.first().and_then(|index| postings[*index]) else {
             return false;
@@ -1855,8 +1883,9 @@ pub mod wasm {
         parse_header, validate_search_budget,
     };
     use serde::{Deserialize, Serialize};
+    use std::cell::RefCell;
     use std::collections::{BTreeMap, BTreeSet};
-    use std::rc::Rc;
+    use std::rc::{Rc, Weak};
     use wasm_bindgen::prelude::*;
 
     fn summary_bounds(blocks: &[BlockMeta]) -> Vec<(u32, u32, u32, u32)> {
@@ -2774,6 +2803,7 @@ pub mod wasm {
     #[wasm_bindgen]
     pub struct FrequencyPage {
         rows: Box<[super::DecodedFrequencyPosting]>,
+        validated_header: RefCell<Weak<Header>>,
     }
 
     #[wasm_bindgen]
@@ -2795,12 +2825,21 @@ pub mod wasm {
             .map_err(|cause| JsValue::from_str(&cause))?;
             Ok(Self {
                 rows: rows.into_boxed_slice(),
+                validated_header: RefCell::default(),
             })
         }
 
         #[must_use]
         pub fn heap_bytes(&self) -> usize {
-            self.rows.len() * size_of::<super::DecodedFrequencyPosting>() + size_of::<Self>() + 32
+            let retained_header = if self.rows.len() > 1 {
+                size_of::<Header>() + 2 * size_of::<usize>()
+            } else {
+                0
+            };
+            self.rows.len() * size_of::<super::DecodedFrequencyPosting>()
+                + size_of::<Self>()
+                + retained_header
+                + 32
         }
     }
 
@@ -2881,9 +2920,28 @@ pub mod wasm {
 
         #[doc = "# Errors\nRejects unrequested terms, positional mode, invalid rows/positions, or unordered blocks."]
         pub fn add_frequency(&mut self, term: &str, page: &FrequencyPage) -> Result<(), JsValue> {
+            if page.rows.len() < 2 {
+                return self
+                    .search
+                    .add_frequency_page(term, &page.rows)
+                    .map_err(|cause| JsValue::from_str(&cause));
+            }
+            let validated = std::ptr::eq(
+                page.validated_header.borrow().as_ptr(),
+                Rc::as_ptr(&self.search.header),
+            );
+            if validated {
+                return self
+                    .search
+                    .add_validated_frequency_page(term, &page.rows)
+                    .map_err(|cause| JsValue::from_str(&cause));
+            }
             self.search
                 .add_frequency_page(term, &page.rows)
-                .map_err(|cause| JsValue::from_str(&cause))
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            page.validated_header
+                .replace(Rc::downgrade(&self.search.header));
+            Ok(())
         }
 
         #[doc = "# Errors\nRejects invalid requested terms, pages, rows, positions, or block ordering."]

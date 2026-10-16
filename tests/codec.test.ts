@@ -620,6 +620,57 @@ test("retained frequency pages preserve dynamic masks, block ordering and positi
   segment.free();
 });
 
+test("frequency page validation follows exact directory lifetime and never memoizes failure", () => {
+  using longSegment = new Segment(
+    JSON.stringify(["a", "b"].map((id) => ({ id, text: "alpha ".repeat(101), attributes: {} }))),
+  );
+  using shortSegment = new Segment(
+    JSON.stringify(["a", "b"].map((id) => ({ id, text: "alpha", attributes: {} }))),
+  );
+  const data = new Uint8Array([2, 0, 0, 1, 99, 1, 0, 1, 99]);
+  const compressed = deflateSync(data);
+  const frame = new Uint8Array(8 + compressed.length);
+  new DataView(frame.buffer).setUint32(0, data.length, true);
+  new DataView(frame.buffer).setUint32(4, crc32(data), true);
+  frame.set(compressed, 8);
+  using page = new FrequencyPage(frame);
+  const input = Schema.decodeSync(RankingInput)({
+    text: "alpha",
+    mode: "any",
+    top_k: 10,
+    dead: [],
+    filters: [],
+    statistics: { documents: 2, title_length: 0, body_length: 202, frequencies: { alpha: 2 } },
+  });
+  const query = Schema.encodeSync(Schema.fromJsonString(RankingInput))(input);
+  const first = new Directory(longSegment.bytes());
+  const warm = first.ranker(query);
+  warm.add_frequency("alpha", page);
+  const reference = warm.finish();
+  const retained = first.retain();
+  warm.free();
+  first.free();
+  const shared = retained.ranker(query);
+  shared.add_frequency("alpha", page);
+  expect(shared.finish()).toBe(reference);
+  expect(() => shared.add_frequency("alpha", page)).toThrow("out of order");
+  const unrequested = retained.ranker(query);
+  expect(() => unrequested.add_frequency("beta", page)).toThrow("Unrequested");
+  shared.free();
+  unrequested.free();
+  retained.free();
+  using shortDirectory = new Directory(shortSegment.bytes());
+  const hidden = Schema.encodeSync(Schema.fromJsonString(RankingInput))({ ...input, dead: [0, 1] });
+  for (const ranker of Array.from({ length: 2 }, () => shortDirectory.ranker(hidden))) {
+    using invalid = ranker;
+    expect(() => invalid.add_frequency("alpha", page)).toThrow("Invalid token position");
+  }
+  using reparsed = new Directory(longSegment.bytes());
+  using fresh = reparsed.ranker(query);
+  fresh.add_frequency("alpha", page);
+  expect(fresh.finish()).toBe(reference);
+});
+
 test("cutoff posting pages preserve every competitive hit across modes, masks and Unicode ties", () => {
   const documents = ["😀 alpha beta", "\uE000 beta gamma", "a alpha alpha padding beta"].flatMap(
     (text, group) =>

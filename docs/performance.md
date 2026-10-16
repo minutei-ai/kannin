@@ -3470,4 +3470,16 @@ The comparison used baseline source `2044858` and the candidate WASM in separate
 
 Both two-term unfiltered variants improved in all nine pairs. Eight-term variants improved in eight or nine pairs each. These measurements isolate local ranking; they exclude R2 acquisition, directory construction, candidate decoding and native Cloudflare placement, and do not establish complete-query gains. No additional cache, per-document retained table, canonical format or public contract was introduced.
 
-The local gate passed all 257 Worker/tooling tests and 42 Rust tests, including strict lint/types and native/WASM Clippy. A separate old/new WASM comparison at the 64-term query limit covered 36 combinations of any/all/phrase mode, top-k 1/10/100, filters and tombstones, preserving all 685 returned hits exactly. The entire 300-query SciFact report also remained identical. Native complete-query measurements for this Rust change remain pending.
+The local gate passed all 257 Worker/tooling tests and 42 Rust tests, including strict lint/types and native/WASM Clippy. A separate old/new WASM comparison at the 64-term query limit covered 36 combinations of any/all/phrase mode, top-k 1/10/100, filters and tombstones, preserving all 685 returned hits exactly. The entire 300-query SciFact report also remained identical. Source `c242172` was then deployed through the `minutei` profile. Native inspection confirmed version `0b0c6708-49f2-4613-8f6e-6e3c412fab32` at 100%, with the same R2 binding and lifecycle rules.
+
+The native comparison used the existing one-million-document namespace at sequence 2000. Each cohort interleaved fourteen strong queries for each of two selectors: `cloudflare rust`, and the eight-term query `cloudflare rust search storage latency durable object group72`. A different, always-matching year lower bound on every round forced new plans; both selectors shared that round's filter. The first two rounds were excluded, leaving twelve measured responses per selector. Every response entered through GRU and returned HTTP 200, with complete baseline rows and scores preserved.
+
+| Native cohort            | Two terms p50/p95 ms | Eight terms p50/p95 ms |
+| ------------------------ | -------------------: | ---------------------: |
+| Before, source `4f984ea` |     794.67 / 1770.57 |        242.50 / 317.48 |
+| After, source `c242172`  |      740.37 / 940.63 |       253.39 / 1549.02 |
+| After, repeated          |      615.73 / 858.62 |        248.45 / 288.91 |
+
+With twelve observations, nearest-rank p95 is the maximum. The first post-deploy eight-term tail coincided with 25 catalog RPCs, 374 ms in the directory interval, 142 ms in root acquisition and 81 ms in ranking. These intervals include waiting and are not CPU measurements. Cache/isolate turnover and network conditions were uncontrolled; the cohorts do not isolate a consistent complete-query gain from the Rust change. The local ranking improvement should not be presented as a native latency reduction.
+
+Sixteen additional native rare/dense queries across filters and strong/edge consistency retained complete baseline results. Twelve native Vectorize/hybrid checks retained all 105 baseline rows and scores. The remaining acquisition cost, cold-tail reliability, whole-Worker peak heap and large-scale ANN recall remain open.

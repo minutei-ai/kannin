@@ -51,6 +51,7 @@ for (const sample of [
       documents: sample.size,
       segments: 1,
       manifestEncodedBytes: 1,
+      wasmMemoryBytes: 65536,
       vectorOutbox: 0,
       cache: Object.fromEntries(Object.keys(CacheMetrics.fields).map((key) => [key, 0])),
     });

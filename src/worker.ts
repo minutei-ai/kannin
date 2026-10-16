@@ -2189,6 +2189,7 @@ export class SearchNamespace extends DurableObject<Env> {
                   documents: manifest.documents,
                   segments: manifest.segments.length,
                   manifestEncodedBytes: new TextEncoder().encode(encodeRoot(manifest)).byteLength,
+                  wasmMemoryBytes: wasm.memory.buffer.byteLength,
                   vectorOutbox: manifest.vectorJobs.length,
                   cache: cacheUsage(),
                 }),
@@ -2313,7 +2314,7 @@ export class SearchNamespace extends DurableObject<Env> {
     }).pipe(
       Effect.tapError((error) => {
         if (Schema.is(Rejected)(error) && error.status < 500) return Effect.void;
-        return Effect.logError("kannin.namespace", { namespace, operation, error });
+        return Effect.logError("kannin.namespace", Cause.fail(error), { namespace, operation });
       }),
       Effect.catch((error) => {
         if (operation !== "query") {
@@ -2936,7 +2937,7 @@ export default {
       }).pipe(
         Effect.tapError((error) => {
           if (Schema.is(Rejected)(error) && error.status < 500) return Effect.void;
-          return Effect.logError("kannin.gateway", { namespace, operation, error });
+          return Effect.logError("kannin.gateway", Cause.fail(error), { namespace, operation });
         }),
         Effect.catch((error) => {
           if (Schema.is(Rejected)(error))

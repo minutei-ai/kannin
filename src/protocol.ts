@@ -265,6 +265,7 @@ export const Metadata = Schema.Struct({
   documents: Schema.Int,
   segments: Schema.Int,
   manifestEncodedBytes: Schema.Int,
+  wasmMemoryBytes: Schema.Int,
   vectorOutbox: Schema.Int,
   cache: CacheMetrics,
 });

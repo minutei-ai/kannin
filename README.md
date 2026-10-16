@@ -13,13 +13,15 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Concurrency | p50 ms | p95 ms | Requests/s |
 | ----------: | -----: | -----: | ---------: |
-|           1 |  47.49 |  60.64 |      19.81 |
-|           4 |  47.04 |  78.77 |      70.14 |
-|          16 |  50.18 | 199.38 |     138.32 |
+|           1 |  51.30 |  68.43 |      18.39 |
+|           4 |  49.42 |  89.82 |      50.63 |
+|          16 |  52.20 | 420.89 |     100.65 |
 
-Two post-deploy runs checked **768 responses** against strong baseline rows, scores and sequence. Each run used 128 requests per concurrency; all entered through GRU without snapshot coordinator fallback. The first run had p50 **46.54/48.73/55.99 ms** at concurrency 1/4/16. These are cache-sensitive workload observations, not sustained-capacity guarantees. Edge freshness is weaker than strong consistency.
+Two post-deploy runs checked **768 responses** against strong baseline rows, scores and sequence. Each run used 128 requests per concurrency; all entered through GRU without snapshot coordinator fallback. The first run had p50 **49.97/49.49/51.88 ms** at concurrency 1/4/16. These are cache-sensitive workload observations, not sustained-capacity guarantees. Edge freshness is weaker than strong consistency.
 
 Rust now constructs decoded term dictionaries in bulk. Controlled local workerd measurements reduced directory-opening batch median by **10.0%**, full-query median after volatile-memory reset by **17.8%**, and WASM linear memory with 24 retained directories by **7.8%**. Canonical bytes and results stayed exact; the WASM binary grew **1.8%**. These local gains do not isolate native end-to-end improvement. [Method and limits](docs/performance.md#bulk-construction-of-rust-directory-term-maps).
+
+Retained Rust frequency pages now reuse validation against the exact directory header. Large cached-ranking batches improved **33–38%** in workerd; repeated complete-Worker measurements did **not** establish a consistent end-to-end gain. Against its immediate pre-deploy reference, the native repeat above improved p95 but increased median latency at concurrency 1/4. [Measurements and regressions](docs/performance.md#retained-frequency-page-header-validation).
 
 Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10**, with the entire 300-query report unchanged. Twelve native Vectorize/hybrid checks preserved 105 complete rows and scores across three 100-vector fixtures; large-corpus ANN recall remains unmeasured.
 
@@ -38,7 +40,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **227 Worker/tooling tests and 41 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **228 Worker/tooling tests and 41 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

@@ -3061,3 +3061,46 @@ Each corrected workerd comparison alternated 25 pairs per workload, discarded fi
 | With 259-byte room | Cached-frequency any control      |          21.065 |           23.571 |          35.564 |           36.694 |
 
 Some document modes were close, while phrase medians/tails worsened in both recorded comparisons and fresh-frequency work worsened in the padded run. The unchanged cached-frequency control also moved substantially, demonstrating residual execution/layout noise. These results do not establish a consistent speedup that justifies replacing the current decoder. Both experimental source changes and their temporary allocation test were removed, the published decoder and generated WASM restored, and the existing integrity regressions retained. No candidate was deployed and no production data, native bindings or cache budgets changed. Local emulator startup failures produced no samples; successful padded runs used fresh dedicated emulator storage directories.
+
+## Retained frequency-page header validation
+
+Commit `0c8841a` reuses successful row and token-position validation only for a frequency page attached to the exact same retained Rust header. Weak allocation identity prevents address reuse without keeping header contents alive. A new header validates again; failures never populate the memo. Requested terms, any/all mode, cross-page order, filters and tombstones still apply on every attachment. Single-row pages use the original method; phrase queries use the original positional path. Cache accounting includes conservative space for the weak allocation. No canonical format, snapshot age, authorization or ranking rule changed.
+
+A paired local workerd probe compared the preceding WASM with the published candidate in the same isolate. It used 1, 16, 128 and 5,000 documents, two repeated terms, any/all/phrase modes, with and without an equality filter, and current tombstones. Each case alternated fifteen pairs, discarded five warmup pairs and retained ten samples per variant. Small fixtures ran 256 rankings per request; the 5,000-document fixture ran twenty. All 720 requests checked every complete encoded ranking against the same reference. This measures cached-page attachment and ranking, excluding storage I/O and HTTP authorization.
+
+| Documents | Mode | Baseline batch p50 ms | Candidate batch p50 ms | Baseline batch p95 ms | Candidate batch p95 ms |
+| --------: | :--- | --------------------: | ---------------------: | --------------------: | ---------------------: |
+|         1 | any  |                 2.208 |                  2.512 |                 2.244 |                  3.195 |
+|         1 | all  |                 1.982 |                  2.114 |                 2.101 |                  2.187 |
+|        16 | any  |                 4.347 |                  4.041 |                 4.932 |                  4.631 |
+|        16 | all  |                 3.608 |                  3.381 |                 3.724 |                  3.563 |
+|       128 | any  |                 5.211 |                  4.073 |                 5.452 |                  4.304 |
+|       128 | all  |                 5.410 |                  4.088 |                 5.686 |                  4.402 |
+|     5,000 | any  |                 5.609 |                  3.763 |                 5.837 |                  3.909 |
+|     5,000 | all  |                 5.653 |                  3.649 |                 5.717 |                  3.704 |
+
+These unfiltered batch medians improve 6–7% at sixteen documents, 22–24% at 128 and 33–35% at 5,000. The filtered 5,000-document cases improve 37–38%. The one-document path regresses by 0.132–0.304 ms per 256-operation batch despite bypassing the memo, so this is not a universal speedup. Unchanged phrase controls moved from a 4.1% improvement to a 5.4% regression. Earlier prototypes that added a validation boolean to the original per-row method had worse small-fixture behavior; the adopted version leaves that method intact and separates the validated path.
+
+A complete-Worker comparison used identical 4,096-document, eight-segment corpora, alternating sixteen pairs per any/all/phrase, filtered/unfiltered and strong/edge scenario. Four warmup pairs preceded twelve retained pairs. Every one of its 384 responses preserved complete rows, scores and sequence. Strong any/all medians ranged from a 10.0% improvement to a 6.3% regression; hot edge any/all changed by less than 1%. The unchanged phrase control ranged from a 2.1% improvement to an 8.0% regression for strong reads. Full-query work includes cache selection, storage and materialization, so the isolated attachment gains must not be presented as equivalent end-to-end gains.
+
+A second independent complete-Worker run repeated all 384 response checks. Strong any/all medians ranged from a 4.6% improvement to a 13.1% regression; strong phrase controls regressed 3.6–8.6%. Edge any/all ranged from a 0.7% improvement to a 4.4% regression, and edge phrase changed from a 1.1% improvement to a 1.8% regression. The repeats do not establish a consistent full-query speedup. The retained-page optimization is supported by the isolated ranking measurements, not a universal latency claim.
+
+The complete local gate passed 228 Worker/tooling tests and 41 Rust tests, along with formatting, TypeScript/Effect lint, native/WASM Clippy, build and typecheck. The added regression exercises exact-header lifetime, retained directories, reparsed and invalid headers, repeated failures, excluded rows and ordering. An independent SciFact rerun preserved the entire previous 300-query report: 0.6730619695232347 nDCG@10, 0.7956666666666666 recall@10 and 0.641808201058201 MRR@10.
+
+The generated WASM shrank from 783,245 to 782,550 bytes. Alchemy deployed through profile `minutei`; the provider confirmed version `b58c1cdb-18ef-4b3d-a042-32ad4b78b25e` at 100%, unchanged R2 binding and unchanged disposable-cache lifecycle rules. Sixteen native strong/edge checks with 16/64 selected terms preserved their previous complete rows, scores and sequence over the one-million-document corpus at sequence 2,000. Those already-exercised cache paths are not independent cold-storage trials. Twelve native Vectorize/hybrid cases preserved all 105 complete rows and scores from the existing three 100-vector fixtures. These fixtures do not establish large-corpus ANN recall.
+
+A native pre-deploy reference and two post-deploy loads each checked 128 requests at concurrency 1/4/16. Every measured response matched a fresh strong baseline, all entered through GRU and none used snapshot coordinator fallback. The post-deploy pair checked 768 responses. Edge reads retained their acknowledged sequence barrier and weaker freshness contract.
+
+| Run           | Concurrency | p50 ms | p95 ms | Requests/s |
+| :------------ | ----------: | -----: | -----: | ---------: |
+| Before        |           1 |  48.27 | 202.83 |      14.00 |
+| Before        |           4 |  48.47 | 125.35 |      57.31 |
+| Before        |          16 |  57.18 | 538.06 |      95.35 |
+| After, first  |           1 |  49.97 |  82.10 |      16.30 |
+| After, first  |           4 |  49.49 |  83.94 |      63.40 |
+| After, first  |          16 |  51.88 | 340.78 |     156.10 |
+| After, repeat |           1 |  51.30 |  68.43 |      18.39 |
+| After, repeat |           4 |  49.42 |  89.82 |      50.63 |
+| After, repeat |          16 |  52.20 | 420.89 |     100.65 |
+
+Before/first/repeat maxima were 678.31/817.24/727.19 ms. Both post-deploy runs improved p95, while concurrency-one/four medians worsened slightly and repeat concurrency-four throughput fell below the pre-deploy reference. These cache-sensitive short runs do not isolate the Rust change or measure sustained capacity. Strong remote coordination, broad cold-tail reliability, peak whole-Worker heap, large-corpus ANN quality and Turbopuffer parity remain unresolved.

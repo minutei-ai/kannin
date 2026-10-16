@@ -518,6 +518,44 @@ export const OverviewFrameMetadata = Schema.Struct({
   ),
 });
 export const SegmentCacheProps = Schema.Struct({ bucket: TermProjectionProps.fields.bucket });
+export const NativeRankingInput = Schema.Struct({
+  bucket: SegmentCacheProps.fields.bucket,
+  query: Schema.Struct({
+    text: TextFields.text,
+    mode: RankingInput.fields.mode,
+    top_k: QueryFields.topK,
+    filters: QueryFields.filters,
+    statistics: RankingInput.fields.statistics,
+  }),
+  segments: Schema.Array(
+    Schema.Struct({
+      key: Root.fields.segments.value.fields.key,
+      headerBytes: Root.fields.segments.value.fields.headerBytes,
+      bytes: Root.fields.segments.value.fields.bytes,
+      dead: Root.fields.segments.value.fields.dead,
+    }),
+  ).check(Schema.isBetweenLength(1, 8)),
+  cutoff: Schema.NullOr(Schema.Struct({ id: Row.fields.id, score: Row.fields.score })),
+});
+export const NativeRankingResult = Schema.Struct({
+  segments: Schema.Array(SegmentHits).check(Schema.isBetweenLength(1, 8)),
+  metrics: Schema.Struct({
+    headerHits: Schema.Int,
+    rangeHits: Schema.Int,
+    sourceReads: Schema.Int,
+    sourceBytes: Schema.Int,
+    headerCacheBytes: Schema.Int,
+    rangeCacheBytes: Schema.Int,
+    prepareMs: Schema.Finite,
+    acquireMs: Schema.Finite,
+    decodeMs: Schema.Finite,
+    scoreMs: Schema.Finite,
+    spans: Schema.Int,
+    ranges: Schema.Int,
+    bytes: Schema.Int,
+    blocks: Schema.Int,
+  }),
+});
 export class Rejected extends Schema.TaggedError<Rejected>()("Rejected", {
   status: Schema.Int,
   message: Schema.String,

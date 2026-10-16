@@ -32,6 +32,8 @@ The SIMD checksum backend reduced native Durable Object CPU p50 from **250 to 22
 
 An isolated Worker/DO/Container prototype measured **174–175 ms warm HTTP p50** on two fixed-snapshot selectors, preserving IDs and scores. Full API integration, cold latency and cost remain delivery gates. [Experimental Container evidence](docs/performance.md#native-container-feasibility-isolated-probe).
 
+The experimental native range reader transfers about **34% fewer source bytes** than complete segments in a million-document test and validates headers directly in Rust. It has not replaced the production WASM path. [Cold-read evidence and limits](docs/performance.md#native-cold-read-through-canonical-header-and-posting-ranges) · [native process](crates/native/README.md).
+
 Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10**, with the entire 300-query report unchanged. Twelve native Vectorize/hybrid checks preserved 105 complete rows and scores across three 100-vector fixtures; large-corpus ANN recall remains unmeasured.
 
 A subsequent rare/dense native sweep encountered five strong-query 503s with the Durable Object overload flag; later queries recovered without deployment, and the cause remains unresolved. Cold broad queries have reached the 30-second edge lease in earlier trials. Peak whole-Worker heap and cold-tail reliability remain open. The earlier fully indexed sequential comparison measured p50 **175–178 ms strong**, **127–130 ms edge** and **45–47 ms Turbopuffer strong**, with Kannin ingress in MIA and Turbopuffer in `aws-sa-east-1`. Different placement and consistency prevent a parity claim.
@@ -49,7 +51,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **257 Worker/tooling tests and 42 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **262 Worker/tooling tests and 48 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

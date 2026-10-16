@@ -208,6 +208,26 @@ impl<'de> serde::de::Visitor<'de> for SelectedAttributes<'_> {
 }
 
 impl Header {
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        let documents = self.documents.capacity() * size_of::<DocumentMeta>()
+            + self
+                .documents
+                .iter()
+                .map(|doc| doc.id.capacity() + doc.attributes.get().len() + 32)
+                .sum::<usize>();
+        let terms = (self.terms.len() / 4 + 1)
+            * (11 * (size_of::<String>() + size_of::<TermMeta>()) + 12 * size_of::<usize>() + 32)
+            + self
+                .terms
+                .iter()
+                .map(|(term, meta)| {
+                    term.capacity() + 16 + meta.blocks.len() * size_of::<BlockMeta>()
+                })
+                .sum::<usize>();
+        documents + terms + size_of::<Self>() + 32 + FILTER_CACHE_BYTES
+    }
+
     fn encode(&self, payload: &[u8]) -> Result<Vec<u8>, String> {
         let json = serde_json::to_vec(self).map_err(|e| e.to_string())?;
         if json.len() + payload.len() + 16 > MAX_BYTES {
@@ -1906,10 +1926,10 @@ pub fn bloom_filter_many<'a>(
 #[cfg(target_arch = "wasm32")]
 pub mod wasm {
     use super::{
-        BlockMeta, BuiltSegment, Document, DocumentMeta, FILTER_CACHE_BYTES, Filter, Header,
-        MAX_BYTES, QueryTerms, Range, Search, SelectedAttributes, Statistics, TermMeta, TermScorer,
-        append, bloom_build, bloom_filter_many, build, decode_page, document_terms, matches,
-        parse_header, validate_search_budget,
+        BlockMeta, BuiltSegment, Document, DocumentMeta, Filter, Header, MAX_BYTES, QueryTerms,
+        Range, Search, SelectedAttributes, Statistics, TermMeta, TermScorer, append, bloom_build,
+        bloom_filter_many, build, decode_page, document_terms, matches, parse_header,
+        validate_search_budget,
     };
     use serde::{Deserialize, Serialize};
     use std::cell::RefCell;
@@ -2797,25 +2817,7 @@ pub mod wasm {
 
         #[must_use]
         pub fn heap_bytes(&self) -> usize {
-            let header = &self.header;
-            let documents = header.documents.capacity() * size_of::<DocumentMeta>()
-                + header
-                    .documents
-                    .iter()
-                    .map(|doc| doc.id.capacity() + doc.attributes.get().len() + 32)
-                    .sum::<usize>();
-            let terms = (header.terms.len() / 4 + 1)
-                * (11 * (size_of::<String>() + size_of::<TermMeta>())
-                    + 12 * size_of::<usize>()
-                    + 32)
-                + header
-                    .terms
-                    .iter()
-                    .map(|(term, meta)| {
-                        term.capacity() + 16 + meta.blocks.len() * size_of::<BlockMeta>()
-                    })
-                    .sum::<usize>();
-            documents + terms + size_of::<Header>() + 32 + FILTER_CACHE_BYTES
+            self.header.heap_bytes()
         }
 
         #[doc = "# Errors\nRejects invalid term JSON or directory serialization errors."]

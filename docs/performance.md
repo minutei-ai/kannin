@@ -3269,3 +3269,20 @@ A further native edge load checked 384 responses against fresh complete strong b
 |          16 |  62.19 | 487.09 |      92.77 |
 
 The maximum was 736.82 ms. Higher-concurrency tails and rates regressed relative to the preceding load observation; these runs do not establish a uniform native speedup. The final local gate passed 239 Worker/tooling tests with 8,181 assertions and 42 Rust tests, including formatting, Effect/Oxlint, Effect tsgo and native/WASM Clippy. The remaining cold R2 and concurrent-tail work is unchanged.
+
+## Native cold catalog concurrency
+
+A temporary authenticated Alchemy Worker compared one, two, four and eight concurrent sixteen-segment catalog batches against the same fixed million-document namespace at sequence 2,000. Its Terms entrypoint used the production `readTermProjections` implementation and four tasks per origin. Native Worker Cache was disabled, the disposable overview Cache API lookup was bypassed in the probe bundle, and namespace-local immutable memory was cleared before each origin. Canonical R2 reads and projection validation remained unchanged. The probe rejected R2 writes and deletes. This isolates the fully cold summary path; it is not a complete search or production-cache measurement.
+
+Twelve rounds rotated the configuration order. Excluding the first two rounds leaves ten measured requests per configuration. All 48 responses entered through GRU, retained the same canonical root ETag, matched one ordered complete-catalog digest and passed a per-segment cloudflare/rust frequency check against canonical document counts. Every request performed exactly 200 successful correlated-summary R2 reads, transferred 5,191,921 summary bytes, used no memory/API overview hits and required no canonical-directory fallback. The root read and final digest were outside the catalog interval; client time includes them.
+
+| Concurrent batches | Catalog median ms | Catalog min–max ms | Client median ms |
+| -----------------: | ----------------: | -----------------: | ---------------: |
+|                  1 |           8,998.0 |        8,708–9,345 |         9,416.64 |
+|                  2 |           5,489.5 |        5,299–5,871 |         6,037.70 |
+|                  4 |           5,358.0 |        5,281–5,552 |         5,855.42 |
+|                  8 |           5,360.0 |        5,189–5,493 |         5,884.90 |
+
+Four and eight differed by two milliseconds at the catalog median, with overlapping ranges. Two was slower and one substantially slower. These samples provide no basis to reduce the production limit of eight batches. Cloudflare's [shared waiting-for-headers limit](https://developers.cloudflare.com/workers/platform/limits/#simultaneous-open-connections) applies across bound Workers, but this experiment does not measure that queue directly or prove it caused the residual latency. The next useful experiment should reduce R2 acquisition count rather than assume fewer offered tasks make the same 200 reads faster.
+
+The temporary Worker was destroyed through Alchemy and its removal confirmed by native `WorkerNotFound`. The production Worker remained at version `13f58d58-f1e0-4652-af04-caebb672a971`, 100%, with the R2 binding and lifecycle rules unchanged. No production runtime configuration changed.

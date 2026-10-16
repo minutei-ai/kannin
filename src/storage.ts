@@ -622,6 +622,12 @@ function rememberOverview(identity: string, bytes: Uint8Array) {
   overviewBudget.bytes += charge;
 }
 
+export function hasResidentTermOverviews(ranges: ReadonlyArray<typeof TermProjectionRange.Type>) {
+  return ranges.every((input) =>
+    overviewBuffers.has(`${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}`),
+  );
+}
+
 export const readTermProjections = Effect.fn("kannin.readTermProjections")(
   (
     ranges: ReadonlyArray<typeof TermProjectionRange.Type>,

@@ -83,6 +83,7 @@ import {
   readTermCatalogs,
   addFrequencyPosting,
   readTermProjections,
+  hasResidentTermOverviews,
   buildSegment,
   storeSegmentCaches,
   bloom,
@@ -242,9 +243,12 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
     );
     const keyedAt = Effect.runSync(Clock.currentTimeNanos);
     const cache = await Effect.runPromise(
-      Effect.tryPromise(() => caches.open("raio-terms-v6")).pipe(
-        Effect.orElseSucceed(() => undefined),
-      ),
+      Effect.gen(function* () {
+        if (hasResidentTermOverviews(props.value.ranges)) return undefined;
+        return yield* Effect.tryPromise(() => caches.open("raio-terms-v6")).pipe(
+          Effect.orElseSucceed(() => undefined),
+        );
+      }),
     );
     const openedAt = Effect.runSync(Clock.currentTimeNanos);
     const lookup = { endedAt: openedAt };

@@ -3,8 +3,28 @@ import worker, { Terms as Catalogs } from "../src/worker";
 import type { Env } from "../alchemy.run";
 export { SearchNamespace, Segments } from "../src/worker";
 
-const state = { started: 0, active: 0, peak: 0, firstCompleted: false, refilled: false };
+const state = {
+  started: 0,
+  active: 0,
+  peak: 0,
+  firstCompleted: false,
+  refilled: false,
+  termMatches: 0,
+};
 const wrapped = new WeakSet<R2Bucket>();
+const opened = new WeakSet<Cache>();
+const open = caches.open.bind(caches);
+caches.open = async (name) => {
+  const cache = await open(name);
+  if (name !== "raio-terms-v6" || opened.has(cache)) return cache;
+  opened.add(cache);
+  const match = cache.match.bind(cache);
+  cache.match = (input, options) => {
+    state.termMatches += 1;
+    return match(input, options);
+  };
+  return cache;
+};
 
 export class Terms extends Catalogs {
   override async fetch(request: Request) {
@@ -49,6 +69,7 @@ export default {
           "x-fixture-active": String(state.active),
           "x-fixture-peak": String(state.peak),
           "x-fixture-refilled": String(state.refilled),
+          "x-fixture-term-matches": String(state.termMatches),
         },
       });
     return worker.fetch(request, env, ctx);

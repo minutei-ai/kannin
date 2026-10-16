@@ -11,6 +11,11 @@ import { VectorFilterFields } from "./src/protocol";
 export const Bucket = Cloudflare.R2.Bucket("Storage", {
   lifecycleRules: [
     {
+      id: "expire-directory-cache",
+      prefix: "cache/directory-v1/",
+      deleteObjectsTransition: { condition: { type: "Age", maxAge: 60 * 60 * 24 * 30 } },
+    },
+    {
       id: "expire-correlated-cache",
       prefix: "cache/correlated-",
       deleteObjectsTransition: { condition: { type: "Age", maxAge: 60 * 60 * 24 * 30 } },

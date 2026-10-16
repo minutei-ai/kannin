@@ -9,15 +9,17 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 ## Performance
 
-**1,000,000 documents · deployed Cloudflare · MRS responses · edge reads with acknowledged sequence barrier**
+**1,000,000 documents · deployed Cloudflare · GRU/GIG ingress · edge reads with acknowledged sequence barrier**
 
 | Concurrency | p50 ms |  p95 ms | Requests/s |
 | ----------: | -----: | ------: | ---------: |
-|           1 | 195.80 |  237.41 |       3.39 |
-|           4 | 246.38 |  714.47 |      12.17 |
-|          16 | 248.60 | 1138.99 |      31.48 |
+|           1 | 104.67 |  937.27 |       4.39 |
+|           4 |  85.05 |  546.44 |      21.91 |
+|          16 |  94.12 | 1153.76 |      36.31 |
 
-The latest deployed candidate preserved strong baseline rows, scores and sequence in all **384 standard load responses**, with MRS in their `CF-Ray` suffixes. Its maximum request took **5.31 s**. Earlier runs used EWR/MIA and GRU; these region and cache differences prevent attributing the new timing changes to the latest code. Local workerd measurements reduced dense seeded span-selection batch time by **65.7%** on a warmed repeated-length fixture; the warmed high-diversity filtered fixture was **1.6% slower**. Shorter warmup showed a larger regression in that fixture. These are CPU-phase measurements, not native end-to-end gains. Cold acquisition, peak memory and comparable-region performance parity remain open. [Measurements and limits](docs/performance.md#reusing-dense-seed-scores-by-document-length).
+The latest deployed candidate preserved strong baseline rows, scores and sequence in all **384 standard load responses**, with GRU/GIG ingress. Its maximum request took **2.29 s**. Earlier runs used MRS, EWR/MIA and GRU with different cache state; these serial observations do not isolate a code speedup. Cold tails, peak memory and comparable-region performance parity remain open.
+
+A controlled workerd recovery now reads **139,941 compressed R2 bytes instead of 1,724,997 canonical header bytes**, preserving the exact data: **91.9% fewer bytes** in that path. A native 32-document fixture confirmed R2-frame reuse through the origin and direct recovery, then was reset to zero documents. Cache misses and failed publications still recover canonically; the extra lookup and indexing work are tradeoffs. [Measurements and limits](docs/performance.md#reusing-compressed-directory-frames-from-r2).
 
 Rust now preserves document-length correlation in disposable R2 score summaries. Six fresh strong plans over the unchanged 200-segment corpus ranked **3 segments instead of 200**, preserving complete rows and scores. After alternate-mode warmups, elapsed queries changed **6.17–7.61 seconds→0.29–2.06 seconds**, a **67–96%** reduction in those samples. The first alternate-mode warmup still took **5.10 seconds**. Cache loss recovers through canonical R2; cold catalog acquisition remains a bottleneck. [Measurements and limits](docs/performance.md#correlated-length-bounds-on-immutable-segments).
 
@@ -27,7 +29,7 @@ An additional sixteen-rare-term edge query reached its 30-second lease limit and
 
 Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10**, with the complete 300-query report unchanged. Native Vectorize checks across three existing 100-vector namespaces preserved all 105 returned rows and scores across twelve vector/hybrid queries before and after deployment. A separate three-vector ingestion became fully visible on the fifteenth observation, approximately 33 seconds after synchronization, and passed unfiltered, equality, numeric and hybrid checks before cleanup. These small controlled fixtures do not establish large-corpus ANN recall.
 
-The fully indexed sequential million-document comparison measured p50 **175–178 ms strong**, **127–130 ms edge** and **45–47 ms Turbopuffer strong**. All 200 measured Turbopuffer responses reported zero unindexed rows. Kannin responses entered through MIA; Turbopuffer used `aws-sa-east-1`. Edge reads have a weaker freshness contract. These results show a performance gap, not parity. [Comparison method and limits](docs/performance.md#fully-indexed-million-document-comparison).
+Before the latest cache change, the fully indexed sequential million-document comparison measured p50 **175–178 ms strong**, **127–130 ms edge** and **45–47 ms Turbopuffer strong**. All 200 measured Turbopuffer responses reported zero unindexed rows. Kannin responses entered through MIA; Turbopuffer used `aws-sa-east-1`. Edge reads have a weaker freshness contract. These results show a performance gap, not parity. [Comparison method and limits](docs/performance.md#fully-indexed-million-document-comparison).
 
 [Native and local methodology](docs/performance.md) · [contract comparison](docs/turbopuffer-contracts.md) · [ranking quality](docs/quality.md)
 

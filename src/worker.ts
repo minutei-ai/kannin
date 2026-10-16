@@ -76,12 +76,14 @@ import {
 import {
   range,
   publishQueryCache,
+  readDirectoryFrame,
+  publishDirectoryFrame,
   withDirectory,
   readTermCatalogs,
   addFrequencyPosting,
   readTermProjections,
   buildSegment,
-  storeCorrelatedOverview,
+  storeSegmentCaches,
   bloom,
   bloomCandidates,
   readDocument,
@@ -141,6 +143,26 @@ export class Segments extends WorkerEntrypoint<Env, typeof SegmentCacheProps.Typ
         return response;
       }
     }
+    if (url.pathname === "/directory-v1") {
+      const frame = await Effect.runPromise(readDirectoryFrame(input.key, input.length));
+      if (Option.isSome(frame)) {
+        const response = new Response(new Uint8Array(frame.value), {
+          headers: {
+            "content-type": "application/octet-stream",
+            "cache-control": "public, max-age=31536000, immutable",
+            "content-length": String(frame.value.byteLength),
+            "x-raio-cache": "r2-directory-hit",
+          },
+        });
+        if (cache !== undefined)
+          this.ctx.waitUntil(
+            Effect.runPromise(
+              Effect.tryPromise(() => cache.put(cacheKey, response.clone())).pipe(Effect.ignore),
+            ),
+          );
+        return response;
+      }
+    }
     const object = await this.env.STORAGE.get(input.key, {
       range: { offset: input.offset, length: input.length },
     });
@@ -153,6 +175,8 @@ export class Segments extends WorkerEntrypoint<Env, typeof SegmentCacheProps.Typ
       Match.when("/directory-v1", () => directory_compress(new Uint8Array(bytes)).slice()),
       Match.orElse(() => bytes),
     );
+    if (url.pathname === "/directory-v1")
+      publishDirectoryFrame(input.key, input.length, new Uint8Array(encoded), this.ctx);
     const response = new Response(encoded, {
       headers: {
         "content-type": "application/octet-stream",
@@ -1503,7 +1527,7 @@ export class SearchNamespace extends DurableObject<Env> {
       writes.push(async () => {
         const stored = await this.env.STORAGE.put(key, built.bytes);
         if (stored !== null)
-          await Effect.runPromise(storeCorrelatedOverview(key, headerBytes, built.bytes));
+          await Effect.runPromise(storeSegmentCaches(key, headerBytes, built.bytes));
         return stored;
       });
       segments.push({
@@ -1908,7 +1932,7 @@ export class SearchNamespace extends DurableObject<Env> {
       if (stored === null)
         throw new Rejected({ status: 503, message: "Compacted R2 segment write failed" });
       await Effect.runPromise(
-        storeCorrelatedOverview(
+        storeSegmentCaches(
           key,
           16 + new DataView(built.bytes.buffer, built.bytes.byteOffset).getUint32(8, true),
           built.bytes,

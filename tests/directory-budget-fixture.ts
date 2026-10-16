@@ -1,4 +1,5 @@
-import { Effect, Schema } from "effect";
+import { Effect, Match, Schema } from "effect";
+import { exports } from "cloudflare:workers";
 import { Segments as CachedSegments, SearchNamespace as Namespace } from "../src/worker";
 import { range, cacheUsage } from "../src/storage";
 import type { Env } from "../alchemy.run";
@@ -12,11 +13,17 @@ const state = {
   completed: 0,
   cacheDelay: 5000,
   bodyDelay: 80,
+  directoryBodyDelay: 80,
+  failDirectoryCache: false,
+  failDirectoryWrites: false,
+  rejectedWrites: 0,
+  canonicalReads: 0,
 };
 const wrapped = new WeakSet<R2Bucket>();
 
 export class Segments extends CachedSegments {
   override async fetch(request: Request) {
+    if (new URL(request.url).searchParams.has("direct-origin")) return super.fetch(request);
     const key = new URL(request.url).searchParams.get("key");
     if (key?.endsWith("/body.rsix") === true) {
       const response = await super.fetch(request);
@@ -50,8 +57,21 @@ async function probe(request: Request, env: Env) {
   if (!wrapped.has(env.STORAGE)) {
     wrapped.add(env.STORAGE);
     const get = env.STORAGE.get.bind(env.STORAGE);
+    const put = env.STORAGE.put.bind(env.STORAGE);
+    Object.defineProperty(env.STORAGE, "put", {
+      value: (...args: Parameters<R2Bucket["put"]>) => {
+        if (state.failDirectoryWrites && args[0].startsWith("cache/directory-v1/")) {
+          state.rejectedWrites += 1;
+          return Promise.reject(new Error("Injected directory cache publication failure"));
+        }
+        return put(...args);
+      },
+    });
     Object.defineProperty(env.STORAGE, "get", {
       value: async (...args: Parameters<R2Bucket["get"]>) => {
+        if (state.failDirectoryCache && args[0].startsWith("cache/directory-v1/"))
+          return Promise.reject(new Error("Injected directory cache read failure"));
+        if (args[0].startsWith("namespaces/")) state.canonicalReads += 1;
         const object = await get(...args);
         if (object === null || !("body" in object)) return object;
         const read = object.arrayBuffer.bind(object);
@@ -61,7 +81,12 @@ async function probe(request: Request, env: Env) {
             state.active += 1;
             state.peak = Math.max(state.peak, state.active);
             return Effect.runPromise(
-              Effect.sleep(state.bodyDelay).pipe(
+              Effect.sleep(
+                Match.value(args[0].startsWith("cache/directory-v1/")).pipe(
+                  Match.when(true, () => state.directoryBodyDelay),
+                  Match.orElse(() => state.bodyDelay),
+                ),
+              ).pipe(
                 Effect.andThen(Effect.tryPromise(read)),
                 Effect.tap(() =>
                   Effect.sync(() => {
@@ -81,6 +106,22 @@ async function probe(request: Request, env: Env) {
       },
     });
   }
+  if (new URL(request.url).pathname === "/cache-failure") {
+    state.failDirectoryCache = true;
+    return new Response(null, { status: 204 });
+  }
+  if (new URL(request.url).pathname === "/cache-write-failure") {
+    state.failDirectoryWrites = true;
+    return new Response(null, { status: 204 });
+  }
+  if (new URL(request.url).pathname === "/cache-stall") {
+    state.directoryBodyDelay = 1600;
+    return new Response(null, { status: 204 });
+  }
+  if (new URL(request.url).pathname === "/fast-origin") {
+    state.cacheDelay = 0;
+    return new Response(null, { status: 204 });
+  }
   if (new URL(request.url).pathname === "/race") {
     state.cacheDelay = 400;
     state.bodyDelay = 1600;
@@ -98,9 +139,19 @@ async function probe(request: Request, env: Env) {
         "x-r2-completed": String(state.completed),
         "x-r2-active": String(state.active),
         "x-r2-peak": String(state.peak),
+        "x-canonical-reads": String(state.canonicalReads),
+        "x-rejected-writes": String(state.rejectedWrites),
       },
     });
   const input = Schema.decodeUnknownSync(DirectoryBudgetInput)(await request.json());
+  if (new URL(request.url).pathname === "/origin") {
+    const url = new URL("https://segments.internal/directory-v1");
+    url.searchParams.set("key", input.key);
+    url.searchParams.set("offset", String(input.offset));
+    url.searchParams.set("length", String(input.length));
+    url.searchParams.set("direct-origin", "1");
+    return exports.Segments({ props: { bucket: env.STORAGE_CACHE_SCOPE } }).fetch(url);
+  }
   const before = cacheUsage();
   return Effect.runPromise(
     Effect.tryPromise(() =>
@@ -121,6 +172,19 @@ async function probe(request: Request, env: Env) {
             "x-timeouts": String(after.rangeCacheTimeouts - before.rangeCacheTimeouts),
             "x-fallbacks": String(after.rangeR2FallbackReads - before.rangeR2FallbackReads),
             "x-fallback-bytes": String(after.rangeR2FallbackBytes - before.rangeR2FallbackBytes),
+            "x-directory-r2-hits": String(after.directoryR2CacheHits - before.directoryR2CacheHits),
+            "x-directory-r2-bytes": String(
+              after.directoryR2CacheBytes - before.directoryR2CacheBytes,
+            ),
+            "x-directory-r2-rejected": String(
+              after.directoryR2CacheRejected - before.directoryR2CacheRejected,
+            ),
+            "x-directory-r2-timeouts": String(
+              after.directoryR2CacheTimeouts - before.directoryR2CacheTimeouts,
+            ),
+            "x-directory-r2-origins": String(
+              after.directoryR2CacheOriginResponses - before.directoryR2CacheOriginResponses,
+            ),
           },
         });
       }),

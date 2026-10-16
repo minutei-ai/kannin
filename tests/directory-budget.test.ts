@@ -5,10 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Response } from "miniflare";
 import { initSync, Segment, Directory, directory_compress } from "../dist/wasm/raio_engine";
-import { SegmentHeader } from "../src/protocol";
+import { QueryResult, Root, SegmentHeader, TermProjectionRange } from "../src/protocol";
 import { corpus } from "../tooling/corpus";
 import { DirectoryBudgetInput } from "./range-contract";
-import { startWorker } from "./harness";
+import { document, request, startWorker, textQuery, write } from "./harness";
 
 initSync({
   module: new WebAssembly.Module(
@@ -25,10 +25,25 @@ const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.h
 const final = header.documents[4999];
 if (final === undefined) throw new Error("Missing fixture row");
 
-function padded(padding: string) {
+function directoryWithLength(expected: number) {
   const first = documents[0];
   if (first === undefined) throw new Error("Missing fixture document");
-  return [{ ...first, attributes: { ...first.attributes, padding } }, ...documents.slice(1)];
+  const boundary = { padding: expected - length, bytes: canonical, length };
+  for (const attempt of Array.from({ length: 8 }, (_, index) => index)) {
+    using built = new Segment(
+      JSON.stringify([
+        { ...first, attributes: { ...first.attributes, padding: "x".repeat(boundary.padding) } },
+        ...documents.slice(1),
+      ]),
+    );
+    boundary.bytes = built.bytes();
+    boundary.length =
+      16 + new DataView(boundary.bytes.buffer, boundary.bytes.byteOffset).getUint32(8, true);
+    if (boundary.length === expected) return boundary;
+    boundary.padding += expected - boundary.length;
+    if (attempt === 7) throw new Error("Unable to construct directory boundary");
+  }
+  throw new Error("Missing directory boundary");
 }
 
 async function fixture() {
@@ -86,6 +101,297 @@ async function cacheFrame(
     new Response(new Uint8Array(bytes), { headers: { "cache-control": "public, max-age=3600" } }),
   );
 }
+
+test("R2 directory frames recover cold readers with compressed bytes across isolates", async () => {
+  const key = "namespaces/directory-r2/segments/shared.rsix";
+  const identity = `cache/directory-v1/${key}/${length}`;
+  const input = Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
+    key,
+    offset: 0,
+    length,
+    count: 32,
+  });
+  await using first = await fixture();
+  const bucket = await first.worker.getR2Bucket("STORAGE");
+  await bucket.put(key, canonical);
+  await cacheFrame(first.worker, key, length, frame);
+  const initial = await fetch(await first.worker.ready, { method: "POST", body: input });
+  expect(initial.status).toBe(200);
+  expect(new Uint8Array(await initial.arrayBuffer())).toEqual(frame);
+  expect(initial.headers.get("x-fallback-bytes")).toBe(String(length));
+  for (const attempt of Array.from({ length: 40 }, (_, index) => index)) {
+    if ((await bucket.head(identity)) !== null) break;
+    if (attempt === 39) throw new Error("Directory publication did not settle");
+    await Effect.runPromise(Effect.sleep("50 millis"));
+  }
+  const saved = await bucket.get(identity);
+  if (saved === null) throw new Error("Missing directory frame");
+  const bytes = new Uint8Array(await saved.arrayBuffer());
+  expect(bytes).toEqual(frame);
+  expect(
+    Schema.decodeUnknownSync(Schema.fromJsonString(TermProjectionRange))(
+      saved.customMetadata?.source,
+    ),
+  ).toEqual({ key, headerBytes: length });
+  await using second = await fixture();
+  const remote = await second.worker.getR2Bucket("STORAGE");
+  await remote.put(key, canonical);
+  await remote.put(identity, bytes, {
+    customMetadata: {
+      source: Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))({
+        key,
+        headerBytes: length,
+      }),
+    },
+  });
+  await cacheFrame(second.worker, key, length, frame);
+  const recovered = await fetch(await second.worker.ready, { method: "POST", body: input });
+  expect(recovered.status).toBe(200);
+  expect(new Uint8Array(await recovered.arrayBuffer())).toEqual(frame);
+  expect(recovered.headers.get("x-fallbacks")).toBe("0");
+  expect(recovered.headers.get("x-fallback-bytes")).toBe("0");
+  expect(recovered.headers.get("x-directory-r2-hits")).toBe("1");
+  expect(recovered.headers.get("x-directory-r2-bytes")).toBe(String(frame.byteLength));
+  expect(recovered.headers.get("x-distinct-bodies")).toBe("1");
+  expect(frame.byteLength * 10).toBeLessThan(length);
+}, 15000);
+
+test("invalid R2 directory frames recover canonical data and repair disposable artifacts", async () => {
+  await using active = await fixture();
+  const worker = active.worker;
+  const bucket = await worker.getR2Bucket("STORAGE");
+  for (const failure of ["checksum", "identity", "oversized", "missing"]) {
+    const key = `namespaces/directory-r2/segments/${failure}.rsix`;
+    const identity = `cache/directory-v1/${key}/${length}`;
+    await bucket.put(key, canonical);
+    await cacheFrame(worker, key, length, frame);
+    const bytes = frame.slice();
+    if (failure === "checksum") bytes[12] = (bytes[12] ?? 0) ^ 1;
+    const source = { key, headerBytes: length };
+    if (failure === "identity") source.key = "namespaces/other/segments/other.rsix";
+    const metadata = {
+      source: Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))(source),
+    };
+    if (failure === "oversized")
+      await bucket.put(identity, new Uint8Array(length + 8193), { customMetadata: metadata });
+    else if (failure !== "missing") await bucket.put(identity, bytes, { customMetadata: metadata });
+    const response = await fetch(await worker.ready, {
+      method: "POST",
+      body: Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
+        key,
+        offset: 0,
+        length,
+        count: 8,
+      }),
+    });
+    expect(response.status).toBe(200);
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(frame);
+    expect(response.headers.get("x-fallbacks")).toBe("1");
+    expect(response.headers.get("x-fallback-bytes")).toBe(String(length));
+    if (failure === "missing") expect(response.headers.get("x-directory-r2-rejected")).toBe("0");
+    else expect(response.headers.get("x-directory-r2-rejected")).toBe("1");
+    for (const attempt of Array.from({ length: 40 }, (_, index) => index)) {
+      const repaired = await bucket.get(identity);
+      if (
+        repaired !== null &&
+        repaired.size === frame.byteLength &&
+        repaired.customMetadata?.source ===
+          Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))({
+            key,
+            headerBytes: length,
+          })
+      ) {
+        expect(new Uint8Array(await repaired.arrayBuffer())).toEqual(frame);
+        break;
+      }
+      if (attempt === 39) throw new Error("Directory repair did not settle");
+      if (repaired !== null) await repaired.body.cancel();
+      await Effect.runPromise(Effect.sleep("50 millis"));
+    }
+  }
+}, 15000);
+
+test("unavailable R2 directory cache preserves canonical recovery", async () => {
+  await using active = await fixture();
+  const worker = active.worker;
+  const key = "namespaces/directory-r2/segments/unavailable.rsix";
+  await (await worker.getR2Bucket("STORAGE")).put(key, canonical);
+  await cacheFrame(worker, key, length, frame);
+  expect((await fetch(new URL("/cache-failure", await worker.ready))).status).toBe(204);
+  const response = await fetch(await worker.ready, {
+    method: "POST",
+    body: Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
+      key,
+      offset: 0,
+      length,
+      count: 8,
+    }),
+  });
+  expect(response.status).toBe(200);
+  expect(new Uint8Array(await response.arrayBuffer())).toEqual(frame);
+  expect(response.headers.get("x-fallbacks")).toBe("1");
+  expect(response.headers.get("x-fallback-bytes")).toBe(String(length));
+});
+
+test("segment origins validate R2 frames before publishing the native Cache API response", async () => {
+  await using active = await fixture();
+  const worker = active.worker;
+  const key = "namespaces/directory-origin/segments/shared.rsix";
+  const identity = `cache/directory-v1/${key}/${length}`;
+  const bucket = await worker.getR2Bucket("STORAGE");
+  await bucket.put(key, canonical);
+  await bucket.put(identity, frame, {
+    customMetadata: {
+      source: Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))({
+        key,
+        headerBytes: length,
+      }),
+    },
+  });
+  const body = Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
+    key,
+    offset: 0,
+    length,
+    count: 1,
+  });
+  const response = await fetch(new URL("/origin", await worker.ready), { method: "POST", body });
+  expect(response.status).toBe(200);
+  expect(response.headers.get("x-raio-cache")).toBe("r2-directory-hit");
+  expect(new Uint8Array(await response.arrayBuffer())).toEqual(frame);
+  expect((await fetch(new URL("/fast-origin", await worker.ready))).status).toBe(204);
+  const relayed = await fetch(await worker.ready, { method: "POST", body });
+  expect(relayed.status).toBe(200);
+  expect(new Uint8Array(await relayed.arrayBuffer())).toEqual(frame);
+  expect(relayed.headers.get("x-directory-r2-origins")).toBe("1");
+  const state = await fetch(new URL("/state", await worker.ready));
+  expect(state.headers.get("x-canonical-reads")).toBe("0");
+  await bucket.delete(identity);
+  for (const attempt of Array.from({ length: 40 }, (_, index) => index)) {
+    const cached = await fetch(new URL("/origin", await worker.ready), { method: "POST", body });
+    expect(cached.status).toBe(200);
+    expect(new Uint8Array(await cached.arrayBuffer())).toEqual(frame);
+    if (cached.headers.get("x-raio-cache") === "api-hit") break;
+    if (attempt === 39) throw new Error("Cache API publication did not settle");
+    await Effect.runPromise(Effect.sleep("50 millis"));
+  }
+});
+
+test("slow R2 directory cache bodies keep admission while canonical recovery returns", async () => {
+  await using active = await fixture();
+  const worker = active.worker;
+  const bucket = await worker.getR2Bucket("STORAGE");
+  expect((await fetch(new URL("/cache-stall", await worker.ready))).status).toBe(204);
+  for (const name of ["first", "second"]) {
+    const key = `namespaces/directory-r2-stall/segments/${name}.rsix`;
+    await bucket.put(key, canonical);
+    await bucket.put(`cache/directory-v1/${key}/${length}`, frame, {
+      customMetadata: {
+        source: Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))({
+          key,
+          headerBytes: length,
+        }),
+      },
+    });
+    await cacheFrame(worker, key, length, frame);
+    const response = await fetch(await worker.ready, {
+      method: "POST",
+      body: Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
+        key,
+        offset: 0,
+        length,
+        count: 8,
+      }),
+    });
+    expect(response.status).toBe(200);
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(frame);
+    expect(response.headers.get("x-fallbacks")).toBe("1");
+    const state = await fetch(new URL("/state", await worker.ready));
+    expect(state.headers.get("x-r2-active")).toBe("1");
+    expect(state.headers.get("x-r2-peak")).toBe("2");
+    if (name === "first") expect(response.headers.get("x-directory-r2-timeouts")).toBe("1");
+    else expect(response.headers.get("x-directory-r2-timeouts")).toBe("0");
+  }
+  for (const attempt of Array.from({ length: 60 }, (_, index) => index)) {
+    const state = await fetch(new URL("/state", await worker.ready));
+    if (state.headers.get("x-r2-active") === "0") return;
+    if (attempt === 59) throw new Error("Directory cache body did not settle");
+    await Effect.runPromise(Effect.sleep("50 millis"));
+  }
+}, 15000);
+
+test("failed R2 directory publications preserve complete canonical results", async () => {
+  await using active = await fixture();
+  const worker = active.worker;
+  const key = "namespaces/directory-r2/segments/rejected-write.rsix";
+  const bucket = await worker.getR2Bucket("STORAGE");
+  await bucket.put(key, canonical);
+  await cacheFrame(worker, key, length, frame);
+  expect((await fetch(new URL("/cache-write-failure", await worker.ready))).status).toBe(204);
+  const response = await fetch(await worker.ready, {
+    method: "POST",
+    body: Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
+      key,
+      offset: 0,
+      length,
+      count: 8,
+    }),
+  });
+  expect(response.status).toBe(200);
+  expect(new Uint8Array(await response.arrayBuffer())).toEqual(frame);
+  const state = await fetch(new URL("/state", await worker.ready));
+  expect(state.headers.get("x-rejected-writes")).toBe("1");
+  expect(await bucket.head(`cache/directory-v1/${key}/${length}`)).toBeNull();
+});
+
+test("writes and compaction publish valid immutable directory frames", async () => {
+  await using cleanup = new AsyncDisposableStack();
+  const worker = await startWorker();
+  cleanup.defer(() => worker.dispose());
+  const namespace = "directory-writer";
+  for (const id of ["a", "b"])
+    expect(
+      (await request(worker, namespace, "write", write([document(id, "alpha beta")]))).status,
+    ).toBe(200);
+  const reference = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", textQuery("alpha"))).json(),
+  );
+  const bucket = await worker.getR2Bucket("STORAGE");
+  for (const phase of ["write", "compact"]) {
+    if (phase === "compact")
+      expect((await request(worker, namespace, "compact", {})).status).toBe(200);
+    const object = await bucket.get(`namespaces/${namespace}/root.json`);
+    if (object === null) throw new Error("Missing canonical root");
+    const root = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
+    for (const source of root.segments) {
+      const identity = `cache/directory-v1/${source.key}/${source.headerBytes}`;
+      for (const attempt of Array.from({ length: 40 }, (_, index) => index)) {
+        const stored = await bucket.get(identity);
+        if (stored !== null) {
+          const bytes = new Uint8Array(await stored.arrayBuffer());
+          using decoded = Directory.compressed(bytes, source.headerBytes);
+          expect(
+            Schema.decodeUnknownSync(Schema.fromJsonString(TermProjectionRange))(
+              stored.customMetadata?.source,
+            ),
+          ).toEqual({ key: source.key, headerBytes: source.headerBytes });
+          expect(
+            Schema.decodeSync(Schema.fromJsonString(SegmentHeader.fields.documents))(
+              decoded.rows(JSON.stringify(Array.from({ length: source.count }, (_, row) => row))),
+            ),
+          ).toHaveLength(source.count);
+          break;
+        }
+        if (attempt === 39) throw new Error("Writer directory publication did not settle");
+        await Effect.runPromise(Effect.sleep("50 millis"));
+      }
+    }
+    expect(
+      Schema.decodeUnknownSync(QueryResult)(
+        await (await request(worker, namespace, "query", textQuery("alpha"))).json(),
+      ),
+    ).toEqual(reference);
+  }
+});
 
 for (const name of ["headers", "body"])
   test(`directory cache wait recovers through bounded R2 with delayed ${name}`, async () => {
@@ -183,23 +489,7 @@ test("directory recovery serializes distinct R2 bodies and releases failed admis
 test("directory bodies above two MiB preserve the cached acquisition path", async () => {
   await using active = await fixture();
   const worker = active.worker;
-  using seed = new Segment(JSON.stringify(padded("")));
-  const seedBytes = seed.bytes();
-  const seedHeader = 16 + new DataView(seedBytes.buffer, seedBytes.byteOffset).getUint32(8, true);
-  const boundary = {
-    padding: 2 * 1024 * 1024 + 1 - seedHeader,
-    bytes: seedBytes,
-    length: seedHeader,
-  };
-  for (const attempt of Array.from({ length: 8 }, (_, index) => index)) {
-    using oversized = new Segment(JSON.stringify(padded("x".repeat(boundary.padding))));
-    boundary.bytes = oversized.bytes();
-    boundary.length =
-      16 + new DataView(boundary.bytes.buffer, boundary.bytes.byteOffset).getUint32(8, true);
-    if (boundary.length === 2 * 1024 * 1024 + 1) break;
-    if (attempt === 7) throw new Error("Could not construct the exact directory boundary");
-    boundary.padding -= boundary.length - (2 * 1024 * 1024 + 1);
-  }
+  const boundary = directoryWithLength(2 * 1024 * 1024 + 1);
   const large = boundary.bytes;
   const headerBytes = boundary.length;
   expect(headerBytes).toBe(2 * 1024 * 1024 + 1);
@@ -223,6 +513,43 @@ test("directory bodies above two MiB preserve the cached acquisition path", asyn
   expect(response.headers.get("x-fallbacks")).toBe("0");
   const state = await fetch(new URL("/state", await worker.ready));
   expect(state.headers.get("x-r2-started")).toBe("0");
+}, 15000);
+
+test("R2 directory publication includes exactly two MiB and excludes the next byte", async () => {
+  await using active = await fixture();
+  const worker = active.worker;
+  const bucket = await worker.getR2Bucket("STORAGE");
+  for (const extra of [0, 1]) {
+    const built = directoryWithLength(2 * 1024 * 1024 + extra);
+    const key = `namespaces/directory-boundary/segments/frame-${extra}.rsix`;
+    const identity = `cache/directory-v1/${key}/${built.length}`;
+    await bucket.put(key, built.bytes);
+    const response = await fetch(new URL("/origin", await worker.ready), {
+      method: "POST",
+      body: Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
+        key,
+        offset: 0,
+        length: built.length,
+        count: 1,
+      }),
+    });
+    expect(response.status).toBe(200);
+    const encoded = new Uint8Array(await response.arrayBuffer());
+    expect(encoded).toEqual(
+      new Uint8Array(directory_compress(built.bytes.subarray(0, built.length))),
+    );
+    if (extra === 1) expect(await bucket.head(identity)).toBeNull();
+    else
+      for (const attempt of Array.from({ length: 40 }, (_, index) => index)) {
+        const stored = await bucket.get(identity);
+        if (stored !== null) {
+          expect(new Uint8Array(await stored.arrayBuffer())).toEqual(encoded);
+          break;
+        }
+        if (attempt === 39) throw new Error("Boundary publication did not settle");
+        await Effect.runPromise(Effect.sleep("50 millis"));
+      }
+  }
 }, 15000);
 
 test("a winning cache response does not wait for the R2 loser or release its body slot early", async () => {

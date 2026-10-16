@@ -12,7 +12,7 @@ import {
   segment_correlated_overview,
 } from "../dist/wasm/raio_engine";
 import type { Ranker } from "../dist/wasm/raio_engine";
-import type { DataRange, TermProjectionRange, Root } from "./protocol";
+import type { DataRange, Root } from "./protocol";
 import {
   StoredDocument,
   SegmentHeader,
@@ -20,6 +20,7 @@ import {
   TermCatalog,
   TermSummaries,
   TermProjection,
+  TermProjectionRange,
   CorrelatedOverview,
   CatalogTelemetry,
   EligibleMinimum,
@@ -40,7 +41,7 @@ export function publishQueryCache(
   identity: string,
   charge: number,
   publication: Effect.Effect<void, Cause.UnknownError>,
-  ctx: ExecutionContext | DurableObjectState,
+  ctx?: ExecutionContext | DurableObjectState,
 ) {
   if (
     pendingQueryPublications.has(identity) ||
@@ -50,19 +51,19 @@ export function publishQueryCache(
     return false;
   pendingQueryPublications.set(identity, charge);
   queryPublicationBudget.bytes += charge;
-  ctx.waitUntil(
-    Effect.runPromise(
-      publication.pipe(
-        Effect.ignore,
-        Effect.ensuring(
-          Effect.sync(() => {
-            pendingQueryPublications.delete(identity);
-            queryPublicationBudget.bytes -= charge;
-          }),
-        ),
+  const pending = Effect.runPromise(
+    publication.pipe(
+      Effect.ignore,
+      Effect.ensuring(
+        Effect.sync(() => {
+          pendingQueryPublications.delete(identity);
+          queryPublicationBudget.bytes -= charge;
+        }),
       ),
     ),
   );
+  if (ctx === undefined) waitUntil(pending);
+  else ctx.waitUntil(pending);
   return true;
 }
 
@@ -77,6 +78,7 @@ const SMALL_RANGE_BODY_UNIT = 64 * 1024;
 const smallRangeReads = Semaphore.makeUnsafe(64);
 const MAX_DIRECTORY_FALLBACK_LENGTH = 2 * 1024 * 1024;
 const directoryFallbackReads = Semaphore.makeUnsafe(1);
+const directoryCacheReads = Semaphore.makeUnsafe(1);
 const budget = { bytes: 0, payloadBytes: 0 };
 const MAX_CACHE_BYTES = 12 * 1024 * 1024;
 const encodedDirectories = new Map<string, Uint8Array>();
@@ -129,6 +131,13 @@ const reads = {
   directoryCacheTimeouts: 0,
   directoryR2FallbackReads: 0,
   directoryR2FallbackBytes: 0,
+  directoryR2CacheReads: 0,
+  directoryR2CacheHits: 0,
+  directoryR2CacheBytes: 0,
+  directoryR2CacheRejected: 0,
+  directoryR2CacheTimeouts: 0,
+  directoryR2CachePublications: 0,
+  directoryR2CacheOriginResponses: 0,
   rangeBytes: 0,
   rangeCacheHits: 0,
   directoryCacheHits: 0,
@@ -277,6 +286,88 @@ export function addFrequencyPosting(
   ranker.add_frequency(term, page);
 }
 
+export const readDirectoryFrame = Effect.fn("kannin.readDirectoryFrame")(
+  (key: string, length: number) =>
+    Effect.gen(function* () {
+      if (length > MAX_DIRECTORY_FALLBACK_LENGTH) return Option.none<Uint8Array>();
+      const acquisition = directoryCacheReads.withPermitsIfAvailable(1)(
+        Effect.gen(function* () {
+          reads.directoryR2CacheReads += 1;
+          const object = yield* Effect.tryPromise(() =>
+            env.STORAGE.get(`cache/directory-v1/${key}/${length}`),
+          );
+          if (object === null) return Option.none<Uint8Array>();
+          const source = yield* Schema.decodeUnknownEffect(
+            Schema.fromJsonString(TermProjectionRange),
+          )(object.customMetadata?.source).pipe(Effect.option);
+          if (
+            object.size > length + 8192 ||
+            Option.isNone(source) ||
+            source.value.key !== key ||
+            source.value.headerBytes !== length
+          ) {
+            yield* Effect.tryPromise(() => object.body.cancel());
+            reads.directoryR2CacheRejected += 1;
+            return Option.none<Uint8Array>();
+          }
+          const bytes = new Uint8Array(yield* Effect.tryPromise(() => object.arrayBuffer()));
+          reads.directoryR2CacheBytes += bytes.byteLength;
+          const checked = yield* Effect.try(() => {
+            const directory = Directory.compressed(bytes, length);
+            directory.free();
+            return bytes;
+          }).pipe(Effect.option);
+          if (Option.isSome(checked)) reads.directoryR2CacheHits += 1;
+          else reads.directoryR2CacheRejected += 1;
+          return checked;
+        }).pipe(Effect.uninterruptible),
+      );
+      const acquired = yield* Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const reader = yield* Effect.forkDetach(acquisition);
+          waitUntil(new Promise<void>((resolve) => reader.addObserver(() => resolve())));
+          return yield* restore(Fiber.join(reader)).pipe(Effect.timeoutOption("250 millis"));
+        }),
+      );
+      if (Option.isNone(acquired)) {
+        reads.directoryR2CacheTimeouts += 1;
+        return Option.none<Uint8Array>();
+      }
+      return Option.flatten(acquired.value);
+    }).pipe(Effect.orElseSucceed(() => Option.none<Uint8Array>())),
+);
+
+export function publishDirectoryFrame(
+  key: string,
+  length: number,
+  bytes: Uint8Array,
+  ctx?: ExecutionContext | DurableObjectState,
+) {
+  if (length > MAX_DIRECTORY_FALLBACK_LENGTH) return false;
+  const identity = `cache/directory-v1/${key}/${length}`;
+  const published = publishQueryCache(
+    `${env.STORAGE_CACHE_SCOPE}:${identity}`,
+    bytes.byteLength * 4 + identity.length * 4 + 128,
+    Schema.encodeEffect(Schema.fromJsonString(TermProjectionRange))({
+      key,
+      headerBytes: length,
+    }).pipe(
+      Effect.orDie,
+      Effect.flatMap((source) =>
+        Effect.tryPromise(() =>
+          env.STORAGE.put(identity, new Uint8Array(bytes), {
+            customMetadata: { source },
+          }),
+        ),
+      ),
+      Effect.asVoid,
+    ),
+    ctx,
+  );
+  if (published) reads.directoryR2CachePublications += 1;
+  return published;
+}
+
 export async function range(
   key: string,
   offset: number,
@@ -327,6 +418,8 @@ export async function range(
         else if (status === "MISS") reads.workerCacheMisses += 1;
         if (status !== "HIT" && response.headers.get("x-raio-cache") === "api-hit")
           reads.cacheApiHits += 1;
+        if (response.headers.get("x-raio-cache") === "r2-directory-hit")
+          reads.directoryR2CacheOriginResponses += 1;
         if (!response.ok)
           throw new Rejected({
             status: 503,
@@ -363,7 +456,9 @@ export async function range(
             });
           if (compressedDirectory) {
             reads.directoryR2FallbackBytes += body.byteLength;
-            return yield* Effect.try(() => directory_compress(new Uint8Array(body)).slice());
+            const frame = yield* Effect.try(() => directory_compress(new Uint8Array(body)).slice());
+            publishDirectoryFrame(key, length, frame);
+            return frame;
           }
           return new Uint8Array(body);
         }),
@@ -372,6 +467,11 @@ export async function range(
         return Effect.tryPromise(() => object.body.cancel()).pipe(Effect.ignore);
       },
     ).pipe(Effect.uninterruptible);
+    const directoryRecovery = Effect.gen(function* () {
+      const frame = yield* readDirectoryFrame(key, length);
+      if (Option.isSome(frame)) return frame.value;
+      return yield* fallback;
+    });
     const boundedRead = Effect.gen(function* () {
       const acquired = yield* cachedRead.pipe(Effect.timeoutOption("250 millis"));
       if (Option.isSome(acquired)) return acquired.value;
@@ -391,7 +491,7 @@ export async function range(
               const attempt = Effect.uninterruptibleMask((restore) =>
                 Effect.gen(function* () {
                   const recovery = yield* Effect.forkDetach(
-                    directoryFallbackReads.withPermitsIfAvailable(1)(fallback),
+                    directoryFallbackReads.withPermitsIfAvailable(1)(directoryRecovery),
                   );
                   waitUntil(
                     new Promise<void>((resolve) => {
@@ -1029,9 +1129,15 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
     }),
 );
 
-export const storeCorrelatedOverview = Effect.fn("kannin.storeCorrelatedOverview")(
+export const storeSegmentCaches = Effect.fn("kannin.storeSegmentCaches")(
   (key: string, headerBytes: number, bytes: Uint8Array) =>
     Effect.gen(function* () {
+      if (headerBytes <= MAX_DIRECTORY_FALLBACK_LENGTH) {
+        const frame = yield* Effect.try(() =>
+          directory_compress(bytes.subarray(0, headerBytes)).slice(),
+        );
+        publishDirectoryFrame(key, headerBytes, frame);
+      }
       const overview = yield* Effect.try(() => segment_correlated_overview(bytes));
       if (overview === undefined) return;
       const encoded = yield* encodeCorrelatedOverview({

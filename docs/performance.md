@@ -3813,3 +3813,34 @@ The complete deployed comparison includes the certified tie bounds, compact fram
 Rare-selector repeated medians were about 33% and 36% lower. Dense medians changed modestly, and repeated dense tails regressed. The 669.87-ms response reported gateway timing of 20 ms; these timing headers do not isolate client transport or billed CPU. The comparison does not establish a universal tail improvement, sustained capacity or billing reduction. Observed WASM buffers reached 34,668,544 bytes before and 28,442,624 after, while decoded-cache charge remained below twenty MiB; these observations exclude other isolates, JavaScript/native memory and whole-Worker peak accounting.
 
 Initial selector observations before/after were 2034/2756 ms for sixteen terms, 1481/1744 for sixty-four, 1364/1577 for dense group 72 and 6025/1122 for group 43. They do not compare matched cold states: process caches, native Workers Cache and R2 backstops could already be warm, and the mandatory rebuild acquired headers before candidate measurements. The controlled local first-read results above therefore remain separate from these warmed Cloudflare cohorts. Fully cold Cloudflare R2 performance remains unproven.
+
+## Borrowing discarded attribute keys
+
+Source `f7b6204` avoids allocating owned strings for unselected attribute names while projecting Rust headers and computing filter eligibility. Discarded nested maps also validate their keys without retaining them. Escapes, duplicate-key behavior, finite-number checks and malformed-input rejection remain enforced. Canonical bytes, cache identities and admission budgets are unchanged.
+
+Against source `6f12e25`, a 5,000-document Rust/WASM filter kernel with 64 attributes reduced median preparation from 38.46 to 21.13 ms across forty observations after four exclusions. Reversing variant order in a second cohort measured 33.29 to 21.91 ms. Each query used a different filter value. These are component measurements, not complete request latency.
+
+Three local complete-API cohorts per variant and attribute width used 2,000 documents in four segments. Each cohort excluded four initial queries and retained forty distinct-filter observations; the middle cohort reversed variant order. All 528 complete responses preserved IDs, exact scores, attributes, revisions and sequence.
+
+| Local complete API | Before median ms | Candidate median ms |
+| ------------------ | ---------------: | ------------------: |
+| 64 attributes      |            51.38 |               47.54 |
+| 2 attributes       |            36.19 |               36.52 |
+
+The wide-attribute median improved about 7.5%, consistently across the three cohorts. The two-attribute control was nearly flat when pooled, but its first candidate cohort regressed about 19%; subsequent cohorts were nearly flat. This is a targeted allocation improvement, not a universal request-speed improvement.
+
+A separate million-document comparison used fresh workerd processes and empty Worker caches, three cohorts per variant/selector, preserving all 48 complete first/repeated responses. First-query medians changed 1094 → 1078 ms for sixteen rare terms, 2186 → 2116 for sixty-four, 1803 → 1828 for dense group 72 and 1895 → 1871 for group 43. This ordinary two-attribute corpus was largely unchanged. Existing local R2 fixtures do not establish fully cold Cloudflare storage latency.
+
+The full gate passed 268 Bun/workerd tests and 51 Rust tests, including malformed ignored keys and values, escaped matching names and duplicate selected keys. Both native and WASM Clippy, strict Effect lint and TypeScript checks passed. The complete 300-query SciFact report remained identical, including every evaluated result and aggregate metric.
+
+The same change was deployed through the `minutei` Alchemy profile as version `d730ebda-a895-4a79-8d5c-69cc8139af3b`, receiving 100% of traffic with Smart Placement. The mandatory rebuild completed across 39 namespaces and submitted 398 existing vectors with eventual visibility. The R2 binding and lifecycle rules were unchanged; the canonical million-document manifest remained byte-identical at sequence 2000 with 200 segments.
+
+A separate Cloudflare fixture held 2,000 documents, 64 attributes and four segments. Each version received 44 strong queries with distinct filter values and minimum sequence 4; the first four were excluded from latency and CPU summaries. All 44 complete before/after responses matched, including exact scores, attributes and revisions. Both cohorts entered through GRU. Native observability events joined by request ray supplied one SearchNamespace CPU observation for every retained query. Gateway CPU was excluded.
+
+| Cloudflare, forty observations per version | Before | Candidate |
+| ------------------------------------------ | -----: | --------: |
+| Durable Object CPU median ms               |  31.00 |     25.50 |
+| Durable Object CPU nearest-rank p95 ms     |  47.00 |     39.00 |
+| Complete HTTP median ms                    | 431.34 |    259.13 |
+
+The observed engine CPU median decreased about 18%. These sequential cohorts do not control network or placement conditions, so the larger HTTP decrease cannot be attributed entirely to the parser. Distinct filters exercise uncached predicate masks; physical directories and storage can remain warm. This does not measure fully cold Cloudflare R2, sustained capacity, total billing or Turbopuffer parity. The temporary fixture was reset through the native write API and verified empty with no vector outbox; physical retirement follows the normal grace period.

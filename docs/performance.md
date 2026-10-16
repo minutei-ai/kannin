@@ -3497,3 +3497,5 @@ Native deployment `df4793db-c21b-4701-bebe-753461da78d4` used the same R2 bindin
 | Candidate repeated |     722.11 / 2025.46 |        264.49 / 317.87 |
 
 Eight-term responses reused catalog halves without RPCs and serve as a workload control, not a randomized control group. Cache and network conditions were uncontrolled; twelve samples make nearest-rank p95 the maximum. The lower RPC count and local speedup did not establish a native latency gain. The change was reverted, restoring eight-range caller RPCs and the previous eight-source cache fragments. Cold acquisition, whole-Worker peak heap and broad native performance remain open.
+
+The restoration was deployed from `34fd98f` as version `8de920ae-02fc-426a-a952-456bd669d387` at 100%. The rebuilt Worker and WASM matched the pre-experiment artifacts byte for byte, and the restored source/test tree matched `3dfbe49`. Forty-five focused cache/recovery tests passed, followed by sixteen native text checks and twelve Vectorize/hybrid checks preserving all 105 baseline vector rows and scores. The R2 binding and lifecycle rules were unchanged. No native latency improvement is claimed for this rejected experiment.

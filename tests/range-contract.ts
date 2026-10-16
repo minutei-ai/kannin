@@ -1,5 +1,5 @@
 import { Schema } from "effect";
-import { SegmentRange, CacheMetrics } from "../src/protocol";
+import { SegmentRange, SegmentHeader, CacheMetrics } from "../src/protocol";
 
 export const RangeProbeInput = Schema.Struct({
   ...SegmentRange.fields,
@@ -37,6 +37,14 @@ export const DirectoryScanResult = Schema.Array(
 );
 
 export const DirectoryAgingInput = Schema.Tuple([SegmentRange, SegmentRange]);
+export const DecodedDirectoryScanResult = Schema.Array(
+  Schema.Struct({
+    hits: CacheMetrics.fields.directoryCacheHits,
+    bytes: CacheMetrics.fields.directoryCacheChargedBytes,
+    history: CacheMetrics.fields.encodedDirectoryAdmissionChargedBytes,
+    metadata: Schema.Array(SegmentHeader.fields.terms),
+  }),
+);
 export const DirectoryAgingResult = Schema.Struct({
   before: CacheMetrics.fields.encodedDirectoryAdmissionChargedBytes,
   after: CacheMetrics.fields.encodedDirectoryAdmissionChargedBytes,

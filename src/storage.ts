@@ -110,7 +110,8 @@ const MAX_SCORE_BOUND_BYTES = 1024 * 1024;
 const admissionCounts = new Map<string, number>();
 const admissionBudget = { bytes: 0, requests: 0 };
 const MAX_ADMISSION_BYTES = 1024 * 1024;
-const directories = new Map<string, { directory: Directory; bytes: number }>();
+const directories = new Map<string, { directory: Directory; bytes: number; headerBytes: number }>();
+const activeDirectories = new Map<string, { readers: number; directory: Directory | undefined }>();
 const decodedBudget = { bytes: 0 };
 const MAX_DECODED_BYTES = 40 * 1024 * 1024;
 const MAX_DECODED_CACHE_BYTES = 20 * 1024 * 1024;
@@ -310,19 +311,30 @@ export function addFrequencyPosting(
   ranker.add_frequency(term, page);
 }
 
-function rememberDirectory(identity: string, directory: Directory) {
-  if (directories.has(identity)) return;
+function rememberDirectory(identity: string, headerBytes: number, directory: Directory) {
   const bytes = directory.heap_bytes();
+  const active = activeDirectories.get(`${identity}/0/${headerBytes}/directory-v1`);
+  if (active !== undefined && active.directory === undefined && bytes <= MAX_DECODED_BYTES)
+    active.directory = directory.retain();
+  if (directories.has(identity)) return;
   if (bytes > MAX_DECODED_CACHE_BYTES) return;
-  while (decodedBudget.bytes + bytes > MAX_DECODED_CACHE_BYTES) {
-    const oldest = directories.entries().next().value;
-    if (oldest === undefined) break;
-    directories.delete(oldest[0]);
-    decodedBudget.bytes -= oldest[1].bytes;
-    oldest[1].directory.free();
+  const frequency = admissionCounts.get(`${identity}/0/${headerBytes}/directory-v1`) ?? 1;
+  const victims = [];
+  const remaining = { bytes: decodedBudget.bytes };
+  for (const [key, entry] of directories) {
+    if (remaining.bytes + bytes <= MAX_DECODED_CACHE_BYTES) break;
+    if (frequency <= (admissionCounts.get(`${key}/0/${entry.headerBytes}/directory-v1`) ?? 0))
+      return;
+    victims.push(key);
+    remaining.bytes -= entry.bytes;
   }
-  directories.set(identity, { directory: directory.retain(), bytes });
-  decodedBudget.bytes += bytes;
+  for (const key of victims) {
+    const entry = directories.get(key);
+    directories.delete(key);
+    entry?.directory.free();
+  }
+  directories.set(identity, { directory: directory.retain(), bytes, headerBytes });
+  decodedBudget.bytes = remaining.bytes + bytes;
 }
 
 export const readDirectoryFrame = Effect.fn("kannin.readDirectoryFrame")(
@@ -353,7 +365,7 @@ export const readDirectoryFrame = Effect.fn("kannin.readDirectoryFrame")(
           reads.directoryR2CacheBytes += bytes.byteLength;
           const checked = yield* Effect.try(() => {
             using directory = Directory.compressed(bytes, length);
-            rememberDirectory(`${env.STORAGE_CACHE_SCOPE}:${key}`, directory);
+            rememberDirectory(`${env.STORAGE_CACHE_SCOPE}:${key}`, length, directory);
             return bytes;
           }).pipe(Effect.option);
           if (Option.isSome(checked)) reads.directoryR2CacheHits += 1;
@@ -592,16 +604,25 @@ export async function range(
 
 async function acquireDirectory(key: string, headerBytes: number) {
   const identity = `${env.STORAGE_CACHE_SCOPE}:${key}`;
+  const admissionIdentity = `${identity}/0/${headerBytes}/directory-v1`;
   const cached = directories.get(identity);
   if (cached !== undefined) {
+    noteDirectoryRequest(admissionIdentity);
     reads.directoryCacheHits += 1;
     directories.delete(identity);
     directories.set(identity, cached);
     return cached.directory.retain();
   }
+  const retained = activeDirectories.get(admissionIdentity);
+  if (retained?.directory !== undefined) {
+    noteDirectoryRequest(admissionIdentity);
+    return retained.directory.retain();
+  }
   const bytes = await range(key, 0, headerBytes, true);
   const concurrent = directories.get(identity);
   if (concurrent !== undefined) return concurrent.directory.retain();
+  const active = activeDirectories.get(admissionIdentity);
+  if (active?.directory !== undefined) return active.directory.retain();
   const decoded = Directory.compressed(bytes, headerBytes);
   if (decoded.heap_bytes() > MAX_DECODED_BYTES) {
     decoded.free();
@@ -610,7 +631,7 @@ async function acquireDirectory(key: string, headerBytes: number) {
       message: "Segment directory exceeds the decoded-memory budget",
     });
   }
-  rememberDirectory(identity, decoded);
+  rememberDirectory(identity, headerBytes, decoded);
   return decoded;
 }
 
@@ -622,19 +643,41 @@ export const withDirectory = Effect.fn("raio.withDirectory")(
     permits?: Semaphore.Semaphore,
   ) =>
     Effect.acquireUseRelease(
-      Effect.gen(function* () {
-        const acquire = Effect.tryPromise({
-          try: () => acquireDirectory(key, headerBytes),
-          catch: (cause) => {
-            if (Schema.is(Rejected)(cause)) return cause;
-            return new Cause.UnknownError(cause);
-          },
-        });
-        if (permits === undefined) return yield* acquire;
-        return yield* permits.withPermit(acquire);
+      Effect.sync(() => {
+        const identity = `${env.STORAGE_CACHE_SCOPE}:${key}/0/${headerBytes}/directory-v1`;
+        const existing = activeDirectories.get(identity);
+        if (existing !== undefined) {
+          existing.readers += 1;
+          return { identity, active: existing };
+        }
+        const active = { readers: 1, directory: undefined };
+        if (activeDirectories.size < MAX_PENDING_RANGES) activeDirectories.set(identity, active);
+        return { identity, active };
       }),
-      use,
-      (directory) => Effect.sync(() => directory.free()),
+      () =>
+        Effect.acquireUseRelease(
+          Effect.gen(function* () {
+            const acquire = Effect.tryPromise({
+              try: () => acquireDirectory(key, headerBytes),
+              catch: (cause) => {
+                if (Schema.is(Rejected)(cause)) return cause;
+                return new Cause.UnknownError(cause);
+              },
+            });
+            if (permits === undefined) return yield* acquire;
+            return yield* permits.withPermit(acquire);
+          }),
+          use,
+          (directory) => Effect.sync(() => directory.free()),
+        ),
+      ({ identity, active }) =>
+        Effect.sync(() => {
+          active.readers -= 1;
+          if (active.readers === 0) {
+            if (activeDirectories.get(identity) === active) activeDirectories.delete(identity);
+            active.directory?.free();
+          }
+        }),
     ),
 );
 

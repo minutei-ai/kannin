@@ -4,6 +4,7 @@ import { Segments as CachedSegments, SearchNamespace as Namespace } from "../src
 import { range, cacheUsage, withDirectory } from "../src/storage";
 import type { Env } from "../alchemy.run";
 import { DirectoryBudgetInput } from "./range-contract";
+import { Directory } from "../dist/wasm/raio_engine";
 
 const state = {
   cacheCompleted: 0,
@@ -18,7 +19,15 @@ const state = {
   failDirectoryWrites: false,
   rejectedWrites: 0,
   canonicalReads: 0,
+  directoryParses: 0,
 };
+const parseDirectory = Directory.compressed.bind(Directory);
+Object.defineProperty(Directory, "compressed", {
+  value: (...input: Parameters<typeof Directory.compressed>) => {
+    state.directoryParses += 1;
+    return parseDirectory(...input);
+  },
+});
 const wrapped = new WeakSet<R2Bucket>();
 
 export class Segments extends CachedSegments {
@@ -141,24 +150,33 @@ async function probe(request: Request, env: Env) {
         "x-r2-peak": String(state.peak),
         "x-canonical-reads": String(state.canonicalReads),
         "x-rejected-writes": String(state.rejectedWrites),
+        "x-directory-parses": String(state.directoryParses),
       },
     });
   const input = Schema.decodeUnknownSync(DirectoryBudgetInput)(await request.json());
   if (new URL(request.url).pathname === "/decoded") {
     const before = cacheUsage();
-    return Effect.runPromise(
-      withDirectory(input.key, input.length, (directory) =>
-        Effect.sync(() => {
-          const after = cacheUsage();
-          return new Response(directory.terms('["unique3711"]'), {
-            headers: {
-              "x-directory-hits": String(after.directoryCacheHits - before.directoryCacheHits),
-              "x-directory-bytes": String(after.directoryCacheChargedBytes),
-            },
-          });
-        }),
+    const responses = await Effect.runPromise(
+      Effect.forEach(
+        Array.from({ length: input.count }, () => input),
+        (entry) =>
+          withDirectory(entry.key, entry.length, (directory) =>
+            Effect.sync(() => {
+              const after = cacheUsage();
+              return new Response(directory.terms('["unique3711"]'), {
+                headers: {
+                  "x-directory-hits": String(after.directoryCacheHits - before.directoryCacheHits),
+                  "x-directory-bytes": String(after.directoryCacheChargedBytes),
+                },
+              });
+            }),
+          ),
+        { concurrency: "unbounded" },
       ),
     );
+    const first = responses[0];
+    if (first === undefined) return new Response(null, { status: 500 });
+    return first;
   }
   if (new URL(request.url).pathname === "/origin") {
     const url = new URL("https://segments.internal/directory-v1");

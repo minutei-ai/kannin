@@ -283,6 +283,61 @@ test("segment origins validate R2 frames before publishing the native Cache API 
   }
 });
 
+test("rejected cache admission shares a validated directory only for active readers", async () => {
+  await using active = await fixture();
+  const worker = active.worker;
+  const bucket = await worker.getR2Bucket("STORAGE");
+  expect((await fetch(new URL("/fast-origin", await worker.ready))).status).toBe(204);
+  using expected = Directory.compressed(frame, length);
+  const metadata = expected.terms('["unique3711"]');
+  const capacity = Math.floor((20 * 1024 * 1024) / expected.heap_bytes());
+  expect(capacity).toBeGreaterThan(0);
+  expect(capacity).toBeLessThan(16);
+  const inputs = Array.from({ length: capacity + 1 }, (_, index) => ({
+    key: `namespaces/directory-active/segments/blob-${index}.rsix`,
+    offset: 0,
+    length,
+    count: 1,
+  }));
+  for (const input of inputs) {
+    await bucket.put(input.key, canonical);
+    await bucket.put(`cache/directory-v1/${input.key}/${length}`, frame, {
+      customMetadata: {
+        source: Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))({
+          key: input.key,
+          headerBytes: length,
+        }),
+      },
+    });
+  }
+  for (const input of inputs.slice(0, -1)) {
+    const response = await fetch(new URL("/decoded", await worker.ready), {
+      method: "POST",
+      body: Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({ ...input, count: 32 }),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe(metadata);
+  }
+  const last = inputs.at(-1);
+  if (last === undefined) throw new Error("Missing uncached directory");
+  for (const input of [{ ...last, count: 16 }, last]) {
+    const before = await fetch(new URL("/state", await worker.ready));
+    const response = await fetch(new URL("/decoded", await worker.ready), {
+      method: "POST",
+      body: Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))(input),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe(metadata);
+    expect(response.headers.get("x-directory-hits")).toBe("0");
+    expect(Number(response.headers.get("x-directory-bytes"))).toBeLessThanOrEqual(20 * 1024 * 1024);
+    const after = await fetch(new URL("/state", await worker.ready));
+    expect(
+      Number(after.headers.get("x-directory-parses")) -
+        Number(before.headers.get("x-directory-parses")),
+    ).toBe(1);
+  }
+}, 15000);
+
 test("slow R2 directory cache bodies keep admission while canonical recovery returns", async () => {
   await using active = await fixture();
   const worker = active.worker;

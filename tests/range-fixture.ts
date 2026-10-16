@@ -16,6 +16,7 @@ import {
   DirectoryScanResult,
   DirectoryAgingInput,
   DirectoryAgingResult,
+  DecodedDirectoryScanResult,
 } from "./range-contract";
 
 export { Segments, SearchNamespace } from "../src/worker";
@@ -25,6 +26,37 @@ export default {
     if (request.headers.get("authorization") !== `Bearer ${env.API_TOKEN}`)
       return new Response(null, { status: 401 });
     if (request.method !== "POST") return new Response(null, { status: 405 });
+    if (new URL(request.url).pathname === "/decoded-directory-scan") {
+      const inputs = Schema.decodeUnknownSync(DirectoryScanInput)(await request.json());
+      clearImmutableCache("namespaces");
+      const reports = [];
+      for (const cycle of [0, 1, 2]) {
+        const before = cacheUsage();
+        const metadata = [];
+        for (const input of inputs)
+          metadata.push(
+            await Effect.runPromise(
+              withDirectory(input.key, input.length, (directory) =>
+                Effect.try(() => directory.terms('["alpha"]')).pipe(
+                  Effect.flatMap(
+                    Schema.decodeEffect(Schema.fromJsonString(SegmentHeader.fields.terms)),
+                  ),
+                ),
+              ),
+            ),
+          );
+        const after = cacheUsage();
+        reports[cycle] = {
+          hits: after.directoryCacheHits - before.directoryCacheHits,
+          bytes: after.directoryCacheChargedBytes,
+          history: after.encodedDirectoryAdmissionChargedBytes,
+          metadata,
+        };
+      }
+      return new Response(
+        Schema.encodeSync(Schema.fromJsonString(DecodedDirectoryScanResult))(reports),
+      );
+    }
     if (new URL(request.url).pathname === "/directory-aging") {
       const inputs = Schema.decodeUnknownSync(DirectoryAgingInput)(await request.json());
       clearImmutableCache("namespaces");

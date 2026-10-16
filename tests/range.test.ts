@@ -13,6 +13,7 @@ import {
   DirectoryScanResult,
   DirectoryAgingInput,
   DirectoryAgingResult,
+  DecodedDirectoryScanResult,
 } from "./range-contract";
 import { initSync, Segment } from "../dist/wasm/raio_engine";
 
@@ -272,6 +273,51 @@ test("repeated directory scans retain a hot subset when the namespace exceeds ad
   expect(last.encodedDirectoryCacheChargedBytes).toBeLessThanOrEqual(20 * 1024 * 1024);
   expect(last.encodedDirectoryAdmissionChargedBytes).toBeGreaterThan(0);
   expect(last.encodedDirectoryAdmissionChargedBytes).toBeLessThanOrEqual(1024 * 1024);
+}, 30000);
+
+test("decoded directory scans retain validated metadata beyond cache capacity", async () => {
+  using segment = new Segment('[{"id":"a","text":"alpha","attributes":{}}]');
+  const original = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
+  const json = new TextEncoder().encode(
+    Schema.encodeSync(Schema.fromJsonString(SegmentHeader))({
+      ...original,
+      terms: {
+        ...original.terms,
+        ...Object.fromEntries(
+          Array.from({ length: 40000 }, (_, index) => [`term${index}`, { df: 0, blocks: [] }]),
+        ),
+      },
+    }),
+  );
+  const frame = new Uint8Array(16 + json.byteLength);
+  frame.set(new TextEncoder().encode("RAIOSEG1"));
+  const view = new DataView(frame.buffer);
+  view.setUint32(8, json.byteLength, true);
+  view.setUint32(12, crc32(json), true);
+  frame.set(json, 16);
+  const inputs = Array.from({ length: 8 }, (_, index) => ({
+    key: `namespaces/decoded-directory-scan/segments/blob-${index}.rsix`,
+    offset: 0,
+    length: frame.byteLength,
+  }));
+  const bucket = await worker.getR2Bucket("STORAGE");
+  for (const input of inputs) await bucket.put(input.key, frame);
+  const response = await fetch(new URL("/decoded-directory-scan", await worker.ready), {
+    method: "POST",
+    headers: { authorization: "Bearer local-test-token", "content-type": "application/json" },
+    body: Schema.encodeSync(Schema.fromJsonString(DirectoryScanInput))(inputs),
+  });
+  expect(response.status).toBe(200);
+  const reports = Schema.decodeUnknownSync(DecodedDirectoryScanResult)(await response.json());
+  expect(reports[0]?.hits).toBe(0);
+  for (const report of reports) {
+    expect(report.metadata).toEqual(inputs.map(() => original.terms));
+    expect(report.bytes).toBeGreaterThan(0);
+    expect(report.bytes).toBeLessThanOrEqual(20 * 1024 * 1024);
+    expect(report.history).toBeLessThanOrEqual(1024 * 1024);
+  }
+  expect(reports[1]?.hits).toBeGreaterThan(0);
+  expect(reports[2]?.hits).toBeGreaterThanOrEqual(reports[1]?.hits ?? 0);
 }, 30000);
 
 test("directory admission ages cold history while retaining a repeatedly read header", async () => {

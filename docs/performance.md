@@ -2792,3 +2792,37 @@ Coordinator metadata counters stayed at zero for directory recovery during those
 The standard load preserved **384/384** strong-baseline row/score/sequence comparisons, with MRS throughout. Concurrency 1/4/16 p50 was **195.80/246.38/248.60 ms**, p95 **237.41/714.47/1,138.99 ms**, and throughput **3.39/12.17/31.48 requests/s**; maximum latency was **5.31 seconds**. Most of these client metrics regressed against the previous MIA run. This is not evidence of an end-to-end native speedup. The source recovery/lifecycle improvement is established by the controlled workerd tests; geography, cache state, cold tails, the historical timeout and a fully indexed comparator remain unresolved.
 
 Twelve native vector/hybrid queries also preserved **105 complete rows and scores** against the preceding deployment, covering unfiltered, equality and numeric-interval cases across the three existing 100-vector fixtures. This does not establish large-corpus ANN recall.
+
+## Fully indexed million-document comparison
+
+The comparator now prepares balanced, chunk-aligned bulk writes for Turbopuffer, targeting 50,000 documents per call without leaving a tiny final WAL tail. Kannin retains its original 500-document write contract. Payloads are bounded to 64 MiB before submission, and each native write explicitly disables SDK retries and checks the acknowledged row count. Different ingestion batch sizes are not a comparable write-throughput benchmark.
+
+The deployed comparison reused the existing one-million-document Kannin namespace at sequence 2000 without writes. Its corpus SHA-256 was `8bd38242bd5eaad8d4b69bc4e21d8d29000e59dd659018489d42758b88911bcd`. Turbopuffer received twenty 50,000-row writes, each between 22,893,008 and 23,015,017 encoded bytes, in a fresh temporary namespace in `aws-sa-east-1`. Metadata reached one million rows and up-to-date indexing after ten observations over 18.99 seconds. Query readiness additionally required `exhaustive_search_count === 0`; metadata alone remains insufficient. Every one of the 200 measured comparator responses passed that gate. The temporary namespace was deleted and a subsequent native SDK existence check confirmed its absence.
+
+Each case ran serially in strong Kannin, edge Kannin, Turbopuffer order: one initial observation, five warmups and fifty measured observations. Kannin responses had MIA `CF-Ray` suffixes throughout. The active Worker version remained `d29dc359-e957-46fb-9a5a-84800e7d9b72`, with no placement configured. `CF-Ray` identifies ingress and is not proof of backend execution location. Readiness queries already warmed the comparator, so initial observations do not establish cold performance.
+
+| Query     | Kannin strong p50 / p95 ms | Kannin edge p50 / p95 ms | Turbopuffer strong p50 / p95 ms |
+| --------- | -------------------------: | -----------------------: | ------------------------------: |
+| Rare      |            178.37 / 189.74 |          130.06 / 148.24 |                   47.05 / 51.52 |
+| Selective |            174.98 / 189.00 |          126.50 / 142.49 |                   45.24 / 54.25 |
+| Common    |            177.49 / 198.04 |          129.69 / 144.11 |                   46.86 / 50.11 |
+| Filtered  |            175.80 / 200.04 |          129.01 / 141.65 |                   45.23 / 50.23 |
+
+All Kannin responses preserved the expected sequence, result count and complete rows/scores across iterations and consistency modes. The final metadata remained one million documents at sequence 2000. This checks Kannin stability, not cross-engine ranking parity. Edge freshness is weaker than strong reads, even with the acknowledged sequence barrier. The rare edge p99 was 731.02 ms; the other edge p99 values were 143.22–154.45 ms. Median strong gateway durations were 53–58 ms while coordinator query/root timings were usually zero at native clock resolution; this suggests a network cost but does not measure synchronous CPU time. Client geography, regional routing and warmed cache state prevent interpreting the timings as an isolated engine comparison. Kannin remains materially slower in this run.
+
+Three local transport tests exercise the real comparator CLI and native SDK: balanced 50,000/50,001-row writes with unchanged corpus hashing and zero Kannin writes; partial provider-write failure with no retry; and rejection of an up-to-date index whose query still scans unindexed documents. All require cleanup of the exact owned temporary namespace. The complete local gate passed 210 Worker/tooling tests and 39 Rust tests, with 7,590 Bun assertions, strict Effect/Oxlint/tsgo, native and WASM Clippy, formatting and build checks.
+
+## Native Smart Placement experiment
+
+A reversible Alchemy experiment enabled native `placement: { mode: "smart" }` without changing engine code, canonical data or consistency. Cloudflare reported `SUCCESS` on version `c1099c2d-6e5c-4d77-82b8-82a80230669c`. Nevertheless, all 128 observed responses reported `cf-placement: local-EWR`; no relocation occurred. The same 128-request probe was captured before deployment, with EWR ingress on both sides and identical complete rows/scores at sequence 2000. Each case and consistency mode ran sixteen times, discarding the first two observations for the table below. Each percentile therefore has only fourteen observations. The p95 uses the sorted sample at `floor(0.95 * (n - 1))`.
+
+| Query     | Strong p50 before / after ms | Edge p50 before / after ms |
+| --------- | ---------------------------: | -------------------------: |
+| Rare      |              165.08 / 177.43 |            148.91 / 160.10 |
+| Selective |              174.56 / 180.11 |            153.79 / 172.35 |
+| Common    |              174.10 / 179.77 |            159.93 / 173.19 |
+| Filtered  |              167.26 / 181.54 |            158.51 / 172.16 |
+
+The observations show no latency benefit and do not isolate placement overhead from network/cache variation. The explicit setting was removed rather than retaining an unproven optimization. `SUCCESS` does not prove relocation or faster execution. This short single-client experiment does not establish how Smart Placement would behave with sustained traffic from multiple locations. [Cloudflare's native placement contract](https://developers.cloudflare.com/workers/configuration/placement/) limits automatic placement to observed locations and excludes named entrypoints and RPC methods. Future comparison samples now capture both strong/edge `cf-placement` headers alongside ingress rays and server timings. The first full local gate hit an existing fifteen-second plan-cache pressure timeout, followed by a cache-count failure in the next test. All six affected-file tests passed independently; a complete unchanged retry passed all 249 tests and 7,590 Bun assertions. No timeout or correctness assertion was relaxed.
+
+Restoration was verified through the native Cloudflare API: version `95e05c59-9e81-43f3-9e91-63fae9f255e2` has an empty placement configuration and no placement status. Sixteen additional strong/edge responses preserved the prior complete rows/scores, one million documents and sequence 2000; their placement headers were absent again. No canonical corpus writes were performed in either deployment.

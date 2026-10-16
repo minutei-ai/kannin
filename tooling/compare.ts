@@ -281,6 +281,8 @@ const report = await (async () => {
           edgeTiming: edgeResponse.headers.get("server-timing"),
           strongRay: ray,
           edgeRay,
+          strongPlacement: response.headers.get("cf-placement"),
+          edgePlacement: edgeResponse.headers.get("cf-placement"),
         });
       }
     }

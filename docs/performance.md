@@ -3544,3 +3544,14 @@ An alternating workerd comparison ran 350 query pairs over 10,000 documents in 2
 The candidate was faster in 309 of 350 pairs, with p50 about 18% lower. This measures the combined TypeScript/Rust change in local workerd, not the Rust portion independently or native network latency. A codec regression compares all scalar operators, reordered predicates, repeated predicates on one field and contradictory predicates against canonical directory minima. The native baseline for this experiment was captured with Smart Placement already enabled and `remote-MIA` observed.
 
 The local gate passed 261 Worker/tooling tests (9,130 assertions), 42 Rust tests, strict TypeScript/Effect lint and types, and both native/WASM Clippy targets. The paired fixture charged 751,936 bytes before and 801,536 bytes after in the term L1: escaped string encoding increases conservative admission charge while retaining the same four-MiB quota. These counters do not measure whole-Worker heap.
+
+Source `d6ea529` deployed as version `91b4a77b-33e0-4e96-b9ae-f8b6b0a2be42` at 100%. The native API confirmed Smart Placement remained enabled, with unchanged R2 binding and lifecycle rules. Both cohorts observed `remote-MIA` through GRU ingress. Twenty-eight strong queries over one million documents retained complete rows, scores and sequence 2000, using fresh equivalent year bounds plus three missing-field predicates per query. Two warmup rounds were excluded from each fourteen-round two-selector cohort.
+
+| Native cohort                          | Two terms p50/p95 ms | Eight terms p50/p95 ms |
+| -------------------------------------- | -------------------: | ---------------------: |
+| Before                                 |      306.15 / 457.36 |        326.44 / 392.76 |
+| Encoded admission + indexed predicates |      296.84 / 341.15 |        289.95 / 341.69 |
+
+Both selectors had zero catalog RPCs across all twelve measured responses in each cohort. Median directory intervals fell from 8.0 to 6.5 ms for two terms and 8.0 to 7.0 ms for eight terms. These are wall-time intervals, not isolated CPU measurements. Twelve samples make nearest-rank p95 the maximum; network and cache/isolate residency remained uncontrolled between cohorts. The observed native reductions do not establish sustained throughput, cold-tail behavior or a universal gain. The complete 300-query SciFact report remained identical to the reference.
+
+Sixteen additional rare/dense text checks across strong and edge consistency retained complete baseline results. Twelve native Vectorize/hybrid checks retained all 105 baseline rows and scores. Cold broad acquisition, whole-Worker heap, sustained capacity and large-scale ANN recall remain open.

@@ -861,6 +861,30 @@ impl TermScorer {
         }
     }
 
+    fn denominators(&self, title: u32, body: u32) -> [f64; 2] {
+        let mean = |average: f64| if average > 0.0 { average } else { 1.0 };
+        [
+            0.25 + 0.75 * f64::from(title) / mean(self.title_average),
+            0.25 + 0.75 * f64::from(body) / mean(self.body_average),
+        ]
+    }
+
+    fn score_normalized(&self, title: u32, body: u32, denominators: [f64; 2]) -> f64 {
+        let Some(idf) = self.idf else {
+            return 0.0;
+        };
+        let contribution = |tf: u32, denominator: f64| {
+            if tf == 0 {
+                0.0
+            } else {
+                f64::from(tf) / denominator
+            }
+        };
+        let title = contribution(title, denominators[0]);
+        let tf = title + title + contribution(body, denominators[1]);
+        idf * tf * 2.2 / (tf + 1.2)
+    }
+
     fn score(&self, tf_title: u32, tf_body: u32, len_title: u32, len_body: u32) -> f64 {
         let Some(idf) = self.idf else {
             return 0.0;
@@ -1630,6 +1654,9 @@ impl Search {
             return Ok(Vec::new());
         }
         let scorers = &self.terms.scorers;
+        let Some(normalization) = scorers.first() else {
+            return Ok(Vec::new());
+        };
         let mut bounds = None;
         let mut bound_cursors = vec![0; terms.len()];
         let phrase_order = &self.terms.phrase_order;
@@ -1674,17 +1701,17 @@ impl Search {
             selected.fill(None);
             let mut matched = 0;
             let mut score = 0.0;
+            let meta = &self.header.documents[row as usize];
+            let denominators = normalization.denominators(meta.title_length, meta.body_length);
             for (index, list) in positions.lists.iter().enumerate() {
                 if let Some(posting) = list
                     .get(positions.cursors[index])
                     .filter(|p| p.row() == row)
                 {
-                    let meta = &self.header.documents[row as usize];
-                    score += scorers[index].score(
+                    score += scorers[index].score_normalized(
                         u32::try_from(posting.counts()[0]).map_err(|cause| cause.to_string())?,
                         u32::try_from(posting.counts()[1]).map_err(|cause| cause.to_string())?,
-                        meta.title_length,
-                        meta.body_length,
+                        denominators,
                     );
                     selected[index] = Some(posting);
                     matched += 1;
@@ -3087,6 +3114,16 @@ mod numeric_contract_tests {
                                     assert_eq!(
                                         scorer
                                             .score(title, body, title_length, body_length)
+                                            .to_bits(),
+                                        expected.to_bits()
+                                    );
+                                    assert_eq!(
+                                        scorer
+                                            .score_normalized(
+                                                title,
+                                                body,
+                                                scorer.denominators(title_length, body_length),
+                                            )
                                             .to_bits(),
                                         expected.to_bits()
                                     );

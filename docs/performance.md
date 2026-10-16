@@ -3454,3 +3454,20 @@ On the existing one-million-document namespace (sequence 2000), each native coho
 | After, repeated          | 191.02 | 467.46 |           27 |               22 |
 
 Counts cover the 24 measured responses. Bloom false positives still require normal acquisition, and isolate/cache turnover can cause misses. The first responses took 1,751.84 ms and 925.39 ms in the two post-deploy cohorts; they are not controlled cold-start measurements. Cache placement and network conditions were uncontrolled, so these sequential observations establish the reduction in catalog work for this workload rather than a general latency guarantee. Sixteen additional native queries spanning rare/dense terms, filters and strong/edge modes preserved complete baseline rows, scores and sequence. Twelve Vectorize/hybrid checks also preserved all 105 baseline rows and scores. Large-scale ANN recall, whole-Worker peak heap, cold-tail reliability and fair Turbopuffer parity remain unverified.
+
+## Sharing BM25 length normalization within a document
+
+Rust ranking previously repeated the title/body length-normalization denominators for every matched term in a document. The denominators depend on the document lengths and global corpus averages, while document frequency affects only IDF. Candidate evaluation now computes the pair once and shares it across the query's term scorers. Scalar scoring for minimum scores and block bounds retains its original path, including zero-frequency shortcuts. The floating-point order of each term contribution, IDF multiplication and query-score accumulation is unchanged. The independent numeric-boundary test also checks the shared-denominator path bit for bit against its original formula.
+
+The comparison used baseline source `2044858` and the candidate WASM in separate local workerd instances. It loaded all queried postings into each ranker, warmed `finish()` with 1,000 calls, and alternated variant order over nine pairs of 1,000 calls. Complete serialized hits matched on every measured response. Repeated-length fixtures contain 5,000 documents with eight body lengths; diverse-length fixtures contain 2,048 documents with 257 body-length patterns and seven title-length patterns. The filtered variants select attribute group 42 out of 100 groups. Times below are medians in milliseconds per 1,000 calls, including the local fixture transport.
+
+| Fixture                      | Two terms before | Two terms after | Eight terms before | Eight terms after |
+| ---------------------------- | ---------------: | --------------: | -----------------: | ----------------: |
+| Repeated lengths, unfiltered |           498.20 |          437.35 |            1353.27 |           1165.08 |
+| Repeated lengths, filtered   |            26.26 |           25.97 |              92.31 |             76.47 |
+| Diverse lengths, unfiltered  |           214.64 |          187.67 |             633.69 |            513.71 |
+| Diverse lengths, filtered    |            18.55 |           16.66 |              40.88 |             34.45 |
+
+Both two-term unfiltered variants improved in all nine pairs. Eight-term variants improved in eight or nine pairs each. These measurements isolate local ranking; they exclude R2 acquisition, directory construction, candidate decoding and native Cloudflare placement, and do not establish complete-query gains. No additional cache, per-document retained table, canonical format or public contract was introduced.
+
+The local gate passed all 257 Worker/tooling tests and 42 Rust tests, including strict lint/types and native/WASM Clippy. A separate old/new WASM comparison at the 64-term query limit covered 36 combinations of any/all/phrase mode, top-k 1/10/100, filters and tombstones, preserving all 685 returned hits exactly. The entire 300-query SciFact report also remained identical. Native complete-query measurements for this Rust change remain pending.

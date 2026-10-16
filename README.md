@@ -30,7 +30,7 @@ Source `d3caa42` removes a duplicate exact catalog cache and retains native Work
 
 The SIMD checksum backend reduced native Durable Object CPU p50 from **250 to 224 ms** for sixteen rare terms and **437 to 385 ms** for sixty-four terms, with identical results. HTTP p50 did not improve in that comparison. [CPU and latency evidence](docs/performance.md#simd-checksum-backend-on-the-existing-compressed-formats).
 
-An isolated Worker/DO/Container prototype measured **174–175 ms warm HTTP p50** on two fixed-snapshot selectors, preserving IDs and scores. Full API integration, cold latency and cost remain delivery gates. [Experimental Container evidence](docs/performance.md#native-container-feasibility-isolated-probe).
+An isolated native prototype now exercises the complete strong-text API: warm median **205/222 ms**, versus **542/619 ms** for production WASM on sixteen/sixty-four-term selectors. All 48 complete responses matched. The first native request took **8.6 seconds**, so production routing, cold reliability, mutable-data contracts and cost remain delivery gates. [Method and limits](docs/performance.md#experimental-native-ranking-inside-the-complete-strong-text-api).
 
 The experimental native range reader transfers about **34% fewer source bytes** than complete segments in a million-document test and validates headers directly in Rust. It has not replaced the production WASM path. [Cold-read evidence and limits](docs/performance.md#native-cold-read-through-canonical-header-and-posting-ranges) · [native process](crates/native/README.md).
 

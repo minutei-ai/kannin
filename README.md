@@ -19,7 +19,7 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 The load run at source `6c03e72` checked **384 responses** against strong baseline rows, scores and sequence, with 128 requests per concurrency. All entered through GRU without snapshot coordinator fallback. Two 16-query probes with fresh selectors preserved complete pre-deploy results. These are cache-sensitive workload observations, not sustained-capacity guarantees. Edge freshness is weaker than strong consistency.
 
-Catalog acquisition now uses eight-source batches: a sixteen-source envelope exceeded both publication limits and could never be cached as a batch. The two smaller frames are persisted in R2. On a one-million-document changing-filter workload, measured individual overview reads fell from sixteen in 11/24 baseline responses to zero in 48/48 post-deploy responses. Native p50/p95 was **649/966 ms before**, **659/912 ms after**, and **615/796 ms on repetition**. These sequential, cache-sensitive cohorts do not establish a uniform median gain or sustained capacity. [Detailed measurements](docs/performance.md) include the local experiments and remaining limits.
+Bloom candidate masks now reuse per-segment projections and plans when added query words cannot occur in any segment. On the deployed one-million-document corpus, sequential strong queries with changing absent words measured p50/p95 **660/909 ms before**, **179/363 ms after**, and **191/467 ms on repetition**. Each cohort measured 24 responses after four warmups; all entered through GRU and retained complete rows, scores and sequence. Catalog RPCs fell from **600 to 6 and 27** per measured cohort. These cache-sensitive observations do not establish cold latency or sustained capacity. [Detailed measurements](docs/performance.md) also cover the eight-source R2 batches and local experiments.
 
 Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10**, with the entire 300-query report unchanged. Twelve native Vectorize/hybrid checks preserved 105 complete rows and scores across three 100-vector fixtures; large-corpus ANN recall remains unmeasured.
 
@@ -38,7 +38,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **253 Worker/tooling tests and 42 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **257 Worker/tooling tests and 42 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

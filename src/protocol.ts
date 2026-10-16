@@ -427,7 +427,7 @@ export const SharedTextPlan = Schema.Struct({
   plan: TextPlan,
 });
 export const SegmentHits = Schema.Array(
-  Schema.Struct({ row: Schema.Int, id: Id, score: Schema.Finite }),
+  Schema.Struct({ row: Schema.Int, id: Id, score: Schema.Finite, data: DataRange }),
 );
 export const VectorSyncResult = Schema.Struct({
   submitted: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 16 })),

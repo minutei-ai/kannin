@@ -1280,6 +1280,12 @@ export const readDocuments = Effect.fn("raio.readDocuments")(function* (
   totalBytes: number,
   permits: Semaphore.Semaphore,
 ) {
+  const identity = `${env.STORAGE_CACHE_SCOPE}:${key}`;
+  const cached = directories.get(identity);
+  if (cached !== undefined) {
+    directories.delete(identity);
+    directories.set(identity, cached);
+  }
   if (pages.length > 4)
     return yield* new Rejected({ status: 503, message: "Document batch exceeds four pages" });
   const ordered = pages.toSorted((left, right) => left.offset - right.offset);

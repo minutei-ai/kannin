@@ -9,15 +9,17 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 ## Performance
 
-**1,000,000 documents · deployed Cloudflare · GRU/GIG ingress · edge reads with acknowledged sequence barrier**
+**1,000,000 documents · deployed Cloudflare · GRU ingress · warmed edge repeat with acknowledged sequence barrier**
 
 | Concurrency | p50 ms |  p95 ms | Requests/s |
 | ----------: | -----: | ------: | ---------: |
-|           1 | 104.67 |  937.27 |       4.39 |
-|           4 |  85.05 |  546.44 |      21.91 |
-|          16 |  94.12 | 1153.76 |      36.31 |
+|           1 |  59.08 |  262.48 |       9.43 |
+|           4 |  70.86 |  191.76 |      30.60 |
+|          16 |  73.72 | 1196.75 |      41.68 |
 
-The latest deployed candidate preserved strong baseline rows, scores and sequence in all **384 standard load responses**, with GRU/GIG ingress. Its maximum request took **2.29 s**. Earlier runs used MRS, EWR/MIA and GRU with different cache state; these serial observations do not isolate a code speedup. Cold tails, peak memory and comparable-region performance parity remain open.
+The warmed repeat preserved strong baseline rows, scores and sequence in all **384 responses**, with GRU ingress; its maximum request took **1.96 s**. The first run on the same version had a concurrency-one p50 of **209.68 ms**, with snapshot acquisition falling back to the coordinator in all 128 requests. These results remain sensitive to cache state and native I/O delays. [Full measurements](docs/performance.md#carrying-document-ranges-through-the-rust-ranker).
+
+Rust now carries document ranges directly through ranking. Six deployed queries returning fifty scattered documents changed from **3.12 to 1.75 seconds median**, about **44% lower**, with complete rows/scores preserved and directory reloads changing **50→0**. Both versions used GRU ingress, process-memory resets and warmed immutable sources. This is a measured workload gain, not general performance parity. [Method and limits](docs/performance.md#carrying-document-ranges-through-the-rust-ranker).
 
 A controlled workerd recovery now reads **139,941 compressed R2 bytes instead of 1,724,997 canonical header bytes**, preserving the exact data: **91.9% fewer bytes** in that path. A native 32-document fixture confirmed R2-frame reuse through the origin and direct recovery, then was reset to zero documents. Cache misses and failed publications still recover canonically; the extra lookup and indexing work are tradeoffs. [Measurements and limits](docs/performance.md#reusing-compressed-directory-frames-from-r2).
 

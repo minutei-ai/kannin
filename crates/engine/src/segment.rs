@@ -1814,7 +1814,7 @@ pub fn bloom_filter_many<'a>(
 pub mod wasm {
     use super::{
         BlockMeta, BuiltSegment, Document, DocumentMeta, FILTER_CACHE_BYTES, Filter, Header,
-        MAX_BYTES, QueryTerms, Search, SelectedAttributes, Statistics, TermMeta, TermScorer,
+        MAX_BYTES, QueryTerms, Range, Search, SelectedAttributes, Statistics, TermMeta, TermScorer,
         append, bloom_build, bloom_filter_many, build, decode_page, document_terms, matches,
         parse_header, validate_search_budget,
     };
@@ -2574,24 +2574,6 @@ pub mod wasm {
             serde_json::to_string(&selected).map_err(|e| JsValue::from_str(&e.to_string()))
         }
 
-        #[doc = "# Errors\nRejects invalid row JSON, missing rows, or range serialization errors."]
-        pub fn document_ranges(&self, rows: &str) -> Result<String, JsValue> {
-            let rows: Vec<u32> = serde_json::from_str(rows)
-                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
-            let selected = rows
-                .iter()
-                .map(|row| {
-                    self.header
-                        .documents
-                        .get(*row as usize)
-                        .map(|document| &document.data)
-                        .ok_or("Invalid row")
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(JsValue::from_str)?;
-            serde_json::to_string(&selected).map_err(|cause| JsValue::from_str(&cause.to_string()))
-        }
-
         #[doc = "# Errors\nRejects invalid tombstone JSON, filter attributes, or deleted rows."]
         pub fn ranker_prepared(
             &self,
@@ -2882,10 +2864,14 @@ pub mod wasm {
                 .map_err(|cause| JsValue::from_str(&cause))?;
             let ranked: Vec<_> = hits
                 .iter()
-                .map(|hit| Ranked {
-                    row: hit.row,
-                    id: &self.search.header.documents[hit.row as usize].id,
-                    score: hit.score,
+                .map(|hit| {
+                    let document = &self.search.header.documents[hit.row as usize];
+                    Ranked {
+                        row: hit.row,
+                        id: &document.id,
+                        score: hit.score,
+                        data: &document.data,
+                    }
                 })
                 .collect();
             serde_json::to_string(&ranked).map_err(|cause| JsValue::from_str(&cause.to_string()))
@@ -2897,6 +2883,7 @@ pub mod wasm {
         row: u32,
         id: &'a str,
         score: f64,
+        data: &'a Range,
     }
 }
 

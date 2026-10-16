@@ -42,7 +42,6 @@ import {
   Root,
   SnapshotCacheHeaders,
   SegmentDocument,
-  DataRange,
   SegmentHits,
   PostingSpans,
   TermCatalog,
@@ -638,12 +637,9 @@ async function textQuery(
   const dictionaryEnded = Effect.runSync(Clock.currentTimeNanos);
   timings.append("server-timing", 'text_phase;desc="ranking"');
   timings.append("server-timing", `text_directory;dur=${Number(dictionaryEnded - started) / 1e6}`);
-  const ranked: Array<{
-    segment: (typeof Root.Type)["segments"][number];
-    row: number;
-    id: string;
-    score: number;
-  }> = [];
+  const ranked: Array<
+    (typeof SegmentHits.Type)[number] & { segment: (typeof Root.Type)["segments"][number] }
+  > = [];
   const rankMetrics = {
     prepare: 0n,
     acquire: 0n,
@@ -991,24 +987,10 @@ async function textQuery(
           Effect.gen(function* () {
             const first = window[0];
             if (first === undefined) return [];
-            const pages = yield* permits.withPermit(
-              withDirectory(first.segment.key, first.segment.headerBytes, (decoded) =>
-                Effect.gen(function* () {
-                  const encoded = yield* Schema.encodeEffect(integers)(
-                    window.map((hit) => hit.row),
-                  );
-                  return yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Array(DataRange)))(
-                    decoded.document_ranges(encoded),
-                  );
-                }),
-              ),
-            );
-            if (pages.length !== window.length)
-              return yield* new Rejected({ status: 503, message: "Document ranges omitted a hit" });
             const documents = yield* readDocuments(
               first.segment.key,
               first.segment.headerBytes,
-              pages,
+              window.map((hit) => hit.data),
               first.segment.bytes,
               permits,
             );

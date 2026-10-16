@@ -10,6 +10,7 @@ import {
   segment_bloom_filter_many,
   segment_term_bounds,
   segment_overview_project,
+  segment_document,
   Segment,
   Directory,
   directory_compress,
@@ -21,7 +22,6 @@ import {
   StoredDocument,
   PostingSpans,
   SegmentHeader,
-  DataRange,
   Filter,
   TermCatalog,
   TermSummaries,
@@ -242,29 +242,75 @@ test("overview projection validates unrequested values and rejects malformed roo
   }
 });
 
-test("WASM document ranges preserve requested order without copying document attributes", () => {
-  const segment = new Segment(
-    JSON.stringify([
-      { id: "a", text: "first", attributes: { large: "value".repeat(1000) } },
-      { id: "b", text: "second", attributes: {} },
-    ]),
-  );
-  const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
-  const directory = new Directory(segment.bytes());
-  const second = header.documents[1];
-  if (second === undefined) throw new Error("Missing second document");
-  const encoded = directory.document_ranges("[1,0,1]");
-  expect(Schema.decodeSync(Schema.fromJsonString(Schema.Array(DataRange)))(encoded)).toEqual([
-    second.data,
-    header.documents[0].data,
-    second.data,
+test("WASM ranked hits retain exact document ranges after their directory is released", () => {
+  const documents = Schema.decodeSync(Schema.Array(StoredDocument))([
+    {
+      id: "z",
+      revision: 9,
+      title: "alpha beta",
+      text: "alpha alpha beta",
+      attributes: { group: 1 },
+    },
+    {
+      id: "a",
+      revision: 2,
+      title: "alpha beta alpha beta",
+      text: "alpha beta alpha beta",
+      attributes: { group: 2, large: "value".repeat(1000) },
+    },
+    { id: "m", revision: 7, title: "", text: "alpha beta", attributes: { group: 1 } },
+    { id: "b", revision: 4, title: "", text: "beta alpha", attributes: { group: 1 } },
+    { id: "c", revision: 5, title: "", text: "alpha gamma", attributes: { group: 1 } },
   ]);
-  expect(encoded.length).toBeLessThan(directory.rows("[1,0,1]").length / 10);
-  expect(directory.document_ranges("[]")).toBe("[]");
-  expect(() => directory.document_ranges("[2]")).toThrow("Invalid row");
-  expect(() => directory.document_ranges("[-1]")).toThrow();
-  directory.free();
-  segment.free();
+  using segment = new Segment(JSON.stringify(documents));
+  const bytes = segment.bytes();
+  const base = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
+  const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
+  for (const sample of [
+    { mode: "any", dead: [3], expected: ["z", "b", "c"] },
+    { mode: "all", dead: [3], expected: ["z", "b"] },
+    { mode: "phrase", dead: [], expected: ["z", "m"] },
+  ] as const) {
+    const directory = new Directory(bytes);
+    using ranker = directory.ranker(
+      Schema.encodeSync(Schema.fromJsonString(RankingInput))({
+        text: "alpha beta",
+        mode: sample.mode,
+        top_k: 10,
+        dead: sample.dead,
+        filters: [{ field: "group", op: "eq", value: 1 }],
+        statistics: {
+          documents: documents.length,
+          title_length: header.total_title_length,
+          body_length: header.total_body_length,
+          frequencies: Object.fromEntries(
+            Object.entries(header.terms).map(([term, meta]) => [term, meta.df]),
+          ),
+        },
+      }),
+    );
+    const spans = Schema.decodeSync(Schema.fromJsonString(PostingSpans))(ranker.posting_spans());
+    for (const span of spans)
+      for (const block of span.blocks)
+        ranker.add(
+          span.term,
+          bytes.subarray(base + block.data.offset, base + block.data.offset + block.data.length),
+        );
+    directory.free();
+    const hits = Schema.decodeSync(Schema.fromJsonString(SegmentHits))(ranker.finish());
+    expect(hits.map((hit) => hit.id)).toEqual([...sample.expected]);
+    for (const hit of hits) {
+      const expected = documents.find((document) => document.id === hit.id);
+      if (expected === undefined) throw new Error("Unexpected ranked document");
+      expect(header.documents[hit.row]?.data).toEqual(hit.data);
+      const decoded = Schema.decodeSync(Schema.fromJsonString(StoredDocument))(
+        segment_document(
+          bytes.subarray(base + hit.data.offset, base + hit.data.offset + hit.data.length),
+        ),
+      );
+      expect(decoded).toEqual(expected);
+    }
+  }
 });
 
 test("WASM batched blooms preserve Unicode membership and reject broken offsets", () => {

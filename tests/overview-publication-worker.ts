@@ -8,7 +8,7 @@ const opened = new WeakSet<Cache>();
 const open = caches.open.bind(caches);
 caches.open = async (name) => {
   const cache = await open(name);
-  if (name !== "raio-overview-batches-v4" || opened.has(cache)) return cache;
+  if (name !== "raio-overview-batches-v5" || opened.has(cache)) return cache;
   opened.add(cache);
   const put = cache.put.bind(cache);
   cache.put = async (input, response) => {

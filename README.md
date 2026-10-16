@@ -19,7 +19,7 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 A post-deploy run checked **384 responses** against strong baseline rows, scores and sequence, with 128 requests per concurrency. All entered through GRU without snapshot coordinator fallback. A separate 64-query probe with fresh selectors preserved complete pre-deploy results. These are cache-sensitive workload observations, not sustained-capacity guarantees. Edge freshness is weaker than strong consistency.
 
-Catalog reads refill four concurrent tasks and project resident overviews before consulting the selector Cache API. A controlled local R2-delay experiment reduced complete-query median from 1,724 to 821 ms; this is not a native Cloudflare speedup claim. Optional shared-plan lookups recover through catalog acquisition after a nominal 250 ms cache budget. Rust builds term dictionaries in bulk, reuses posting validation against exact retained headers and avoids software fused arithmetic for the fixed BM25 title weight. Isolated workerd gains and regressions are [documented](docs/performance.md); repeated complete-Worker measurements did not establish consistent end-to-end gains.
+Catalog reads refill four concurrent tasks, project resident overviews before selector-cache lookup and recover Cache API misses through packed R2 batches before individual summaries. A controlled local R2-delay experiment reduced complete-query median from 1,724 to 821 ms; this is not a native Cloudflare speedup claim. Optional shared-plan lookups recover through catalog acquisition after a nominal 250 ms cache budget. Rust builds term dictionaries in bulk, reuses posting validation against exact retained headers and avoids software fused arithmetic for the fixed BM25 title weight. Isolated workerd gains and regressions are [documented](docs/performance.md); repeated complete-Worker measurements did not establish consistent end-to-end gains.
 
 Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10**, with the entire 300-query report unchanged. Twelve native Vectorize/hybrid checks preserved 105 complete rows and scores across three 100-vector fixtures; large-corpus ANN recall remains unmeasured.
 
@@ -38,7 +38,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **239 Worker/tooling tests and 42 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **253 Worker/tooling tests and 42 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

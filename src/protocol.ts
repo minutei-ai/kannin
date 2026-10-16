@@ -350,6 +350,11 @@ export const CatalogTelemetry = Schema.Struct({
   memoryHits: Schema.Int,
   overviewCacheHits: Schema.Int,
   overviewCacheLookups: Schema.Int,
+  batchReads: Schema.Int,
+  batchHits: Schema.Int,
+  batchBytes: Schema.Int,
+  batchMs: Schema.Finite,
+  batchTimeouts: Schema.Int,
   r2Reads: Schema.Int,
   r2Peak: Schema.Int,
   r2Hits: Schema.Int,
@@ -478,6 +483,17 @@ export const TermProjectionProps = Schema.Struct({
   terms: Schema.fromJsonString(Schema.Array(Schema.String).check(Schema.isMaxLength(64))),
   filters: Schema.fromJsonString(Schema.Array(Filter).check(Schema.isMaxLength(16))),
   ranges: Schema.Array(TermProjectionRange).check(Schema.isBetweenLength(1, 16)),
+});
+export const StoredOverviewBatch = Schema.Struct({
+  bucket: TermProjectionProps.fields.bucket,
+  ranges: TermProjectionProps.fields.ranges,
+  overviews: OverviewBatch,
+});
+export const OverviewFrameMetadata = Schema.Struct({
+  rawBytes: Schema.NumberFromString.check(
+    Schema.isInt(),
+    Schema.isBetween({ minimum: 1, maximum: 512 * 1024 }),
+  ),
 });
 export const SegmentCacheProps = Schema.Struct({ bucket: TermProjectionProps.fields.bucket });
 export class Rejected extends Schema.TaggedError<Rejected>()("Rejected", {

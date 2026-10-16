@@ -3,6 +3,8 @@ import { env, exports, waitUntil } from "cloudflare:workers";
 import {
   Segment,
   Directory,
+  pack,
+  unpack,
   directory_compress,
   segment_document,
   segment_bloom,
@@ -25,7 +27,9 @@ import {
   CatalogTelemetry,
   EligibleMinimum,
   TermCatalogBatch,
-  OverviewBatch,
+  type OverviewBatch,
+  StoredOverviewBatch,
+  OverviewFrameMetadata,
   TermProjectionProps,
   SegmentCacheProps,
   Rejected,
@@ -156,7 +160,7 @@ const decodeCatalogTelemetry = Schema.decodeEffect(Schema.fromJsonString(Catalog
 const correlatedOverviewJson = Schema.fromJsonString(CorrelatedOverview);
 const decodeCorrelatedOverview = Schema.decodeEffect(correlatedOverviewJson);
 const encodeCorrelatedOverview = Schema.encodeEffect(correlatedOverviewJson);
-const overviewBatchJson = Schema.fromJsonString(OverviewBatch);
+const overviewBatchJson = Schema.fromJsonString(StoredOverviewBatch);
 const decodeOverviewBatch = Schema.decodeEffect(overviewBatchJson);
 const encodeOverviewBatch = Schema.encodeEffect(overviewBatchJson);
 const decodeTermSummaries = Schema.decodeEffect(Schema.fromJsonString(TermSummaries));
@@ -518,9 +522,14 @@ export async function range(
         }),
         Match.orElse(() => {
           if (length > SMALL_RANGE_LIMIT) return cachedRead;
-          return smallRangeReads.withPermits(
-            Math.max(1, Math.ceil((length * 4) / SMALL_RANGE_BODY_UNIT)),
-          )(boundedRead);
+          return smallRangeReads
+            .withPermitsIfAvailable(Math.max(1, Math.ceil((length * 4) / SMALL_RANGE_BODY_UNIT)))(
+              boundedRead,
+            )
+            .pipe(
+              Effect.repeat({ while: Option.isNone, schedule: Schedule.spaced("1 millis") }),
+              Effect.flatMap(Option.match({ onNone: () => Effect.never, onSome: Effect.succeed })),
+            );
         }),
       ),
     );
@@ -622,6 +631,110 @@ function rememberOverview(identity: string, bytes: Uint8Array) {
   overviewBudget.bytes += charge;
 }
 
+const pendingOverviewBatches = new Map<
+  string,
+  Promise<Option.Option<Effect.Success<ReturnType<typeof readStoredOverviewBatch>>>>
+>();
+const OVERVIEW_BATCH_BUDGET = 1_000_000_000n;
+const readStoredOverviewBatch = Effect.fn("kannin.readStoredOverviewBatch")(
+  (key: string, encodedRanges: string) =>
+    Effect.gen(function* () {
+      const started = yield* Clock.currentTimeNanos;
+      return yield* Effect.acquireUseRelease(
+        Effect.tryPromise(() => env.STORAGE.get(key)),
+        (object) =>
+          Effect.gen(function* () {
+            if (
+              object === null ||
+              object.size > 512 * 1024 ||
+              (yield* Clock.currentTimeNanos) - started >= OVERVIEW_BATCH_BUDGET
+            )
+              return undefined;
+            const metadata = yield* Schema.decodeUnknownEffect(OverviewFrameMetadata)(
+              object.customMetadata,
+            );
+            const units = Math.ceil(
+              Math.max(object.size, metadata.rawBytes * 4) / OVERVIEW_BODY_UNIT,
+            );
+            const acquired = yield* overviewBodyReads
+              .withPermitsIfAvailable(units)(
+                Effect.gen(function* () {
+                  if ((yield* Clock.currentTimeNanos) - started >= OVERVIEW_BATCH_BUDGET)
+                    return undefined;
+                  const bytes = yield* Effect.tryPromise(() => object.arrayBuffer());
+                  if ((yield* Clock.currentTimeNanos) - started >= OVERVIEW_BATCH_BUDGET)
+                    return undefined;
+                  if (
+                    bytes.byteLength !== object.size ||
+                    bytes.byteLength < 16 ||
+                    new DataView(bytes).getUint32(8, true) !== metadata.rawBytes
+                  )
+                    return undefined;
+                  const encoded = yield* Effect.try(() => unpack(new Uint8Array(bytes)));
+                  const candidate = yield* decodeOverviewBatch(encoded);
+                  const source = yield* Schema.encodeEffect(
+                    Schema.fromJsonString(TermProjectionProps.fields.ranges),
+                  )(candidate.ranges);
+                  if (
+                    candidate.bucket !== env.STORAGE_CACHE_SCOPE ||
+                    source !== encodedRanges ||
+                    candidate.overviews.length !== candidate.ranges.length
+                  )
+                    return undefined;
+                  return { value: candidate, encoded, encodedBytes: object.size };
+                }).pipe(Effect.uninterruptible),
+              )
+              .pipe(
+                Effect.repeat({
+                  while: Option.isNone,
+                  schedule: Schedule.exponential("1 millis").pipe(
+                    Schedule.upTo({ duration: OVERVIEW_BATCH_BUDGET }),
+                  ),
+                }),
+              );
+            return Option.getOrUndefined(acquired);
+          }),
+        (object) => {
+          if (object === null || object.bodyUsed) return Effect.void;
+          return Effect.tryPromise(() => object.body.cancel()).pipe(Effect.ignore);
+        },
+      );
+    }).pipe(Effect.orElseSucceed(() => undefined)),
+);
+
+async function acquireStoredOverviewBatch(
+  key: string,
+  encodedRanges: string,
+  ctx: ExecutionContext,
+) {
+  const selected = { completion: pendingOverviewBatches.get(key), started: false };
+  if (selected.completion === undefined) {
+    if (pendingOverviewBatches.size >= 16)
+      return { started: false, result: Option.some(undefined) };
+    selected.started = true;
+    const source = Effect.runPromise(readStoredOverviewBatch(key, encodedRanges));
+    const completion = Effect.runPromise(
+      Effect.tryPromise(() => source).pipe(
+        Effect.timeoutOption(OVERVIEW_BATCH_BUDGET),
+        Effect.orElseSucceed(() => Option.some(undefined)),
+      ),
+    );
+    selected.completion = completion;
+    pendingOverviewBatches.set(key, completion);
+    ctx.waitUntil(
+      source
+        .finally(() => {
+          if (pendingOverviewBatches.get(key) === completion) pendingOverviewBatches.delete(key);
+        })
+        .then(
+          () => undefined,
+          () => undefined,
+        ),
+    );
+  }
+  return { started: selected.started, result: await selected.completion };
+}
+
 export function hasResidentTermOverviews(ranges: ReadonlyArray<typeof TermProjectionRange.Type>) {
   return ranges.every((input) =>
     overviewBuffers.has(`${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}`),
@@ -641,6 +754,11 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
         memoryHits: 0,
         overviewCacheHits: 0,
         overviewCacheLookups: 0,
+        batchReads: 0,
+        batchHits: 0,
+        batchBytes: 0,
+        batchMs: 0,
+        batchTimeouts: 0,
         r2Reads: 0,
         r2Peak: 0,
         r2Hits: 0,
@@ -690,14 +808,15 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
         telemetry.totalMs = Number((yield* Clock.currentTimeNanos) - started) / 1e6;
         return { catalogs: hits.map((hit) => hit.catalog), telemetry };
       }
-      const cacheKey = new URL("https://overviews.internal/batch-v4");
+      const cacheKey = new URL("https://overviews.internal/batch-v5");
       cacheKey.searchParams.set("bucket", env.STORAGE_CACHE_SCOPE);
       const encodedRanges = yield* Schema.encodeEffect(
         Schema.fromJsonString(TermProjectionProps.fields.ranges),
       )(ranges);
-      cacheKey.searchParams.set("ranges", yield* Effect.tryPromise(() => sha256(encodedRanges)));
+      const rangesDigest = yield* Effect.tryPromise(() => sha256(encodedRanges));
+      cacheKey.searchParams.set("ranges", rangesDigest);
       const cacheStarted = yield* Clock.currentTimeNanos;
-      const cache = yield* Effect.tryPromise(() => caches.open("raio-overview-batches-v4")).pipe(
+      const cache = yield* Effect.tryPromise(() => caches.open("raio-overview-batches-v5")).pipe(
         Effect.orElseSucceed(() => undefined),
       );
       if (cache !== undefined) {
@@ -711,12 +830,19 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
             Effect.flatMap(decodeOverviewBatch),
             Effect.orElseSucceed(() => undefined),
           );
-          if (candidate !== undefined && candidate.length === ranges.length) {
+          if (
+            candidate !== undefined &&
+            candidate.overviews.length === ranges.length &&
+            candidate.bucket === env.STORAGE_CACHE_SCOPE &&
+            (yield* Schema.encodeEffect(Schema.fromJsonString(TermProjectionProps.fields.ranges))(
+              candidate.ranges,
+            )) === encodedRanges
+          ) {
             telemetry.overviewCacheMs +=
               Number((yield* Clock.currentTimeNanos) - cacheStarted) / 1e6;
             const projectedAt = yield* Clock.currentTimeNanos;
             const projected = yield* Effect.forEach(
-              candidate,
+              candidate.overviews,
               (bytes) =>
                 Effect.try(() => segment_overview_project(bytes, terms, filters)).pipe(
                   Effect.flatMap(decodeTermCatalog),
@@ -725,7 +851,7 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
             ).pipe(Effect.orElseSucceed(() => undefined));
             telemetry.projectMs += Number((yield* Clock.currentTimeNanos) - projectedAt) / 1e6;
             if (projected !== undefined) {
-              for (const [index, bytes] of candidate.entries()) {
+              for (const [index, bytes] of candidate.overviews.entries()) {
                 const input = ranges[index];
                 if (input === undefined)
                   return yield* new Rejected({
@@ -737,8 +863,8 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
                   bytes,
                 );
               }
-              reads.overviewCacheApiHits += candidate.length;
-              telemetry.overviewCacheHits = candidate.length;
+              reads.overviewCacheApiHits += candidate.overviews.length;
+              telemetry.overviewCacheHits = candidate.overviews.length;
               telemetry.totalMs = Number((yield* Clock.currentTimeNanos) - started) / 1e6;
               return { catalogs: projected, telemetry };
             }
@@ -750,6 +876,67 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
       }
       if (telemetry.overviewCacheMs === 0)
         telemetry.overviewCacheMs = Number((yield* Clock.currentTimeNanos) - cacheStarted) / 1e6;
+      const first = ranges[0];
+      const batch = { key: Option.none<string>() };
+      if (first !== undefined && ranges.length >= 8) {
+        const identity = `cache/correlated-batches-v1/${first.key}/${rangesDigest}`;
+        batch.key = Option.some(identity);
+        const fetchedAt = yield* Clock.currentTimeNanos;
+        const acquired = yield* Effect.tryPromise(() =>
+          acquireStoredOverviewBatch(identity, encodedRanges, ctx),
+        );
+        if (acquired.started) telemetry.batchReads += 1;
+        const result = acquired.result;
+        if (Option.isNone(result)) telemetry.batchTimeouts += 1;
+        else if (result.value !== undefined) {
+          const loaded = result.value;
+          const candidate = loaded.value;
+          const projected = yield* Effect.forEach(
+            candidate.overviews,
+            (bytes) =>
+              Effect.try(() => segment_overview_project(bytes, terms, filters)).pipe(
+                Effect.flatMap(decodeTermCatalog),
+              ),
+            { concurrency: 1 },
+          ).pipe(Effect.orElseSucceed(() => undefined));
+          if (projected !== undefined) {
+            for (const [index, bytes] of candidate.overviews.entries()) {
+              const input = ranges[index];
+              if (input !== undefined)
+                rememberOverview(
+                  `${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}`,
+                  bytes,
+                );
+            }
+            if (cache !== undefined) {
+              const bytes = new TextEncoder().encode(loaded.encoded);
+              publishQueryCache(
+                cacheKey.href,
+                bytes.byteLength * 4 + cacheKey.href.length * 4 + 128,
+                Effect.tryPromise(() =>
+                  cache.put(
+                    cacheKey,
+                    new Response(new Uint8Array(bytes), {
+                      headers: {
+                        "cache-control": "public, max-age=31536000, immutable",
+                        "content-type": "application/json",
+                      },
+                    }),
+                  ),
+                ),
+                ctx,
+              );
+            }
+            telemetry.batchHits += 1;
+            if (acquired.started) telemetry.batchBytes = loaded.encodedBytes;
+            telemetry.batchMs = Number((yield* Clock.currentTimeNanos) - fetchedAt) / 1e6;
+            telemetry.totalMs = Number((yield* Clock.currentTimeNanos) - started) / 1e6;
+            return { catalogs: projected, telemetry };
+          }
+        }
+
+        telemetry.batchMs = Number((yield* Clock.currentTimeNanos) - fetchedAt) / 1e6;
+      }
       const sources: Array<(typeof OverviewBatch.Type)[number]> = [];
       const admission = { bytes: 0, enabled: true };
       const r2Activity = { count: 0 };
@@ -777,18 +964,28 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
                         MAX_OVERVIEW_BODY_UNITS,
                         Math.max(1, Math.ceil((object.size * 4) / OVERVIEW_BODY_UNIT)),
                       );
-                      return yield* overviewBodyReads.withPermits(units)(
-                        Effect.gen(function* () {
-                          const encoded = yield* Effect.tryPromise(() => object.text());
-                          telemetry.r2Bytes += object.size;
-                          reads.correlatedBytes += object.size;
-                          const decodedAt = yield* Clock.currentTimeNanos;
-                          const decoded = yield* decodeCorrelatedOverview(encoded);
-                          telemetry.projectMs +=
-                            Number((yield* Clock.currentTimeNanos) - decodedAt) / 1e6;
-                          return decoded;
-                        }).pipe(Effect.uninterruptible),
-                      );
+                      const acquired = yield* overviewBodyReads
+                        .withPermitsIfAvailable(units)(
+                          Effect.gen(function* () {
+                            const encoded = yield* Effect.tryPromise(() => object.text());
+                            telemetry.r2Bytes += object.size;
+                            reads.correlatedBytes += object.size;
+                            const decodedAt = yield* Clock.currentTimeNanos;
+                            const decoded = yield* decodeCorrelatedOverview(encoded);
+                            telemetry.projectMs +=
+                              Number((yield* Clock.currentTimeNanos) - decodedAt) / 1e6;
+                            return decoded;
+                          }).pipe(Effect.uninterruptible),
+                        )
+                        .pipe(
+                          Effect.repeat({
+                            while: Option.isNone,
+                            schedule: Schedule.exponential("1 millis").pipe(
+                              Schedule.upTo({ duration: "2 seconds" }),
+                            ),
+                          }),
+                        );
+                      return Option.getOrUndefined(acquired);
                     }),
                   (object) => {
                     if (object === null || object.bodyUsed) return Effect.void;
@@ -872,24 +1069,44 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
           }),
         { concurrency: 4 },
       );
-      if (cache !== undefined && admission.enabled) {
+      if ((cache !== undefined || Option.isSome(batch.key)) && admission.enabled) {
         const publishedAt = yield* Clock.currentTimeNanos;
-        const encoded = yield* encodeOverviewBatch(sources);
+        const encoded = yield* encodeOverviewBatch({
+          bucket: env.STORAGE_CACHE_SCOPE,
+          ranges,
+          overviews: sources,
+        });
         const bytes = new TextEncoder().encode(encoded);
+        const storedKey = Option.getOrUndefined(batch.key);
         publishQueryCache(
           cacheKey.href,
           bytes.byteLength * 4 + cacheKey.href.length * 4 + 128,
-          Effect.tryPromise(() =>
-            cache.put(
-              cacheKey,
-              new Response(new Uint8Array(bytes), {
-                headers: {
-                  "cache-control": "public, max-age=31536000, immutable",
-                  "content-type": "application/json",
-                },
-              }),
-            ),
-          ),
+          Effect.gen(function* () {
+            if (cache !== undefined)
+              yield* Effect.tryPromise(() =>
+                cache.put(
+                  cacheKey,
+                  new Response(new Uint8Array(bytes), {
+                    headers: {
+                      "cache-control": "public, max-age=31536000, immutable",
+                      "content-type": "application/json",
+                    },
+                  }),
+                ),
+              ).pipe(Effect.ignore);
+            if (storedKey !== undefined && bytes.byteLength <= 512 * 1024) {
+              const frame = yield* Effect.try(() => pack(encoded));
+              if (frame.byteLength > 512 * 1024) return;
+              const metadata = yield* Schema.encodeEffect(OverviewFrameMetadata)({
+                rawBytes: bytes.byteLength,
+              }).pipe(Effect.orDie);
+              yield* Effect.tryPromise(() =>
+                env.STORAGE.put(storedKey, new Uint8Array(frame), {
+                  customMetadata: metadata,
+                }),
+              );
+            }
+          }),
           ctx,
         );
         telemetry.publishMs += Number((yield* Clock.currentTimeNanos) - publishedAt) / 1e6;
@@ -940,6 +1157,11 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
         bodyMs: 0,
         decodeMs: 0,
         sourceTotalMs: 0,
+        sourceBatchReads: 0,
+        sourceBatchHits: 0,
+        sourceBatchBytes: 0,
+        sourceBatchMs: 0,
+        sourceBatchTimeouts: 0,
         sourceEntryMs: 0,
         sourceKeyMs: 0,
         sourceCacheOpenMs: 0,
@@ -1062,6 +1284,11 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
                   metrics.originResponses += 1;
                   metrics.sourceTotalMs += telemetry.totalMs;
                   metrics.sourceEntryMs += telemetry.entryMs;
+                  metrics.sourceBatchReads += telemetry.batchReads;
+                  metrics.sourceBatchHits += telemetry.batchHits;
+                  metrics.sourceBatchBytes += telemetry.batchBytes;
+                  metrics.sourceBatchMs += telemetry.batchMs;
+                  metrics.sourceBatchTimeouts += telemetry.batchTimeouts;
                   metrics.sourceKeyMs += telemetry.keyMs;
                   metrics.sourceCacheOpenMs += telemetry.cacheOpenMs;
                   metrics.sourceCacheMatchMs += telemetry.cacheMatchMs;
@@ -1128,6 +1355,7 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
           `catalog_decode_sum;dur=${metrics.decodeMs}`,
           `catalog_origin_sum;dur=${metrics.sourceTotalMs}`,
           `catalog_entry_sum;dur=${metrics.sourceEntryMs}`,
+          `catalog_batch_r2_sum;dur=${metrics.sourceBatchMs};desc="reads=${metrics.sourceBatchReads} hits=${metrics.sourceBatchHits} bytes=${metrics.sourceBatchBytes} timeouts=${metrics.sourceBatchTimeouts}"`,
           `catalog_key_sum;dur=${metrics.sourceKeyMs}`,
           `catalog_cache_open_sum;dur=${metrics.sourceCacheOpenMs}`,
           `catalog_cache_match_sum;dur=${metrics.sourceCacheMatchMs}`,

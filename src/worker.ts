@@ -121,8 +121,8 @@ export class Segments extends WorkerEntrypoint<Env, typeof SegmentCacheProps.Typ
       request.method !== "GET" ||
       props._tag === "Failure" ||
       props.value.bucket !== this.env.STORAGE_CACHE_SCOPE ||
-      (url.pathname !== "/range" && url.pathname !== "/directory-v1") ||
-      (url.pathname === "/directory-v1" && decoded.value.offset !== 0)
+      (url.pathname !== "/range" && url.pathname !== "/directory-v2") ||
+      (url.pathname === "/directory-v2" && decoded.value.offset !== 0)
     )
       return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });
     const input = decoded.value;
@@ -145,7 +145,7 @@ export class Segments extends WorkerEntrypoint<Env, typeof SegmentCacheProps.Typ
         return response;
       }
     }
-    if (url.pathname === "/directory-v1") {
+    if (url.pathname === "/directory-v2") {
       const frame = await Effect.runPromise(readDirectoryFrame(input.key, input.length));
       if (Option.isSome(frame)) {
         const response = new Response(new Uint8Array(frame.value), {
@@ -174,10 +174,10 @@ export class Segments extends WorkerEntrypoint<Env, typeof SegmentCacheProps.Typ
     if (bytes.byteLength !== input.length)
       return new Response(null, { status: 503, headers: { "cache-control": "no-store" } });
     const encoded = Match.value(url.pathname).pipe(
-      Match.when("/directory-v1", () => directory_compress(new Uint8Array(bytes)).slice()),
+      Match.when("/directory-v2", () => directory_compress(new Uint8Array(bytes)).slice()),
       Match.orElse(() => bytes),
     );
-    if (url.pathname === "/directory-v1")
+    if (url.pathname === "/directory-v2")
       publishDirectoryFrame(input.key, input.length, new Uint8Array(encoded), this.ctx);
     const response = new Response(encoded, {
       headers: {

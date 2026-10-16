@@ -92,7 +92,7 @@ test("native Cache API retains compressed canonical directories after memory evi
   if (segment === undefined) throw new Error("Missing committed segment");
   const caches = await worker.getCaches();
   const cache = await caches.open("raio-segments-v1");
-  const key = new URL("https://raio-cache.internal/directory-v1");
+  const key = new URL("https://raio-cache.internal/directory-v2");
   key.searchParams.set("key", segment.key);
   key.searchParams.set("offset", "0");
   key.searchParams.set("length", String(segment.headerBytes));
@@ -102,7 +102,7 @@ test("native Cache API retains compressed canonical directories after memory evi
   if (cached === undefined) return;
   const encoded = new Uint8Array(await cached.arrayBuffer());
   expect(encoded.byteLength).toBeLessThan(segment.headerBytes);
-  expect(new TextDecoder().decode(encoded.subarray(0, 8))).toBe("RAIODIR1");
+  expect(new TextDecoder().decode(encoded.subarray(0, 8))).toBe("RAIODIR2");
   expect(new DataView(encoded.buffer, encoded.byteOffset).getUint32(8, true)).toBe(
     segment.headerBytes,
   );
@@ -143,7 +143,7 @@ test("cached old segments cannot resurrect updated or deleted documents", async 
 });
 
 test("the authenticated gateway never exposes immutable cache entrypoints", async () => {
-  for (const path of ["/range", "/directory-v1", "/catalog-v7"]) {
+  for (const path of ["/range", "/directory-v2", "/catalog-v7"]) {
     const url = new URL(path, await worker.ready);
     const anonymous = await fetch(url);
     expect(anonymous.status).toBe(401);

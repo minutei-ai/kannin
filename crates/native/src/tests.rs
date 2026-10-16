@@ -117,7 +117,7 @@ fn source(
                                         .bytes
                                         .get(offset..offset + length)
                                         .ok_or("Invalid range")?;
-                                    if url.path() == "/directory-v1" {
+                                    if url.path() == "/directory-v2" {
                                         return Ok(segment::compress_directory(bytes)?);
                                     }
                                     Ok(bytes.to_vec())

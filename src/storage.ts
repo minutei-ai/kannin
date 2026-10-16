@@ -314,17 +314,17 @@ export function addFrequencyPosting(
 
 function rememberDirectory(identity: string, headerBytes: number, directory: Directory) {
   const bytes = directory.heap_bytes();
-  const active = activeDirectories.get(`${identity}/0/${headerBytes}/directory-v1`);
+  const active = activeDirectories.get(`${identity}/0/${headerBytes}/directory-v2`);
   if (active !== undefined && active.directory === undefined && bytes <= MAX_DECODED_BYTES)
     active.directory = directory.retain();
   if (directories.has(identity)) return;
   if (bytes > MAX_DECODED_CACHE_BYTES) return;
-  const frequency = admissionCounts.get(`${identity}/0/${headerBytes}/directory-v1`) ?? 1;
+  const frequency = admissionCounts.get(`${identity}/0/${headerBytes}/directory-v2`) ?? 1;
   const victims = [];
   const remaining = { bytes: decodedBudget.bytes };
   for (const [key, entry] of directories) {
     if (remaining.bytes + bytes <= MAX_DECODED_CACHE_BYTES) break;
-    if (frequency <= (admissionCounts.get(`${key}/0/${entry.headerBytes}/directory-v1`) ?? 0))
+    if (frequency <= (admissionCounts.get(`${key}/0/${entry.headerBytes}/directory-v2`) ?? 0))
       return;
     victims.push(key);
     remaining.bytes -= entry.bytes;
@@ -346,7 +346,7 @@ export const readDirectoryFrame = Effect.fn("kannin.readDirectoryFrame")(
         Effect.gen(function* () {
           reads.directoryR2CacheReads += 1;
           const object = yield* Effect.tryPromise(() =>
-            env.STORAGE.get(`cache/directory-v1/${key}/${length}`),
+            env.STORAGE.get(`cache/directory-v2/${key}/${length}`),
           );
           if (object === null) return Option.none<Uint8Array>();
           const source = yield* Schema.decodeUnknownEffect(
@@ -396,7 +396,7 @@ export function publishDirectoryFrame(
   ctx?: ExecutionContext | DurableObjectState,
 ) {
   if (length > MAX_DIRECTORY_FALLBACK_LENGTH) return false;
-  const identity = `cache/directory-v1/${key}/${length}`;
+  const identity = `cache/directory-v2/${key}/${length}`;
   const published = publishQueryCache(
     `${env.STORAGE_CACHE_SCOPE}:${identity}`,
     bytes.byteLength * 4 + identity.length * 4 + 128,
@@ -427,12 +427,12 @@ export async function range(
   compressedDirectory = false,
 ) {
   const resource = Match.value(compressedDirectory).pipe(
-    Match.when(true, () => "directory-v1"),
+    Match.when(true, () => "directory-v2"),
     Match.orElse(() => "range"),
   );
   const rawIdentity = `${env.STORAGE_CACHE_SCOPE}:${key}/${offset}/${length}`;
   const cacheKey = Match.value(compressedDirectory).pipe(
-    Match.when(true, () => `${rawIdentity}/directory-v1`),
+    Match.when(true, () => `${rawIdentity}/directory-v2`),
     Match.orElse(() => rawIdentity),
   );
   if (compressedDirectory) noteDirectoryRequest(cacheKey);
@@ -605,7 +605,7 @@ export async function range(
 
 async function acquireDirectory(key: string, headerBytes: number) {
   const identity = `${env.STORAGE_CACHE_SCOPE}:${key}`;
-  const admissionIdentity = `${identity}/0/${headerBytes}/directory-v1`;
+  const admissionIdentity = `${identity}/0/${headerBytes}/directory-v2`;
   const cached = directories.get(identity);
   if (cached !== undefined) {
     noteDirectoryRequest(admissionIdentity);
@@ -645,7 +645,7 @@ export const withDirectory = Effect.fn("raio.withDirectory")(
   ) =>
     Effect.acquireUseRelease(
       Effect.sync(() => {
-        const identity = `${env.STORAGE_CACHE_SCOPE}:${key}/0/${headerBytes}/directory-v1`;
+        const identity = `${env.STORAGE_CACHE_SCOPE}:${key}/0/${headerBytes}/directory-v2`;
         const existing = activeDirectories.get(identity);
         if (existing !== undefined) {
           existing.readers += 1;

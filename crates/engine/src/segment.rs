@@ -714,6 +714,11 @@ pub fn parse_header(bytes: &[u8]) -> Result<(Header, usize), String> {
     }
     let text = std::str::from_utf8(json).map_err(|cause| cause.to_string())?;
     let header: Header = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    validate_header(&header)?;
+    Ok((header, 16 + length))
+}
+
+fn validate_header(header: &Header) -> Result<(), String> {
     if header.version != 1 || header.documents.len() > 10000 {
         return Err("Invalid segment version or document count".into());
     }
@@ -745,33 +750,101 @@ pub fn parse_header(bytes: &[u8]) -> Result<(Header, usize), String> {
             }
         }
     }
-    Ok((header, 16 + length))
+    Ok(())
 }
 
-const DIRECTORY_MAGIC: &[u8; 8] = b"RAIODIR1";
+const DIRECTORY_MAGIC: &[u8; 8] = b"RAIODIR2";
+
+struct DirectoryDocuments<'a>(&'a [DocumentMeta]);
+
+impl Serialize for DirectoryDocuments<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(|document| {
+            (
+                &document.id,
+                document.revision,
+                document.title_length,
+                document.body_length,
+                &document.attributes,
+                (document.data.offset, document.data.length),
+                document.vector,
+            )
+        }))
+    }
+}
+
+struct DirectoryBlocks<'a>(&'a [BlockMeta]);
+
+impl Serialize for DirectoryBlocks<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(|block| {
+            (
+                block.first,
+                block.last,
+                block.count,
+                block.max_title_tf,
+                block.max_body_tf,
+                block.min_title_length,
+                block.min_body_length,
+                (block.data.offset, block.data.length),
+            )
+        }))
+    }
+}
+
+struct DirectoryTerms<'a>(&'a BTreeMap<String, TermMeta>);
+
+impl Serialize for DirectoryTerms<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(
+            self.0
+                .iter()
+                .map(|(term, metadata)| (term, (metadata.df, DirectoryBlocks(&metadata.blocks)))),
+        )
+    }
+}
 
 #[doc = "# Errors\nRejects invalid or incomplete canonical headers and directory size limits."]
 pub fn compress_directory(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let (_, length) = parse_header(bytes)?;
+    let (header, length) = parse_header(bytes)?;
     if length != bytes.len() || length > MAX_BYTES {
         return Err("Directory must contain exactly one complete header".into());
     }
-    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(bytes, 3);
-    let mut encoded = Vec::with_capacity(16 + compressed.len());
+    let compact = serde_json::to_vec(&(
+        header.version,
+        DirectoryDocuments(&header.documents),
+        DirectoryTerms(&header.terms),
+        header.total_title_length,
+        header.total_body_length,
+    ))
+    .map_err(|cause| cause.to_string())?;
+    if compact.len() > MAX_BYTES {
+        return Err("Compact directory exceeds size budget".into());
+    }
+    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&compact, 3);
+    let mut encoded = Vec::with_capacity(20 + compressed.len());
     encoded.extend_from_slice(DIRECTORY_MAGIC);
     encoded.extend_from_slice(
         &u32::try_from(length)
             .map_err(|cause| cause.to_string())?
             .to_le_bytes(),
     );
-    encoded.extend_from_slice(&crc32fast::hash(bytes).to_le_bytes());
+    encoded.extend_from_slice(
+        &u32::try_from(compact.len())
+            .map_err(|cause| cause.to_string())?
+            .to_le_bytes(),
+    );
+    let mut checksum = crc32fast::Hasher::new();
+    checksum.update(&encoded);
+    checksum.update(&compact);
+    encoded.extend_from_slice(&checksum.finalize().to_le_bytes());
     encoded.extend_from_slice(&compressed);
     Ok(encoded)
 }
 
 #[doc = "# Errors\nRejects framing, size, compression, checksum, expected length and canonical header violations."]
 pub fn parse_compressed_directory(bytes: &[u8], expected: usize) -> Result<Header, String> {
-    if bytes.len() < 16 || &bytes[..8] != DIRECTORY_MAGIC || bytes.len() > MAX_BYTES + 8192 {
+    if bytes.len() < 20 || &bytes[..8] != DIRECTORY_MAGIC || bytes.len() > MAX_BYTES + 8192 {
         return Err("Invalid compressed directory frame".into());
     }
     let length = u32::from_le_bytes(
@@ -782,34 +855,30 @@ pub fn parse_compressed_directory(bytes: &[u8], expected: usize) -> Result<Heade
     if !(16..=MAX_BYTES).contains(&length) || length != expected {
         return Err("Invalid compressed directory length".into());
     }
-    let checksum = u32::from_le_bytes(
+    let compact_length = u32::from_le_bytes(
         bytes[12..16]
             .try_into()
             .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
-    );
-    let decoded = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&bytes[16..], length)
-        .map_err(|cause| cause.to_string())?;
-    if decoded.len() != length {
-        return Err("Compressed directory integrity check failed".into());
+    ) as usize;
+    if compact_length > MAX_BYTES {
+        return Err("Compact directory exceeds size budget".into());
     }
-    let (header, header_bytes) = parse_header(&decoded)?;
-    if header_bytes != length {
-        return Err("Compressed directory contains trailing bytes".into());
-    }
-    let canonical_checksum = u32::from_le_bytes(
-        decoded[12..16]
+    let checksum = u32::from_le_bytes(
+        bytes[16..20]
             .try_into()
             .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
     );
-    let mut framed_checksum = crc32fast::Hasher::new();
-    framed_checksum.update(&decoded[..16]);
-    framed_checksum.combine(&crc32fast::Hasher::new_with_initial_len(
-        canonical_checksum,
-        u64::try_from(length - 16).map_err(|cause| cause.to_string())?,
-    ));
-    if framed_checksum.finalize() != checksum {
+    let decoded =
+        miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&bytes[20..], compact_length)
+            .map_err(|cause| cause.to_string())?;
+    let mut verified = crc32fast::Hasher::new();
+    verified.update(&bytes[..16]);
+    verified.update(&decoded);
+    if decoded.len() != compact_length || verified.finalize() != checksum {
         return Err("Compressed directory integrity check failed".into());
     }
+    let header: Header = serde_json::from_slice(&decoded).map_err(|cause| cause.to_string())?;
+    validate_header(&header)?;
     Ok(header)
 }
 

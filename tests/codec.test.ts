@@ -702,15 +702,18 @@ test("frequency page validation follows exact directory lifetime and never memoi
   });
   const query = Schema.encodeSync(Schema.fromJsonString(RankingInput))(input);
   const first = new Directory(longSegment.bytes());
+  const charge = first.heap_bytes();
   const warm = first.ranker(query);
   warm.add_frequency("alpha", page);
   const reference = warm.finish();
   const retained = first.retain();
   warm.free();
   first.free();
+  expect(retained.heap_bytes()).toBe(charge);
   const shared = retained.ranker(query);
   shared.add_frequency("alpha", page);
   expect(shared.finish()).toBe(reference);
+  expect(retained.heap_bytes()).toBe(charge);
   expect(() => shared.add_frequency("alpha", page)).toThrow("out of order");
   const unrequested = retained.ranker(query);
   expect(() => unrequested.add_frequency("beta", page)).toThrow("Unrequested");
@@ -724,6 +727,7 @@ test("frequency page validation follows exact directory lifetime and never memoi
     expect(() => invalid.add_frequency("alpha", page)).toThrow("Invalid token position");
   }
   using reparsed = new Directory(longSegment.bytes());
+  expect(reparsed.heap_bytes()).toBe(charge);
   using fresh = reparsed.ranker(query);
   fresh.add_frequency("alpha", page);
   expect(fresh.finish()).toBe(reference);
@@ -1037,7 +1041,7 @@ test("eligible document lengths prune filtered pages while preserving sparse top
   }
 });
 
-test("compressed directories validate payload and frame checksums independently", () => {
+test("compact directories validate framing, checksums and header semantics", () => {
   using segment = new Segment(
     JSON.stringify(
       Array.from({ length: 128 }, (_, index) => ({
@@ -1049,25 +1053,62 @@ test("compressed directories validate payload and frame checksums independently"
   );
   const bytes = segment.bytes();
   const length = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
-  const header = bytes.slice(0, length);
-  const encoded = directory_compress(header);
-  expect(new DataView(encoded.buffer, encoded.byteOffset).getUint32(12, true)).toBe(crc32(header));
-  const marker = new TextEncoder().encode('"state":"initial"');
-  const position = header.findIndex((_, index) =>
-    marker.every((value, offset) => header[index + offset] === value),
-  );
-  expect(position).toBeGreaterThanOrEqual(16);
-  header[position + '"state":"'.length] = "j".charCodeAt(0);
-  const compressed = deflateSync(header);
-  const forged = new Uint8Array(16 + compressed.byteLength);
-  forged.set(encoded.subarray(0, 16));
-  forged.set(compressed, 16);
+  const encoded = directory_compress(bytes.subarray(0, length));
+  const compact = inflateSync(encoded.subarray(20));
+  const covered = new Uint8Array(16 + compact.length);
+  covered.set(encoded.subarray(0, 16));
+  covered.set(compact, 16);
+  expect(new DataView(encoded.buffer, encoded.byteOffset).getUint32(16, true)).toBe(crc32(covered));
+  expect(new DataView(encoded.buffer, encoded.byteOffset).getUint32(12, true)).toBe(compact.length);
+  expect(compact[0]).toBe("[".charCodeAt(0));
+  const invalid = new Uint8Array(compact);
+  expect(invalid[1]).toBe("1".charCodeAt(0));
+  invalid[1] = "2".charCodeAt(0);
+  const compressed = deflateSync(invalid);
+  const forged = new Uint8Array(20 + compressed.byteLength);
+  forged.set(encoded.subarray(0, 20));
+  forged.set(compressed, 20);
   expect(() => Directory.compressed(forged, length)).toThrow();
-  expect(() => new Directory(header)).toThrow();
+  covered.set(forged.subarray(0, 16));
+  covered.set(invalid, 16);
+  new DataView(forged.buffer).setUint32(16, crc32(covered), true);
+  expect(() => Directory.compressed(forged, length)).toThrow("version");
   const damaged = encoded.slice();
-  const checksum = damaged[12];
+  const checksum = damaged[16];
   if (checksum === undefined) throw new Error("Missing directory checksum");
-  damaged[12] = checksum ^ 1;
+  damaged[16] = checksum ^ 1;
+  expect(() => Directory.compressed(damaged, length)).toThrow();
+  const legacy = encoded.slice();
+  legacy.set(new TextEncoder().encode("RAIODIR1"));
+  expect(() => Directory.compressed(legacy, length)).toThrow();
+});
+
+test("compressed directories reject both output length mismatches and incomplete zlib streams", () => {
+  using segment = new Segment(
+    JSON.stringify([
+      { id: "compressed", text: "alpha", attributes: { padding: "x".repeat(65536) } },
+    ]),
+  );
+  const bytes = segment.bytes();
+  const length = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
+  const encoded = directory_compress(bytes.subarray(0, length));
+  using directory = Directory.compressed(encoded, length);
+  using canonical = new Directory(bytes.subarray(0, length));
+  expect(directory.terms('["alpha"]')).toBe(canonical.terms('["alpha"]'));
+  for (const delta of [-1, 1]) {
+    const invalid = encoded.slice();
+    new DataView(invalid.buffer, invalid.byteOffset).setUint32(8, length + delta, true);
+    expect(() => Directory.compressed(invalid, length + delta)).toThrow();
+  }
+  for (const missing of [1, 4, 8])
+    expect(() =>
+      Directory.compressed(encoded.subarray(0, encoded.length - missing), length),
+    ).toThrow();
+  const damaged = encoded.slice();
+  const end = damaged.length - 1;
+  const checksum = damaged[end];
+  if (checksum === undefined) throw new Error("Missing zlib checksum");
+  damaged[end] = checksum ^ 1;
   expect(() => Directory.compressed(damaged, length)).toThrow();
 });
 

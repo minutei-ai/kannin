@@ -89,7 +89,7 @@ async function cacheFrame(
   headerBytes: number,
   bytes: Uint8Array,
 ) {
-  const cacheKey = new URL("https://raio-cache.internal/directory-v1");
+  const cacheKey = new URL("https://raio-cache.internal/directory-v2");
   cacheKey.searchParams.set("key", key);
   cacheKey.searchParams.set("offset", "0");
   cacheKey.searchParams.set("length", String(headerBytes));
@@ -104,7 +104,7 @@ async function cacheFrame(
 
 test("R2 directory frames recover cold readers with compressed bytes across isolates", async () => {
   const key = "namespaces/directory-r2/segments/shared.rsix";
-  const identity = `cache/directory-v1/${key}/${length}`;
+  const identity = `cache/directory-v2/${key}/${length}`;
   const input = Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
     key,
     offset: 0,
@@ -162,11 +162,11 @@ test("invalid R2 directory frames recover canonical data and repair disposable a
   const bucket = await worker.getR2Bucket("STORAGE");
   for (const failure of ["checksum", "identity", "oversized", "missing"]) {
     const key = `namespaces/directory-r2/segments/${failure}.rsix`;
-    const identity = `cache/directory-v1/${key}/${length}`;
+    const identity = `cache/directory-v2/${key}/${length}`;
     await bucket.put(key, canonical);
     await cacheFrame(worker, key, length, frame);
     const bytes = frame.slice();
-    if (failure === "checksum") bytes[12] = (bytes[12] ?? 0) ^ 1;
+    if (failure === "checksum") bytes[16] = (bytes[16] ?? 0) ^ 1;
     const source = { key, headerBytes: length };
     if (failure === "identity") source.key = "namespaces/other/segments/other.rsix";
     const metadata = {
@@ -237,7 +237,7 @@ test("segment origins validate R2 frames before publishing the native Cache API 
   await using active = await fixture();
   const worker = active.worker;
   const key = "namespaces/directory-origin/segments/shared.rsix";
-  const identity = `cache/directory-v1/${key}/${length}`;
+  const identity = `cache/directory-v2/${key}/${length}`;
   const bucket = await worker.getR2Bucket("STORAGE");
   await bucket.put(key, canonical);
   await bucket.put(identity, frame, {
@@ -301,7 +301,7 @@ test("rejected cache admission shares a validated directory only for active read
   }));
   for (const input of inputs) {
     await bucket.put(input.key, canonical);
-    await bucket.put(`cache/directory-v1/${input.key}/${length}`, frame, {
+    await bucket.put(`cache/directory-v2/${input.key}/${length}`, frame, {
       customMetadata: {
         source: Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))({
           key: input.key,
@@ -346,7 +346,7 @@ test("slow R2 directory cache bodies keep admission while canonical recovery ret
   for (const name of ["first", "second"]) {
     const key = `namespaces/directory-r2-stall/segments/${name}.rsix`;
     await bucket.put(key, canonical);
-    await bucket.put(`cache/directory-v1/${key}/${length}`, frame, {
+    await bucket.put(`cache/directory-v2/${key}/${length}`, frame, {
       customMetadata: {
         source: Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))({
           key,
@@ -402,7 +402,7 @@ test("failed R2 directory publications preserve complete canonical results", asy
   expect(new Uint8Array(await response.arrayBuffer())).toEqual(frame);
   const state = await fetch(new URL("/state", await worker.ready));
   expect(state.headers.get("x-rejected-writes")).toBe("1");
-  expect(await bucket.head(`cache/directory-v1/${key}/${length}`)).toBeNull();
+  expect(await bucket.head(`cache/directory-v2/${key}/${length}`)).toBeNull();
 });
 
 test("writes and compaction publish valid immutable directory frames", async () => {
@@ -425,7 +425,7 @@ test("writes and compaction publish valid immutable directory frames", async () 
     if (object === null) throw new Error("Missing canonical root");
     const root = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
     for (const source of root.segments) {
-      const identity = `cache/directory-v1/${source.key}/${source.headerBytes}`;
+      const identity = `cache/directory-v2/${source.key}/${source.headerBytes}`;
       for (const attempt of Array.from({ length: 40 }, (_, index) => index)) {
         const stored = await bucket.get(identity);
         if (stored !== null) {
@@ -584,7 +584,7 @@ test("R2 directory publication includes exactly two MiB and excludes the next by
   for (const extra of [0, 1]) {
     const built = directoryWithLength(2 * 1024 * 1024 + extra);
     const key = `namespaces/directory-boundary/segments/frame-${extra}.rsix`;
-    const identity = `cache/directory-v1/${key}/${built.length}`;
+    const identity = `cache/directory-v2/${key}/${built.length}`;
     await bucket.put(key, built.bytes);
     const response = await fetch(new URL("/origin", await worker.ready), {
       method: "POST",

@@ -12,7 +12,7 @@ export const Bucket = Cloudflare.R2.Bucket("Storage", {
   lifecycleRules: [
     {
       id: "expire-directory-cache",
-      prefix: "cache/directory-v1/",
+      prefix: "cache/directory-",
       deleteObjectsTransition: { condition: { type: "Age", maxAge: 60 * 60 * 24 * 30 } },
     },
     {

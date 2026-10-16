@@ -13,15 +13,13 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Concurrency | p50 ms | p95 ms | Requests/s |
 | ----------: | -----: | -----: | ---------: |
-|           1 |  51.30 |  68.43 |      18.39 |
-|           4 |  49.42 |  89.82 |      50.63 |
-|          16 |  52.20 | 420.89 |     100.65 |
+|           1 |  42.58 |  47.91 |      22.49 |
+|           4 |  46.73 | 209.53 |      53.50 |
+|          16 |  62.79 | 397.55 |     105.11 |
 
-Two post-deploy runs checked **768 responses** against strong baseline rows, scores and sequence. Each run used 128 requests per concurrency; all entered through GRU without snapshot coordinator fallback. The first run had p50 **49.97/49.49/51.88 ms** at concurrency 1/4/16. These are cache-sensitive workload observations, not sustained-capacity guarantees. Edge freshness is weaker than strong consistency.
+Two post-deploy runs checked **768 responses** against strong baseline rows, scores and sequence. Each run used 128 requests per concurrency; all entered through GRU without snapshot coordinator fallback. The first run had p50 **43.83/44.38/50.70 ms** at concurrency 1/4/16. These are cache-sensitive workload observations, not sustained-capacity guarantees. Edge freshness is weaker than strong consistency.
 
-Rust now constructs decoded term dictionaries in bulk. Controlled local workerd measurements reduced directory-opening batch median by **10.0%**, full-query median after volatile-memory reset by **17.8%**, and WASM linear memory with 24 retained directories by **7.8%**. Canonical bytes and results stayed exact; the WASM binary grew **1.8%**. These local gains do not isolate native end-to-end improvement. [Method and limits](docs/performance.md#bulk-construction-of-rust-directory-term-maps).
-
-Retained Rust frequency pages now reuse validation against the exact directory header. Large cached-ranking batches improved **33–38%** in workerd; repeated complete-Worker measurements did **not** establish a consistent end-to-end gain. Against its immediate pre-deploy reference, the native repeat above improved p95 but increased median latency at concurrency 1/4. [Measurements and regressions](docs/performance.md#retained-frequency-page-header-validation).
+Rust builds term dictionaries in bulk, reuses posting validation against exact retained headers and avoids software fused arithmetic for the fixed BM25 title weight. Isolated workerd gains and regressions are [documented](docs/performance.md); repeated complete-Worker measurements did not establish consistent end-to-end gains.
 
 Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10**, with the entire 300-query report unchanged. Twelve native Vectorize/hybrid checks preserved 105 complete rows and scores across three 100-vector fixtures; large-corpus ANN recall remains unmeasured.
 

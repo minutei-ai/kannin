@@ -3131,3 +3131,21 @@ Mixed-title batch medians improved 6.8–7.3% for any and 9.0–9.5% for phrase 
 The complete local gate passed 228 Worker/tooling and 42 Rust tests, 7,822 Bun assertions, formatting, TypeScript/Effect lint and types, and native/WASM Clippy. The production WASM reconstructed by that gate exactly matched the measured artifact.
 
 The independent SciFact rerun retained the entire preceding 300-query report, including all returned IDs and metrics: nDCG@10 0.6730619695232347, recall@10 0.7956666666666666 and MRR@10 0.641808201058201.
+
+Alchemy deployed source `d43ee74` through profile `minutei`; native provider reads confirmed version `d86d0f5f-4485-4615-a46a-ac44e51f73cb` at 100%, unchanged R2 binding and cache lifecycle rules. Sixteen strong/edge selections with 16/64 terms retained their saved complete rows/scores and sequence. The already-exercised million-document corpus stayed at sequence 2,000. Twelve native Vectorize/hybrid cases retained all 105 complete rows/scores across the three existing 100-vector fixtures.
+
+A pre-deploy load and two post-deploy loads each ran 128 requests at concurrency 1/4/16. Every response matched its fresh strong baseline, all entered through GRU and none used snapshot coordinator fallback. The post-deploy pair therefore checked 768 measured responses.
+
+| Run           | Concurrency | p50 ms | p95 ms | Requests/s |
+| :------------ | ----------: | -----: | -----: | ---------: |
+| Before        |           1 |  46.72 |  70.42 |      19.71 |
+| Before        |           4 |  47.36 |  78.93 |      62.83 |
+| Before        |          16 |  54.95 | 370.55 |     119.53 |
+| After, first  |           1 |  43.83 |  59.65 |      19.76 |
+| After, first  |           4 |  44.38 | 102.19 |      65.39 |
+| After, first  |          16 |  50.70 | 421.09 |     113.02 |
+| After, repeat |           1 |  42.58 |  47.91 |      22.49 |
+| After, repeat |           4 |  46.73 | 209.53 |      53.50 |
+| After, repeat |          16 |  62.79 | 397.55 |     105.11 |
+
+Before/first/repeat maxima were 607.95/646.01/624.94 ms. The first post-deploy run lowered all three medians, while its p95 worsened at concurrency four/sixteen. The repeat improved concurrency-one median/p95 but worsened concurrency-sixteen median/p95 and concurrency-four p95 against the reference. Cache state, placement, scheduling and network effects remain uncontrolled; these short workloads do not isolate the scorer change or prove sustained capacity. Peak whole-Worker heap, cold-tail reliability, large-corpus ANN recall and Turbopuffer parity remain open.

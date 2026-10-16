@@ -81,7 +81,7 @@ async function seed(worker: Awaited<ReturnType<typeof startWorker>>, namespace =
 test("oversized combined sources recover through admissible physical batches", async () => {
   await using instance = await fixture();
   const { worker } = instance;
-  for (const index of Array.from({ length: 128 }, (_, i) => i))
+  for (const index of Array.from({ length: 16 }, (_, i) => i))
     expect(
       (
         await request(
@@ -104,10 +104,6 @@ test("oversized combined sources recover through admissible physical batches", a
     const source = Schema.decodeSync(Schema.fromJsonString(CorrelatedOverview))(
       await cached.text(),
     );
-    if (sources.length >= 16) {
-      sources.push(source);
-      continue;
-    }
     const decoded = inflateSync(source.overview.subarray(8));
     const padded = new Uint8Array(30000).fill(32);
     padded.set(decoded);
@@ -128,8 +124,8 @@ test("oversized combined sources recover through admissible physical batches", a
   if (first === undefined) throw new Error("Missing physical source");
   const full = Schema.encodeSync(Schema.fromJsonString(StoredOverviewBatch))({
     bucket: first.bucket,
-    ranges: sources.slice(0, 16).map((source) => source.source),
-    overviews: sources.slice(0, 16).map((source) => source.overview),
+    ranges: sources.map((source) => source.source),
+    overviews: sources.map((source) => source.overview),
   });
   expect(new TextEncoder().encode(full).byteLength).toBeGreaterThan(512 * 1024);
   const references: Array<typeof QueryResult.Type> = [];
@@ -147,9 +143,9 @@ test("oversized combined sources recover through admissible physical batches", a
     const reference = references[0];
     if (reference === undefined) throw new Error("Missing original result");
     expect(result).toEqual(reference);
-    expect(result.sequence).toBe(128);
+    expect(result.sequence).toBe(16);
     expect(result.rows.map((row) => row.id)).toEqual(
-      Array.from({ length: 128 }, (_, i) => String(i))
+      Array.from({ length: 16 }, (_, i) => String(i))
         .toSorted()
         .slice(0, 10),
     );
@@ -160,7 +156,7 @@ test("oversized combined sources recover through admissible physical batches", a
     }
   }
   const persisted = await bucket.list({ prefix: "cache/correlated-batches-v1/" });
-  expect(persisted.objects).toHaveLength(16);
+  expect(persisted.objects).toHaveLength(2);
   expect((await request(worker, "large-overviews", "rebuild", {})).status).toBe(200);
   const recovered = await request(
     worker,
@@ -172,10 +168,9 @@ test("oversized combined sources recover through admissible physical batches", a
   const reference = references[0];
   if (reference === undefined) throw new Error("Missing original result");
   expect(Schema.decodeUnknownSync(QueryResult)(await recovered.json())).toEqual(reference);
-  expect(recovered.headers.get("server-timing")).toContain('desc="reads=16 hits=16');
-  expect(recovered.headers.get("server-timing")).toContain('desc="requests=8');
+  expect(recovered.headers.get("server-timing")).toContain('desc="reads=2 hits=2');
   expect(recovered.headers.get("server-timing")).toContain("reads=0 hits=0 bytes=0 batch_peak=0");
-}, 15000);
+});
 
 for (const variant of [
   "valid",

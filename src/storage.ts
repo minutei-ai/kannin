@@ -6,7 +6,6 @@ import {
   Fiber,
   Match,
   Option,
-  Record as EffectRecord,
   Schedule,
   Schema,
   Semaphore,
@@ -755,7 +754,7 @@ export function hasResidentTermOverviews(ranges: ReadonlyArray<typeof TermProjec
   );
 }
 
-const readTermProjectionFragment = Effect.fn("kannin.readTermProjectionFragment")(
+export const readTermProjections = Effect.fn("kannin.readTermProjections")(
   (
     ranges: ReadonlyArray<typeof TermProjectionRange.Type>,
     terms: string,
@@ -1130,36 +1129,6 @@ const readTermProjectionFragment = Effect.fn("kannin.readTermProjectionFragment"
     }),
 );
 
-export const readTermProjections = Effect.fn("kannin.readTermProjections")(
-  (
-    ranges: ReadonlyArray<typeof TermProjectionRange.Type>,
-    terms: string,
-    filters: string,
-    ctx: ExecutionContext,
-  ) =>
-    Effect.gen(function* () {
-      if (ranges.length <= 8) return yield* readTermProjectionFragment(ranges, terms, filters, ctx);
-      const started = yield* Clock.currentTimeNanos;
-      const fragments = yield* Effect.forEach(
-        Array.from({ length: Math.ceil(ranges.length / 8) }, (_, index) =>
-          ranges.slice(index * 8, index * 8 + 8),
-        ),
-        (fragment) => readTermProjectionFragment(fragment, terms, filters, ctx),
-        { concurrency: 1 },
-      );
-      const elapsed = Number((yield* Clock.currentTimeNanos) - started) / 1e6;
-      return {
-        catalogs: fragments.flatMap((fragment) => fragment.catalogs),
-        telemetry: EffectRecord.map(CatalogTelemetry.fields, (_, field) => {
-          if (field === "totalMs") return elapsed;
-          const values = fragments.map((fragment) => fragment.telemetry[field]);
-          if (field === "r2Peak") return Math.max(...values);
-          return values.reduce((total, value) => total + value, 0);
-        }),
-      };
-    }),
-);
-
 function rememberTermCatalog(identity: string, value: typeof CachedTermCatalog.Type) {
   const encoded = encodeCachedTermCatalog(value);
   const bytes =
@@ -1225,16 +1194,11 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
         sourceApiHits: 0,
         sourceFallbacks: 0,
       };
-      const full = Math.floor(ranges.length / 128) * 128;
-      const offsets = [
-        ...Array.from({ length: full / 16 }, (_, index) => ({ offset: index * 16, size: 16 })),
-        ...Array.from({ length: Math.ceil((ranges.length - full) / 8) }, (_, index) => ({
-          offset: full + index * 8,
-          size: 8,
-        })),
-      ];
-      const windows = offsets.map(({ offset, size }) =>
-        EffectArray.zip(ranges.slice(offset, offset + size), terms.slice(offset, offset + size)),
+      const windows = Array.from({ length: Math.ceil(ranges.length / 8) }, (_, index) =>
+        EffectArray.zip(
+          ranges.slice(index * 8, index * 8 + 8),
+          terms.slice(index * 8, index * 8 + 8),
+        ),
       );
       const batches = yield* Effect.forEach(
         windows,

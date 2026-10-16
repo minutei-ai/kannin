@@ -101,11 +101,12 @@ const directories = new Map<string, { directory: Directory; bytes: number }>();
 const decodedBudget = { bytes: 0 };
 const MAX_DECODED_BYTES = 40 * 1024 * 1024;
 const MAX_DECODED_CACHE_BYTES = 20 * 1024 * 1024;
-const CachedTermCatalogs = Schema.Struct({
-  projections: Schema.Record(Schema.String, TermProjection),
-  minima: Schema.Record(Schema.String, EligibleMinimum),
-});
-const termCatalogs = new Map<string, { value: typeof CachedTermCatalogs.Type; bytes: number }>();
+const CachedTermCatalog = Schema.Union([
+  Schema.Struct({ kind: Schema.Literal("projection"), projection: TermProjection }),
+  Schema.Struct({ kind: Schema.Literal("minimum"), minimum: EligibleMinimum }),
+]);
+const encodeCachedTermCatalog = Schema.encodeSync(Schema.fromJsonString(CachedTermCatalog));
+const termCatalogs = new Map<string, { value: typeof CachedTermCatalog.Type; bytes: number }>();
 const termBudget = { bytes: 0 };
 const MAX_TERM_CACHE_BYTES = 4 * 1024 * 1024;
 const overviewBuffers = new Map<string, Uint8Array>();
@@ -1116,8 +1117,8 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
     }),
 );
 
-function rememberTermCatalogs(identity: string, value: typeof CachedTermCatalogs.Type) {
-  const encoded = Schema.encodeSync(Schema.fromJsonString(CachedTermCatalogs))(value);
+function rememberTermCatalog(identity: string, value: typeof CachedTermCatalog.Type) {
+  const encoded = encodeCachedTermCatalog(value);
   const bytes =
     4 *
       (new TextEncoder().encode(encoded).byteLength +
@@ -1188,16 +1189,30 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
           Effect.gen(function* () {
             const selected = window.map((input) => {
               const identity = `${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}`;
-              const entry = termCatalogs.get(identity);
-              if (entry !== undefined) {
-                termCatalogs.delete(identity);
-                termCatalogs.set(identity, entry);
+              const projectionIdentity = `${identity}/projection:${terms}`;
+              const minimumIdentity = `${identity}/minimum:${filters}`;
+              const projection = termCatalogs.get(projectionIdentity);
+              const minimum = termCatalogs.get(minimumIdentity);
+              if (projection !== undefined) {
+                termCatalogs.delete(projectionIdentity);
+                termCatalogs.set(projectionIdentity, projection);
+              }
+              if (minimum !== undefined) {
+                termCatalogs.delete(minimumIdentity);
+                termCatalogs.set(minimumIdentity, minimum);
               }
               return {
                 input,
-                identity,
-                projection: entry?.value.projections[terms],
-                minimum: entry?.value.minima[filters],
+                projectionIdentity,
+                minimumIdentity,
+                projection: Match.value(projection?.value).pipe(
+                  Match.when({ kind: "projection" }, (cached) => cached.projection),
+                  Match.orElse(() => undefined),
+                ),
+                minimum: Match.value(minimum?.value).pipe(
+                  Match.when({ kind: "minimum" }, (cached) => cached.minimum),
+                  Match.orElse(() => undefined),
+                ),
               };
             });
             reads.termMemoryHits += selected.filter(
@@ -1319,21 +1334,23 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
                     status: 503,
                     message: "Term projection batch added a segment",
                   });
-                if (entry.projection === undefined)
+                if (entry.projection === undefined) {
                   entry.projection = {
                     dictionary: catalog.dictionary,
                     partitions: catalog.partitions,
                   };
-                if (entry.minimum === undefined) entry.minimum = catalog.minimum;
-                const previous = termCatalogs.get(entry.identity);
-                const projections = new Map(Object.entries(previous?.value.projections ?? {}));
-                const minima = new Map(Object.entries(previous?.value.minima ?? {}));
-                projections.set(terms, entry.projection);
-                minima.set(filters, entry.minimum);
-                rememberTermCatalogs(entry.identity, {
-                  projections: Object.fromEntries(projections),
-                  minima: Object.fromEntries(minima),
-                });
+                  rememberTermCatalog(entry.projectionIdentity, {
+                    kind: "projection",
+                    projection: entry.projection,
+                  });
+                }
+                if (entry.minimum === undefined) {
+                  entry.minimum = catalog.minimum;
+                  rememberTermCatalog(entry.minimumIdentity, {
+                    kind: "minimum",
+                    minimum: entry.minimum,
+                  });
+                }
               }
             }
             return yield* Effect.forEach(selected, (entry) => {

@@ -36,7 +36,7 @@ A subsequent rare/dense native sweep encountered five strong-query 503s with the
 
 ## Run
 
-Requires Bun, Rust 1.96 with `wasm32-unknown-unknown`, and `wasm-bindgen-cli` 0.2.129.
+Requires Bun, Rust 1.96 with `wasm32-unknown-unknown`, and `wasm-bindgen-cli` 0.2.129. The WASM build enables SIMD, supported by Cloudflare Workers.
 
 ```sh
 bun install --frozen-lockfile

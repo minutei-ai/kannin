@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { Schema } from "effect";
-import { crc32, deflateSync } from "node:zlib";
+import { crc32, deflateSync, inflateSync } from "node:zlib";
 import {
   initSync,
   pack,
@@ -47,6 +47,22 @@ test("real WASM log codec survives Unicode and rejects corrupted compressed data
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   view.setUint8(12, view.getUint8(12) ^ 1);
   expect(() => unpack(bytes)).toThrow("InvalidChecksum");
+});
+
+test("WASM zlib checksums agree with the native decoder across vector and block boundaries", () => {
+  for (const length of [
+    0, 15, 16, 31, 32, 63, 64, 127, 128, 255, 4095, 4096, 5551, 5552, 5553, 65535, 65536,
+  ]) {
+    const input = "x".repeat(length);
+    const encoded = pack(input);
+    expect(inflateSync(encoded.subarray(16)).toString()).toBe(input);
+    expect(unpack(encoded)).toBe(input);
+    const corrupted = encoded.slice();
+    const view = new DataView(corrupted.buffer, corrupted.byteOffset, corrupted.byteLength);
+    const last = corrupted.byteLength - 1;
+    view.setUint8(last, view.getUint8(last) ^ 1);
+    expect(() => unpack(corrupted)).toThrow("InvalidCompression");
+  }
 });
 
 test("WASM text tokenization agrees across normalization forms", () => {

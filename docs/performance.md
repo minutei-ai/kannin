@@ -3594,3 +3594,22 @@ Diagnostic source `d738aca` passed the complete local gate (261 Worker/tooling t
 Coordinator WASM linear memory grew from 1.25 MiB before querying to 23.31 MiB after the first strong rare-16 query, 26.38 MiB after rare-64 and 30.44 MiB after the second rare-64 query. Charged retained directories stayed between 18.01 and 19.22 MiB once loaded, below the twenty-MiB quota. These observations cover WASM linear memory and charged cache retention, not whole-isolate peak heap. Unlike the failing run, this sweep began immediately after deployment without the preceding selector-churn cohorts. The overload did not recur, so its root cause remains unproven; a successful recovery sweep does not close the overload or capacity gate.
 
 Twelve Vectorize/hybrid checks on the diagnostic deployment also preserved all 105 baseline rows and scores. No automatic overload retry or cache quota change was introduced.
+
+## SIMD checksum backend on the existing compressed formats
+
+A continuous native reproduction executed the previous sequence without observer pauses: 28 changing-selector queries, a two-query cache probe with coordinator rebuilds, another 28 changing-selector queries and the sixteen-query rare/dense sweep. All 74 query responses and their metadata observations succeeded with complete expected results. Recorded coordinator WASM linear memory did not decrease between stages and peaked at 33.5 MiB. This did not reproduce the overload or identify its root cause; it does not prove whole-isolate peak heap or sustained capacity.
+
+A read-only export of the synthetic one-million-document namespace captured all 200 canonical segments (531,084,449 bytes), validating the unchanged manifest at sequence 2000 before and after export. The local mirror regenerated disposable directory/overview artifacts under its local bucket scope. An initial diagnostic profile used directory frames with missing source metadata and forced recompression; that profile is excluded from performance conclusions. After repairing the fixture metadata, a symbolized workerd CPU profile showed inflate, Adler-32 and CRC among major costs. Its diagnostic build retained Rust function names; profiling timings are not comparative latency evidence.
+
+The installed miniz library provides a SIMD Adler-32 backend. The engine now enables that native feature and compiles the WASM target with `simd128`. It retains Adler-32, CRC and all structural/size checks, using unchanged compressed formats. This uses [SIMD supported by Cloudflare Workers](https://developers.cloudflare.com/workers/runtime-apis/webassembly/), not an application checksum implementation. The built WASM changed from 803,519 to 797,035 bytes; this size difference does not prove startup latency.
+
+A non-profiled alternating comparison used independent local persistence copies and production release artifacts. Each selector ran thirty before/after pairs, resetting volatile namespace caches before each query. The first two pairs per selector were excluded from percentiles. All 120 complete query results and sequence 2000 matched the corpus oracle and each other.
+
+| Local workerd, 1M documents | Before p50/p95 ms |   SIMD p50/p95 ms | Faster paired queries |
+| --------------------------- | ----------------: | ----------------: | --------------------: |
+| Sixteen rare terms          |   526.52 / 655.42 |   504.80 / 624.53 |               18 / 28 |
+| Sixty-four rare terms       | 1165.45 / 1259.35 | 1061.76 / 1256.23 |               25 / 28 |
+
+Measured catalog RPC counts remained 84 and 252 per variant for the two selectors. Maximum observed WASM linear memory was 29.25 MiB in both variants. The p50 reductions were about 4% and 9%; the sixty-four-term p95 barely changed. Physical caches and host conditions are not production equivalents. The added codec regression checks independent native-zlib decoding and rejects altered Adler-32 tails across seventeen vector/block boundary sizes, including empty input.
+
+The complete local gate passed 262 Worker/tooling tests (9,181 assertions), 42 Rust tests, strict TypeScript/Effect lint and types, native/WASM Clippy and the production build.

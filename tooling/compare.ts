@@ -62,38 +62,45 @@ const report = await (async () => {
       `Resuming acknowledged corpus: ${prior.documents} documents, sequence ${prior.sequence}`,
     );
   }
-  for (const offset of Array.from(
-    { length: Math.ceil(size / 500) },
-    (_, ordinal) => ordinal * 500,
-  )) {
-    const documents = corpus(offset, size);
-    hash.update(JSON.stringify(documents));
-    if (Option.isNone(reuse)) {
-      const started = performance.now();
-      const response = await fetch(new URL(`/v1/namespaces/${namespace}/write`, url), {
-        method: "POST",
-        headers,
-        body: Schema.encodeSync(Schema.fromJsonString(Write))({
-          requestId: `batch-${offset}`,
-          upserts: documents,
-          deletes: [],
-        }),
-      });
-      const body = await response.text();
-      if (!response.ok) throw new Error(`Raio ingestion failed: ${response.status} ${body}`);
-      ingestion.raioMs += performance.now() - started;
+  const comparatorBatches = [];
+  const chunks = Math.ceil(size / 500);
+  const batchCount = Math.max(1, Math.floor(size / 50000));
+  for (const batch of Array.from({ length: batchCount }, (_, index) => index)) {
+    const first = Math.floor((batch * chunks) / batchCount);
+    const end = Math.floor(((batch + 1) * chunks) / batchCount);
+    const rows = [];
+    for (const offset of Array.from({ length: end - first }, (_, index) => (first + index) * 500)) {
+      const documents = corpus(offset, size);
+      hash.update(JSON.stringify(documents));
+      if (Option.isNone(reuse)) {
+        const started = performance.now();
+        const response = await fetch(new URL(`/v1/namespaces/${namespace}/write`, url), {
+          method: "POST",
+          headers,
+          body: Schema.encodeSync(Schema.fromJsonString(Write))({
+            requestId: `batch-${offset}`,
+            upserts: documents,
+            deletes: [],
+          }),
+        });
+        const body = await response.text();
+        if (!response.ok) throw new Error(`Raio ingestion failed: ${response.status} ${body}`);
+        ingestion.raioMs += performance.now() - started;
+      }
+      rows.push(
+        ...documents.map((document) => ({
+          id: document.id,
+          text: document.text,
+          title: "",
+          group: document.attributes.group,
+          year: document.attributes.year,
+        })),
+      );
+      if (offset % 5000 === 0) console.error(`Prepared ${offset + documents.length}/${size}`);
     }
     const begin = performance.now();
-    const parameters: Turbopuffer.NamespaceWriteParams = {
-      upsert_rows: documents.map((document) => ({
-        id: document.id,
-        text: document.text,
-        title: "",
-        group: document.attributes.group,
-        year: document.attributes.year,
-      })),
-    };
-    if (offset === 0)
+    const parameters: Turbopuffer.NamespaceWriteParams = { upsert_rows: rows };
+    if (batch === 0)
       parameters.schema = {
         text: {
           type: "string",
@@ -109,9 +116,15 @@ const report = await (async () => {
         group: { type: "uint" },
         year: { type: "uint" },
       };
-    await comparator.write(parameters);
+    const bytes = new TextEncoder().encode(JSON.stringify(parameters)).byteLength;
+    if (bytes > 64 * 1024 * 1024)
+      throw new Error("Comparator batch exceeds the 64 MiB request budget");
+    const written = await comparator.write(parameters, { maxRetries: 0 });
+    if (written.rows_affected !== rows.length)
+      throw new Error("Comparator acknowledged an unexpected row count");
     ingestion.turbopufferMs += performance.now() - begin;
-    if (offset % 5000 === 0) console.error(`Ingested ${offset + documents.length}/${size}`);
+    comparatorBatches.push({ rows: rows.length, bytes });
+    console.error(`Comparator acknowledged ${Math.min(end * 500, size)}/${size}`);
   }
   const metadataResponse = await fetch(new URL(`/v1/namespaces/${namespace}/metadata`, url), {
     headers,
@@ -131,22 +144,24 @@ const report = await (async () => {
   for (const attempt of Array.from({ length: 180 }, (_, index) => index)) {
     const state = await comparator.metadata();
     indexing.polls += 1;
-    if (state.index.status === "up-to-date") {
+    if (state.index.status === "up-to-date" && state.approx_row_count === size) {
       indexing.ready = true;
       break;
     }
-    console.error(`Comparator indexing status: ${state.index.status}`);
+    console.error(
+      `Comparator indexing: ${state.index.status}; rows: ${state.approx_row_count}/${size}`,
+    );
     if (attempt < 179) await Effect.runPromise(Effect.sleep("2 seconds"));
   }
   indexing.waitedMs = performance.now() - indexingStarted;
   if (!indexing.ready)
     throw new Error("Comparator did not finish indexing within observation window");
   const reports = [];
-  for (const [name, text] of [
-    ["rare", "unique42"],
-    ["selective", "group42"],
-    ["common", "cloudflare rust"],
-    ["filtered", "cloudflare"],
+  for (const [name, text, expectedRows] of [
+    ["rare", "unique42", 1],
+    ["selective", "group42", 10],
+    ["common", "cloudflare rust", 10],
+    ["filtered", "cloudflare", 10],
   ] as const) {
     const filters: Array<typeof Filter.Type> = [];
     if (name === "filtered") filters.push({ field: "group", op: "eq", value: 42 });
@@ -184,6 +199,8 @@ const report = await (async () => {
     const edgeSamples: number[] = [];
     const samples = { raio: raioSamples, edge: edgeSamples, turbopuffer: turboSamples };
     const server = [];
+    const kanninPerformance = [];
+    const signatures = new Set<string>();
     const cold = { raio: 0, edge: 0, turbopuffer: 0 };
     for (const iteration of Array.from({ length: 56 }, (_, ordinal) => ordinal)) {
       const first = performance.now();
@@ -202,7 +219,16 @@ const report = await (async () => {
         });
       const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
       const raioMs = performance.now() - first;
-      if (result.rows.length === 0) throw new Error("Empty Raio result");
+      if (
+        result.rows.length !== expectedRows ||
+        result.sequence !== metadata.sequence ||
+        result.consistency !== "strong"
+      )
+        throw new Error("Kannin strong result differs from the static benchmark contract");
+      const signature = JSON.stringify(result.rows);
+      signatures.add(signature);
+      if (signatures.size !== 1)
+        throw new Error("Kannin rows or scores changed between iterations");
       const ray = response.headers.get("cf-ray");
       if (ray !== null && ray.length > 0) rays.add(ray.split("-").at(-1) ?? ray);
       const edgeStarted = performance.now();
@@ -226,15 +252,18 @@ const report = await (async () => {
       const edge = Schema.decodeUnknownSync(QueryResult)(await edgeResponse.json());
       const edgeMs = performance.now() - edgeStarted;
       if (
-        edge.sequence < metadata.sequence ||
-        JSON.stringify(edge.rows) !== JSON.stringify(result.rows)
+        edge.sequence !== metadata.sequence ||
+        edge.consistency !== "edge-eventual" ||
+        JSON.stringify(edge.rows) !== signature
       )
         throw new Error("Edge snapshot differs from the acknowledged corpus");
+      const edgeRay = edgeResponse.headers.get("cf-ray");
+      if (edgeRay !== null && edgeRay.length > 0) rays.add(edgeRay.split("-").at(-1) ?? edgeRay);
       const second = performance.now();
       const turbo = await comparator.query(parameters);
       const turboMs = performance.now() - second;
-      if (turbo.rows === undefined || turbo.rows.length === 0)
-        throw new Error("Empty Turbopuffer result");
+      if (turbo.rows === undefined || turbo.rows.length !== expectedRows)
+        throw new Error("Comparator returned an unexpected row count");
       if (turbo.performance?.exhaustive_search_count !== 0)
         throw new Error("Comparator index readiness changed during measurement");
       if (iteration === 0) {
@@ -247,6 +276,12 @@ const report = await (async () => {
         samples.edge.push(edgeMs);
         samples.turbopuffer.push(turboMs);
         server.push(turbo.performance);
+        kanninPerformance.push({
+          strongTiming: response.headers.get("server-timing"),
+          edgeTiming: edgeResponse.headers.get("server-timing"),
+          strongRay: ray,
+          edgeRay,
+        });
       }
     }
     const percentiles = Object.fromEntries(
@@ -262,6 +297,7 @@ const report = await (async () => {
       percentiles,
       samples,
       turbopufferPerformance: server,
+      kanninPerformance,
     });
     console.error(`${name}: ${JSON.stringify(percentiles)}`);
   }
@@ -277,6 +313,8 @@ const report = await (async () => {
       serverTiming: final.headers.get("server-timing"),
     });
   const finalMetadata = Schema.decodeUnknownSync(Metadata)(await final.json());
+  if (finalMetadata.sequence !== metadata.sequence || finalMetadata.documents !== size)
+    throw new Error("The benchmark corpus changed during measurement");
   return {
     runtime: "deployed-cloudflare-vs-turbopuffer",
     namespace,
@@ -291,7 +329,7 @@ const report = await (async () => {
       turbopuffer: "strong",
     },
     concurrency: 1,
-    batchSize: 500,
+    batchSizes: { raio: 500, turbopuffer: comparatorBatches },
     samplesPerQuery: 50,
     warmupsPerQuery: 5,
     ingestion: {

@@ -47,6 +47,7 @@ import {
   SegmentCacheProps,
   Rejected,
   TextPlan,
+  type SegmentScoreBound,
 } from "./protocol";
 
 const pendingQueryPublications = new Map<string, number>();
@@ -104,7 +105,7 @@ const MAX_ENCODED_DIRECTORY_BYTES = 18 * 1024 * 1024;
 const textPlans = new Map<string, { plan: typeof TextPlan.Type; bytes: number }>();
 const textPlanBudget = { bytes: 0 };
 const MAX_TEXT_PLAN_BYTES = 1024 * 1024;
-const scoreBounds = new Map<string, number>();
+const scoreBounds = new Map<string, typeof SegmentScoreBound.Type>();
 const scoreBoundBudget = { bytes: 0 };
 const MAX_SCORE_BOUND_BYTES = 1024 * 1024;
 const admissionCounts = new Map<string, number>();
@@ -1752,22 +1753,28 @@ export function segmentScoreBound(key: string) {
   return bound;
 }
 
-export function rememberSegmentScoreBound(key: string, bound: number) {
-  const charge = key.length * 4 + 128;
-  if (charge > MAX_SCORE_BOUND_BYTES) return;
+export function rememberSegmentScoreBound(key: string, bound: typeof SegmentScoreBound.Type) {
   const prior = scoreBounds.get(key);
+  const retained = { value: bound };
+  if (
+    prior !== undefined &&
+    (prior.bound < bound.bound ||
+      (prior.bound === bound.bound && prior.minimumId >= bound.minimumId))
+  )
+    retained.value = prior;
+  const charge = (key.length + retained.value.minimumId.length) * 4 + 128;
+  if (charge > MAX_SCORE_BOUND_BYTES) return;
   if (prior !== undefined) {
     scoreBounds.delete(key);
-    scoreBounds.set(key, Math.min(prior, bound));
-    return;
+    scoreBoundBudget.bytes -= (key.length + prior.minimumId.length) * 4 + 128;
   }
   while (scoreBoundBudget.bytes + charge > MAX_SCORE_BOUND_BYTES) {
-    const oldest = scoreBounds.keys().next().value;
+    const oldest = scoreBounds.entries().next().value;
     if (oldest === undefined) break;
-    scoreBounds.delete(oldest);
-    scoreBoundBudget.bytes -= oldest.length * 4 + 128;
+    scoreBounds.delete(oldest[0]);
+    scoreBoundBudget.bytes -= (oldest[0].length + oldest[1].minimumId.length) * 4 + 128;
   }
-  scoreBounds.set(key, bound);
+  scoreBounds.set(key, retained.value);
   scoreBoundBudget.bytes += charge;
 }
 
@@ -1778,10 +1785,10 @@ export function clearImmutableCache(prefix: string) {
       textPlans.delete(key);
       textPlanBudget.bytes -= entry.bytes;
     }
-  for (const key of scoreBounds.keys())
+  for (const [key, bound] of scoreBounds)
     if (key.startsWith(`${identity}/`)) {
       scoreBounds.delete(key);
-      scoreBoundBudget.bytes -= key.length * 4 + 128;
+      scoreBoundBudget.bytes -= (key.length + bound.minimumId.length) * 4 + 128;
     }
   for (const [key, bytes] of overviewBuffers)
     if (key.startsWith(`${identity}/`)) {

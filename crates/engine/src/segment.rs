@@ -4108,6 +4108,178 @@ mod eligible_bound_tests {
 }
 
 #[cfg(test)]
+mod cutoff_certificate_tests {
+    use super::{BuiltSegment, Document, Filter, Hit, Search, Statistics, build};
+    use std::{cmp::Ordering, collections::BTreeMap};
+
+    fn fixture() -> Result<BuiltSegment, String> {
+        let documents = (0..384)
+            .map(|row| {
+                let id = match row {
+                    0 => String::from("\u{e000}"),
+                    1 => String::from("\u{10000}"),
+                    _ => format!("row-{row:03}"),
+                };
+                Document {
+                    id,
+                    revision: 0,
+                    title: "alpha ".repeat(row % 4),
+                    text: format!(
+                        "{} {}",
+                        match row % 3 {
+                            0 => "alpha beta",
+                            1 => "beta alpha",
+                            _ => "alpha padding beta",
+                        },
+                        "padding ".repeat(row % 17)
+                    ),
+                    attributes: BTreeMap::from([("group".into(), serde_json::json!(row % 2))]),
+                    vector: None,
+                }
+            })
+            .collect();
+        build(documents)
+    }
+
+    fn assert_cutoff_certificate(
+        mut search: Search,
+        built: &BuiltSegment,
+        best: &Hit,
+        base: usize,
+        score: f64,
+        id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let header = &built.header;
+        let best_id = &header.documents[best.row as usize].id;
+        let spans: Vec<_> = search
+            .posting_spans_after(score, id)?
+            .into_iter()
+            .map(|span| {
+                (
+                    span.term.to_owned(),
+                    span.blocks
+                        .iter()
+                        .map(|block| block.data.clone())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        for (word, pages) in spans {
+            for page in pages {
+                let start = base + usize::try_from(page.offset)?;
+                search.add(
+                    &word,
+                    &built.bytes[start..start + usize::try_from(page.length)?],
+                )?;
+            }
+        }
+        let mut upper = score;
+        let mut minimum_id = header
+            .documents
+            .first()
+            .ok_or("Missing source minimum")?
+            .id
+            .clone();
+        if minimum_id.encode_utf16().cmp(id.encode_utf16()) == Ordering::Less {
+            minimum_id = id.to_owned();
+        }
+        for hit in search.finish()? {
+            let hit_id = &header.documents[hit.row as usize].id;
+            match hit.score.total_cmp(&upper) {
+                Ordering::Greater => {
+                    upper = hit.score;
+                    minimum_id.clone_from(hit_id);
+                }
+                Ordering::Equal => {
+                    if hit_id.encode_utf16().cmp(minimum_id.encode_utf16()) == Ordering::Less {
+                        minimum_id.clone_from(hit_id);
+                    }
+                }
+                Ordering::Less => {}
+            }
+        }
+        assert!(
+            best.score < upper
+                || (best.score.total_cmp(&upper) == Ordering::Equal
+                    && best_id.encode_utf16().cmp(minimum_id.encode_utf16()) != Ordering::Less)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn partial_postings_certify_the_complete_score_and_utf16_tie_bound()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let built = fixture()?;
+        let header = &built.header;
+        let base = 16 + serde_json::to_vec(header)?.len();
+        let statistics = Statistics {
+            documents: u64::try_from(header.documents.len())?,
+            title_length: header.total_title_length,
+            body_length: header.total_body_length,
+            frequencies: header
+                .terms
+                .iter()
+                .map(|(word, meta)| (word.clone(), u64::from(meta.df)))
+                .collect(),
+        };
+        for mode in ["any", "all", "phrase"] {
+            for filters in [
+                Vec::new(),
+                vec![Filter {
+                    field: "group".into(),
+                    op: "eq".into(),
+                    value: serde_json::json!(1),
+                }],
+            ] {
+                for dead in [Vec::new(), (0..128).collect()] {
+                    let mut complete = Search::new(
+                        header.clone(),
+                        statistics.clone(),
+                        "alpha beta",
+                        mode,
+                        100,
+                        &dead,
+                        &filters,
+                    )?;
+                    for (word, metadata) in &header.terms {
+                        if word == "alpha" || word == "beta" {
+                            for block in &metadata.blocks {
+                                let start = base + usize::try_from(block.data.offset)?;
+                                complete.add(
+                                    word,
+                                    &built.bytes
+                                        [start..start + usize::try_from(block.data.length)?],
+                                )?;
+                            }
+                        }
+                    }
+                    let all = complete.finish()?;
+                    let best = all.first().ok_or("Missing complete hit")?;
+                    let best_id = &header.documents[best.row as usize].id;
+                    for score in [best.score - 1e-13, best.score, best.score + 1e-13] {
+                        for id in ["", "row-150", "\u{10000}", "\u{e000}", best_id.as_str()] {
+                            for top_k in [1, 10, 100] {
+                                let partial = Search::new(
+                                    header.clone(),
+                                    statistics.clone(),
+                                    "alpha beta",
+                                    mode,
+                                    top_k,
+                                    &dead,
+                                    &filters,
+                                )?;
+                                assert_cutoff_certificate(partial, &built, best, base, score, id)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod required_term_tests {
     use super::{
         Document, Posting, PostingRow, Search, Statistics, build, decode_postings, parse_header,

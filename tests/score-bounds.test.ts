@@ -6,6 +6,62 @@ import { document, request, startWorker, textQuery, write } from "./harness";
 const worker = await startWorker();
 afterAll(() => worker.dispose());
 
+test("tied score certificates prune misleading minima and preserve UTF-16 winners", async () => {
+  const suffixes = ["\uE000", "\u{10000}", "z", "y", "x", "c", "b", "a"];
+  for (const [order, ids] of [suffixes, suffixes.toReversed()].entries()) {
+    const namespace = `tied-bound-${order}`;
+    const oracle = `tied-oracle-${order}`;
+    const revisions = new Map(ids.map((id, index) => [`hit-${id}`, index + 1]));
+    const groups = ids.map((id, index) => [
+      document(`00-${index}`, "other words", { group: 0 }),
+      document(`hit-${id}`, "alpha beta", { group: 1 }),
+    ]);
+    for (const group of groups)
+      expect((await request(worker, namespace, "write", write(group))).status).toBe(200);
+    expect((await request(worker, oracle, "write", write(groups.flat()))).status).toBe(200);
+    for (const match of ["any", "all", "phrase"] as const)
+      for (const filters of [[], [{ field: "group", op: "eq", value: 1 }]]) {
+        const input = { ...textQuery("alpha beta", 1, filters), match };
+        const cold = await request(worker, namespace, "query", input);
+        expect(cold.status).toBe(200);
+        const expected = Schema.decodeUnknownSync(QueryResult)(await cold.json());
+        expect(expected.rows.map((row) => row.id)).toEqual(["hit-a"]);
+        expect(cold.headers.get("server-timing")).toContain('desc="segments=8"');
+        const warm = await request(worker, namespace, "query", input);
+        expect(warm.status).toBe(200);
+        expect(Schema.decodeUnknownSync(QueryResult)(await warm.json())).toEqual(expected);
+        expect(warm.headers.get("server-timing")).toContain('desc="segments=1"');
+        for (const topK of [3, 1, 8, 100]) {
+          const query = { ...input, topK };
+          const response = await request(worker, namespace, "query", query);
+          expect(response.status).toBe(200);
+          const actual = Schema.decodeUnknownSync(QueryResult)(await response.json());
+          const complete = await request(worker, oracle, "query", query);
+          expect(complete.status).toBe(200);
+          const unpruned = Schema.decodeUnknownSync(QueryResult)(await complete.json());
+          expect(actual.rows).toEqual(
+            unpruned.rows.map((row) => {
+              const revision = revisions.get(row.id);
+              if (revision === undefined) throw new Error("Missing source revision");
+              return Object.assign({}, row, { revision });
+            }),
+          );
+        }
+      }
+    for (const target of [namespace, oracle])
+      expect((await request(worker, target, "write", write([], ["hit-a"]))).status).toBe(200);
+    const retained = Schema.decodeUnknownSync(QueryResult)(
+      await (await request(worker, namespace, "query", textQuery("alpha beta", 3))).json(),
+    );
+    expect(retained.rows.map((row) => row.id)).toEqual(["hit-b", "hit-c", "hit-x"]);
+    expect((await request(worker, namespace, "rebuild", {})).status).toBe(200);
+    const cleared = Schema.decodeUnknownSync(QueryResult)(
+      await (await request(worker, namespace, "query", textQuery("alpha beta", 3))).json(),
+    );
+    expect(cleared).toEqual(retained);
+  }
+}, 30000);
+
 test("learned segment bounds prune dense repeats without caching result rows", async () => {
   const namespace = "learned-bounds";
   for (const segment of Array.from({ length: 12 }, (_, index) => index))

@@ -436,17 +436,22 @@ export const TextPlanIdentity = Schema.Struct({
     Schema.Struct({
       key: Root.fields.segments.value.fields.key,
       headerBytes: Root.fields.segments.value.fields.headerBytes,
+      minimumId: Root.fields.segments.value.fields.minimumId,
       count: Root.fields.segments.value.fields.count,
       dead: Root.fields.segments.value.fields.dead,
       removedFrequencies: Root.fields.segments.value.fields.removedFrequencies,
     }),
   ),
 });
+export const SegmentScoreBound = Schema.Struct({
+  bound: Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0)),
+  minimumId: Root.fields.segments.value.fields.minimumId,
+});
 export const TextPlan = Schema.Struct({
   statistics: SearchStatistics,
   segments: Schema.Array(
     Schema.Struct({
-      bound: Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0)),
+      ...SegmentScoreBound.fields,
       eligible: Schema.Boolean,
       maximumMatches: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
     }),

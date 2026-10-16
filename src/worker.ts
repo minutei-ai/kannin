@@ -655,7 +655,12 @@ async function textQuery(
           if (input.match !== "all" && input.match !== "phrase")
             matches.maximum = Math.min(liveCount, matches.union);
           if (entry.minimum === null) matches.maximum = 0;
-          return { bound, eligible: matches.maximum > 0, maximumMatches: matches.maximum };
+          return {
+            bound,
+            minimumId: entry.segment.minimumId,
+            eligible: matches.maximum > 0,
+            maximumMatches: matches.maximum,
+          };
         }),
       );
     }
@@ -681,11 +686,15 @@ async function textQuery(
     if (planned === undefined)
       throw new Rejected({ status: 503, message: "Text plan omitted a segment" });
     const identity = `${workerEnv.STORAGE_CACHE_SCOPE}:${segment.key}:${segment.headerBytes}:${Schema.encodeSync(integers)(segment.dead)}:${selection.digest}`;
-    const retained = { bound: planned.bound };
+    const retained = { bound: planned.bound, minimumId: planned.minimumId };
     if (selection.digest !== "") {
       const learned = segmentScoreBound(identity);
       if (learned !== undefined) {
-        retained.bound = Math.min(planned.bound, learned);
+        if (learned.bound < retained.bound) {
+          retained.bound = learned.bound;
+          retained.minimumId = learned.minimumId;
+        } else if (learned.bound === retained.bound && learned.minimumId > retained.minimumId)
+          retained.minimumId = learned.minimumId;
         reuse.bounds += 1;
       }
     }
@@ -695,13 +704,14 @@ async function textQuery(
       eligible: planned.eligible,
       maximumMatches: planned.maximumMatches,
       bound: retained.bound,
+      minimumId: retained.minimumId,
       identity,
     };
   });
   const prioritized = bounded.sort((left, right) => {
     if (left.bound !== right.bound) return right.bound - left.bound;
-    if (left.segment.minimumId < right.segment.minimumId) return -1;
-    if (left.segment.minimumId > right.segment.minimumId) return 1;
+    if (left.minimumId < right.minimumId) return -1;
+    if (left.minimumId > right.minimumId) return 1;
     return 0;
   });
   timings.append(
@@ -754,15 +764,12 @@ async function textQuery(
     rankingWindow.splice(width);
     scheduling.offset += rankingWindow.length;
     const cutoff = ranked[input.topK - 1];
-    const eligible = rankingWindow.filter(({ segment, eligible: allowed, bound }) => {
+    const eligible = rankingWindow.filter(({ eligible: allowed, bound, minimumId }) => {
       if (!allowed) return false;
       if (ranked.length === input.topK) {
         if (cutoff === undefined)
           throw new Rejected({ status: 503, message: "Invalid ranking cutoff" });
-        if (
-          bound + 1e-12 < cutoff.score ||
-          (bound === cutoff.score && segment.minimumId >= cutoff.id)
-        )
+        if (bound + 1e-12 < cutoff.score || (bound === cutoff.score && minimumId >= cutoff.id))
           return false;
       }
       return true;
@@ -932,9 +939,20 @@ async function textQuery(
                     const scoreStarted = yield* Clock.currentTimeNanos;
                     const hits = yield* decodeSegmentHits(ranker.finish());
                     if (selection.digest !== "") {
-                      const upper = { score: cutoff?.score ?? 0 };
-                      for (const hit of hits) upper.score = Math.max(upper.score, hit.score);
-                      rememberSegmentScoreBound(identity, upper.score);
+                      const upper = {
+                        bound: cutoff?.score ?? 0,
+                        minimumId: segment.minimumId,
+                      };
+                      if (cutoff !== undefined && cutoff.id > upper.minimumId)
+                        upper.minimumId = cutoff.id;
+                      for (const hit of hits) {
+                        if (hit.score > upper.bound) {
+                          upper.bound = hit.score;
+                          upper.minimumId = hit.id;
+                        } else if (hit.score === upper.bound && hit.id < upper.minimumId)
+                          upper.minimumId = hit.id;
+                      }
+                      rememberSegmentScoreBound(identity, upper);
                     }
                     rankMetrics.score += (yield* Clock.currentTimeNanos) - scoreStarted;
                     rankMetrics.segments += 1;
@@ -965,8 +983,13 @@ async function textQuery(
     for (const entry of prioritized) {
       const upper = segmentScoreBound(entry.identity);
       const original = plan.segments[entry.index];
-      if (upper !== undefined && original !== undefined && upper < original.bound) {
-        tightened[entry.index] = { ...original, bound: upper };
+      if (
+        upper !== undefined &&
+        original !== undefined &&
+        (upper.bound < original.bound ||
+          (upper.bound === original.bound && upper.minimumId > original.minimumId))
+      ) {
+        tightened[entry.index] = { ...original, ...upper };
         publication.improved = true;
       }
     }

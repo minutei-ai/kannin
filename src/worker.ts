@@ -220,7 +220,7 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
     if (
       request.method !== "GET" ||
       props._tag === "Failure" ||
-      url.pathname !== "/catalog-v6" ||
+      url.pathname !== "/catalog-v7" ||
       props.value.bucket !== this.env.STORAGE_CACHE_SCOPE
     )
       return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });
@@ -245,7 +245,7 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
     const cache = await Effect.runPromise(
       Effect.gen(function* () {
         if (hasResidentTermOverviews(props.value.ranges)) return undefined;
-        return yield* Effect.tryPromise(() => caches.open("raio-terms-v6")).pipe(
+        return yield* Effect.tryPromise(() => caches.open("raio-terms-v7")).pipe(
           Effect.orElseSucceed(() => undefined),
         );
       }),
@@ -632,12 +632,11 @@ async function textQuery(
     }
   }
   if (planning.value === undefined) {
-    const encodedFilters = Schema.encodeSync(TermProjectionProps.fields.filters)(input.filters);
     const projections = await Effect.runPromise(
       readTermCatalogs(
         selected,
         selections.map((candidate) => candidate.terms),
-        encodedFilters,
+        input.filters,
         timings,
       ),
     );

@@ -3,13 +3,25 @@ import { Schema } from "effect";
 import { Health, QueryResult } from "../src/protocol";
 import { document, request, startWorker, textQuery, write } from "./harness";
 
-test("filter selector eviction preserves hot immutable term projections", async () => {
+test("oversized field projections preserve hot term entries through filter selector eviction", async () => {
   const worker = await startWorker();
   await using cleanup = new AsyncDisposableStack();
   cleanup.defer(() => worker.dispose());
   for (const id of ["left", "right"])
     expect(
-      (await request(worker, "selector-churn", "write", write([document(id, "shared")]))).ok,
+      (
+        await request(
+          worker,
+          "selector-churn",
+          "write",
+          write([
+            document(id, "shared"),
+            ...Array.from({ length: 499 }, (_, index) =>
+              document(`${id}-${index}`, "filler", { group: index }),
+            ),
+          ]),
+        )
+      ).ok,
     ).toBe(true);
   const original = Schema.decodeUnknownSync(QueryResult)(
     await (await request(worker, "selector-churn", "query", textQuery("shared"))).json(),

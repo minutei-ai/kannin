@@ -17,6 +17,7 @@ import {
   BloomBatch,
   PreparedQuery,
   FrequencyPage,
+  EligibilityQuery,
 } from "../dist/wasm/raio_engine";
 import {
   StoredDocument,
@@ -24,6 +25,8 @@ import {
   SegmentHeader,
   Filter,
   TermCatalog,
+  ProjectedTermCatalog,
+  EligibilityProjection,
   TermSummaries,
   EligibleMinimum,
   RankingInput,
@@ -1128,4 +1131,82 @@ test("compact term envelopes preserve full-block maxima and filter minima exactl
       Schema.decodeSync(Schema.fromJsonString(EligibleMinimum))(directory.minimum(encodedFilters)),
     );
   }
+});
+
+test("field eligibility retains numeric wire values, missing cells and query scope", () => {
+  using segment = new Segment(
+    '[{"id":"a","revision":1,"title":"","text":"alpha","attributes":{"year":2.0}},{"id":"b","revision":1,"title":"","text":"alpha alpha","attributes":{"year":9007199254740993}},{"id":"c","revision":1,"title":"","text":"alpha","attributes":{"year":null}},{"id":"d","revision":1,"title":"","text":"alpha alpha alpha","attributes":{}}]',
+  );
+  using directory = new Directory(segment.bytes());
+  const warm = '[{"field":"year","op":"exists","value":true}]';
+  const projected = Schema.decodeSync(Schema.fromJsonString(ProjectedTermCatalog))(
+    segment_overview_project(directory.overview(), '["alpha"]', warm),
+  );
+  if (projected.eligibility === null) throw new Error("Missing eligibility projection");
+  const raw = projected.eligibility.groups.flatMap(([values]) => values.flat());
+  expect(raw).toContain("2.0");
+  expect(raw).toContain("9007199254740993");
+  const encoded = Schema.encodeSync(Schema.fromJsonString(EligibilityProjection))(
+    projected.eligibility,
+  );
+  for (const filters of [
+    '[{"field":"year","op":"eq","value":2}]',
+    '[{"field":"year","op":"ne","value":2}]',
+    '[{"field":"year","op":"eq","value":9007199254740992}]',
+    '[{"field":"year","op":"ne","value":9007199254740992}]',
+    '[{"field":"year","op":"eq","value":null}]',
+    '[{"field":"year","op":"exists","value":false}]',
+  ]) {
+    using query = new EligibilityQuery(filters);
+    expect(query.minimum(encoded)).toBe(directory.minimum(filters));
+  }
+  using query = new EligibilityQuery(warm);
+  expect(() => query.minimum(" ".repeat(4097))).toThrow();
+  expect(() =>
+    query.minimum(JSON.stringify({ ...projected.eligibility, fields: ["other"] })),
+  ).toThrow();
+  expect(() => query.minimum('{"fields":["year"],"groups":[[[["[]"]],0,0]]}')).toThrow();
+});
+
+test("oversized field projections retain the original minimum fallback", () => {
+  using segment = new Segment(
+    JSON.stringify(
+      Array.from({ length: 1000 }, (_, index) => ({
+        id: String(index),
+        revision: 1,
+        title: "",
+        text: "alpha ".repeat(1 + (index % 3)),
+        attributes: { year: index },
+      })),
+    ),
+  );
+  using directory = new Directory(segment.bytes());
+  const filters = '[{"field":"year","op":"gte","value":500}]';
+  const projected = Schema.decodeSync(Schema.fromJsonString(ProjectedTermCatalog))(
+    segment_overview_project(directory.overview(), '["alpha"]', filters),
+  );
+  expect(projected.eligibility).toBeNull();
+  expect(projected.minimum).toEqual(
+    Schema.decodeSync(Schema.fromJsonString(EligibleMinimum))(directory.minimum(filters)),
+  );
+  using large = new Segment(
+    JSON.stringify([
+      {
+        id: "large",
+        revision: 1,
+        title: "",
+        text: "alpha",
+        attributes: { note: "x".repeat(8192) },
+      },
+    ]),
+  );
+  using largeDirectory = new Directory(large.bytes());
+  const largeFilters = '[{"field":"note","op":"exists","value":true}]';
+  const largeProjection = Schema.decodeSync(Schema.fromJsonString(ProjectedTermCatalog))(
+    segment_overview_project(largeDirectory.overview(), '["alpha"]', largeFilters),
+  );
+  expect(largeProjection.eligibility).toBeNull();
+  expect(largeProjection.minimum).toEqual(
+    Schema.decodeSync(Schema.fromJsonString(EligibleMinimum))(largeDirectory.minimum(largeFilters)),
+  );
 });

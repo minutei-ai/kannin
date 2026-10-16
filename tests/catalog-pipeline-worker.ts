@@ -16,7 +16,7 @@ const opened = new WeakSet<Cache>();
 const open = caches.open.bind(caches);
 caches.open = async (name) => {
   const cache = await open(name);
-  if (name !== "raio-terms-v6" || opened.has(cache)) return cache;
+  if (name !== "raio-terms-v7" || opened.has(cache)) return cache;
   opened.add(cache);
   const match = cache.match.bind(cache);
   cache.match = (input, options) => {

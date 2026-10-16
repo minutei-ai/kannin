@@ -21,6 +21,7 @@ import {
   segment_bloom,
   BloomBatch,
   FrequencyPage,
+  EligibilityQuery,
   segment_overview_project,
   segment_correlated_overview,
 } from "../dist/wasm/raio_engine";
@@ -30,13 +31,14 @@ import {
   StoredDocument,
   SegmentHeader,
   SegmentRange,
-  TermCatalog,
+  ProjectedTermCatalog,
   TermSummaries,
   TermProjection,
   TermProjectionRange,
   CorrelatedOverview,
   CatalogTelemetry,
   EligibleMinimum,
+  EligibilityProjection,
   TermCatalogBatch,
   type OverviewBatch,
   StoredOverviewBatch,
@@ -115,6 +117,7 @@ const MAX_DECODED_CACHE_BYTES = 20 * 1024 * 1024;
 const CachedTermCatalog = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("projection"), projection: TermProjection }),
   Schema.Struct({ kind: Schema.Literal("minimum"), minimum: EligibleMinimum }),
+  Schema.Struct({ kind: Schema.Literal("eligibility"), eligibility: EligibilityProjection }),
 ]);
 const encodeCachedTermCatalog = Schema.encodeSync(Schema.fromJsonString(CachedTermCatalog));
 const termCatalogs = new Map<string, { value: typeof CachedTermCatalog.Type; bytes: number }>();
@@ -167,7 +170,7 @@ const bloomBatches = new Map<string, { batch: BloomBatch; bytes: number; prefix:
 const bloomBudget = { bytes: 0 };
 const strings = Schema.fromJsonString(Schema.Array(Schema.String));
 const encodeStrings = Schema.encodeSync(strings);
-const decodeTermCatalog = Schema.decodeEffect(Schema.fromJsonString(TermCatalog));
+const decodeTermCatalog = Schema.decodeEffect(Schema.fromJsonString(ProjectedTermCatalog));
 const decodeCatalogTelemetry = Schema.decodeEffect(Schema.fromJsonString(CatalogTelemetry));
 const correlatedOverviewJson = Schema.fromJsonString(CorrelatedOverview);
 const decodeCorrelatedOverview = Schema.decodeEffect(correlatedOverviewJson);
@@ -179,6 +182,11 @@ const decodeTermSummaries = Schema.decodeEffect(Schema.fromJsonString(TermSummar
 const decodeEligibleMinimum = Schema.decodeEffect(Schema.fromJsonString(EligibleMinimum));
 const decodeTermCatalogBatch = Schema.decodeEffect(Schema.fromJsonString(TermCatalogBatch));
 const encodeProjectionTerms = Schema.encodeSync(TermProjectionProps.fields.terms);
+const encodeEligibility = Schema.encodeSync(Schema.fromJsonString(EligibilityProjection));
+const encodeEligibilityFields = Schema.encodeSync(
+  Schema.fromJsonString(EligibilityProjection.fields.fields),
+);
+const decodeEligibilityMinimum = Schema.decodeSync(Schema.fromJsonString(EligibleMinimum));
 const storedDocumentJson = Schema.fromJsonString(StoredDocument);
 const decodeStoredDocument = Schema.decodeSync(storedDocumentJson);
 const decodeStoredDocumentEffect = Schema.decodeEffect(storedDocumentJson);
@@ -1050,7 +1058,10 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
                       const bytes = yield* Effect.try(() => directory.overview()).pipe(
                         Effect.orElseSucceed(() => undefined),
                       );
-                      return { bytes, catalog: { dictionary, minimum, partitions: null } };
+                      return {
+                        bytes,
+                        catalog: { dictionary, minimum, partitions: null, eligibility: null },
+                      };
                     }),
                   ),
                 ));
@@ -1156,12 +1167,22 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
   (
     ranges: ReadonlyArray<typeof TermProjectionRange.Type>,
     terms: ReadonlyArray<typeof TermProjectionProps.Type.terms>,
-    filters: string,
+    filters: typeof TermProjectionProps.Type.filters,
     timings: Headers,
   ) =>
     Effect.gen(function* () {
       if (ranges.length !== terms.length)
         return yield* new Rejected({ status: 503, message: "Bloom projection omitted a segment" });
+      const encodedFilters = yield* Schema.encodeEffect(TermProjectionProps.fields.filters)(
+        filters,
+      );
+      const fieldSelector = encodeEligibilityFields(
+        [...new Set(filters.map((filter) => filter.field))].toSorted(),
+      );
+      const eligibilityQuery = yield* Effect.acquireRelease(
+        Effect.sync(() => new EligibilityQuery(encodedFilters)),
+        (query) => Effect.sync(() => query.free()),
+      );
       const metrics = {
         requests: 0,
         nativeHits: 0,
@@ -1204,42 +1225,69 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
         windows,
         (window) =>
           Effect.gen(function* () {
-            const selected = window.map(([input, requested]) => {
-              const selector = encodeProjectionTerms(requested.toSorted());
-              const identity = `${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}`;
-              const projectionIdentity = `${identity}/projection:${selector}`;
-              const minimumIdentity = `${identity}/minimum:${filters}`;
-              const projection = termCatalogs.get(projectionIdentity);
-              const minimum = termCatalogs.get(minimumIdentity);
-              if (projection !== undefined) {
-                termCatalogs.delete(projectionIdentity);
-                termCatalogs.set(projectionIdentity, projection);
-              }
-              if (minimum !== undefined) {
-                termCatalogs.delete(minimumIdentity);
-                termCatalogs.set(minimumIdentity, minimum);
-              }
-              return {
-                input,
-                terms: requested,
-                projectionIdentity,
-                minimumIdentity,
-                projection: Match.value(projection?.value).pipe(
-                  Match.when({ kind: "projection" }, (cached) => cached.projection),
-                  Match.orElse(() => undefined),
-                ),
-                minimum: Match.value(minimum?.value).pipe(
-                  Match.when({ kind: "minimum" }, (cached) => cached.minimum),
-                  Match.orElse(() => undefined),
-                ),
-              };
-            });
+            const selected = yield* Effect.forEach(
+              window,
+              ([input, requested]) =>
+                Effect.gen(function* () {
+                  const selector = encodeProjectionTerms(requested.toSorted());
+                  const identity = `${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}`;
+                  const projectionIdentity = `${identity}/projection:${selector}`;
+                  const minimumIdentity = `${identity}/minimum:${encodedFilters}`;
+                  const eligibilityIdentity = `${identity}/eligibility:${fieldSelector}`;
+                  const projection = termCatalogs.get(projectionIdentity);
+                  const minimum = termCatalogs.get(minimumIdentity);
+                  if (projection !== undefined) {
+                    termCatalogs.delete(projectionIdentity);
+                    termCatalogs.set(projectionIdentity, projection);
+                  }
+                  if (minimum !== undefined) {
+                    termCatalogs.delete(minimumIdentity);
+                    termCatalogs.set(minimumIdentity, minimum);
+                  }
+                  const minimumValue = {
+                    value: Match.value(minimum?.value).pipe(
+                      Match.when({ kind: "minimum" }, (cached) => cached.minimum),
+                      Match.orElse(() => undefined),
+                    ),
+                  };
+                  if (minimumValue.value === undefined) {
+                    const cached = termCatalogs.get(eligibilityIdentity);
+                    if (cached?.value.kind === "eligibility") {
+                      const eligibility = cached.value.eligibility;
+                      const projected = yield* Effect.try(() =>
+                        decodeEligibilityMinimum(
+                          eligibilityQuery.minimum(encodeEligibility(eligibility)),
+                        ),
+                      ).pipe(Effect.option);
+                      if (Option.isSome(projected)) minimumValue.value = projected.value;
+                      if (termCatalogs.get(eligibilityIdentity) === cached) {
+                        termCatalogs.delete(eligibilityIdentity);
+                        if (Option.isSome(projected)) termCatalogs.set(eligibilityIdentity, cached);
+                        else termBudget.bytes -= cached.bytes;
+                      }
+                    }
+                  }
+                  return {
+                    input,
+                    terms: requested,
+                    projectionIdentity,
+                    minimumIdentity,
+                    eligibilityIdentity,
+                    projection: Match.value(projection?.value).pipe(
+                      Match.when({ kind: "projection" }, (cached) => cached.projection),
+                      Match.orElse(() => undefined),
+                    ),
+                    minimum: minimumValue.value,
+                  };
+                }),
+              { concurrency: 1 },
+            );
             reads.termMemoryHits += selected.filter(
               (entry) => entry.projection !== undefined && entry.minimum !== undefined,
             ).length;
             const groups = [
               {
-                filters,
+                filters: encodedFilters,
                 entries: selected.filter(
                   (entry) => entry.projection === undefined && entry.minimum === undefined,
                 ),
@@ -1251,7 +1299,7 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
                 ),
               },
               {
-                filters,
+                filters: encodedFilters,
                 entries: selected.filter(
                   (entry) => entry.projection !== undefined && entry.minimum === undefined,
                 ),
@@ -1275,7 +1323,7 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
               };
               const fetchedAt = yield* Clock.currentTimeNanos;
               const response = yield* Effect.tryPromise({
-                try: () => exports.Terms({ props }).fetch("https://terms.internal/catalog-v6"),
+                try: () => exports.Terms({ props }).fetch("https://terms.internal/catalog-v7"),
                 catch: (cause) => {
                   if (Schema.is(Rejected)(cause)) return cause;
                   return new Cause.UnknownError(cause);
@@ -1367,10 +1415,21 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
                 }
                 if (entry.minimum === undefined) {
                   entry.minimum = catalog.minimum;
-                  rememberTermCatalog(entry.minimumIdentity, {
-                    kind: "minimum",
-                    minimum: entry.minimum,
-                  });
+                  if (
+                    catalog.eligibility !== null &&
+                    encodeEligibilityFields(catalog.eligibility.fields) === fieldSelector &&
+                    new TextEncoder().encode(encodeEligibility(catalog.eligibility)).byteLength <=
+                      4096
+                  )
+                    rememberTermCatalog(entry.eligibilityIdentity, {
+                      kind: "eligibility",
+                      eligibility: catalog.eligibility,
+                    });
+                  else
+                    rememberTermCatalog(entry.minimumIdentity, {
+                      kind: "minimum",
+                      minimum: entry.minimum,
+                    });
                 }
               }
             }
@@ -1406,6 +1465,7 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
       );
       return batches.flat();
     }),
+  Effect.scoped,
 );
 
 export const storeSegmentCaches = Effect.fn("kannin.storeSegmentCaches")(

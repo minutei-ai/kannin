@@ -143,7 +143,7 @@ test("cached old segments cannot resurrect updated or deleted documents", async 
 });
 
 test("the authenticated gateway never exposes immutable cache entrypoints", async () => {
-  for (const path of ["/range", "/directory-v1", "/catalog-v6"]) {
+  for (const path of ["/range", "/directory-v1", "/catalog-v7"]) {
     const url = new URL(path, await worker.ready);
     const anonymous = await fetch(url);
     expect(anonymous.status).toBe(401);
@@ -235,9 +235,27 @@ test("term projection batches preserve global frequencies and filter eligibility
   );
   expect(after.termRequests - acquired.termRequests).toBe(17);
   expect(after.termReads - acquired.termReads).toBe(129);
-  expect(after.termBytes - acquired.termBytes).toBeLessThan(
-    (acquired.termBytes - before.termBytes) / 2,
+  expect(after.termBytes - acquired.termBytes).toBeLessThan(acquired.termBytes - before.termBytes);
+  const changedFilter = Schema.decodeUnknownSync(QueryResult)(
+    await (
+      await request(
+        worker,
+        namespace,
+        "query",
+        textQuery("shared storage", 10, [{ field: "group", op: "eq", value: 0 }]),
+      )
+    ).json(),
   );
+  expect(changedFilter.rows.map((row) => row.id)).toEqual(
+    Array.from({ length: 10 }, (_, index) => String(index * 2).padStart(3, "0")),
+  );
+  expect(changedFilter.rows.map((row) => row.score)).toEqual(first.rows.map((row) => row.score));
+  const reused = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(reused.termRequests - after.termRequests).toBe(0);
+  expect(reused.termBytes - after.termBytes).toBe(0);
+  expect(reused.termCacheBytes).toBeLessThanOrEqual(4 * 1024 * 1024);
   const changedTerms = Schema.decodeUnknownSync(QueryResult)(
     await (
       await request(
@@ -252,7 +270,7 @@ test("term projection batches preserve global frequencies and filter eligibility
   const changed = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(changed.termRequests - after.termRequests).toBe(17);
+  expect(changed.termRequests - reused.termRequests).toBe(17);
   expect(changed.termCacheBytes).toBeLessThanOrEqual(4 * 1024 * 1024);
   const repeat = Schema.decodeUnknownSync(QueryResult)(
     await (
@@ -625,8 +643,8 @@ test("term projections keep phrase order, filter eligibility and revisions query
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.termReads - before.termReads).toBe(2);
-  expect(after.termMemoryHits - before.termMemoryHits).toBe(0);
+  expect(after.termReads - before.termReads).toBe(1);
+  expect(after.termMemoryHits - before.termMemoryHits).toBe(1);
   expect(after.termCacheBytes).toBeLessThanOrEqual(4 * 1024 * 1024);
   await request(worker, namespace, "write", write([document("left", "storage", { group: 3 })]));
   const changed = Schema.decodeUnknownSync(QueryResult)(

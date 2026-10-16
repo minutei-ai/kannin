@@ -7,7 +7,7 @@ const state = { started: 0, completed: 0 };
 const opened = new WeakSet<Cache>();
 const open = caches.open.bind(caches);
 caches.open = async (name) => {
-  if (name === "kannin-text-plans-v1" || name === "raio-terms-v6")
+  if (name === "kannin-text-plans-v1" || name === "raio-terms-v7")
     return Promise.reject(new Error("Projected caches disabled for overview fixture"));
   const cache = await open(name);
   if (name !== "raio-overview-batches-v5" || opened.has(cache)) return cache;

@@ -72,6 +72,7 @@ export const Worker = Cloudflare.Worker(
     return {
       main: join(import.meta.dir, "dist/worker/worker.js"),
       bundle: false,
+      placement: { mode: "smart" },
       cache: { enabled: true, crossVersionCache: true },
       entrypoints: {
         default: { cache: { enabled: false } },

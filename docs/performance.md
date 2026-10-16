@@ -3499,3 +3499,22 @@ Native deployment `df4793db-c21b-4701-bebe-753461da78d4` used the same R2 bindin
 Eight-term responses reused catalog halves without RPCs and serve as a workload control, not a randomized control group. Cache and network conditions were uncontrolled; twelve samples make nearest-rank p95 the maximum. The lower RPC count and local speedup did not establish a native latency gain. The change was reverted, restoring eight-range caller RPCs and the previous eight-source cache fragments. Cold acquisition, whole-Worker peak heap and broad native performance remain open.
 
 The restoration was deployed from `34fd98f` as version `8de920ae-02fc-426a-a952-456bd669d387` at 100%. The rebuilt Worker and WASM matched the pre-experiment artifacts byte for byte, and the restored source/test tree matched `3dfbe49`. Forty-five focused cache/recovery tests passed, followed by sixteen native text checks and twelve Vectorize/hybrid checks preserving all 105 baseline vector rows and scores. The R2 binding and lifecycle rules were unchanged. No native latency improvement is claimed for this rejected experiment.
+
+## Reusing physical eligibility across predicate values
+
+The term L1 now retains bounded physical attribute groups by filter field set, in the same four-MiB budget as term projections and exact minima. Predicates over the same fields can reuse these groups through the Rust matcher. More than 256 groups, more than sixteen fields or a model exceeding four KiB falls back to the existing exact-filter minimum acquisition. The internal projected catalog response moves to v7; canonical R2 formats and eight-range RPC batching remain unchanged.
+
+A new workerd regression failed on the preceding build because a changed predicate issued two catalog RPCs. It now checks complete results against a compacted oracle across null/missing values, correlated fields and reordered predicates without new RPCs after initial field acquisition. Codec checks preserve integer/float representations, reject invalid models and verify oversized-model fallback. Existing tests retain exact phrase, global frequency and revision behavior and the four-MiB admission limit.
+
+A serialized alternating comparison ran 350 query pairs over 10,000 documents in 200 segments, changing an always-matching predicate value each time. Complete rows, scores and sequence 200 matched in every pair.
+
+| Local workerd    | p50 ms | p95 ms | Catalog RPCs |
+| ---------------- | -----: | -----: | -----------: |
+| Before           |  58.29 |  70.37 |        8,750 |
+| Field projection |  39.30 |  47.41 |           25 |
+
+The candidate was faster in 347 of 350 pairs. The 25 RPCs belong to initial acquisition; subsequent values reused the physical field model. These are local synthetic measurements, not native latency, ANN recall or Turbopuffer parity evidence.
+
+The local gate passed 260 Worker/tooling tests (9,110 assertions), 42 Rust tests, strict TypeScript/Effect lint and types, and native/WASM Clippy.
+
+The same deployment enables Cloudflare Smart Placement through Alchemy. It affects HTTP fetch handlers, not RPC entrypoints or Durable Object placement. Native results from this deployment include both changes and cannot isolate their individual latency effects.

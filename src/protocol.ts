@@ -342,9 +342,32 @@ export const TermProjection = Schema.Struct({
   dictionary: TermSummaries,
   partitions: Schema.NullOr(Schema.Array(TermSummaries).check(Schema.isBetweenLength(1, 32))),
 });
+const decodeEligibilityScalar = Schema.decodeExit(Schema.fromJsonString(Scalar));
+const EncodedEligibilityScalar = Schema.String.check(
+  Schema.makeFilter(
+    (value) =>
+      decodeEligibilityScalar(value)._tag === "Success" || "Expected encoded attribute scalar",
+  ),
+);
+export const EligibilityProjection = Schema.Struct({
+  fields: Schema.Array(FieldName).check(Schema.isMaxLength(16)),
+  groups: Schema.Array(
+    Schema.Tuple([
+      Schema.Array(Schema.Array(EncodedEligibilityScalar).check(Schema.isMaxLength(1))).check(
+        Schema.isMaxLength(16),
+      ),
+      SegmentBlock.fields.min_title_length,
+      SegmentBlock.fields.min_body_length,
+    ]),
+  ).check(Schema.isBetweenLength(1, 256)),
+});
 export const TermCatalog = TermProjection.mapFields((fields) => ({
   ...fields,
   minimum: EligibleMinimum,
+}));
+export const ProjectedTermCatalog = TermCatalog.mapFields((fields) => ({
+  ...fields,
+  eligibility: Schema.NullOr(EligibilityProjection),
 }));
 export const CatalogTelemetry = Schema.Struct({
   memoryHits: Schema.Int,
@@ -371,7 +394,9 @@ export const CatalogTelemetry = Schema.Struct({
   cacheMatchMs: Schema.Finite,
   totalMs: Schema.Finite,
 });
-export const TermCatalogBatch = Schema.Array(TermCatalog).check(Schema.isBetweenLength(1, 16));
+export const TermCatalogBatch = Schema.Array(ProjectedTermCatalog).check(
+  Schema.isBetweenLength(1, 16),
+);
 export const OverviewBatch = Schema.Array(Schema.Uint8ArrayFromBase64)
   .check(Schema.isBetweenLength(1, 16))
   .check(

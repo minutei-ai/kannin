@@ -1949,9 +1949,178 @@ pub mod wasm {
 
     #[derive(Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
+    struct EligibilityProjection {
+        fields: Vec<String>,
+        groups: Vec<(Vec<Vec<String>>, u32, u32)>,
+    }
+
+    struct EligibilityProjectionBuilder {
+        fields: Vec<String>,
+        groups: Option<BTreeMap<String, (u32, u32)>>,
+        bytes: usize,
+    }
+
+    impl EligibilityProjectionBuilder {
+        fn new(fields: Vec<String>) -> Result<Self, String> {
+            let bytes = serde_json::to_vec(&fields)
+                .map_err(|cause| cause.to_string())?
+                .len()
+                + 40;
+            let groups = if fields.is_empty() {
+                None
+            } else {
+                Some(BTreeMap::new())
+            };
+            Ok(Self {
+                fields,
+                groups,
+                bytes,
+            })
+        }
+
+        fn push(
+            &mut self,
+            attributes: &BTreeMap<String, serde_json::Value>,
+            title: u32,
+            body: u32,
+        ) -> Result<(), String> {
+            let Some(groups) = &mut self.groups else {
+                return Ok(());
+            };
+            if self
+                .fields
+                .iter()
+                .filter_map(|field| attributes.get(field))
+                .any(|value| value.is_array() || value.is_object())
+                || self
+                    .fields
+                    .iter()
+                    .filter_map(|field| attributes.get(field))
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::len)
+                    .sum::<usize>()
+                    > 4096
+            {
+                self.groups = None;
+                return Ok(());
+            }
+            let values: Vec<Vec<_>> = self
+                .fields
+                .iter()
+                .map(|field| {
+                    attributes
+                        .get(field)
+                        .map(serde_json::to_string)
+                        .transpose()
+                        .map(|value| value.into_iter().collect())
+                })
+                .collect::<Result<_, _>>()
+                .map_err(|cause| cause.to_string())?;
+            let key = serde_json::to_string(&values).map_err(|cause| cause.to_string())?;
+            if let Some((minimum_title, minimum_body)) = groups.get_mut(&key) {
+                *minimum_title = (*minimum_title).min(title);
+                *minimum_body = (*minimum_body).min(body);
+            } else {
+                self.bytes += key.len() + 32;
+                if groups.len() >= 256 || self.bytes > 4096 {
+                    self.groups = None;
+                    return Ok(());
+                }
+                groups.insert(key, (title, body));
+            }
+            Ok(())
+        }
+
+        fn finish(self) -> Result<Option<EligibilityProjection>, String> {
+            let Some(groups) = self.groups else {
+                return Ok(None);
+            };
+            let groups = groups
+                .into_iter()
+                .map(|(values, (title, body))| {
+                    serde_json::from_str(&values)
+                        .map(|values| (values, title, body))
+                        .map_err(|cause| cause.to_string())
+                })
+                .collect::<Result<_, _>>()?;
+            Ok(Some(EligibilityProjection {
+                fields: self.fields,
+                groups,
+            }))
+        }
+    }
+
+    #[wasm_bindgen]
+    pub struct EligibilityQuery {
+        filters: Vec<Filter>,
+        fields: Vec<String>,
+    }
+
+    #[wasm_bindgen]
+    impl EligibilityQuery {
+        #[wasm_bindgen(constructor)]
+        #[doc = "# Errors\nRejects invalid filters or more than sixteen predicates."]
+        pub fn new(filters: &str) -> Result<Self, JsValue> {
+            let filters: Vec<Filter> = serde_json::from_str(filters)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            if filters.len() > 16 {
+                return Err(JsValue::from_str("Eligibility exceeds sixteen filters"));
+            }
+            let fields = filters
+                .iter()
+                .map(|filter| filter.field.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            Ok(Self { filters, fields })
+        }
+
+        #[doc = "# Errors\nRejects oversized, malformed or differently scoped eligibility projections."]
+        pub fn minimum(&self, projection: &str) -> Result<String, JsValue> {
+            if projection.len() > 4096 {
+                return Err(JsValue::from_str("Eligibility projection exceeds four KiB"));
+            }
+            let projection: EligibilityProjection = serde_json::from_str(projection)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            if projection.fields != self.fields
+                || projection.groups.is_empty()
+                || projection.groups.len() > 256
+            {
+                return Err(JsValue::from_str("Eligibility projection scope mismatch"));
+            }
+            let mut minimum = None;
+            for (values, title, body) in projection.groups {
+                if values.len() != self.fields.len() || values.iter().any(|value| value.len() > 1) {
+                    return Err(JsValue::from_str("Eligibility projection omitted a field"));
+                }
+                let mut attributes = BTreeMap::new();
+                for (field, values) in self.fields.iter().zip(values) {
+                    if let Some(value) = values.into_iter().next() {
+                        let value: serde_json::Value = serde_json::from_str(&value)
+                            .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+                        if value.is_array() || value.is_object() {
+                            return Err(JsValue::from_str("Eligibility value must be scalar"));
+                        }
+                        attributes.insert(field.clone(), value);
+                    }
+                }
+                if matches(&attributes, &self.filters).map_err(|cause| JsValue::from_str(&cause))? {
+                    minimum = Some(match minimum {
+                        Some((a, b)) => (title.min(a), body.min(b)),
+                        None => (title, body),
+                    });
+                }
+            }
+            serde_json::to_string(&minimum).map_err(|cause| JsValue::from_str(&cause.to_string()))
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct Overview {
         dictionary: BTreeMap<String, TermSummary>,
         minimum: Option<(u32, u32)>,
+        eligibility: Option<EligibilityProjection>,
         partitions: Option<Vec<BTreeMap<String, TermSummary>>>,
     }
 
@@ -2142,10 +2311,15 @@ pub mod wasm {
         }
     }
 
+    struct EligibleSelection {
+        minimum: Option<(u32, u32)>,
+        projection: Option<EligibilityProjection>,
+    }
+
     struct EligibleGroups<'a>(&'a [Filter]);
 
     impl<'de> serde::de::DeserializeSeed<'de> for EligibleGroups<'_> {
-        type Value = Option<(u32, u32)>;
+        type Value = EligibleSelection;
 
         fn deserialize<D: serde::Deserializer<'de>>(
             self,
@@ -2156,7 +2330,7 @@ pub mod wasm {
     }
 
     impl<'de> serde::de::Visitor<'de> for EligibleGroups<'_> {
-        type Value = Option<(u32, u32)>;
+        type Value = EligibleSelection;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             formatter.write_str("attribute groups with minimum document lengths")
@@ -2167,12 +2341,19 @@ pub mod wasm {
             mut sequence: A,
         ) -> Result<Self::Value, A::Error> {
             let mut minimum = None;
-            let fields = self.0.iter().map(|filter| filter.field.as_str()).collect();
+            let fields: BTreeSet<_> = self.0.iter().map(|filter| filter.field.as_str()).collect();
+            let mut groups = EligibilityProjectionBuilder::new(
+                fields.iter().map(|field| (*field).to_owned()).collect(),
+            )
+            .map_err(serde::de::Error::custom)?;
             let mut present = false;
             while let Some((attributes, title, body)) =
                 sequence.next_element_seed(SelectedGroup(&fields))?
             {
                 present = true;
+                groups
+                    .push(&attributes, title, body)
+                    .map_err(serde::de::Error::custom)?;
                 if matches(&attributes, self.0).map_err(serde::de::Error::custom)? {
                     minimum = Some(match minimum {
                         Some((minimum_title, minimum_body)) => {
@@ -2186,9 +2367,15 @@ pub mod wasm {
                 return Err(serde::de::Error::custom("Overview eligibility is empty"));
             }
             if self.0.is_empty() {
-                return Ok(Some((0, 0)));
+                return Ok(EligibleSelection {
+                    minimum: Some((0, 0)),
+                    projection: None,
+                });
             }
-            Ok(minimum)
+            Ok(EligibleSelection {
+                minimum,
+                projection: groups.finish().map_err(serde::de::Error::custom)?,
+            })
         }
     }
 
@@ -2272,6 +2459,7 @@ pub mod wasm {
         ) -> Result<Self::Value, A::Error> {
             let mut dictionary = None;
             let mut minimum = None;
+            let mut eligibility = None;
             let mut partitions = None;
             while let Some(field) = map.next_key::<OverviewField>()? {
                 match field {
@@ -2293,13 +2481,16 @@ pub mod wasm {
                         if minimum.is_some() {
                             return Err(serde::de::Error::duplicate_field("eligibility"));
                         }
-                        minimum = Some(map.next_value_seed(EligibleGroups(self.filters))?);
+                        let selected = map.next_value_seed(EligibleGroups(self.filters))?;
+                        minimum = Some(selected.minimum);
+                        eligibility = selected.projection;
                     }
                 }
             }
             Ok(Overview {
                 dictionary: dictionary
                     .ok_or_else(|| serde::de::Error::missing_field("dictionary"))?,
+                eligibility,
                 minimum: minimum.ok_or_else(|| serde::de::Error::missing_field("eligibility"))?,
                 partitions: partitions
                     .ok_or_else(|| serde::de::Error::missing_field("partitions"))?,

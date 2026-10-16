@@ -40,6 +40,8 @@ Decoded-directory admission now retains useful headers within the existing **20 
 
 Compact directory frames reduced first-query local medians with empty Worker caches from **1,273 → 1,103 ms** for sixteen rare terms and **2,483 → 2,033 ms** for sixty-four. All 48 complete responses matched. This uses three fresh workerd processes per variant/selector with an existing R2 dataset; it does not establish fully cold Cloudflare R2 latency. [Cold-read method and limits](docs/performance.md#compact-directory-frames-for-the-first-read).
 
+The deployed WASM API also retained all 168 complete responses across Cloudflare cohorts. Repeated warm strong-query medians fell from **347 → 234 ms** for sixteen rare terms and **475 → 304 ms** for sixty-four; dense-query tail outliers remain. [Production validation](docs/performance.md#cloudflare-validation-of-compact-directories).
+
 Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10**, with the entire 300-query report unchanged. Twelve native Vectorize/hybrid checks preserved 105 complete rows and scores across three 100-vector fixtures; large-corpus ANN recall remains unmeasured.
 
 A subsequent rare/dense native sweep encountered five strong-query 503s with the Durable Object overload flag; later queries recovered without deployment, and the cause remains unresolved. Cold broad queries have reached the 30-second edge lease in earlier trials. Peak whole-Worker heap and cold-tail reliability remain open. The earlier fully indexed sequential comparison measured p50 **175–178 ms strong**, **127–130 ms edge** and **45–47 ms Turbopuffer strong**, with Kannin ingress in MIA and Turbopuffer in `aws-sa-east-1`. Different placement and consistency prevent a parity claim.

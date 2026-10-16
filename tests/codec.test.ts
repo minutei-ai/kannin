@@ -261,6 +261,22 @@ test("overview projection validates unrequested values and rejects malformed roo
   }
 });
 
+test("overview projection rejects invalid UTF-8 inside unrequested dictionary keys", () => {
+  const json =
+    '{"dictionary":{"unused":{"df":1,"bounds":[]}},"eligibility":[[{},0,0]],"partitions":null}';
+  for (const invalid of [[0x80], [0xc0, 0xaf], [0xed, 0xa0, 0x80], [0xf4, 0x90, 0x80, 0x80]]) {
+    const data = new TextEncoder().encode(json);
+    data.set(invalid, json.indexOf("unused"));
+    const compressed = deflateSync(data);
+    const bytes = new Uint8Array(8 + compressed.byteLength);
+    const frame = new DataView(bytes.buffer);
+    frame.setUint32(0, data.byteLength, true);
+    frame.setUint32(4, crc32(data), true);
+    bytes.set(compressed, 8);
+    expect(() => segment_overview_project(bytes, '["wanted"]', "[]")).toThrow();
+  }
+});
+
 test("overview partitions validate every summary while projecting in one pass", () => {
   const summary = { df: 2, bounds: [[1, 1, 2, 4]] } as const;
   const terms = JSON.stringify(["wanted"]);

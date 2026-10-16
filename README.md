@@ -30,6 +30,8 @@ Source `d3caa42` removes a duplicate exact catalog cache and retains native Work
 
 The SIMD checksum backend reduced native Durable Object CPU p50 from **250 to 224 ms** for sixteen rare terms and **437 to 385 ms** for sixty-four terms, with identical results. HTTP p50 did not improve in that comparison. [CPU and latency evidence](docs/performance.md#simd-checksum-backend-on-the-existing-compressed-formats).
 
+An isolated Worker/DO/Container prototype measured **174–175 ms warm HTTP p50** on two fixed-snapshot selectors, preserving IDs and scores. Full API integration, cold latency and cost remain delivery gates. [Experimental Container evidence](docs/performance.md#native-container-feasibility-isolated-probe).
+
 Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10**, with the entire 300-query report unchanged. Twelve native Vectorize/hybrid checks preserved 105 complete rows and scores across three 100-vector fixtures; large-corpus ANN recall remains unmeasured.
 
 A subsequent rare/dense native sweep encountered five strong-query 503s with the Durable Object overload flag; later queries recovered without deployment, and the cause remains unresolved. Cold broad queries have reached the 30-second edge lease in earlier trials. Peak whole-Worker heap and cold-tail reliability remain open. The earlier fully indexed sequential comparison measured p50 **175–178 ms strong**, **127–130 ms edge** and **45–47 ms Turbopuffer strong**, with Kannin ingress in MIA and Turbopuffer in `aws-sa-east-1`. Different placement and consistency prevent a parity claim.

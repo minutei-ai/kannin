@@ -3036,3 +3036,28 @@ The standard load ran twice at one million documents and sequence 2,000. Every o
 | Bulk map, repeat         |          16 |  50.18 | 199.38 |     138.32 |
 
 First/repeat maxima were 742.94/744.02 ms. The repeat had lower p50/p95 and higher measured throughput than the preceding repeat at each level; the first run had a slightly higher concurrency-sixteen p95. Cache state, I/O and scheduling are uncontrolled between versions. They do not isolate the bulk-map CPU gain, establish sustained throughput or prove Turbopuffer parity. Broad cold-query stalls, large-corpus ANN recall and whole-Worker peak heap remain open.
+
+## Rejected declared-output ceilings for dynamic page inflation
+
+The existing dynamic miniz decoder was compared with two smaller output ceilings: the validated declared length, then that length plus 259 bytes capped by the existing sixteen-MiB maximum. Both prototypes retained dynamic Vec growth, zlib Adler-32, actual-length equality and CRC. They did not use the fixed-slice implementation rejected earlier. The 259-byte variant was motivated by the resolved miniz_oxide 0.9.1 fast loop, which requires that much output room for a literal plus a maximum-length match. It was a measured hypothesis, not an adopted constant.
+
+A native allocation inspection showed that the exact ceiling reduced a 1,025-byte incompressible page's output capacity from 2,072 to 1,025 bytes, and a 65,537-byte page's capacity from 131,116 to 65,537 bytes. Highly compressible cases often retained the same capacity because Vec growth still rounds upward. A red regression demonstrated the original initial-capacity excess; temporary tests and all existing integrity tests passed for both candidates. Capacity observations are not whole-Worker heap or latency measurements.
+
+The initial workerd probe accidentally exercised the separate log codec through pack/unpack, which does not call the changed decoder; those timings were discarded as candidate evidence. Corrected document fixtures used actual page frames and segment_document, validating complete serialized documents on every operation. Posting fixtures used fresh FrequencyPage construction or positional add, with a cached-frequency any-term control; the first encoded ranking in every request was checked against the reference.
+
+Each corrected workerd comparison alternated 25 pairs per workload, discarded five warmup pairs and retained twenty elapsed-request samples per variant. Document batches ran 2,048 operations except one-MiB cases, which ran four; posting batches ran twenty. Independent runs had different host/runtime conditions and must not be combined into a cross-run speedup claim.
+
+| Candidate          | Workload                          | Baseline p50 ms | Candidate p50 ms | Baseline p95 ms | Candidate p95 ms |
+| :----------------- | :-------------------------------- | --------------: | ---------------: | --------------: | ---------------: |
+| Exact ceiling      | Typical document                  |          27.410 |           27.151 |          39.779 |           48.061 |
+| Exact ceiling      | Four-KiB entropy document         |         110.788 |          110.177 |         189.937 |          173.040 |
+| Exact ceiling      | Fresh frequency pages and ranking |         266.845 |          261.268 |         324.514 |          323.109 |
+| Exact ceiling      | Positional phrase                 |         174.995 |          187.515 |         212.989 |          230.661 |
+| Exact ceiling      | Cached-frequency any control      |          36.581 |           32.882 |          39.719 |           40.214 |
+| With 259-byte room | Typical document                  |          25.307 |           24.622 |          25.876 |           25.353 |
+| With 259-byte room | Four-KiB entropy document         |         155.418 |          164.746 |         202.617 |          192.491 |
+| With 259-byte room | Fresh frequency pages and ranking |         162.267 |          168.888 |         184.883 |          213.338 |
+| With 259-byte room | Positional phrase                 |         169.261 |          178.401 |         186.270 |          210.495 |
+| With 259-byte room | Cached-frequency any control      |          21.065 |           23.571 |          35.564 |           36.694 |
+
+Some document modes were close, while phrase medians/tails worsened in both recorded comparisons and fresh-frequency work worsened in the padded run. The unchanged cached-frequency control also moved substantially, demonstrating residual execution/layout noise. These results do not establish a consistent speedup that justifies replacing the current decoder. Both experimental source changes and their temporary allocation test were removed, the published decoder and generated WASM restored, and the existing integrity regressions retained. No candidate was deployed and no production data, native bindings or cache budgets changed. Local emulator startup failures produced no samples; successful padded runs used fresh dedicated emulator storage directories.

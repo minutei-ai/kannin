@@ -9,17 +9,17 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 ## Performance
 
-**1,000,000 documents · deployed Cloudflare · GRU ingress · warmed edge repeat with an acknowledged sequence barrier**
+**1,000,000 documents · deployed Cloudflare · GRU ingress · edge queries with an acknowledged sequence barrier**
 
 | Concurrency | p50 ms | p95 ms | Requests/s |
 | ----------: | -----: | -----: | ---------: |
-|           1 |  49.88 |  73.37 |      18.41 |
-|           4 |  47.76 | 167.12 |      55.91 |
-|          16 |  52.64 | 401.83 |     114.14 |
+|           1 |  45.55 |  62.79 |      18.36 |
+|           4 |  49.86 | 318.35 |      44.82 |
+|          16 |  62.19 | 487.09 |      92.77 |
 
-Two post-deploy runs checked **768 responses** against strong baseline rows, scores and sequence. Each run used 128 requests per concurrency; all entered through GRU without snapshot coordinator fallback. The first run had p50 **44.59/46.72/52.13 ms** and p95 **84.59/90.29/445.65 ms** at concurrency 1/4/16. These are cache-sensitive workload observations, not sustained-capacity guarantees. Edge freshness is weaker than strong consistency.
+A post-deploy run checked **384 responses** against strong baseline rows, scores and sequence, with 128 requests per concurrency. All entered through GRU without snapshot coordinator fallback. A separate 64-query probe with fresh selectors preserved complete pre-deploy results. These are cache-sensitive workload observations, not sustained-capacity guarantees. Edge freshness is weaker than strong consistency.
 
-Catalog reads refill four concurrent tasks without waiting for a complete group. A controlled local R2-delay experiment reduced complete-query median from 1,724 to 821 ms; this is not a native Cloudflare speedup claim. Optional shared-plan lookups recover through catalog acquisition after a nominal 250 ms cache budget. Rust builds term dictionaries in bulk, reuses posting validation against exact retained headers and avoids software fused arithmetic for the fixed BM25 title weight. Isolated workerd gains and regressions are [documented](docs/performance.md); repeated complete-Worker measurements did not establish consistent end-to-end gains.
+Catalog reads refill four concurrent tasks and project resident overviews before consulting the selector Cache API. A controlled local R2-delay experiment reduced complete-query median from 1,724 to 821 ms; this is not a native Cloudflare speedup claim. Optional shared-plan lookups recover through catalog acquisition after a nominal 250 ms cache budget. Rust builds term dictionaries in bulk, reuses posting validation against exact retained headers and avoids software fused arithmetic for the fixed BM25 title weight. Isolated workerd gains and regressions are [documented](docs/performance.md); repeated complete-Worker measurements did not establish consistent end-to-end gains.
 
 Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10**, with the entire 300-query report unchanged. Twelve native Vectorize/hybrid checks preserved 105 complete rows and scores across three 100-vector fixtures; large-corpus ANN recall remains unmeasured.
 

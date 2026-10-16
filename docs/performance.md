@@ -3202,3 +3202,21 @@ An earlier weighted run hit EDQUOT in the local /tmp filesystem and its samples 
 The complete original local gate passed 238 Worker/tooling tests and 42 Rust tests, with 8,152 Bun assertions, formatting, strict Effect/Oxlint/TypeScript and native/WASM Clippy. An initial run on SSD-backed temporary storage hit the default five-second timeout in five write-heavy functional cases. After retiring only owned, rebuildable Rust scratch caches and recovering writable tmpfs storage, the same gate passed with its original timeouts and assertions.
 
 The independent SciFact rerun preserved the entire preceding 300-query report: nDCG@10 0.6730619695232347, recall@10 0.7956666666666666 and MRR@10 0.641808201058201.
+
+Alchemy deployed source `89fc6b3` with the minutei profile. Native provider reads confirmed version `9f7279bd-cc34-4da9-a322-04bb991ae9b0` at 100% and the unchanged production R2 binding. The sixteen existing strong/edge cases with 16/64 selected terms retained their complete previous rows, scores and sequence. Twelve native Vectorize/hybrid cases retained all 105 complete rows and scores in the existing three 100-vector fixtures. The canonical benchmark corpus remained one million documents at sequence 2,000.
+
+The standard native load ran before deployment and twice afterward, each with 128 requests at concurrency 1/4/16. All 768 post-deploy responses equaled their fresh strong baseline, entered through GRU and used no snapshot coordinator fallback.
+
+| Run           | Concurrency | p50 ms | p95 ms | Requests/s |
+| :------------ | ----------: | -----: | -----: | ---------: |
+| Before        |           1 |  43.31 |  65.68 |      18.25 |
+| Before        |           4 |  46.18 | 133.93 |      48.03 |
+| Before        |          16 |  57.10 | 473.69 |      86.83 |
+| After, first  |           1 |  40.73 |  56.49 |      19.96 |
+| After, first  |           4 |  45.64 | 281.50 |      52.35 |
+| After, first  |          16 |  53.02 | 367.22 |     104.58 |
+| After, repeat |           1 |  45.72 |  66.55 |      20.21 |
+| After, repeat |           4 |  45.43 |  92.44 |      70.66 |
+| After, repeat |          16 |  47.68 | 158.06 |     141.33 |
+
+Before/first/repeat maxima were 817.67/721.88/606.83 ms. The first run lowered medians at all levels but worsened concurrency-four p95. The repeat worsened concurrency-one median/p95 while lowering concurrency-four/sixteen median/p95 against the reference. No measured load response reported text_plan_cache_timeout, so these exercised cache paths do not demonstrate the injected-stall improvement in production or classify earlier cold-query lease failures. Serial deployment, warming, network and scheduling remain uncontrolled. These are short, cache-sensitive observations, not sustained capacity, peak-heap bounds, large-corpus ANN quality or Turbopuffer parity.

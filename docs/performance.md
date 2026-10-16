@@ -3149,3 +3149,24 @@ A pre-deploy load and two post-deploy loads each ran 128 requests at concurrency
 | After, repeat |          16 |  62.79 | 397.55 |     105.11 |
 
 Before/first/repeat maxima were 607.95/646.01/624.94 ms. The first post-deploy run lowered all three medians, while its p95 worsened at concurrency four/sixteen. The repeat improved concurrency-one median/p95 but worsened concurrency-sixteen median/p95 and concurrency-four p95 against the reference. Cache state, placement, scheduling and network effects remain uncontrolled; these short workloads do not isolate the scorer change or prove sustained capacity. Peak whole-Worker heap, cold-tail reliability, large-corpus ANN recall and Turbopuffer parity remain open.
+
+## Rejected native HEAD validation for strong reads
+
+A temporary Alchemy Worker referenced the existing production R2 bucket through the native `Bucket.ref` contract. Its runtime exposed only authenticated reads of the fixed benchmark namespace's root; it could not select arbitrary object keys. No new bucket, coordinator, queue or canonical writer was declared. Native provider reads confirmed the exact production bucket binding. The probe disabled Worker caching, returned private/no-store responses and exercised unauthenticated, wrong-method, unknown-route and missing-ETag rejection before each run.
+
+The experiment compared native R2 HEAD, unconditional GET with complete body consumption, and GET with `onlyIf.etagDoesNotMatch` against the existing complete strong query for `unique42`. Each of two runs rotated all four modes through thirty-two rounds, discarded eight warmup rounds and retained twenty-four samples per mode. All 256 calls entered through GRU. Root ETag and size remained identical across both runs; the body was 5,448,863 bytes. Every GET consumed exactly that size, while every HEAD and unchanged conditional GET consumed no body. All 64 complete strong results preserved the same row, score and sequence. Both final metadata checks retained one million documents at sequence 2,000.
+
+| Run    | Path        | Client p50 ms | Client p95 ms | R2 interval p50 ms | Body interval p50 ms |
+| :----- | :---------- | ------------: | ------------: | -----------------: | -------------------: |
+| First  | head        |        198.37 |        211.21 |             157.00 |                 0.00 |
+| First  | get         |        264.19 |        329.00 |             161.00 |                48.00 |
+| First  | conditional |        201.45 |        241.80 |             160.00 |                 0.00 |
+| First  | strong      |        168.97 |        192.32 |                  — |                    — |
+| Repeat | head        |        199.55 |        204.58 |             155.00 |                 0.00 |
+| Repeat | get         |        256.35 |        319.56 |             161.50 |                36.50 |
+| Repeat | conditional |        202.60 |        230.14 |             157.00 |                 0.00 |
+| Repeat | strong      |        172.00 |        187.94 |                  — |                    — |
+
+HEAD reduced transfer relative to unconditional GET, but its client median remained approximately 16.0–17.4% slower than the already-complete strong query. Conditional GET was also slower. Neither acquisition probe includes subsequent query evaluation or full Root Schema decoding, so adding that work cannot establish a gain from these samples. The alternative was rejected without changing the production request path. These observations concern an unchanged root and exercised query caches; they do not prove concurrent-write correctness for a new implementation, universal R2-versus-coordinator latency or sustained capacity. Server intervals describe elapsed native I/O, not isolated CPU.
+
+Alchemy's removal plan contained one temporary Worker deletion and two binding removals, with no bucket deletion. Destruction completed, and the native API returned WorkerNotFound for the probe. Separate native reads confirmed the unchanged production bucket binding and version `d86d0f5f-4485-4615-a46a-ac44e51f73cb` at 100%. Production code, strong-read consistency, snapshot deadlines and cache budgets were preserved.

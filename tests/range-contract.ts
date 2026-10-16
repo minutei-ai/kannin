@@ -43,3 +43,8 @@ export const DirectoryAgingResult = Schema.Struct({
   reads: CacheMetrics.fields.rangeReads,
   hits: CacheMetrics.fields.encodedDirectoryCacheHits,
 });
+
+export const DirectoryBudgetInput = Schema.Struct({
+  ...SegmentRange.fields,
+  count: RangeProbeInput.fields.count,
+});

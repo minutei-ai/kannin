@@ -9,19 +9,19 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 ## Performance
 
-**1,000,000 documents · deployed Cloudflare · MIA responses · edge reads with acknowledged sequence barrier**
+**1,000,000 documents · deployed Cloudflare · MRS responses · edge reads with acknowledged sequence barrier**
 
 | Concurrency | p50 ms |  p95 ms | Requests/s |
 | ----------: | -----: | ------: | ---------: |
-|           1 | 132.06 |  174.11 |       6.52 |
-|           4 | 132.95 |  185.30 |      24.76 |
-|          16 | 136.71 | 1148.76 |      39.33 |
+|           1 | 195.80 |  237.41 |       3.39 |
+|           4 | 246.38 |  714.47 |      12.17 |
+|          16 | 248.60 | 1138.99 |      31.48 |
 
-The latest deployed candidate preserved strong baseline rows, scores and sequence in all **384 standard load responses**, with MIA in their `CF-Ray` suffixes. Its maximum request took **1.99 s**. Earlier runs used EWR/MIA and GRU; these region and cache differences prevent attributing the new timing changes to the latest code. Local workerd measurements reduced dense seeded span-selection batch time by **65.7%** on a warmed repeated-length fixture; the warmed high-diversity filtered fixture was **1.6% slower**. Shorter warmup showed a larger regression in that fixture. These are CPU-phase measurements, not native end-to-end gains. Cold acquisition, peak memory and a fully indexed Turbopuffer comparison remain open. [Measurements and limits](docs/performance.md#reusing-dense-seed-scores-by-document-length).
+The latest deployed candidate preserved strong baseline rows, scores and sequence in all **384 standard load responses**, with MRS in their `CF-Ray` suffixes. Its maximum request took **5.31 s**. Earlier runs used EWR/MIA and GRU; these region and cache differences prevent attributing the new timing changes to the latest code. Local workerd measurements reduced dense seeded span-selection batch time by **65.7%** on a warmed repeated-length fixture; the warmed high-diversity filtered fixture was **1.6% slower**. Shorter warmup showed a larger regression in that fixture. These are CPU-phase measurements, not native end-to-end gains. Cold acquisition, peak memory and a fully indexed Turbopuffer comparison remain open. [Measurements and limits](docs/performance.md#reusing-dense-seed-scores-by-document-length).
 
 Rust now preserves document-length correlation in disposable R2 score summaries. Six fresh strong plans over the unchanged 200-segment corpus ranked **3 segments instead of 200**, preserving complete rows and scores. After alternate-mode warmups, elapsed queries changed **6.17–7.61 seconds→0.29–2.06 seconds**, a **67–96%** reduction in those samples. The first alternate-mode warmup still took **5.10 seconds**. Cache loss recovers through canonical R2; cold catalog acquisition remains a bottleneck. [Measurements and limits](docs/performance.md#correlated-length-bounds-on-immutable-segments).
 
-Catalog acquisition now overlaps four R2 summary reads per window, with a shared body budget. A measured 16-summary strong request changed **2.67→1.51 seconds**, while its edge counterpart regressed **5.62→5.93 seconds** amid slow Cache API access. Snapshot cache lookups have a **250 ms** foreground budget; canonical edge snapshot acquisition has a shared **900 ms** budget before coordinator recovery. Shared text plans and immutable catalog overview batches publish through native `waitUntil`, so these optional cache writes no longer block row delivery. Small immutable ranges can recover from a slow cached binding through R2, with bounded concurrency and explicit fallback counters. [Experiment and cache tails](docs/performance.md#catalog-acquisition-and-snapshot-cache-wait).
+Catalog acquisition now overlaps four R2 summary reads per window, with a shared body budget. A measured 16-summary strong request changed **2.67→1.51 seconds**, while its edge counterpart regressed **5.62→5.93 seconds** amid slow Cache API access. Snapshot cache lookups have a **250 ms** foreground budget; canonical edge snapshot acquisition has a shared **900 ms** budget before coordinator recovery. Shared text plans and immutable catalog overview batches publish through native `waitUntil`, so these optional cache writes no longer block row delivery. Small immutable ranges can recover from a slow cached binding through R2. Compressed headers up to two MiB can also start bounded R2 recovery after 250 ms while retaining the cache source; nonabortable losing bodies finish through native background work. Aggregate counters expose these extra reads and bytes. [Experiment and cache tails](docs/performance.md#catalog-acquisition-and-snapshot-cache-wait).
 
 An additional sixteen-rare-term edge query reached its 30-second lease limit and returned HTTP 504; an identical retry succeeded. Broad-query cold failures remain unresolved.
 
@@ -42,7 +42,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **200 Worker/tooling tests and 39 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **207 Worker/tooling tests and 39 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

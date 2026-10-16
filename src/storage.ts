@@ -1,8 +1,9 @@
-import { Cause, Clock, Effect, Match, Option, Schema, Semaphore } from "effect";
-import { env, exports } from "cloudflare:workers";
+import { Cause, Clock, Effect, Fiber, Match, Option, Schedule, Schema, Semaphore } from "effect";
+import { env, exports, waitUntil } from "cloudflare:workers";
 import {
   Segment,
   Directory,
+  directory_compress,
   segment_document,
   segment_bloom,
   BloomBatch,
@@ -74,6 +75,8 @@ const MAX_PENDING_RANGES = 64;
 const SMALL_RANGE_LIMIT = 64 * 1024;
 const SMALL_RANGE_BODY_UNIT = 64 * 1024;
 const smallRangeReads = Semaphore.makeUnsafe(64);
+const MAX_DIRECTORY_FALLBACK_LENGTH = 2 * 1024 * 1024;
+const directoryFallbackReads = Semaphore.makeUnsafe(1);
 const budget = { bytes: 0, payloadBytes: 0 };
 const MAX_CACHE_BYTES = 12 * 1024 * 1024;
 const encodedDirectories = new Map<string, Uint8Array>();
@@ -123,6 +126,9 @@ const reads = {
   rangeCacheTimeouts: 0,
   rangeR2FallbackReads: 0,
   rangeR2FallbackBytes: 0,
+  directoryCacheTimeouts: 0,
+  directoryR2FallbackReads: 0,
+  directoryR2FallbackBytes: 0,
   rangeBytes: 0,
   rangeCacheHits: 0,
   directoryCacheHits: 0,
@@ -335,37 +341,87 @@ export async function range(
         return new Cause.UnknownError(cause);
       },
     });
+    const fallback = Effect.acquireUseRelease(
+      Effect.gen(function* () {
+        reads.rangeR2FallbackReads += 1;
+        if (compressedDirectory) reads.directoryR2FallbackReads += 1;
+        return yield* Effect.tryPromise(() => env.STORAGE.get(key, { range: { offset, length } }));
+      }),
+      (object) =>
+        Effect.gen(function* () {
+          if (object === null)
+            return yield* new Rejected({
+              status: 503,
+              message: "Committed R2 segment unavailable",
+            });
+          const body = yield* Effect.tryPromise(() => object.arrayBuffer());
+          reads.rangeR2FallbackBytes += body.byteLength;
+          if (body.byteLength !== length)
+            return yield* new Rejected({
+              status: 503,
+              message: "R2 range returned a truncated segment",
+            });
+          if (compressedDirectory) {
+            reads.directoryR2FallbackBytes += body.byteLength;
+            return yield* Effect.try(() => directory_compress(new Uint8Array(body)).slice());
+          }
+          return new Uint8Array(body);
+        }),
+      (object) => {
+        if (object === null || object.bodyUsed) return Effect.void;
+        return Effect.tryPromise(() => object.body.cancel()).pipe(Effect.ignore);
+      },
+    ).pipe(Effect.uninterruptible);
+    const boundedRead = Effect.gen(function* () {
+      const acquired = yield* cachedRead.pipe(Effect.timeoutOption("250 millis"));
+      if (Option.isSome(acquired)) return acquired.value;
+      reads.rangeCacheTimeouts += 1;
+      return yield* fallback;
+    });
     const bytes = await Effect.runPromise(
-      Match.value(compressedDirectory || length > SMALL_RANGE_LIMIT).pipe(
-        Match.when(true, () => cachedRead),
-        Match.orElse(() =>
-          smallRangeReads.withPermits(Math.max(1, Math.ceil((length * 4) / SMALL_RANGE_BODY_UNIT)))(
+      Match.value(compressedDirectory).pipe(
+        Match.when(true, () => {
+          if (length > MAX_DIRECTORY_FALLBACK_LENGTH) return cachedRead;
+          return Effect.raceFirst(
+            cachedRead,
             Effect.gen(function* () {
-              const acquired = yield* cachedRead.pipe(Effect.timeoutOption("250 millis"));
-              if (Option.isSome(acquired)) return acquired.value;
+              yield* Effect.sleep("250 millis");
               reads.rangeCacheTimeouts += 1;
-              reads.rangeR2FallbackReads += 1;
-              return yield* Effect.acquireUseRelease(
-                Effect.tryPromise(() => env.STORAGE.get(key, { range: { offset, length } })),
-                (object) =>
-                  Effect.gen(function* () {
-                    if (object === null)
-                      return yield* new Rejected({
-                        status: 503,
-                        message: "Committed R2 segment unavailable",
-                      });
-                    const body = yield* Effect.tryPromise(() => object.arrayBuffer());
-                    reads.rangeR2FallbackBytes += body.byteLength;
-                    return new Uint8Array(body);
-                  }),
-                (object) => {
-                  if (object === null || object.bodyUsed) return Effect.void;
-                  return Effect.tryPromise(() => object.body.cancel()).pipe(Effect.ignore);
-                },
-              ).pipe(Effect.uninterruptible);
+              reads.directoryCacheTimeouts += 1;
+              const attempt = Effect.uninterruptibleMask((restore) =>
+                Effect.gen(function* () {
+                  const recovery = yield* Effect.forkDetach(
+                    directoryFallbackReads.withPermitsIfAvailable(1)(fallback),
+                  );
+                  waitUntil(
+                    new Promise<void>((resolve) => {
+                      recovery.addObserver(() => resolve());
+                    }),
+                  );
+                  return yield* restore(Fiber.join(recovery));
+                }),
+              );
+              const recovered = yield* attempt.pipe(
+                Effect.repeat({
+                  while: Option.isNone,
+                  schedule: Schedule.spaced("50 millis").pipe(
+                    Schedule.upTo({ duration: "1 second" }),
+                  ),
+                }),
+              );
+              return yield* Option.match(recovered, {
+                onNone: () => Effect.never,
+                onSome: Effect.succeed,
+              });
             }),
-          ),
-        ),
+          );
+        }),
+        Match.orElse(() => {
+          if (length > SMALL_RANGE_LIMIT) return cachedRead;
+          return smallRangeReads.withPermits(
+            Math.max(1, Math.ceil((length * 4) / SMALL_RANGE_BODY_UNIT)),
+          )(boundedRead);
+        }),
       ),
     );
     reads.rangeBytes += bytes.byteLength;

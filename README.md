@@ -13,13 +13,15 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Concurrency | p50 ms | p95 ms | Requests/s |
 | ----------: | -----: | -----: | ---------: |
-|           1 |  45.61 |  69.49 |      18.00 |
-|           4 |  60.45 | 252.36 |      33.50 |
-|          16 |  74.62 | 523.68 |      76.04 |
+|           1 |  58.08 | 188.80 |      11.49 |
+|           4 |  59.39 | 233.64 |      34.29 |
+|          16 |  62.49 | 396.34 |      92.63 |
 
-Both post-deploy runs preserved strong baseline rows, scores and sequence in all **768 responses**, with GRU ingress and no coordinator fallback. The first run had p50 **57.75/57.90/66.07 ms** at concurrency 1/4/16; its maximum request took **996 ms**, versus **888 ms** in the repeat. Native typed-array Base64 conversions reduced local Bloom conversion costs while preserving persisted bytes. Full-query results remain mixed across concurrency levels and sensitive to cache state; the latest change does not establish a universal latency gain. [Full measurements](docs/performance.md#native-typed-array-base64-conversions-for-blooms).
+Both post-deploy runs preserved strong baseline rows, scores and sequence in all **768 responses**, with GRU ingress and no coordinator fallback. The first run had p50 **52.00/53.89/67.76 ms** at concurrency 1/4/16; its maximum request took **854 ms**, versus **1.08 s** in the repeat. Small winning document selections now admit eight readers under a 64 KiB encoded-selection limit. Full-query results remain mixed across concurrency levels and sensitive to cache state; this does not establish a universal latency gain. [Full measurements](docs/performance.md#byte-dependent-document-materialization-concurrency).
 
 Rust now carries document ranges directly through ranking. Six deployed queries returning fifty scattered documents changed from **3.12 to 1.75 seconds median**, about **44% lower**, with complete rows/scores preserved and directory reloads changing **50→0**. Both versions used GRU ingress, process-memory resets and warmed immutable sources. This is a measured workload gain, not general performance parity. [Method and limits](docs/performance.md#carrying-document-ranges-through-the-rust-ranker).
+
+Small winning document selections now use eight readers when their encoded frames total at most 64 KiB; larger selections retain four. A controlled workerd delay model reduced eight-/fifty-document query medians by **40–41%** with exact results. Three native matched pairs changed document-phase median **472→367 ms**, with one pair slightly slower; migration-warmed directories confound the full-query comparison. [Method and limits](docs/performance.md#byte-dependent-document-materialization-concurrency).
 
 A controlled workerd recovery now reads **139,941 compressed R2 bytes instead of 1,724,997 canonical header bytes**, preserving the exact data: **91.9% fewer bytes** in that path. A native 32-document fixture confirmed R2-frame reuse through the origin and direct recovery, then was reset to zero documents. Cache misses and failed publications still recover canonically; the extra lookup and indexing work are tradeoffs. [Measurements and limits](docs/performance.md#reusing-compressed-directory-frames-from-r2).
 
@@ -46,7 +48,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **223 Worker/tooling tests and 39 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **227 Worker/tooling tests and 39 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

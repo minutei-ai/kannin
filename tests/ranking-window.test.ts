@@ -57,7 +57,8 @@ test("sparse ranking overlaps reads before top-k fills within the existing four-
   expect(starts).toHaveLength(16);
   expect(starts.slice(0, 4)).toEqual([0, 0, 0, 0]);
   expect(starts.slice(4, 8)).toEqual([4, 4, 4, 4]);
-  expect(response.headers.get("x-fixture-peak")).toBe("4");
+  expect(response.headers.get("x-fixture-peak")).toBe("8");
+  expect(starts.slice(8)).toEqual(Array.from({ length: 8 }, () => 8));
   for (const segment of [0, 1, 2, 3, 4]) {
     const count = Math.min(10, 9 + segment);
     const values = Array.from({ length: count }, (_, row) =>

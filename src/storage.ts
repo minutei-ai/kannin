@@ -1271,6 +1271,11 @@ export async function readDocument(
   return decodeStoredDocument(segment_document(bytes));
 }
 
+export function documentReadConcurrency(pages: ReadonlyArray<typeof DataRange.Type>) {
+  if (pages.reduce((total, page) => total + page.length, 0) <= 64 * 1024) return 8;
+  return 4;
+}
+
 export const readDocuments = Effect.fn("raio.readDocuments")(function* (
   key: string,
   headerBytes: number,

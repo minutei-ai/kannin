@@ -87,6 +87,7 @@ import {
   bloomCandidates,
   readDocument,
   readDocuments,
+  documentReadConcurrency,
   sha256,
   clearImmutableCache,
   cacheUsage,
@@ -961,6 +962,7 @@ async function textQuery(
   timings.append("server-timing", 'text_phase;desc="documents"');
   const documentsStarted = Effect.runSync(Clock.currentTimeNanos);
   const hits = ranked.slice(0, input.topK);
+  const concurrency = documentReadConcurrency(hits.map((hit) => hit.data));
   const windows = EffectArray.chunksOf(hits, 4).flatMap((window) => {
     const first = window[0];
     if (first === undefined) return [];
@@ -980,7 +982,7 @@ async function textQuery(
   });
   const batches = await Effect.runPromise(
     Effect.gen(function* () {
-      const permits = yield* Semaphore.make(4);
+      const permits = yield* Semaphore.make(concurrency);
       return yield* Effect.forEach(
         windows,
         (window) =>
@@ -1013,7 +1015,7 @@ async function textQuery(
               }),
             );
           }),
-        { concurrency: 4 },
+        { concurrency },
       );
     }),
   );
@@ -1164,7 +1166,9 @@ async function vectorQuery(
   }
   const reconciled = Effect.runSync(Clock.currentTimeNanos);
   timings.append("server-timing", `vector_reconcile;dur=${Number(reconciled - indexEnded) / 1e6}`);
-  const windows = EffectArray.chunksOf(eligible.slice(0, input.topK), 4).flatMap((window) => {
+  const hits = eligible.slice(0, input.topK);
+  const concurrency = documentReadConcurrency(hits.map((hit) => hit.location.document.data));
+  const windows = EffectArray.chunksOf(hits, 4).flatMap((window) => {
     const first = window[0];
     if (first === undefined) return [];
     const physicalRows = window
@@ -1185,7 +1189,7 @@ async function vectorQuery(
   });
   const batches = await Effect.runPromise(
     Effect.gen(function* () {
-      const permits = yield* Semaphore.make(4);
+      const permits = yield* Semaphore.make(concurrency);
       return yield* Effect.forEach(
         windows,
         (window) =>
@@ -1218,7 +1222,7 @@ async function vectorQuery(
               }),
             );
           }),
-        { concurrency: 4 },
+        { concurrency },
       );
     }),
   );

@@ -2930,3 +2930,51 @@ Alchemy deployed the conversion change with the `minutei` profile and completed 
 | Native Base64, repeat    |          16 |  74.62 | 523.68 |      76.04 |
 
 The first conversion-version run had a 995.78 ms maximum, and the repeat had an 888.24 ms maximum. At concurrency 16, both runs had lower p95 and higher throughput than the preceding repeat, but median changes were mixed and the concurrency-four repeat regressed. These sequential measurements do not isolate conversion CPU from cache state, network delay or native scheduling. They support retaining the smaller native implementation with its controlled local conversion gain, not a general end-to-end speedup claim. Twelve native vector/hybrid checks also preserved all 105 rows and scores across the three existing 100-vector fixtures. Large-corpus ANN recall, peak Worker heap, broad cold-query tails and Turbopuffer parity remain open.
+
+## Byte-dependent document materialization concurrency
+
+A read-only probe of new sixteen- and sixty-four-term selections over the million-document corpus at sequence 2,000 preserved all sixteen strong/edge responses. Initial sixteen-term selections spent 451–873 ms materializing their ten winning documents, after catalog and posting work. Repeated selections often reported zero native-clock document time; that is cache/I/O-clock behavior, not proof of zero CPU. Catalog and posting acquisition remained substantial independent costs.
+
+Text and vector materialization now select eight shared readers only when all winning encoded frames in that branch total at most 64 KiB; larger selections retain four. Existing groups still contain at most four adjacent physical rows and never overfetch. Ranking and vector reconciliation remain at four readers. Hybrid evaluation can execute both materialization branches concurrently. The encoded-selection threshold bounds additional raw frame acquisition; it does not bound decoded response size or whole-Worker heap. The same number of winning pages is requested, and existing immutable range reuse and canonical checks remain in force.
+
+The workerd regression was red on the previous implementation: eight small scattered winners reached only four simultaneous reads. The candidate reaches eight for small text/vector selections, while large text/vector selections stay at four. Document identifiers, sequence and payloads are checked. Existing ranking-window assertions continue to verify four-way posting acquisition separately from the widened document phase.
+
+A separate alternating comparison ran both complete Worker variants against identical eight-/fifty-segment fixtures, using one winning document per segment. Only winning document range responses received an artificial 100 ms delay. Each query reset disposable namespace memory; immutable backing caches remained available. Four warmup pairs preceded ten retained pairs per scenario. All 84 full responses, including warmups, preserved rows, scores and sequence.
+
+| Scenario            | Previous query p50 ms | Candidate query p50 ms | Previous document phase p50 ms | Candidate document phase p50 ms | Previous / candidate peak readers |
+| :------------------ | --------------------: | ---------------------: | -----------------------------: | ------------------------------: | :-------------------------------- |
+| Eight small winners |                263.41 |                 156.66 |                          220.0 |                           114.5 | 4 / 8                             |
+| Fifty small winners |               1567.19 |                 917.61 |                         1414.0 |                           779.5 | 4 / 8                             |
+| Eight large winners |                293.43 |                 282.09 |                          225.0 |                           221.0 | 4 / 4                             |
+
+Small-response query medians improved by 40.5% and 41.4% in this controlled delay model. The large control kept its admission limit and similar latency. These are local workerd measurements under injected I/O delay, not native Cloudflare latency or peak-memory evidence.
+
+The complete gate passed 227 Worker/tooling tests (7,816 assertions) and 39 Rust tests, with formatting, strict Effect/Oxlint, TypeScript and native/WASM Clippy. Alchemy deployed through `minutei` and completed the vector metadata migration. Native provider reads confirmed version `e5a0d84f-e465-4912-88c4-46ebac5c45fc` at 100%, unchanged R2 binding/lifecycle and unchanged empty placement settings.
+
+A native probe used three matched pairs of fresh eight-document namespaces. Each document occupied its own segment; ids, content, revisions and statistics were identical between each pair. Both families were seeded before deployment; only the first family was queried on the previous version, and only its paired family was queried on the candidate. All six responses preserved complete rows and scores and entered through GRU. No native range, Worker Cache or Cache API hit was reported during these first queries. All six namespaces were reset afterward and verified at zero documents.
+
+| Pair | Previous document phase ms | Candidate document phase ms | Previous full query ms | Candidate full query ms |
+| ---: | -------------------------: | --------------------------: | ---------------------: | ----------------------: |
+|    1 |                        356 |                         367 |                2455.05 |                 1617.00 |
+|    2 |                        547 |                         219 |                2351.67 |                 1577.59 |
+|    3 |                        472 |                         371 |                2130.27 |                 1315.56 |
+
+Document-phase median changed from 472 to 367 ms (22.2% lower), while one pair regressed slightly. This is only three pairs with native network variation. Full-query differences cannot be attributed to wider document admission: the deployment migration warmed the candidate's directories, reducing logical range acquisitions from 24/3,560 bytes to 16/1,108 bytes. Both versions still requested eight winning document pages; the missing header reads are a cache-state difference. These logical counters are not billed R2-operation measurements.
+
+Sixteen additional strong/edge queries over the unchanged million-document corpus, including 16- and 64-term selections, all retained their saved complete rows, scores and sequence with GRU ingress. Their immutable caches had already been exercised by the earlier probe, so they are not a second independent cold-storage trial. Twelve native vector/hybrid checks also preserved all 105 rows and scores in the three existing 100-vector fixtures. These probes do not prove broad cold tails resolved, large-corpus ANN quality, peak heap or Turbopuffer parity.
+
+The standard load ran twice on the unchanged million-document corpus at sequence 2,000. All 768 responses preserved full rows, scores and sequence against fresh strong references, entered through GRU and avoided snapshot coordinator fallback.
+
+| Run                               | Concurrency | p50 ms | p95 ms | Requests/s |
+| :-------------------------------- | ----------: | -----: | -----: | ---------: |
+| Previous deployed repeat          |           1 |  45.61 |  69.49 |      18.00 |
+| Previous deployed repeat          |           4 |  60.45 | 252.36 |      33.50 |
+| Previous deployed repeat          |          16 |  74.62 | 523.68 |      76.04 |
+| Materialization candidate, first  |           1 |  52.00 |  81.49 |      16.51 |
+| Materialization candidate, first  |           4 |  53.89 | 352.28 |      39.97 |
+| Materialization candidate, first  |          16 |  67.76 | 636.65 |      75.24 |
+| Materialization candidate, repeat |           1 |  58.08 | 188.80 |      11.49 |
+| Materialization candidate, repeat |           4 |  59.39 | 233.64 |      34.29 |
+| Materialization candidate, repeat |          16 |  62.49 | 396.34 |      92.63 |
+
+First/repeat maxima were 854.19/1,075.09 ms. The concurrency-sixteen repeat had lower p95 and higher throughput than the preceding deployment, while concurrency-one latency and throughput worsened. Cache state and native network variation remain uncontrolled between versions. Retaining this change rests on bounded admission, exact results and controlled local evidence plus the small native document-phase probe; these standard load observations do not establish a uniform end-to-end gain.

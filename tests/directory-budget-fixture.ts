@@ -1,7 +1,7 @@
 import { Effect, Match, Schema } from "effect";
 import { exports } from "cloudflare:workers";
 import { Segments as CachedSegments, SearchNamespace as Namespace } from "../src/worker";
-import { range, cacheUsage } from "../src/storage";
+import { range, cacheUsage, withDirectory } from "../src/storage";
 import type { Env } from "../alchemy.run";
 import { DirectoryBudgetInput } from "./range-contract";
 
@@ -144,6 +144,22 @@ async function probe(request: Request, env: Env) {
       },
     });
   const input = Schema.decodeUnknownSync(DirectoryBudgetInput)(await request.json());
+  if (new URL(request.url).pathname === "/decoded") {
+    const before = cacheUsage();
+    return Effect.runPromise(
+      withDirectory(input.key, input.length, (directory) =>
+        Effect.sync(() => {
+          const after = cacheUsage();
+          return new Response(directory.terms('["unique3711"]'), {
+            headers: {
+              "x-directory-hits": String(after.directoryCacheHits - before.directoryCacheHits),
+              "x-directory-bytes": String(after.directoryCacheChargedBytes),
+            },
+          });
+        }),
+      ),
+    );
+  }
   if (new URL(request.url).pathname === "/origin") {
     const url = new URL("https://segments.internal/directory-v1");
     url.searchParams.set("key", input.key);

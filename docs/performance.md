@@ -3698,3 +3698,17 @@ The native reader reserves the already-known immutable range length once, after 
 Two allocation-only quarter-CPU/one-GiB comparisons observed process-cold times of 1,002/1,367 → 961/1,165 ms for sixteen terms and 3,908/3,506 → 3,067/4,067 ms for sixty-four. All 192 query projections matched oracle IDs and scores. These few fresh processes do not establish cold-tail improvements. A separate cgroup probe observed cold CPU usage of 276 → 259 ms and 988 → 815 ms; single observations and noisy warm controls prevent a general CPU or billing claim. Native HTTP SciFact validation preserved all 300 query orders/scores and recovered 3,000 checksum-validated document intervals matching corpus IDs, titles and text.
 
 Both attempted background-I/O executor configurations regressed in local quarter-CPU cold/warm comparisons and were reverted. Removing the dictionary's explicit sort/deduplication was also reverted: a forty-pair WASM parse comparison showed effectively unchanged median time and a worse p95, with unchanged linear-memory size. The runtime and dictionary representation remain unchanged. No Cloudflare deployment or native production-routing change was made in this experiment.
+
+## Reusing validated R2 directories
+
+The Worker now admits the Rust directory constructed while validating an R2 directory frame into the existing twenty-MiB decoded-directory cache. A subsequent reader in that isolate retains the validated structure instead of inflating and parsing the same frame again. Both acquisition paths use one admission owner, and active rankers retain their own handles through eviction. Oversized structures remain uncached; checksum, source identity, canonical shape and length validation remain mandatory.
+
+Two local workerd cohorts ran in reversed variant order without concurrent tests or builds. Each used 44 distinct immutable source keys containing the same 5,000-document segment, with four initial observations excluded. The segment header was 1,724,997 bytes and its prebuilt R2 frame was 140,085 bytes. Every directory result matched the existing Rust reader. The Worker stayed running, while each source started absent from its memory and Cache API caches; this measures cold in-memory directory acquisition with an existing R2 artifact, not a cold process or fully cold Cloudflare R2.
+
+| Local directory acquisition |   Before | Reused validation |
+| --------------------------- | -------: | ----------------: |
+| Observations                |       80 |                80 |
+| p50                         | 44.16 ms |          29.15 ms |
+| p95                         | 58.45 ms |          32.35 ms |
+
+Median elapsed time fell about 34%, with unchanged maximum decoded-cache charge of 20,842,990 bytes. Reuse requires validation and consumption in the same isolate; cross-isolate consumers still decode their own structures. This does not establish end-to-end production latency, CPU billing, fully cold R2 performance or Turbopuffer parity. The workerd regression checks validated-frame reuse, identical term metadata, the cache bound and absence of canonical reads; the existing directory suite covers corruption, failed publications, body admission and concurrent recovery.

@@ -310,6 +310,21 @@ export function addFrequencyPosting(
   ranker.add_frequency(term, page);
 }
 
+function rememberDirectory(identity: string, directory: Directory) {
+  if (directories.has(identity)) return;
+  const bytes = directory.heap_bytes();
+  if (bytes > MAX_DECODED_CACHE_BYTES) return;
+  while (decodedBudget.bytes + bytes > MAX_DECODED_CACHE_BYTES) {
+    const oldest = directories.entries().next().value;
+    if (oldest === undefined) break;
+    directories.delete(oldest[0]);
+    decodedBudget.bytes -= oldest[1].bytes;
+    oldest[1].directory.free();
+  }
+  directories.set(identity, { directory: directory.retain(), bytes });
+  decodedBudget.bytes += bytes;
+}
+
 export const readDirectoryFrame = Effect.fn("kannin.readDirectoryFrame")(
   (key: string, length: number) =>
     Effect.gen(function* () {
@@ -337,8 +352,8 @@ export const readDirectoryFrame = Effect.fn("kannin.readDirectoryFrame")(
           const bytes = new Uint8Array(yield* Effect.tryPromise(() => object.arrayBuffer()));
           reads.directoryR2CacheBytes += bytes.byteLength;
           const checked = yield* Effect.try(() => {
-            const directory = Directory.compressed(bytes, length);
-            directory.free();
+            using directory = Directory.compressed(bytes, length);
+            rememberDirectory(`${env.STORAGE_CACHE_SCOPE}:${key}`, directory);
             return bytes;
           }).pipe(Effect.option);
           if (Option.isSome(checked)) reads.directoryR2CacheHits += 1;
@@ -588,25 +603,15 @@ async function acquireDirectory(key: string, headerBytes: number) {
   const concurrent = directories.get(identity);
   if (concurrent !== undefined) return concurrent.directory.retain();
   const decoded = Directory.compressed(bytes, headerBytes);
-  const entry = { directory: decoded, bytes: decoded.heap_bytes() };
-  if (entry.bytes > MAX_DECODED_BYTES) {
+  if (decoded.heap_bytes() > MAX_DECODED_BYTES) {
     decoded.free();
     throw new Rejected({
       status: 503,
       message: "Segment directory exceeds the decoded-memory budget",
     });
   }
-  if (entry.bytes > MAX_DECODED_CACHE_BYTES) return decoded;
-  while (decodedBudget.bytes + entry.bytes > MAX_DECODED_CACHE_BYTES) {
-    const oldest = directories.entries().next().value;
-    if (oldest === undefined) break;
-    directories.delete(oldest[0]);
-    decodedBudget.bytes -= oldest[1].bytes;
-    oldest[1].directory.free();
-  }
-  directories.set(identity, entry);
-  decodedBudget.bytes += entry.bytes;
-  return decoded.retain();
+  rememberDirectory(identity, decoded);
+  return decoded;
 }
 
 export const withDirectory = Effect.fn("raio.withDirectory")(

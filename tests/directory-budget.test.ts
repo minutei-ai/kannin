@@ -258,6 +258,13 @@ test("segment origins validate R2 frames before publishing the native Cache API 
   expect(response.status).toBe(200);
   expect(response.headers.get("x-raio-cache")).toBe("r2-directory-hit");
   expect(new Uint8Array(await response.arrayBuffer())).toEqual(frame);
+  const decoded = await fetch(new URL("/decoded", await worker.ready), { method: "POST", body });
+  expect(decoded.status).toBe(200);
+  using expected = Directory.compressed(frame, length);
+  expect(await decoded.text()).toBe(expected.terms('["unique3711"]'));
+  expect(decoded.headers.get("x-directory-hits")).toBe("1");
+  expect(Number(decoded.headers.get("x-directory-bytes"))).toBeGreaterThan(0);
+  expect(Number(decoded.headers.get("x-directory-bytes"))).toBeLessThanOrEqual(20 * 1024 * 1024);
   expect((await fetch(new URL("/fast-origin", await worker.ready))).status).toBe(204);
   const relayed = await fetch(await worker.ready, { method: "POST", body });
   expect(relayed.status).toBe(200);

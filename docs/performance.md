@@ -3360,3 +3360,22 @@ The complete local SciFact report remained identical to the prior baseline for a
 `TMPDIR=/tmp bun run check` passed: 254 Worker/tooling tests with 8,666 assertions and 42 Rust tests, plus formatting, strict TypeScript/Effect lint, native/WASM Clippy, build and typechecking.
 
 Source commit `e87a508` deployed through Alchemy's `minutei` profile as Cloudflare version `2017af17-b348-4a5d-8ef4-bfde45450390` at 100%. The R2 binding and lifecycle rules remained unchanged. Sixteen native text responses against the existing one-million-document namespace matched complete pre-deploy rows, scores and sequence 2000, all through GRU. First-pass client latency improved in three of eight cases and regressed in five; the local projection improvement does not establish a complete-search speedup. Twelve native Vectorize/hybrid checks also preserved all 105 rows and scores across the existing three 100-vector fixtures; large-scale ANN recall remains unverified.
+
+## Manifest decoding and Bloom selection cost
+
+A local workerd diagnostic isolated manifest processing from R2/Cache API/coordination latency. Its Schema-valid synthetic root contained 200 immutable segment references and one million documents, with 5,428,726 encoded bytes. Each segment held Blooms built from 5,000 document IDs and 5,102 terms. The same physical Bloom contents were reused across segments, so this is a processing stress fixture rather than a copy of the deployed corpus. All 64 selected terms were present in every segment; every selection checked all 200 result arrays and their 64-term cardinality.
+
+Each request performed ten operations. Twenty measured requests followed four warmups per mode. Medians below divide complete client duration by ten, including amortized request/response overhead:
+
+| Operation                                                                                | Median ms / operation |
+| ---------------------------------------------------------------------------------------- | --------------------: |
+| Empty control                                                                            |                 0.080 |
+| UTF-8 decode and native JSON parse                                                       |                 2.484 |
+| UTF-8 decode and full Effect Root Schema decode                                          |                 3.100 |
+| Schema decode and Bloom selection, clearing immutable Bloom caches before each operation |                 7.101 |
+| Schema decode and resident Bloom selection                                               |                 5.793 |
+| Resident Bloom selection only                                                            |                 2.181 |
+
+These measurements do not justify changing the canonical root format or removing boundary validation to address native complete-search latencies around a second. They exclude acquisition, snapshot age checks, coordination, catalog acquisition and ranking; synthetic local CPU cost does not establish native latency attribution.
+
+A separate instrumented repeat read `Runtime.getHeapUsage` after each mode and then after explicit garbage collection enabled only in the diagnostic workerd process. After decoded-root retention and Bloom reuse, used JavaScript heap was 8,339,844 bytes and the WASM linear memory was 3,604,480 bytes. The inspector separately reported 6,183,365 backing-storage bytes; these counters must not be treated as a proven additive whole-process memory total. Uncollected JavaScript heap readings were much larger and fell after collection. The inspector's asynchronous `HeapProfiler.collectGarbage` did not settle within the diagnostic's five-second deadline; the completed repeat used workerd's exposed synchronous collector outside timed operations. This is retained state for the isolated manifest fixture, not transient peak heap, concurrent complete-query memory, a production memory bound or proof that the full Worker fits its memory limit. The full-Worker memory gate remains open. No production code, canonical format or infrastructure changed for this diagnostic.

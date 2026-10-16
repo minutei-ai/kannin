@@ -2901,3 +2901,32 @@ Each run below used the same million-document, 200-segment corpus at sequence 2,
 The first and repeated after runs had maximum requests of 1.52 seconds. The selected post-load health response retained 5,448,863 payload bytes with 21,795,676 charged bytes, three canonical reads and two revalidations, but zero late retentions. This isolate sample cannot establish that the new branch caused the observed speedup or that other isolates never used it. The new behavior has controlled local evidence; native latency remains sensitive to cache state. Concurrent snapshot acquisition and ranking preparation still have slow tails. Native clocks do not measure synchronous CPU time reliably.
 
 Twelve native Vectorize/hybrid queries over the three existing 100-vector fixtures preserved all 105 complete rows and scores relative to the previous deployment. This is small-fixture parity, not large-corpus ANN recall or Turbopuffer performance parity.
+
+## Native typed-array Base64 conversions for Blooms
+
+Bloom construction now uses `Uint8Array.toBase64()` and cold batch acquisition uses `Uint8Array.fromBase64()`. This removes the intermediate character array/join in encoding and the per-character callback in decoding. Rust hashes, bitsets, membership rules, canonical R2 representation and cache identities are unchanged. The installed TypeScript declarations and local workerd runtime expose these native APIs with the deployment's `2026-10-01` compatibility date.
+
+A local workerd harness alternated old/new operation order over 25 rounds, discarding five warmup rounds and retaining twenty samples per operation. Each request converted four deterministic bitsets of 8/1,000/10,000/20,000 bytes 64 times each (1,984,512 input bytes total). Every encoded string or decoded byte was checked against the fixture inside the measured request. Measurements use the host's elapsed request time, including dispatch, verification and response consumption, rather than a Worker clock estimate of synchronous CPU.
+
+| Operation | Previous p50 ms | Native p50 ms | Previous p95 ms | Native p95 ms |
+| :-------- | --------------: | ------------: | --------------: | ------------: |
+| Encode    |         104.349 |         1.534 |         112.139 |         1.675 |
+| Decode    |         223.842 |        31.665 |         229.234 |        32.804 |
+
+These conversion-batch medians improved by 98.5% and 85.9%; they are not full-query or native Cloudflare CPU measurements. A separate comparison ran both complete Worker variants with 4,000 documents across four segments. All eight persisted Bloom strings were identical between variants, and all 24 strong/edge query responses preserved full rows, scores and sequence across common, unique, absent, all, phrase and attribute-filter cases. The complete local gate passed 223 Worker/tooling tests with 7,745 assertions and 39 Rust tests.
+
+Alchemy deployed the conversion change with the `minutei` profile and completed its vector metadata migration. Provider reads confirmed version `8bee6826-d587-47c9-b04f-9890c5e73a41` at 100%, with the R2 binding/lifecycle and empty placement configuration preserved. The standard million-document load harness then ran twice against the unchanged sequence-2,000 corpus. All 768 complete rows/score/sequence comparisons matched strong baselines, all requests entered through GRU, and none used snapshot coordinator fallback.
+
+| Run                      | Concurrency | p50 ms | p95 ms | Requests/s |
+| :----------------------- | ----------: | -----: | -----: | ---------: |
+| Previous deployed repeat |           1 |  50.28 | 192.27 |      11.27 |
+| Previous deployed repeat |           4 |  51.84 | 153.98 |      40.93 |
+| Previous deployed repeat |          16 |  64.50 | 920.45 |      46.92 |
+| Native Base64, first     |           1 |  57.75 | 106.65 |      13.39 |
+| Native Base64, first     |           4 |  57.90 | 210.14 |      44.74 |
+| Native Base64, first     |          16 |  66.07 | 699.34 |      70.29 |
+| Native Base64, repeat    |           1 |  45.61 |  69.49 |      18.00 |
+| Native Base64, repeat    |           4 |  60.45 | 252.36 |      33.50 |
+| Native Base64, repeat    |          16 |  74.62 | 523.68 |      76.04 |
+
+The first conversion-version run had a 995.78 ms maximum, and the repeat had an 888.24 ms maximum. At concurrency 16, both runs had lower p95 and higher throughput than the preceding repeat, but median changes were mixed and the concurrency-four repeat regressed. These sequential measurements do not isolate conversion CPU from cache state, network delay or native scheduling. They support retaining the smaller native implementation with its controlled local conversion gain, not a general end-to-end speedup claim. Twelve native vector/hybrid checks also preserved all 105 rows and scores across the three existing 100-vector fixtures. Large-corpus ANN recall, peak Worker heap, broad cold-query tails and Turbopuffer parity remain open.

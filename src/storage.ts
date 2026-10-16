@@ -1169,7 +1169,7 @@ export const buildSegment = Effect.fn("raio.buildSegment")(
 
 export function bloom(values: ReadonlyArray<string>) {
   const bytes = segment_bloom(encodeStrings(values));
-  return btoa(Array.from(bytes, (byte) => String.fromCharCode(byte)).join(""));
+  return bytes.toBase64();
 }
 
 export function bloomCandidates(
@@ -1200,9 +1200,7 @@ export function bloomCandidates(
       );
       continue;
     }
-    const bitsets = window.map((segment) =>
-      Uint8Array.from(atob(segment[field]), (character) => character.charCodeAt(0)),
-    );
+    const bitsets = window.map((segment) => Uint8Array.fromBase64(segment[field]));
     const packed = new Uint8Array(bitsets.reduce((total, bytes) => total + bytes.byteLength, 0));
     const offsets = new Uint32Array(bitsets.length + 1);
     const layout = { offset: 0 };

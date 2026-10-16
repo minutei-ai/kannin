@@ -13,11 +13,11 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 | Concurrency | p50 ms | p95 ms | Requests/s |
 | ----------: | -----: | -----: | ---------: |
-|           1 |  50.28 | 192.27 |      11.27 |
-|           4 |  51.84 | 153.98 |      40.93 |
-|          16 |  64.50 | 920.45 |      46.92 |
+|           1 |  45.61 |  69.49 |      18.00 |
+|           4 |  60.45 | 252.36 |      33.50 |
+|          16 |  74.62 | 523.68 |      76.04 |
 
-The latest repeat preserved strong baseline rows, scores and sequence in all **384 responses**, with GRU ingress; its maximum request took **1.52 s**. The first run after deployment had p50 **50.87/52.34/68.17 ms** at concurrency 1/4/16. The preceding version had a concurrency-one p50 of **195.66 ms** and coordinator fallback in 126 of 128 requests. No fallback occurred in either new run, but the observed health sample did not exercise late retention: cache state and native I/O prevent attributing the latency difference to the new optimization. [Full measurements](docs/performance.md#retaining-late-canonical-snapshots-for-revalidation).
+Both post-deploy runs preserved strong baseline rows, scores and sequence in all **768 responses**, with GRU ingress and no coordinator fallback. The first run had p50 **57.75/57.90/66.07 ms** at concurrency 1/4/16; its maximum request took **996 ms**, versus **888 ms** in the repeat. Native typed-array Base64 conversions reduced local Bloom conversion costs while preserving persisted bytes. Full-query results remain mixed across concurrency levels and sensitive to cache state; the latest change does not establish a universal latency gain. [Full measurements](docs/performance.md#native-typed-array-base64-conversions-for-blooms).
 
 Rust now carries document ranges directly through ranking. Six deployed queries returning fifty scattered documents changed from **3.12 to 1.75 seconds median**, about **44% lower**, with complete rows/scores preserved and directory reloads changing **50→0**. Both versions used GRU ingress, process-memory resets and warmed immutable sources. This is a measured workload gain, not general performance parity. [Method and limits](docs/performance.md#carrying-document-ranges-through-the-rust-ranker).
 

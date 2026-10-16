@@ -2165,6 +2165,57 @@ pub mod wasm {
         }
     }
 
+    struct SelectedPartitions<'a>(&'a BTreeSet<String>);
+
+    impl<'de> serde::de::DeserializeSeed<'de> for SelectedPartitions<'_> {
+        type Value = Option<Vec<BTreeMap<String, TermSummary>>>;
+
+        fn deserialize<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_option(self)
+        }
+    }
+
+    impl<'de> serde::de::Visitor<'de> for SelectedPartitions<'_> {
+        type Value = Option<Vec<BTreeMap<String, TermSummary>>>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("null or one to 32 term summary partitions")
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_seq(self)
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut selected = Vec::new();
+            while let Some(group) =
+                sequence.next_element_seed(SelectedTerms { requested: self.0 })?
+            {
+                if selected.len() == 32 {
+                    return Err(serde::de::Error::custom("Invalid overview partitions"));
+                }
+                selected.push(group);
+            }
+            if selected.is_empty() {
+                return Err(serde::de::Error::custom("Invalid overview partitions"));
+            }
+            Ok(Some(selected))
+        }
+    }
+
     struct SelectedOverview<'a> {
         requested: &'a BTreeSet<String>,
         filters: &'a [Filter],
@@ -2209,33 +2260,7 @@ pub mod wasm {
                         if partitions.is_some() {
                             return Err(serde::de::Error::duplicate_field("partitions"));
                         }
-                        let raw: Option<Vec<&serde_json::value::RawValue>> = map.next_value()?;
-                        let selected = raw
-                            .map(|groups| {
-                                if groups.is_empty() || groups.len() > 32 {
-                                    return Err(serde::de::Error::custom(
-                                        "Invalid overview partitions",
-                                    ));
-                                }
-                                groups
-                                    .into_iter()
-                                    .map(|group| {
-                                        let mut decoder =
-                                            serde_json::Deserializer::from_str(group.get());
-                                        let selected = serde::de::DeserializeSeed::deserialize(
-                                            SelectedTerms {
-                                                requested: self.requested,
-                                            },
-                                            &mut decoder,
-                                        )
-                                        .map_err(serde::de::Error::custom)?;
-                                        decoder.end().map_err(serde::de::Error::custom)?;
-                                        Ok(selected)
-                                    })
-                                    .collect::<Result<Vec<_>, A::Error>>()
-                            })
-                            .transpose()?;
-                        partitions = Some(selected);
+                        partitions = Some(map.next_value_seed(SelectedPartitions(self.requested))?);
                     }
                     OverviewField::Eligibility => {
                         if minimum.is_some() {

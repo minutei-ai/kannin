@@ -3340,3 +3340,21 @@ A further native edge load checked 384 responses against newly acquired complete
 |          16 |  61.75 | 468.78 |      90.26 |
 
 The maximum was 915.53 ms. Twelve native Vectorize/hybrid checks preserved 105 complete rows and scores across three existing 100-vector fixtures. Large-corpus ANN recall, whole-Worker peak heap, broad cold-tail reliability and comparable Turbopuffer parity remain open. The grouped R2 path is deployed, but its acquisition reduction must not be presented as an equivalent complete-search speedup.
+
+## Streaming Rust partition projection
+
+Partition projection previously collected each dictionary as borrowed raw JSON, then parsed that dictionary again through the validating term selector. It now feeds partition dictionaries directly into that selector. This removes the preliminary JSON traversal and raw-slice collection while preserving decoded-length/CRC checks, validation of unrequested summaries, null partitions, the one-to-32 partition limit and root/trailing-data rejection. Canonical objects, cache identities and ranking formulas are unchanged.
+
+A local workerd comparison loaded the previous and candidate WASM engines into the same isolate, built identical immutable correlated overviews, and required byte-identical projected JSON on every response. Each response performed 40 projections; 24 paired rounds alternated engine order, discarding four warmup rounds. The selector requested `cloudflare`, `rust`, `unique42` and `group42`, with physical `group = 42` eligibility. The final repeat ran without concurrent repository checks:
+
+| Fixture                                             | Previous median ms / 40 projections | Streaming median ms / 40 projections | Reduction |
+| --------------------------------------------------- | ----------------------------------: | -----------------------------------: | --------: |
+| 500 synthetic documents                             |                              42.200 |                               40.028 |     5.15% |
+| 5,000 synthetic documents                           |                             166.774 |                              162.082 |     2.81% |
+| 5,000 synthetic documents with 32 length partitions |                             203.798 |                              194.273 |     4.67% |
+
+Earlier repeats showed 4.74–5.78% reduction for the smaller fixture; the ordinary 5,000-document fixture ranged from 2.42% faster to 0.11% slower. The 32-partition fixture's earlier repeat improved 5.88%. These are local catalog-projection measurements including decompression and response overhead, not complete-search latency, native Cloudflare CPU time or Turbopuffer parity. Requests satisfied from projected catalog caches bypass this work entirely.
+
+The complete local SciFact report remained identical to the prior baseline for all 300 queries, including ordered document IDs and per-query metrics (nDCG@10 0.6730619695232347, recall@10 0.7956666666666666, MRR@10 0.641808201058201).
+
+`TMPDIR=/tmp bun run check` passed: 254 Worker/tooling tests with 8,666 assertions and 42 Rust tests, plus formatting, strict TypeScript/Effect lint, native/WASM Clippy, build and typechecking.

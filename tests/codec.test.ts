@@ -242,6 +242,45 @@ test("overview projection validates unrequested values and rejects malformed roo
   }
 });
 
+test("overview partitions validate every summary while projecting in one pass", () => {
+  const summary = { df: 2, bounds: [[1, 1, 2, 4]] } as const;
+  const terms = JSON.stringify(["wanted"]);
+  const project = (partitions: string) => {
+    const data = new TextEncoder().encode(
+      `{"dictionary":{},"eligibility":[[{},0,0]],"partitions":${partitions}}`,
+    );
+    const compressed = deflateSync(data);
+    const bytes = new Uint8Array(8 + compressed.byteLength);
+    const frame = new DataView(bytes.buffer);
+    frame.setUint32(0, data.byteLength, true);
+    frame.setUint32(4, crc32(data), true);
+    bytes.set(compressed, 8);
+    return Schema.decodeUnknownSync(TermCatalog)(
+      JSON.parse(segment_overview_project(bytes, terms, "[]")),
+    );
+  };
+  expect(project("null").partitions).toBeNull();
+  for (const length of [1, 32]) {
+    const partitions = Array.from({ length }, () => ({ wanted: summary, unused: summary }));
+    expect(project(JSON.stringify(partitions)).partitions).toEqual(
+      Array.from({ length }, () => ({ wanted: summary })),
+    );
+  }
+  for (const partitions of [
+    "[]",
+    "{}",
+    "[null]",
+    JSON.stringify(Array.from({ length: 33 }, () => ({}))),
+    '[{"unused":{"df":"bad","bounds":[]}}]',
+    '[{"unused":{"df":1,"bounds":[[0,1,0,-1]]}}]',
+    '[{"unused":{"df":1,"bounds":[[0,1,0]]}}]',
+    '[{"unused":{"df":1,"bounds":[],"bounds":[]}}]',
+    '[{}, {"wanted":{"df":1,"bounds":[]}}] trailing',
+  ]) {
+    expect(() => project(partitions)).toThrow();
+  }
+});
+
 test("WASM ranked hits retain exact document ranges after their directory is released", () => {
   const documents = Schema.decodeSync(Schema.Array(StoredDocument))([
     {

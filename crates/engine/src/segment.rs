@@ -167,7 +167,7 @@ impl<'de> serde::de::Visitor<'de> for ValidatedDiscard {
     }
 
     fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self, A::Error> {
-        while map.next_key::<String>()?.is_some() {
+        while map.next_key::<Self>()?.is_some() {
             map.next_value::<Self>()?;
         }
         Ok(self)
@@ -175,6 +175,31 @@ impl<'de> serde::de::Visitor<'de> for ValidatedDiscard {
 }
 
 struct SelectedAttributes<'a>(&'a BTreeSet<&'a str>);
+
+struct SelectedAttribute<'a>(&'a BTreeSet<&'a str>);
+
+impl<'de> serde::de::DeserializeSeed<'de> for SelectedAttribute<'_> {
+    type Value = Option<String>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_str(self)
+    }
+}
+
+impl serde::de::Visitor<'_> for SelectedAttribute<'_> {
+    type Value = Option<String>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an attribute name")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, field: &str) -> Result<Self::Value, E> {
+        Ok(self.0.get(field).copied().map(str::to_owned))
+    }
+}
 
 impl<'de> serde::de::DeserializeSeed<'de> for SelectedAttributes<'_> {
     type Value = BTreeMap<String, serde_json::Value>;
@@ -196,8 +221,8 @@ impl<'de> serde::de::Visitor<'de> for SelectedAttributes<'_> {
 
     fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
         let mut selected = BTreeMap::new();
-        while let Some(field) = map.next_key::<String>()? {
-            if self.0.contains(field.as_str()) {
+        while let Some(field) = map.next_key_seed(SelectedAttribute(self.0))? {
+            if let Some(field) = field {
                 selected.insert(field, map.next_value::<serde_json::Value>()?);
             } else {
                 map.next_value::<ValidatedDiscard>()?;
@@ -3351,8 +3376,51 @@ pub mod wasm {
 
 #[cfg(test)]
 mod filter_cache_tests {
-    use super::{Document, FILTER_CACHE_BYTES, Filter, build};
+    use super::{Document, FILTER_CACHE_BYTES, Filter, SelectedAttributes, build};
+    use serde::de::DeserializeSeed;
     use serde_json::json;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn projected_attribute_keys_preserve_escapes_duplicates_and_ignored_validation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fields = BTreeSet::from(["flag", "group"]);
+        for (input, expected) in [
+            (
+                r#"{"group":1,"ignored":"text","flag":true}"#,
+                json!({"group":1,"flag":true}),
+            ),
+            (
+                r#"{"g\u0072oup":1,"group":2,"ignored":{"1e999":[{"key":"ok"}]}}"#,
+                json!({"group":2}),
+            ),
+            (r#"{"ignored":null}"#, json!({})),
+            (r#"{"group":null,"ignored":1e308}"#, json!({"group":null})),
+        ] {
+            let mut decoder = serde_json::Deserializer::from_str(input);
+            let selected = SelectedAttributes(&fields).deserialize(&mut decoder)?;
+            decoder.end()?;
+            assert_eq!(serde_json::to_value(selected)?, expected);
+        }
+        for input in [
+            r#"{"ignored":1e999,"group":1}"#,
+            r#"{"ignored":{"nested":1e999},"group":1}"#,
+            r#"{"ignored":{"\uD800":1},"group":1}"#,
+            r#"{"ignored":{"key":"\uD800"},"group":1}"#,
+            r#"{"ignored":{[1]:2},"group":1}"#,
+            r#"{"ignored":NaN,"group":1}"#,
+            r#"{"group":1} []"#,
+        ] {
+            let mut decoder = serde_json::Deserializer::from_str(input);
+            assert!(
+                SelectedAttributes(&fields)
+                    .deserialize(&mut decoder)
+                    .and_then(|_| decoder.end())
+                    .is_err()
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn masks_are_bounded_and_tombstones_remain_query_local()

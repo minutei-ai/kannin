@@ -163,7 +163,10 @@ test("pending shared plan admission remains bounded until native reads settle", 
     body: JSON.stringify({ phase: "headers", namespace }),
   });
   const pending = Array.from({ length: 16 }, (_, index) =>
-    request(worker, namespace, "query", { ...input, text: `alpha missing${index}` }),
+    request(worker, namespace, "query", {
+      ...input,
+      filters: [{ field: "missing", op: "ne", value: index }],
+    }),
   );
   for (const attempt of Array.from({ length: 100 }, (_, index) => index)) {
     const state = await fetch(new URL("/fixture/state", origin));
@@ -171,7 +174,10 @@ test("pending shared plan admission remains bounded until native reads settle", 
     if (attempt === 99) throw new Error("Shared plan readers did not enter");
     await Effect.runPromise(Effect.sleep("10 millis"));
   }
-  const overflow = await request(worker, namespace, "query", { ...input, text: "alpha overflow" });
+  const overflow = await request(worker, namespace, "query", {
+    ...input,
+    filters: [{ field: "missing", op: "ne", value: 16 }],
+  });
   expect(overflow.status).toBe(200);
   expect(Schema.decodeUnknownSync(QueryResult)(await overflow.json())).toEqual(reference);
   expect(overflow.headers.get("server-timing")).toContain("text_plan_cache_admission");
@@ -186,7 +192,7 @@ test("pending shared plan admission remains bounded until native reads settle", 
   await settled(worker);
   const recovered = await request(worker, namespace, "query", {
     ...input,
-    text: "alpha recovered",
+    filters: [{ field: "missing", op: "ne", value: 17 }],
   });
   expect(recovered.status).toBe(200);
   expect(Schema.decodeUnknownSync(QueryResult)(await recovered.json())).toEqual(reference);
@@ -203,7 +209,7 @@ test("shared plan body permits survive timeout and cancel expired queued bodies"
   const { input, reference } = await seed(worker, namespace);
   const inputs = Array.from({ length: 6 }, (_, index) => ({
     ...input,
-    text: `alpha missing${index}`,
+    filters: [{ field: "missing", op: "ne", value: index }],
   }));
   for (const query of inputs) {
     const response = await request(worker, namespace, "query", query);
@@ -244,7 +250,7 @@ test("failed shared plan bodies release all permits and allow healthy reacquisit
   const { input, reference } = await seed(worker, namespace);
   const inputs = Array.from({ length: 4 }, (_, index) => ({
     ...input,
-    text: `alpha missing${index}`,
+    filters: [{ field: "missing", op: "ne", value: index }],
   }));
   for (const query of inputs) {
     const response = await request(worker, namespace, "query", query);
@@ -335,7 +341,7 @@ test("small shared plan bodies remain parallel within the charged byte budget", 
   const { input, reference } = await seed(worker, namespace);
   const inputs = Array.from({ length: 16 }, (_, index) => ({
     ...input,
-    text: `alpha missing${index}`,
+    filters: [{ field: "missing", op: "ne", value: index }],
   }));
   for (const query of inputs) {
     const response = await request(worker, namespace, "query", query);

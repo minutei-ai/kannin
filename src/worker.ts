@@ -562,10 +562,6 @@ async function textQuery(
   if (terms.length > 64 || (input.match === "phrase" && words.length > 64))
     throw new Rejected({ status: 400, message: "Query exceeds 64 normalized terms" });
   if (terms.length === 0 || root.documents === 0) return [];
-  const identityText = Match.value(input.match).pipe(
-    Match.when("phrase", () => words.join(" ")),
-    Match.orElse(() => terms.toSorted().join(" ")),
-  );
   const bloomMatches = bloomCandidates(root.segments, terms, "termBloom");
   const candidates = root.segments.map((segment, index) => {
     const selected = bloomMatches[index];
@@ -578,9 +574,15 @@ async function textQuery(
     !candidates.some((candidate) => candidate.terms.length === terms.length)
   )
     return [];
-  const selected = candidates
-    .filter((candidate) => candidate.terms.length > 0)
-    .map((candidate) => candidate.segment);
+  const selections = candidates.filter((candidate) => candidate.terms.length > 0);
+  if (selections.length === 0) return [];
+  const selected = selections.map((candidate) => candidate.segment);
+  const identityText = Match.value(input.match).pipe(
+    Match.when("phrase", () => words.join(" ")),
+    Match.orElse(() =>
+      [...new Set(selections.flatMap((candidate) => candidate.terms))].toSorted().join(" "),
+    ),
+  );
   const reuse = { plan: "bypass", bounds: 0 };
   const shared: { cache: Cache | undefined; key: URL | undefined } = {
     cache: undefined,
@@ -630,10 +632,14 @@ async function textQuery(
     }
   }
   if (planning.value === undefined) {
-    const projectionTerms = Schema.encodeSync(TermProjectionProps.fields.terms)(terms.toSorted());
     const encodedFilters = Schema.encodeSync(TermProjectionProps.fields.filters)(input.filters);
     const projections = await Effect.runPromise(
-      readTermCatalogs(selected, projectionTerms, encodedFilters, timings),
+      readTermCatalogs(
+        selected,
+        selections.map((candidate) => candidate.terms),
+        encodedFilters,
+        timings,
+      ),
     );
     const catalog = selected.map((segment, index) => {
       const projection = projections[index];

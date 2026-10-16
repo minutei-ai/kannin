@@ -25,7 +25,7 @@ test("catalog intervals stay request-local and cached origin measurements are no
   expect(cold.headers.get("server-timing")).toContain("origins=1");
   expect(cold.headers.get("server-timing")).toContain("reads=3 hits=3");
   const responses = await Promise.all([
-    request(worker, namespace, "query", textQuery("alpha unique0")),
+    request(worker, namespace, "query", textQuery("alpha unique0 unique2")),
     request(worker, namespace, "query", textQuery("unique1")),
   ]);
   const complete = responses[0];
@@ -33,7 +33,7 @@ test("catalog intervals stay request-local and cached origin measurements are no
   if (complete === undefined || selective === undefined) throw new Error("Missing timing response");
   expect(complete.status).toBe(200);
   expect(selective.status).toBe(200);
-  expect(complete.headers.get("server-timing")).toContain('desc="memory=3 api=0"');
+  expect(complete.headers.get("server-timing")).toContain('desc="memory=2 api=0"');
   expect(selective.headers.get("server-timing")).toContain('desc="memory=1 api=0"');
   for (const response of responses) {
     expect(response.headers.get("server-timing")).toContain("reads=0 hits=0 bytes=0");

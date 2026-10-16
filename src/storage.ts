@@ -1,4 +1,15 @@
-import { Cause, Clock, Effect, Fiber, Match, Option, Schedule, Schema, Semaphore } from "effect";
+import {
+  Array as EffectArray,
+  Cause,
+  Clock,
+  Effect,
+  Fiber,
+  Match,
+  Option,
+  Schedule,
+  Schema,
+  Semaphore,
+} from "effect";
 import { env, exports, waitUntil } from "cloudflare:workers";
 import {
   Segment,
@@ -167,6 +178,7 @@ const encodeOverviewBatch = Schema.encodeEffect(overviewBatchJson);
 const decodeTermSummaries = Schema.decodeEffect(Schema.fromJsonString(TermSummaries));
 const decodeEligibleMinimum = Schema.decodeEffect(Schema.fromJsonString(EligibleMinimum));
 const decodeTermCatalogBatch = Schema.decodeEffect(Schema.fromJsonString(TermCatalogBatch));
+const encodeProjectionTerms = Schema.encodeSync(TermProjectionProps.fields.terms);
 const storedDocumentJson = Schema.fromJsonString(StoredDocument);
 const decodeStoredDocument = Schema.decodeSync(storedDocumentJson);
 const decodeStoredDocumentEffect = Schema.decodeEffect(storedDocumentJson);
@@ -1143,11 +1155,13 @@ function rememberTermCatalog(identity: string, value: typeof CachedTermCatalog.T
 export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
   (
     ranges: ReadonlyArray<typeof TermProjectionRange.Type>,
-    terms: string,
+    terms: ReadonlyArray<typeof TermProjectionProps.Type.terms>,
     filters: string,
     timings: Headers,
   ) =>
     Effect.gen(function* () {
+      if (ranges.length !== terms.length)
+        return yield* new Rejected({ status: 503, message: "Bloom projection omitted a segment" });
       const metrics = {
         requests: 0,
         nativeHits: 0,
@@ -1181,15 +1195,19 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
         sourceFallbacks: 0,
       };
       const windows = Array.from({ length: Math.ceil(ranges.length / 8) }, (_, index) =>
-        ranges.slice(index * 8, index * 8 + 8),
+        EffectArray.zip(
+          ranges.slice(index * 8, index * 8 + 8),
+          terms.slice(index * 8, index * 8 + 8),
+        ),
       );
       const batches = yield* Effect.forEach(
         windows,
         (window) =>
           Effect.gen(function* () {
-            const selected = window.map((input) => {
+            const selected = window.map(([input, requested]) => {
+              const selector = encodeProjectionTerms(requested.toSorted());
               const identity = `${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}`;
-              const projectionIdentity = `${identity}/projection:${terms}`;
+              const projectionIdentity = `${identity}/projection:${selector}`;
               const minimumIdentity = `${identity}/minimum:${filters}`;
               const projection = termCatalogs.get(projectionIdentity);
               const minimum = termCatalogs.get(minimumIdentity);
@@ -1203,6 +1221,7 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
               }
               return {
                 input,
+                terms: requested,
                 projectionIdentity,
                 minimumIdentity,
                 projection: Match.value(projection?.value).pipe(
@@ -1220,21 +1239,18 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
             ).length;
             const groups = [
               {
-                terms,
                 filters,
                 entries: selected.filter(
                   (entry) => entry.projection === undefined && entry.minimum === undefined,
                 ),
               },
               {
-                terms,
                 filters: "[]",
                 entries: selected.filter(
                   (entry) => entry.projection === undefined && entry.minimum !== undefined,
                 ),
               },
               {
-                terms: "[]",
                 filters,
                 entries: selected.filter(
                   (entry) => entry.projection !== undefined && entry.minimum === undefined,
@@ -1243,9 +1259,14 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
             ];
             for (const group of groups) {
               if (group.entries.length === 0) continue;
+              const requested = new Set(
+                group.entries
+                  .filter((entry) => entry.projection === undefined)
+                  .flatMap((entry) => entry.terms),
+              );
               const props = {
                 bucket: env.STORAGE_CACHE_SCOPE,
-                terms: group.terms,
+                terms: encodeProjectionTerms([...requested].toSorted()),
                 filters: group.filters,
                 ranges: group.entries.map(({ input }) => ({
                   key: input.key,

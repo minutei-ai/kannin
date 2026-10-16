@@ -3572,3 +3572,15 @@ A 100-pair alternating workerd comparison used 10,000 documents in 200 segments,
 The candidate was faster in 98 of 100 pairs, with p50 about 28% lower. This local result does not establish native latency or peak heap. The native comparison uses a fresh missing-field name each round to force metadata acquisition while preserving document eligibility; its eight-term query shares that round's field scope as a warm control.
 
 The local gate passed 261 Worker/tooling tests (9,128 assertions), 42 Rust tests, strict TypeScript/Effect lint and types, build and native/WASM Clippy. Before deployment, a native cache probe cleared the benchmark coordinator memory before each request and switched from `any` to `all` to require a distinct plan while keeping catalog props identical. The second query retained complete results and sequence 2000 and reported 25 native cache hits across 25 catalog RPCs, with zero origin executions. This verifies the existing native cache mechanism; it is not evidence from a local cache emulator.
+
+Source `d3caa42` deployed as version `fb060351-f15b-49d3-8b57-cc11eb04a7ba` at 100%. The native API confirmed Smart Placement remained enabled, with unchanged R2 binding and lifecycle rules. Both post-deploy cohorts reported `remote-MIA` through GRU ingress and retained complete baseline results and sequence 2000 for all 28 responses each. The complete 300-query SciFact report was identical to the reference.
+
+| Native cohort, 1M documents  | Two terms p50/p95 ms | Eight terms p50/p95 ms |
+| ---------------------------- | -------------------: | ---------------------: |
+| Before                       |     787.38 / 1053.99 |        331.85 / 454.66 |
+| Native exact cache           |     796.96 / 1158.96 |        362.45 / 513.92 |
+| Native exact cache, repeated |     732.19 / 1017.82 |        339.67 / 476.96 |
+
+Each selector has twelve measured responses after two excluded warmup rounds. Fresh missing-field names force 300 two-term catalog RPCs per measured cohort; the eight-term control reused the same round's field model and made no RPCs. Source overviews could be served from Cache API, so this is metadata reacquisition rather than a fully cold R2 dataset. In the first comparison, median catalog entry intervals summed across RPCs fell from 476.5 to 358.0 ms, while source-overview cache intervals increased from 213.5 to 358.0 ms. These overlapping wall-time sums are not query latency or CPU measurements. The first native cohort did not improve overall latency; the repeat improved two-term p50 by about 7%. Network/cache residency remained uncontrolled, and twelve observations make nearest-rank p95 the maximum. The evidence does not establish a universal native gain.
+
+The post-deploy native cache probe again required a distinct `all` plan after clearing coordinator memory and retained complete `any` results with sequence 2000. It reported 25 native hits across 25 catalog RPCs and zero origin executions, confirming that native exact caching remained available after removing the manual copy. The probe's different match modes are a cache-mechanism check, not a latency comparison.

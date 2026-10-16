@@ -19,9 +19,14 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 The load run at source `6c03e72` checked **384 responses** against strong baseline rows, scores and sequence, with 128 requests per concurrency. All entered through GRU without snapshot coordinator fallback. Two 16-query probes with fresh selectors preserved complete pre-deploy results. These are cache-sensitive workload observations, not sustained-capacity guarantees. Edge freshness is weaker than strong consistency.
 
-Bloom candidate masks now reuse per-segment projections and plans when added query words cannot occur in any segment. On the deployed one-million-document corpus, sequential strong queries with changing absent words measured p50/p95 **660/909 ms before**, **179/363 ms after**, and **191/467 ms on repetition**. Each cohort measured 24 responses after four warmups; all entered through GRU and retained complete rows, scores and sequence. Catalog RPCs fell from **600 to 6 and 27** per measured cohort. These cache-sensitive observations do not establish cold latency or sustained capacity. [Detailed measurements](docs/performance.md) also cover the eight-source R2 batches and local experiments.
+Current strong-query probes use one million documents, GRU ingress and Smart Placement observed as `remote-MIA`. A fresh missing-field selector forces metadata acquisition; the eight-term control reuses that round's field model. Physical overview caches can stay warm.
 
-Field eligibility is now reused across predicate values. On the one-million-document corpus, twelve measured strong two-term queries fell from p50/p95 **858/1881 ms to 310/415 ms**, with **300 → 0 catalog RPCs** after warmup and identical results. This deployment also enables Smart Placement; responses reported `remote-MIA` through GRU ingress. Eight-term queries increased from **257/303 ms to 314/414 ms**, so the combined changes do not establish a universal latency gain. [Cohort details](docs/performance.md#reusing-physical-eligibility-across-predicate-values).
+| Strong sequential query            | Before p50/p95 ms | Latest repeat p50/p95 ms |
+| ---------------------------------- | ----------------: | -----------------------: |
+| Fresh metadata selector, two terms |  787.38 / 1053.99 |         732.19 / 1017.82 |
+| Warm metadata, eight terms         |   331.85 / 454.66 |          339.67 / 476.96 |
+
+Source `d3caa42` removes a duplicate exact catalog cache and retains native Workers Cache. Its first post-deploy cohort was slower (796.96/1158.96 ms and 362.45/513.92 ms); the table shows its repeat. Each cohort measured twelve responses per selector after two warmup rounds, with identical complete results. A separate 100-pair workerd comparison after memory eviction reduced p50 from **121.55 to 87.61 ms**. These results do not establish fully cold R2 latency or a universal native gain. [Detailed measurements](docs/performance.md#removing-the-duplicate-exact-catalog-cache).
 
 Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10**, with the entire 300-query report unchanged. Twelve native Vectorize/hybrid checks preserved 105 complete rows and scores across three 100-vector fixtures; large-corpus ANN recall remains unmeasured.
 

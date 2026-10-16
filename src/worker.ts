@@ -8,6 +8,7 @@ import {
   Match,
   Option,
   Schema,
+  Schedule,
   Semaphore,
 } from "effect";
 import type { Exit } from "effect";
@@ -52,6 +53,7 @@ import {
   SearchStatistics,
   TextPlanIdentity,
   SharedTextPlan,
+  SharedTextPlanCacheHeaders,
   Write,
   WriteResult,
   VectorMessage,
@@ -395,6 +397,146 @@ async function vectorId(epoch: string, id: string, sequence: number) {
   return sha256(`${epoch}\0${id}\0${sequence}`);
 }
 
+const SHARED_PLAN_READ_BUDGET = 250_000_000n;
+const SHARED_PLAN_BODY_UNIT = 64 * 1024;
+const sharedPlanBodies = Semaphore.makeUnsafe(64);
+const readSharedTextPlan = Effect.fn("raio.readSharedTextPlan")(function* (cacheKey: string) {
+  const started = yield* Clock.currentTimeNanos;
+  const cache = yield* Effect.tryPromise(() => caches.open("kannin-text-plans-v1")).pipe(
+    Effect.orElseSucceed(() => undefined),
+  );
+  const result = { cache, plan: Option.none<typeof SharedTextPlan.Type>(), expired: false };
+  if (cache === undefined) return result;
+  if ((yield* Clock.currentTimeNanos) - started >= SHARED_PLAN_READ_BUDGET) {
+    result.expired = true;
+    return result;
+  }
+  return yield* Effect.acquireUseRelease(
+    Effect.tryPromise(() => cache.match(cacheKey)).pipe(Effect.orElseSucceed(() => undefined)),
+    (cached) =>
+      Effect.gen(function* () {
+        if (cached === undefined) return result;
+        if ((yield* Clock.currentTimeNanos) - started >= SHARED_PLAN_READ_BUDGET) {
+          result.expired = true;
+          return result;
+        }
+        const metadata = yield* Schema.decodeUnknownEffect(SharedTextPlanCacheHeaders)({
+          "content-length": cached.headers.get("content-length"),
+          "x-kannin-plan-bytes": cached.headers.get("x-kannin-plan-bytes"),
+        }).pipe(Effect.option);
+        if (Option.isNone(metadata)) return result;
+        const length = metadata.value["content-length"];
+        const decodedLength = metadata.value["x-kannin-plan-bytes"];
+        const units = Math.ceil(Math.max(length, decodedLength * 4) / SHARED_PLAN_BODY_UNIT);
+        const acquired = yield* sharedPlanBodies
+          .withPermitsIfAvailable(units)(
+            Effect.gen(function* () {
+              if ((yield* Clock.currentTimeNanos) - started >= SHARED_PLAN_READ_BUDGET) {
+                result.expired = true;
+                return result;
+              }
+              const buffer = yield* Effect.tryPromise(() => cached.arrayBuffer());
+              if ((yield* Clock.currentTimeNanos) - started >= SHARED_PLAN_READ_BUDGET) {
+                result.expired = true;
+                return result;
+              }
+              result.plan = yield* Effect.try(() => {
+                if (
+                  buffer.byteLength !== length ||
+                  buffer.byteLength < 16 ||
+                  new DataView(buffer).getUint32(8, true) !== decodedLength
+                )
+                  return undefined;
+                return unpack(new Uint8Array(buffer));
+              }).pipe(
+                Effect.flatMap((encoded) => {
+                  if (encoded === undefined || encoded.length > 1024 * 1024)
+                    return Effect.succeed(Option.none<typeof SharedTextPlan.Type>());
+                  return Schema.decodeEffect(Schema.fromJsonString(SharedTextPlan))(encoded).pipe(
+                    Effect.asSome,
+                  );
+                }),
+                Effect.orElseSucceed(() => Option.none()),
+              );
+              return result;
+            }),
+          )
+          .pipe(
+            Effect.repeat({
+              while: Option.isNone,
+              schedule: Schedule.exponential("1 millis").pipe(
+                Schedule.upTo({ duration: SHARED_PLAN_READ_BUDGET }),
+              ),
+            }),
+          );
+        if (Option.isNone(acquired)) {
+          result.expired = true;
+          return result;
+        }
+        return acquired.value;
+      }),
+    (cached) => {
+      if (cached === undefined || cached.bodyUsed) return Effect.void;
+      const body = cached.body;
+      if (body === null) return Effect.void;
+      return Effect.tryPromise(() => body.cancel()).pipe(Effect.ignore);
+    },
+  );
+});
+const pendingSharedTextPlans = new Map<
+  string,
+  Promise<
+    Exit.Exit<
+      Option.Option<Effect.Success<ReturnType<typeof readSharedTextPlan>>>,
+      Cause.UnknownError
+    >
+  >
+>();
+
+async function acquireSharedTextPlan(
+  cacheKey: URL,
+  ctx: ExecutionContext | DurableObjectState,
+  timings: Headers,
+) {
+  const identity = cacheKey.href;
+  const selected = { completion: pendingSharedTextPlans.get(identity) };
+  if (selected.completion === undefined) {
+    if (pendingSharedTextPlans.size >= 16) {
+      timings.append("server-timing", "text_plan_cache_admission");
+      return undefined;
+    }
+    const source = Effect.runPromise(readSharedTextPlan(identity));
+    const completion = Effect.runPromiseExit(
+      Effect.tryPromise(() => source).pipe(Effect.timeoutOption(SHARED_PLAN_READ_BUDGET)),
+    );
+    selected.completion = completion;
+    pendingSharedTextPlans.set(identity, completion);
+    ctx.waitUntil(
+      source
+        .finally(() => {
+          if (pendingSharedTextPlans.get(identity) === completion)
+            pendingSharedTextPlans.delete(identity);
+        })
+        .then(
+          () => undefined,
+          () => undefined,
+        ),
+    );
+  } else timings.append("server-timing", "text_plan_cache_shared");
+  const completed = await selected.completion;
+  if (completed._tag === "Failure") {
+    timings.append("server-timing", "text_plan_cache_unavailable");
+    return undefined;
+  }
+  if (Option.isNone(completed.value)) {
+    timings.append("server-timing", "text_plan_cache_timeout");
+    return undefined;
+  }
+  const acquired = completed.value.value;
+  if (acquired.expired) timings.append("server-timing", "text_plan_cache_timeout");
+  return acquired;
+}
+
 async function textQuery(
   input: typeof Query.Type,
   root: typeof Root.Type,
@@ -456,59 +598,22 @@ async function textQuery(
     reuse.plan = "memory";
     if (planning.value === undefined) {
       reuse.plan = "miss";
-      shared.cache = await Effect.runPromise(
-        Effect.tryPromise(() => caches.open("kannin-text-plans-v1")).pipe(
-          Effect.orElseSucceed(() => undefined),
-        ),
-      );
-      if (shared.cache !== undefined) {
-        const cache = shared.cache;
-        const cacheKey = shared.key;
-        const cached = await Effect.runPromise(
-          Effect.tryPromise(() => cache.match(cacheKey)).pipe(
-            Effect.orElseSucceed(() => undefined),
-          ),
-        );
-        if (cached !== undefined) {
-          const length = Number(cached.headers.get("content-length"));
-          if (Number.isSafeInteger(length) && length > 0 && length <= 256 * 1024) {
-            const decoded = await Effect.runPromise(
-              Effect.tryPromise(() => cached.arrayBuffer()).pipe(
-                Effect.flatMap((buffer) =>
-                  Effect.try(() => {
-                    if (
-                      buffer.byteLength !== length ||
-                      buffer.byteLength < 16 ||
-                      new DataView(buffer).getUint32(8, true) > 1024 * 1024
-                    )
-                      return undefined;
-                    return unpack(new Uint8Array(buffer));
-                  }),
-                ),
-                Effect.flatMap((encoded) => {
-                  if (encoded === undefined || encoded.length > 1024 * 1024)
-                    return Effect.succeed(Option.none<typeof SharedTextPlan.Type>());
-                  return Schema.decodeEffect(Schema.fromJsonString(SharedTextPlan))(encoded).pipe(
-                    Effect.asSome,
-                  );
-                }),
-                Effect.orElseSucceed(() => Option.none()),
-              ),
-            );
-            if (
-              Option.isSome(decoded) &&
-              decoded.value.identity === planning.key &&
-              decoded.value.version === workerEnv.CF_VERSION_METADATA.id &&
-              decoded.value.plan.segments.length === selected.length &&
-              decoded.value.plan.statistics.documents === root.documents &&
-              decoded.value.plan.statistics.title_length === root.titleLength &&
-              decoded.value.plan.statistics.body_length === root.bodyLength
-            ) {
-              planning.value = decoded.value.plan;
-              rememberTextPlan(planning.key, decoded.value.plan);
-              reuse.plan = "shared";
-            }
-          }
+      const acquired = await acquireSharedTextPlan(shared.key, ctx, timings);
+      if (acquired !== undefined) {
+        shared.cache = acquired.cache;
+        const decoded = acquired.plan;
+        if (
+          Option.isSome(decoded) &&
+          decoded.value.identity === planning.key &&
+          decoded.value.version === workerEnv.CF_VERSION_METADATA.id &&
+          decoded.value.plan.segments.length === selected.length &&
+          decoded.value.plan.statistics.documents === root.documents &&
+          decoded.value.plan.statistics.title_length === root.titleLength &&
+          decoded.value.plan.statistics.body_length === root.bodyLength
+        ) {
+          planning.value = decoded.value.plan;
+          rememberTextPlan(planning.key, decoded.value.plan);
+          reuse.plan = "shared";
         }
       }
     }
@@ -905,9 +1010,14 @@ async function textQuery(
         version: workerEnv.CF_VERSION_METADATA.id,
         plan: value,
       });
-      if (new TextEncoder().encode(encoded).byteLength <= 1024 * 1024) {
+      const encodedBytes = new TextEncoder().encode(encoded).byteLength;
+      if (encodedBytes <= 1024 * 1024) {
         const packed = pack(encoded);
         if (packed.byteLength <= 256 * 1024) {
+          const cacheHeaders = Schema.encodeSync(SharedTextPlanCacheHeaders)({
+            "content-length": packed.byteLength,
+            "x-kannin-plan-bytes": encodedBytes,
+          });
           const cacheKey = shared.key;
           const identity = cacheKey.href;
           const charge = packed.byteLength * 4 + identity.length * 4 + 128;
@@ -928,9 +1038,9 @@ async function textQuery(
                     cacheKey,
                     new Response(new Uint8Array(packed), {
                       headers: {
+                        ...cacheHeaders,
                         "cache-control": "public, max-age=3600",
                         "content-type": "application/octet-stream",
-                        "content-length": String(packed.byteLength),
                       },
                     }),
                   ),

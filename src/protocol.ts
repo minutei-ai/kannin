@@ -427,6 +427,16 @@ export const SharedTextPlan = Schema.Struct({
   version: Schema.NonEmptyString,
   plan: TextPlan,
 });
+export const SharedTextPlanCacheHeaders = Schema.Struct({
+  "content-length": Schema.NumberFromString.check(
+    Schema.isInt(),
+    Schema.isBetween({ minimum: 1, maximum: 256 * 1024 }),
+  ),
+  "x-kannin-plan-bytes": Schema.NumberFromString.check(
+    Schema.isInt(),
+    Schema.isBetween({ minimum: 1, maximum: 1024 * 1024 }),
+  ),
+});
 export const SegmentHits = Schema.Array(
   Schema.Struct({ row: Schema.Int, id: Id, score: Schema.Finite, data: DataRange }),
 );

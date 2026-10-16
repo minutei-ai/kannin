@@ -5,7 +5,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { Response } from "miniflare";
-import { Metadata, QueryResult, Root, SharedTextPlan, TextPlanIdentity } from "../src/protocol";
+import {
+  Metadata,
+  QueryResult,
+  Root,
+  SharedTextPlan,
+  SharedTextPlanCacheHeaders,
+  TextPlanIdentity,
+} from "../src/protocol";
 import { initSync, pack, unpack } from "../dist/wasm/raio_engine";
 import { document, request, startWorker, textQuery, write } from "./harness";
 
@@ -244,7 +251,14 @@ test("shared tightened plans survive fresh workerd instances and reject corrupt 
       new Response(new Uint8Array(encoded.value), {
         headers: {
           "cache-control": "public, max-age=3600",
-          "content-length": String(encoded.value.byteLength),
+          ...Schema.encodeSync(SharedTextPlanCacheHeaders)({
+            "content-length": encoded.value.byteLength,
+            "x-kannin-plan-bytes": new DataView(
+              encoded.value.buffer,
+              encoded.value.byteOffset,
+              encoded.value.byteLength,
+            ).getUint32(8, true),
+          }),
         },
       }),
     );

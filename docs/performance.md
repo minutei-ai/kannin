@@ -3613,3 +3613,14 @@ A non-profiled alternating comparison used independent local persistence copies 
 Measured catalog RPC counts remained 84 and 252 per variant for the two selectors. Maximum observed WASM linear memory was 29.25 MiB in both variants. The p50 reductions were about 4% and 9%; the sixty-four-term p95 barely changed. Physical caches and host conditions are not production equivalents. The added codec regression checks independent native-zlib decoding and rejects altered Adler-32 tails across seventeen vector/block boundary sizes, including empty input.
 
 The complete local gate passed 262 Worker/tooling tests (9,181 assertions), 42 Rust tests, strict TypeScript/Effect lint and types, native/WASM Clippy and the production build.
+
+Source `146f131` deployed as version `f1148942-62ae-4cd5-a719-b22dc6f0ad40` at 100%, using profile `minutei`. Native settings confirmed Smart Placement and unchanged R2 binding/lifecycle. Both native cohorts ran fourteen rounds of sixteen/sixty-four-term strong queries against the unchanged million-document fixture; two warmup rounds were excluded. All 28 complete responses per cohort preserved baseline rows, scores and sequence 2000. The SIMD cohort reported `remote-MIA`; placement was not recorded in the scalar cohort. Both used GRU ingress. The entire 300-query SciFact report remained identical.
+
+| Native strong query   | Scalar HTTP p50/p95 ms | SIMD HTTP p50/p95 ms | Scalar DO CPU p50/p95 ms | SIMD DO CPU p50/p95 ms |
+| --------------------- | ---------------------: | -------------------: | -----------------------: | ---------------------: |
+| Sixteen rare terms    |        487.18 / 794.96 |      490.95 / 569.46 |                250 / 427 |              224 / 339 |
+| Sixty-four rare terms |       650.40 / 1001.61 |      670.10 / 894.99 |                437 / 731 |              385 / 575 |
+
+Durable Object CPU comes from native observability invocation records correlated through a unique benchmark URL tag and round, rather than subtracting elapsed phase timers. All 24 measured invocation records were present in each cohort; one warmup record was unavailable in each. CPU p50 fell about 10% and 12%. HTTP p50 did not improve, while HTTP p95 decreased. These are separate cohorts with uncontrolled host/cache/network conditions, and twelve observations make nearest-rank p95 the maximum. The evidence supports reduced CPU work in this workload, not universally faster HTTP responses or sustained capacity. The earlier overload remains unexplained; this change does not claim to fix it.
+
+Sixteen additional rare/dense strong/edge queries and twelve Vectorize/hybrid checks on the SIMD deployment preserved all baseline results, including all 105 vector/hybrid rows. Maximum observed coordinator WASM linear memory in the comparison was 31.12 MiB before and 30.94 MiB after. These measurements do not establish whole-Worker peak heap, cold-tail reliability or large-scale ANN recall.

@@ -3228,3 +3228,24 @@ The correlated-summary reader previously waited for all four reads in a window b
 A paired local workerd experiment used nine one-document segments per query. The injected R2 lookup delay was 500 ms for acquisitions 1, 5 and 9 and 40 ms for the others. Across four fresh-instance pairs, complete-query medians were **1,723.69 ms before** and **821.47 ms after**, a 52.3% reduction under this controlled delay pattern. Observed ranges were 1,686.81–1,756.62 ms and 766.05–824.33 ms. Both readers peaked at four overlapping lookups. A separate eight-pair control with zero injected delay measured medians of **204.61 ms before** and **200.09 ms after**; the ranges overlapped at 181.81–228.02 ms and 181.06–236.20 ms, so that control establishes no consistent healthy-path latency gain. All 24 complete results, including sequence and scores, matched exactly.
 
 The workerd regression checks that the fifth acquisition starts before the first delayed acquisition completes, all nine reads settle with peak concurrency four, and repeated rows remain identical. After clearing isolate memory, a different selector reuses the published overview batch and finds the correct unique document, checking source alignment after out-of-order completion. The regression fails against the previous windowed reader. These measurements isolate scheduling under injected latency; they do not establish native Cloudflare or Turbopuffer performance.
+
+Native validation deployed source `47f078b` as version `8243bc95-8fd3-41b9-ada6-882ea1bea9b3` at 100% through the minutei Alchemy profile, preserving the R2 binding and cache lifecycle rules. On the fixed one-million-document corpus at sequence 2,000, sixteen post-deploy queries covered rare 16/64-term unions and two filtered dense selectors, both consistency modes and two rounds. Every complete result matched its pre-deploy rows, scores and sequence and the corpus ID oracle. Fresh equivalent filter identities forced new text plans, while shared underlying caches were retained. First-pass complete-query timings were:
+
+| Selector | Strong before / after ms | Edge before / after ms |
+| -------- | -----------------------: | ---------------------: |
+| rare16   |      2,014.91 / 1,227.30 |      1,598.55 / 946.12 |
+| rare64   |      1,495.10 / 4,105.77 |    1,916.85 / 1,894.32 |
+| dense72  |        1,122.07 / 916.59 |        658.60 / 708.78 |
+| dense43  |        1,171.11 / 674.89 |      473.79 / 1,377.66 |
+
+These native observations are mixed, with different overview-cache hits and R2 reads; they do not isolate the pipeline's causal effect. The post-deploy rare64 strong query spent 3,509 ms acquiring catalogs. Summed Terms entry intervals were 3,462 ms versus 320 ms inside summary acquisition, leaving substantial time before that operation that still needs attribution. The post-deploy second round took 60.50–478.23 ms. The broad cold-tail problem remains open.
+
+Two further native load runs each checked 128 edge responses at concurrency 1/4/16 against newly acquired complete strong baselines. All 768 responses matched, all entered through GRU, and none used snapshot coordinator fallback. The first run's p50 values were 44.59/46.72/52.13 ms, p95 values were 84.59/90.29/445.65 ms, and rates were 17.17/62.84/114.12 requests per second. The warmed repeat was:
+
+| Concurrency | p50 ms | p95 ms | Requests/s |
+| ----------: | -----: | -----: | ---------: |
+|           1 |  49.88 |  73.37 |      18.41 |
+|           4 |  47.76 | 167.12 |      55.91 |
+|          16 |  52.64 | 401.83 |     114.14 |
+
+The local gate passed 239 Worker/tooling tests and 42 Rust tests, with formatting, strict Effect/Oxlint, Effect tsgo and native/WASM Clippy. These native checks establish result preservation and deployed observations, not a uniform latency improvement, sustained capacity, large-corpus ANN recall or Turbopuffer parity.

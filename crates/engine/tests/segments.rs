@@ -711,3 +711,77 @@ fn compressed_directories_exceed_the_separate_mutation_log_budget()
     );
     Ok(())
 }
+
+#[test]
+fn decoded_term_maps_match_native_serde_order_and_duplicate_semantics()
+-> Result<(), Box<dyn std::error::Error>> {
+    let built = segment::build(vec![document("a", "alpha beta gamma delta epsilon zeta")])?;
+    let encoded = serde_json::to_string(&built.header)?;
+    let original: BTreeMap<String, Box<serde_json::value::RawValue>> =
+        serde_json::from_str(&encoded)?;
+    let entries = built
+        .header
+        .terms
+        .iter()
+        .map(|(term, meta)| {
+            Ok(format!(
+                "{}:{}",
+                serde_json::to_string(term)?,
+                serde_json::to_string(meta)?
+            ))
+        })
+        .collect::<Result<Vec<_>, serde_json::Error>>()?;
+    let alpha = built.header.terms.get("alpha").ok_or("Missing alpha")?;
+    let mut changed = alpha.clone();
+    changed.df = 19;
+    let changed = serde_json::to_string(&changed)?;
+    let canonical = entries.join(",");
+    let reversed = entries.iter().rev().cloned().collect::<Vec<_>>().join(",");
+    for dictionary in [
+        format!("{{{canonical}}}"),
+        format!("{{{reversed}}}"),
+        format!("{{\"alpha\":{changed},{canonical}}}"),
+        format!("{{{canonical},\"alpha\":{changed}}}"),
+        format!("{{\"\\u0061lpha\":{changed},{canonical},\"alpha\":{changed}}}"),
+        String::from("{}"),
+    ] {
+        let expected: BTreeMap<String, segment::TermMeta> = serde_json::from_str(&dictionary)?;
+        let mut fields = original.clone();
+        fields.insert(
+            String::from("terms"),
+            serde_json::value::RawValue::from_string(dictionary)?,
+        );
+        let decoded: Header = serde_json::from_str(&serde_json::to_string(&fields)?)?;
+        assert_eq!(
+            serde_json::to_string(&decoded.terms)?,
+            serde_json::to_string(&expected)?
+        );
+        assert_eq!(decoded.documents.len(), built.header.documents.len());
+    }
+    Ok(())
+}
+
+#[test]
+fn decoded_term_maps_reject_invalid_entries_and_object_framing()
+-> Result<(), Box<dyn std::error::Error>> {
+    let built = segment::build(vec![document("a", "alpha")])?;
+    let original: BTreeMap<String, Box<serde_json::value::RawValue>> =
+        serde_json::from_str(&serde_json::to_string(&built.header)?)?;
+    for dictionary in [
+        "[]",
+        "null",
+        "{\"alpha\":{}}",
+        "{\"alpha\":{\"df\":-1,\"blocks\":[]}}",
+        "{\"alpha\":{\"df\":4294967296,\"blocks\":[]}}",
+        "{\"alpha\":{\"df\":1,\"blocks\":[false]}}",
+        "{\"alpha\":{\"df\":1,\"df\":2,\"blocks\":[]}}",
+    ] {
+        let mut fields = original.clone();
+        fields.insert(
+            String::from("terms"),
+            serde_json::value::RawValue::from_string(dictionary.into())?,
+        );
+        assert!(serde_json::from_str::<Header>(&serde_json::to_string(&fields)?).is_err());
+    }
+    Ok(())
+}

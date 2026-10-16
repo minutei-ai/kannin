@@ -2978,3 +2978,61 @@ The standard load ran twice on the unchanged million-document corpus at sequence
 | Materialization candidate, repeat |          16 |  62.49 | 396.34 |      92.63 |
 
 First/repeat maxima were 854.19/1,075.09 ms. The concurrency-sixteen repeat had lower p95 and higher throughput than the preceding deployment, while concurrency-one latency and throughput worsened. Cache state and native network variation remain uncontrolled between versions. Retaining this change rests on bounded admission, exact results and controlled local evidence plus the small native document-phase probe; these standard load observations do not establish a uniform end-to-end gain.
+
+## Rejected global WASM SIMD compiler flag
+
+The current scalar build was compared with an otherwise identical release build using `-C target-feature=+simd128`. [Cloudflare supports WASM SIMD](https://developers.cloudflare.com/workers/runtime-apis/webassembly/#simd), and [Rust exposes the feature through target flags](https://doc.rust-lang.org/stable/rustc/platform-support/wasm32-unknown-unknown.html#enabled-webassembly-features). Both artifacts preserved canonical bytes and all 480 direct ranking results in the two-size local WASM screen. The SIMD artifact was 763,680 bytes versus 769,073 bytes for the scalar artifact.
+
+Bun initially showed about 38% faster construction with byte verification, but some phrase ranking medians regressed. An independent workerd/V8 harness did not reproduce the construction gain. It alternated variants over 25 pairs per operation, discarding five warmup pairs and retaining twenty elapsed-request samples per variant. Construction used 1,000 documents; other operations used a 5,000-document segment and twenty operations per request, with exact output comparisons.
+
+| Operation                        | Scalar p50 ms | SIMD p50 ms | Scalar p95 ms | SIMD p95 ms |
+| :------------------------------- | ------------: | ----------: | ------------: | ----------: |
+| Build                            |        89.351 |      89.280 |        97.329 |      91.012 |
+| Open compressed directory, batch |       415.045 |     411.677 |       463.544 |     441.382 |
+| Project overview, batch          |        78.797 |      77.741 |        92.020 |      91.589 |
+| Any-term rank, batch             |        18.798 |      18.986 |        20.648 |      27.571 |
+| Phrase rank, batch               |       169.261 |     165.283 |       195.623 |     170.469 |
+
+The target-runtime medians were approximately unchanged or mixed. The compiler flag was rejected before any product configuration or deployment change. The Bun construction result is not evidence of a Cloudflare speedup.
+
+## Bulk construction of Rust directory term maps
+
+A local V8 CPU profile of the scalar directory-opening workload attributed about 10.6% of sampled time directly to incremental BTreeMap insertion, alongside inflation, Adler-32, CRC and JSON parsing. The candidate collects typed term entries, stable-sorts and deduplicates them with the last value retained, then uses native BTreeMap collection. It changes allocation/construction of the decoded directory, not the canonical serialization, term metadata, byte ranges, scoring arithmetic, cache identities or charging limits.
+
+Differential tests compare Header term-map decoding with native serde BTreeMap behavior for canonical/reversed order, repeated keys, escaped equivalent keys and empty maps. Invalid types, missing fields, invalid block values, duplicate metadata fields and out-of-range frequencies remain rejected. The two WASM variants produced identical canonical bytes and 480 complete direct-ranking results across 5,000-/10,000-document fixtures, any/all/phrase and filtered cases.
+
+An alternating workerd comparison used the same five operations and sampling method as the compiler experiment above. The twenty-operation compressed-directory batch changed from **411.019 to 369.950 ms median** (10.0% lower), and p95 from **473.608 to 417.907 ms**. Build, overview projection and resident ranking medians were close or mixed; the gain applies to directory construction. This elapsed local workload includes dispatch and validation, not remote acquisition or native Cloudflare CPU.
+
+A separate workerd memory fixture initialized two fresh scalar WASM modules and retained 24 independently decoded copies of the same 5,000-document directory. Both started at 1,310,720 linear-memory bytes. At 24 retained directories, the previous module reached **31,916,032 bytes** and the candidate **29,425,664 bytes**, 7.8% lower. Memory.grow high-water observations include allocator slack and transient construction; they do not measure JS memory or whole-Worker peak heap. Existing conservative directory cache charges remain unchanged.
+
+A complete local Worker comparison used 16,000 documents in sixteen segments, identical TypeScript/binding wrappers and different scalar WASM modules. The generated wrappers were byte-identical, so only the Rust implementation changed. Fourteen pairs alternated variant order per workload; four warmup pairs were excluded, leaving ten samples per variant. All 84 responses retained complete rows, scores and sequence.
+
+| Workload                                  | Previous p50 ms | Candidate p50 ms | Previous p95 ms | Candidate p95 ms |
+| :---------------------------------------- | --------------: | ---------------: | --------------: | ---------------: |
+| Two rare terms, resident                  |           7.252 |            5.889 |           7.606 |            7.280 |
+| Sixteen rare terms, warm directories      |          13.917 |           13.379 |          14.610 |           14.774 |
+| Sixteen rare terms, volatile memory reset |         163.170 |          134.132 |         173.933 |          144.955 |
+
+The reset workload reduced median by 17.8%, with reusable immutable sources rather than fully cold storage. The warm-directory tail was slightly higher. These local request timings include the complete Worker path and host/runtime variation; they do not establish a native Cloudflare latency gain.
+
+The full gate passed **227 Worker/tooling tests, 7,816 assertions and 41 Rust tests**, including the two new reader-contract regressions. The entire independent SciFact report over 5,183 documents and all 300 queries exactly matched the previous reference, including ranked IDs and dataset/judgment hashes: nDCG@10 **0.6730619695232347**, recall@10 **0.7956666666666666**, MRR@10 **0.641808201058201**.
+
+Alchemy deployed the scalar bulk-map implementation with the `minutei` profile and completed its unconditional vector metadata migration. Provider reads confirmed version `4d206ffe-d5a1-472c-abda-c8d5c96003b8` at 100%, unchanged R2 binding/lifecycle rules and unchanged empty placement settings. The emitted WASM grew from 769,073 to 783,245 bytes (1.8%); startup cost was not isolated. No SIMD flag or persisted format change shipped.
+
+Sixteen strong/edge queries over the unchanged million-document corpus, using 16- and 64-term selections, preserved the complete saved rows, scores and sequence. All returned HTTP 200 through GRU. The previous probe and deployment migration had exercised immutable sources, so post-deploy observations are not independent cold-storage trials. Twelve native Vectorize/hybrid checks also retained all 105 complete rows and scores in the existing three 100-vector fixtures.
+
+The standard load ran twice at one million documents and sequence 2,000. Every one of the 768 measured responses equaled its fresh strong baseline; all entered through GRU and none fell back to the snapshot coordinator. Each concurrency level contains 128 requests, not a long-duration saturation test.
+
+| Run                      | Concurrency | p50 ms | p95 ms | Requests/s |
+| :----------------------- | ----------: | -----: | -----: | ---------: |
+| Previous deployed repeat |           1 |  58.08 | 188.80 |      11.49 |
+| Previous deployed repeat |           4 |  59.39 | 233.64 |      34.29 |
+| Previous deployed repeat |          16 |  62.49 | 396.34 |      92.63 |
+| Bulk map, first          |           1 |  46.54 |  66.46 |      18.51 |
+| Bulk map, first          |           4 |  48.73 | 105.12 |      60.27 |
+| Bulk map, first          |          16 |  55.99 | 407.85 |     101.90 |
+| Bulk map, repeat         |           1 |  47.49 |  60.64 |      19.81 |
+| Bulk map, repeat         |           4 |  47.04 |  78.77 |      70.14 |
+| Bulk map, repeat         |          16 |  50.18 | 199.38 |     138.32 |
+
+First/repeat maxima were 742.94/744.02 ms. The repeat had lower p50/p95 and higher measured throughput than the preceding repeat at each level; the first run had a slightly higher concurrency-sixteen p95. Cache state, I/O and scheduling are uncontrolled between versions. They do not isolate the bulk-map CPU gain, establish sustained throughput or prove Turbopuffer parity. Broad cold-query stalls, large-corpus ANN recall and whole-Worker peak heap remain open.

@@ -71,9 +71,45 @@ pub struct Header {
     filter_masks: RefCell<FilterMasks>,
     pub version: u32,
     pub documents: Vec<DocumentMeta>,
+    #[serde(deserialize_with = "deserialize_term_map")]
     pub terms: BTreeMap<String, TermMeta>,
     pub total_title_length: u64,
     pub total_body_length: u64,
+}
+
+fn deserialize_term_map<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, TermMeta>, D::Error> {
+    struct Terms;
+
+    impl<'de> serde::de::Visitor<'de> for Terms {
+        type Value = BTreeMap<String, TermMeta>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a term dictionary")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut entries = Vec::<(String, TermMeta)>::new();
+            while let Some(entry) = map.next_entry()? {
+                entries.push(entry);
+            }
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            entries.dedup_by(|later, earlier| {
+                if later.0 != earlier.0 {
+                    return false;
+                }
+                std::mem::swap(&mut later.1, &mut earlier.1);
+                true
+            });
+            Ok(entries.into_iter().collect())
+        }
+    }
+
+    deserializer.deserialize_map(Terms)
 }
 
 #[derive(Clone, Debug)]

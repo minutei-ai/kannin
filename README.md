@@ -1,6 +1,6 @@
 # Kannin
 
-BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and indexes; Rust/WASM handles lexical ranking; TypeScript + Effect owns contracts and operations; Vectorize handles vectors. Alchemy deploys the stack. No application SQLite, D1 or KV.
+BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and indexes; Rust/WASM handles lexical ranking; TypeScript + Effect owns contracts and operations; Vectorize handles vectors. Alchemy deploys the stack with Smart Placement. No application SQLite, D1 or KV.
 
 - BM25F with global live statistics, phrase matching and filters before top-k.
 - Atomic R2 manifest commits, durable idempotency receipts and disposable coordinator memory.
@@ -20,6 +20,8 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 The load run at source `6c03e72` checked **384 responses** against strong baseline rows, scores and sequence, with 128 requests per concurrency. All entered through GRU without snapshot coordinator fallback. Two 16-query probes with fresh selectors preserved complete pre-deploy results. These are cache-sensitive workload observations, not sustained-capacity guarantees. Edge freshness is weaker than strong consistency.
 
 Bloom candidate masks now reuse per-segment projections and plans when added query words cannot occur in any segment. On the deployed one-million-document corpus, sequential strong queries with changing absent words measured p50/p95 **660/909 ms before**, **179/363 ms after**, and **191/467 ms on repetition**. Each cohort measured 24 responses after four warmups; all entered through GRU and retained complete rows, scores and sequence. Catalog RPCs fell from **600 to 6 and 27** per measured cohort. These cache-sensitive observations do not establish cold latency or sustained capacity. [Detailed measurements](docs/performance.md) also cover the eight-source R2 batches and local experiments.
+
+Field eligibility is now reused across predicate values. On the one-million-document corpus, twelve measured strong two-term queries fell from p50/p95 **858/1881 ms to 310/415 ms**, with **300 → 0 catalog RPCs** after warmup and identical results. This deployment also enables Smart Placement; responses reported `remote-MIA` through GRU ingress. Eight-term queries increased from **257/303 ms to 314/414 ms**, so the combined changes do not establish a universal latency gain. [Cohort details](docs/performance.md#reusing-physical-eligibility-across-predicate-values).
 
 Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10**, with the entire 300-query report unchanged. Twelve native Vectorize/hybrid checks preserved 105 complete rows and scores across three 100-vector fixtures; large-corpus ANN recall remains unmeasured.
 

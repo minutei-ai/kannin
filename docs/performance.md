@@ -3518,3 +3518,14 @@ The candidate was faster in 347 of 350 pairs. The 25 RPCs belong to initial acqu
 The local gate passed 260 Worker/tooling tests (9,110 assertions), 42 Rust tests, strict TypeScript/Effect lint and types, and native/WASM Clippy.
 
 The same deployment enables Cloudflare Smart Placement through Alchemy. It affects HTTP fetch handlers, not RPC entrypoints or Durable Object placement. Native results from this deployment include both changes and cannot isolate their individual latency effects.
+
+Production deployed source `975c461` as version `58d8443c-9261-4a5d-a22a-bdd62abd468a` at 100%, using profile `minutei`. The native API confirmed `placement.mode = smart`, unchanged R2 binding and unchanged lifecycle rules. All 28 comparison responses reported `cf-placement: remote-MIA` with GRU ingress and preserved complete rows, scores and sequence 2000 against the preceding deployment. This is observed placement, not inference from ingress.
+
+| Native cohort, 1M documents        | Two terms p50/p95 ms | Eight terms p50/p95 ms | Two-term catalog RPCs |
+| ---------------------------------- | -------------------: | ---------------------: | --------------------: |
+| Before                             |     858.31 / 1880.55 |        256.61 / 302.93 |                   300 |
+| Field projection + Smart Placement |      310.10 / 415.11 |        314.02 / 414.38 |                     0 |
+
+Each selector has twelve measured responses after two excluded warmup rounds; nearest-rank p95 is therefore the maximum. Filters change values each round while preserving eligibility. Eight-term queries had zero catalog RPCs in both cohorts. Their latency increased, so this does not establish a universal improvement or isolate the effect of Smart Placement. Network, isolate/cache residency and placement were uncontrolled between cohorts. The complete 300-query SciFact report remained identical to the preceding reference. Cold broad acquisition, whole-Worker heap and large-scale ANN recall remain unproven.
+
+Sixteen additional rare/dense native text checks across strong and edge consistency preserved complete baseline results. Twelve Vectorize/hybrid checks preserved all 105 baseline rows and scores across three fixtures. These checks establish regression coverage for those fixtures, not large-scale ANN quality.

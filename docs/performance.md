@@ -3555,3 +3555,20 @@ Source `d6ea529` deployed as version `91b4a77b-33e0-4e96-b9ae-f8b6b0a2be42` at 1
 Both selectors had zero catalog RPCs across all twelve measured responses in each cohort. Median directory intervals fell from 8.0 to 6.5 ms for two terms and 8.0 to 7.0 ms for eight terms. These are wall-time intervals, not isolated CPU measurements. Twelve samples make nearest-rank p95 the maximum; network and cache/isolate residency remained uncontrolled between cohorts. The observed native reductions do not establish sustained throughput, cold-tail behavior or a universal gain. The complete 300-query SciFact report remained identical to the reference.
 
 Sixteen additional rare/dense text checks across strong and edge consistency retained complete baseline results. Twelve native Vectorize/hybrid checks retained all 105 baseline rows and scores. Cold broad acquisition, whole-Worker heap, sustained capacity and large-scale ANN recall remain open.
+
+## Removing the duplicate exact catalog cache
+
+The `Terms` entrypoint already uses native Workers Cache, whose key includes the entrypoint, request URL and `ctx.props`. On a native miss it also opened a manual Cache API namespace, hashed the ranges and selector, and looked for another exact projected response before acquiring reusable physical overviews. The manual exact copy is removed. Native projected-response caching, overview memory/Cache API/R2 caches, canonical fallback, eight-range RPCs and their concurrency/byte limits remain unchanged. The manual cache hit counter and its three lookup intervals were removed with their producer; source-overview telemetry remains request-local.
+
+A regression failed on the preceding source because the catalog consulted the manual exact cache. It now requires zero such lookups while retaining the four-reader refill window, ordered results, resident-overview reuse and rebuild recovery. Concurrent-query timing checks verify request-local measurements and source-overview cache recovery. Native Workers Cache is not emulated by local workerd tests.
+
+A 100-pair alternating workerd comparison used 10,000 documents in 200 segments, clearing volatile namespace caches before each query and changing an always-matching missing-field selector. Both variants issued 2,500 catalog RPCs, with all complete rows, scores and sequence 200 identical. Physical overview caches could remain warm, so this measures metadata acquisition after memory eviction, not a fully cold R2 dataset.
+
+| Local workerd                             | p50 ms | p95 ms | Catalog RPCs |
+| ----------------------------------------- | -----: | -----: | -----------: |
+| Before                                    | 121.55 | 156.54 |        2,500 |
+| Native projected cache + shared overviews |  87.61 | 115.84 |        2,500 |
+
+The candidate was faster in 98 of 100 pairs, with p50 about 28% lower. This local result does not establish native latency or peak heap. The native comparison uses a fresh missing-field name each round to force metadata acquisition while preserving document eligibility; its eight-term query shares that round's field scope as a warm control.
+
+The local gate passed 261 Worker/tooling tests (9,128 assertions), 42 Rust tests, strict TypeScript/Effect lint and types, build and native/WASM Clippy. Before deployment, a native cache probe cleared the benchmark coordinator memory before each request and switched from `any` to `all` to require a distinct plan while keeping catalog props identical. The second query retained complete results and sequence 2000 and reported 25 native cache hits across 25 catalog RPCs, with zero origin executions. This verifies the existing native cache mechanism; it is not evidence from a local cache emulator.

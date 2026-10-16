@@ -6,7 +6,7 @@ import { document, request, startWorker, textQuery, write } from "./harness";
 const worker = await startWorker();
 afterAll(() => worker.dispose());
 
-test("catalog intervals stay request-local and cached origin measurements are not replayed", async () => {
+test("catalog intervals stay request-local across concurrent queries and overview cache recovery", async () => {
   const namespace = "catalog-timing";
   for (const index of [0, 1, 2])
     expect(
@@ -42,10 +42,11 @@ test("catalog intervals stay request-local and cached origin measurements are no
   expect((await request(worker, namespace, "rebuild", {})).status).toBe(200);
   const cached = await request(worker, namespace, "query", textQuery("alpha"));
   expect(Schema.decodeUnknownSync(QueryResult)(await cached.json())).toEqual(expected);
-  expect(cached.headers.get("server-timing")).toContain("api_hits=1 origins=0");
-  expect(cached.headers.get("server-timing")).toContain("reads=0 hits=0 bytes=0");
-  for (const phase of ["key", "cache_open", "cache_match"])
-    expect(cached.headers.get("server-timing")).toContain(`catalog_${phase}_sum;dur=0`);
+  expect(cached.headers.get("server-timing")).toContain("requests=1 native_hits=0 origins=1");
+  expect(cached.headers.get("server-timing")).toContain('desc="memory=0 api=3"');
+  expect(cached.headers.get("server-timing")).toContain(
+    'catalog_source_r2_sum;dur=0;desc="reads=0 hits=0 bytes=0 batch_peak=0"',
+  );
 });
 
 test("cold catalog summaries overlap at most four R2 bodies and preserve source order", async () => {

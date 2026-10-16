@@ -19,7 +19,7 @@ const opened = new WeakSet<Cache>();
 const wrapped = new WeakSet<R2Bucket>();
 const open = caches.open.bind(caches);
 caches.open = async (name) => {
-  if (name === "kannin-text-plans-v1" || name === "raio-terms-v7")
+  if (name === "kannin-text-plans-v1")
     return Promise.reject(new Error("Projected caches disabled for overview fixture"));
   const cache = await open(name);
   if (name !== "raio-overview-batches-v5" || opened.has(cache)) return cache;

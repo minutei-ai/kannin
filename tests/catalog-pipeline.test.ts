@@ -63,7 +63,7 @@ test("catalog reads refill available slots while a prior R2 read is pending", as
   expect(state.headers.get("x-fixture-active")).toBe("0");
   expect(state.headers.get("x-fixture-peak")).toBe("4");
   expect(state.headers.get("x-fixture-refilled")).toBe("true");
-  expect(state.headers.get("x-fixture-term-matches")).toBe("1");
+  expect(state.headers.get("x-fixture-term-matches")).toBe("0");
   const resident = await request(worker, namespace, "query", textQuery("alpha unique2", 1));
   expect(resident.status).toBe(200);
   expect(
@@ -71,7 +71,7 @@ test("catalog reads refill available slots while a prior R2 read is pending", as
   ).toEqual(["2"]);
   expect(resident.headers.get("server-timing")).toContain('desc="memory=1 api=0"');
   const reused = await fetch(new URL("/fixture/state", await worker.ready));
-  expect(reused.headers.get("x-fixture-term-matches")).toBe("1");
+  expect(reused.headers.get("x-fixture-term-matches")).toBe("0");
   const repeated = await request(worker, namespace, "query", textQuery("alpha", 10));
   expect(Schema.decodeUnknownSync(QueryResult)(await repeated.json())).toEqual(first);
   expect((await request(worker, namespace, "rebuild", {})).status).toBe(200);

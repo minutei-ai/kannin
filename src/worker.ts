@@ -83,7 +83,6 @@ import {
   readTermCatalogs,
   addFrequencyPosting,
   readTermProjections,
-  hasResidentTermOverviews,
   buildSegment,
   storeSegmentCaches,
   bloom,
@@ -224,48 +223,13 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
       props.value.bucket !== this.env.STORAGE_CACHE_SCOPE
     )
       return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });
-    const encodedTerms = this.ctx.props.terms;
-    const encodedFilters = this.ctx.props.filters;
-    const cacheKey = new URL(request.url);
-    cacheKey.hostname = "raio-terms.internal";
-    cacheKey.searchParams.set("bucket", props.value.bucket);
-    cacheKey.searchParams.set(
-      "ranges",
-      await sha256(
-        Schema.encodeSync(Schema.fromJsonString(TermProjectionProps.fields.ranges))(
-          props.value.ranges,
-        ),
-      ),
-    );
-    cacheKey.searchParams.set(
-      "selector",
-      await sha256(`${encodedTerms}\0${this.ctx.props.filters}`),
-    );
-    const keyedAt = Effect.runSync(Clock.currentTimeNanos);
-    const cache = await Effect.runPromise(
-      Effect.gen(function* () {
-        if (hasResidentTermOverviews(props.value.ranges)) return undefined;
-        return yield* Effect.tryPromise(() => caches.open("raio-terms-v7")).pipe(
-          Effect.orElseSucceed(() => undefined),
-        );
-      }),
-    );
-    const openedAt = Effect.runSync(Clock.currentTimeNanos);
-    const lookup = { endedAt: openedAt };
-    if (cache !== undefined) {
-      const cached = await Effect.runPromise(
-        Effect.tryPromise(() => cache.match(cacheKey)).pipe(Effect.orElseSucceed(() => undefined)),
-      );
-      lookup.endedAt = Effect.runSync(Clock.currentTimeNanos);
-      if (cached !== undefined) {
-        const response = new Response(cached.body, cached);
-        response.headers.delete("cf-cache-status");
-        response.headers.set("x-raio-cache", "terms-api-hit");
-        return response;
-      }
-    }
-    const response = await Effect.runPromise(
-      readTermProjections(props.value.ranges, encodedTerms, encodedFilters, this.ctx).pipe(
+    return Effect.runPromise(
+      readTermProjections(
+        props.value.ranges,
+        this.ctx.props.terms,
+        this.ctx.props.filters,
+        this.ctx,
+      ).pipe(
         Effect.flatMap(({ catalogs, telemetry }) =>
           Effect.gen(function* () {
             const entryEnded = yield* Clock.currentTimeNanos;
@@ -274,9 +238,6 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
               encodeCatalogTelemetry({
                 ...telemetry,
                 entryMs: Number(entryEnded - entryStarted) / 1e6,
-                keyMs: Number(keyedAt - entryStarted) / 1e6,
-                cacheOpenMs: Number(openedAt - keyedAt) / 1e6,
-                cacheMatchMs: Number(lookup.endedAt - openedAt) / 1e6,
               }),
             ]);
           }),
@@ -301,15 +262,6 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
         ),
       ),
     );
-    if (response.ok && cache !== undefined)
-      this.ctx.waitUntil(
-        Effect.runPromise(
-          Effect.tryPromise(() => cache.put(cacheKey, response.clone())).pipe(
-            Effect.orElseSucceed(() => undefined),
-          ),
-        ),
-      );
-    return response;
   }
 }
 

@@ -142,7 +142,6 @@ const reads = {
   termBytes: 0,
   termMemoryHits: 0,
   termWorkerCacheHits: 0,
-  termCacheApiHits: 0,
   rangeReads: 0,
   rangeCacheTimeouts: 0,
   rangeR2FallbackReads: 0,
@@ -756,12 +755,6 @@ async function acquireStoredOverviewBatch(
   return { started: selected.started, result: await selected.completion };
 }
 
-export function hasResidentTermOverviews(ranges: ReadonlyArray<typeof TermProjectionRange.Type>) {
-  return ranges.every((input) =>
-    overviewBuffers.has(`${env.STORAGE_CACHE_SCOPE}:${input.key}/${input.headerBytes}`),
-  );
-}
-
 export const readTermProjections = Effect.fn("kannin.readTermProjections")(
   (
     ranges: ReadonlyArray<typeof TermProjectionRange.Type>,
@@ -791,9 +784,6 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
         fallbackMs: 0,
         publishMs: 0,
         entryMs: 0,
-        keyMs: 0,
-        cacheOpenMs: 0,
-        cacheMatchMs: 0,
         totalMs: 0,
       };
       const inspected = yield* Effect.forEach(
@@ -1186,7 +1176,6 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
       const metrics = {
         requests: 0,
         nativeHits: 0,
-        apiHits: 0,
         originResponses: 0,
         fetchMs: 0,
         fetchMaxMs: 0,
@@ -1199,9 +1188,6 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
         sourceBatchMs: 0,
         sourceBatchTimeouts: 0,
         sourceEntryMs: 0,
-        sourceKeyMs: 0,
-        sourceCacheOpenMs: 0,
-        sourceCacheMatchMs: 0,
         sourcePublishMs: 0,
         sourceCacheMs: 0,
         sourceR2Ms: 0,
@@ -1338,8 +1324,6 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
                 reads.termWorkerCacheHits += group.entries.length;
                 metrics.nativeHits += 1;
               }
-              if (status !== "HIT" && response.headers.get("x-raio-cache") === "terms-api-hit")
-                reads.termCacheApiHits += group.entries.length;
               const bodyAt = yield* Clock.currentTimeNanos;
               const text = yield* Effect.tryPromise(() => response.text());
               metrics.bodyMs += Number((yield* Clock.currentTimeNanos) - bodyAt) / 1e6;
@@ -1351,8 +1335,6 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
               const decodedAt = yield* Clock.currentTimeNanos;
               const catalogs = yield* decodeTermCatalogBatch(text);
               metrics.decodeMs += Number((yield* Clock.currentTimeNanos) - decodedAt) / 1e6;
-              if (status !== "HIT" && response.headers.get("x-raio-cache") === "terms-api-hit")
-                metrics.apiHits += 1;
               const encodedTelemetry = response.headers.get("x-kannin-catalog-telemetry");
               if (
                 status !== "HIT" &&
@@ -1371,9 +1353,6 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
                   metrics.sourceBatchBytes += telemetry.batchBytes;
                   metrics.sourceBatchMs += telemetry.batchMs;
                   metrics.sourceBatchTimeouts += telemetry.batchTimeouts;
-                  metrics.sourceKeyMs += telemetry.keyMs;
-                  metrics.sourceCacheOpenMs += telemetry.cacheOpenMs;
-                  metrics.sourceCacheMatchMs += telemetry.cacheMatchMs;
                   metrics.sourcePublishMs += telemetry.publishMs;
                   metrics.sourceCacheMs += telemetry.overviewCacheMs;
                   metrics.sourceR2Ms += telemetry.r2Ms;
@@ -1448,16 +1427,13 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
       timings.append(
         "server-timing",
         [
-          `catalog_rpc_sum;dur=${metrics.fetchMs};desc="requests=${metrics.requests} native_hits=${metrics.nativeHits} api_hits=${metrics.apiHits} origins=${metrics.originResponses}"`,
+          `catalog_rpc_sum;dur=${metrics.fetchMs};desc="requests=${metrics.requests} native_hits=${metrics.nativeHits} origins=${metrics.originResponses}"`,
           `catalog_rpc_max;dur=${metrics.fetchMaxMs}`,
           `catalog_body_sum;dur=${metrics.bodyMs}`,
           `catalog_decode_sum;dur=${metrics.decodeMs}`,
           `catalog_origin_sum;dur=${metrics.sourceTotalMs}`,
           `catalog_entry_sum;dur=${metrics.sourceEntryMs}`,
           `catalog_batch_r2_sum;dur=${metrics.sourceBatchMs};desc="reads=${metrics.sourceBatchReads} hits=${metrics.sourceBatchHits} bytes=${metrics.sourceBatchBytes} timeouts=${metrics.sourceBatchTimeouts}"`,
-          `catalog_key_sum;dur=${metrics.sourceKeyMs}`,
-          `catalog_cache_open_sum;dur=${metrics.sourceCacheOpenMs}`,
-          `catalog_cache_match_sum;dur=${metrics.sourceCacheMatchMs}`,
           `catalog_publish_sum;dur=${metrics.sourcePublishMs}`,
           `catalog_source_cache_sum;dur=${metrics.sourceCacheMs};desc="memory=${metrics.sourceMemoryHits} api=${metrics.sourceApiHits}"`,
           `catalog_source_r2_sum;dur=${metrics.sourceR2Ms};desc="reads=${metrics.sourceR2Reads} hits=${metrics.sourceR2Hits} bytes=${metrics.sourceR2Bytes} batch_peak=${metrics.sourceR2Peak}"`,

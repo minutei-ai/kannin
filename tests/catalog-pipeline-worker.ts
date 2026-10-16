@@ -19,8 +19,9 @@ caches.open = async (name) => {
   if (name !== "raio-terms-v7" || opened.has(cache)) return cache;
   opened.add(cache);
   const match = cache.match.bind(cache);
-  cache.match = (input, options) => {
+  cache.match = async (input, options) => {
     state.termMatches += 1;
+    await Effect.runPromise(Effect.sleep("200 millis"));
     return match(input, options);
   };
   return cache;

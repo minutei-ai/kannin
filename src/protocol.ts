@@ -238,7 +238,6 @@ export const CacheMetrics = Schema.Struct({
   termBytes: Schema.Int,
   termMemoryHits: Schema.Int,
   termWorkerCacheHits: Schema.Int,
-  termCacheApiHits: Schema.Int,
   rangeReads: Schema.Int,
   rangeCacheTimeouts: Schema.Int,
   rangeR2FallbackReads: Schema.Int,
@@ -389,9 +388,6 @@ export const CatalogTelemetry = Schema.Struct({
   fallbackMs: Schema.Finite,
   publishMs: Schema.Finite,
   entryMs: Schema.Finite,
-  keyMs: Schema.Finite,
-  cacheOpenMs: Schema.Finite,
-  cacheMatchMs: Schema.Finite,
   totalMs: Schema.Finite,
 });
 export const TermCatalogBatch = Schema.Array(ProjectedTermCatalog).check(

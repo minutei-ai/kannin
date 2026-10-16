@@ -924,7 +924,21 @@ struct QueryTerms {
 }
 
 impl QueryTerms {
-    fn new(statistics: Statistics, words: Vec<String>, mode: &str) -> Self {
+    fn new(statistics: Statistics, text: &str, mode: &str, top_k: usize) -> Result<Self, String> {
+        let words = normalize_text(text)
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if top_k == 0 || top_k > 100 || words.iter().collect::<BTreeSet<_>>().len() > 64 {
+            return Err("Invalid search budget".into());
+        }
+        if mode != "any" && mode != "all" && mode != "phrase" {
+            return Err("Unknown match mode".into());
+        }
+        if mode == "phrase" && words.len() > 64 {
+            return Err("Phrase exceeds budget".into());
+        }
+
         let mut order: Vec<_> = (0..words.len()).collect();
         order.sort_unstable_by(|a, b| words[*a].cmp(&words[*b]));
         order.dedup_by(|a, b| words[*a] == words[*b]);
@@ -949,13 +963,13 @@ impl QueryTerms {
         } else {
             Vec::new()
         };
-        Self {
+        Ok(Self {
             statistics: Rc::new(statistics),
             words: Rc::new(words),
             order,
             scorers,
             phrase_order,
-        }
+        })
     }
 }
 
@@ -1184,17 +1198,41 @@ pub struct PostingSpan<'a> {
     pub blocks: Vec<&'a BlockMeta>,
 }
 
-fn validate_search_budget(words: &[String], mode: &str, top_k: usize) -> Result<(), String> {
-    if top_k == 0 || top_k > 100 || words.iter().collect::<BTreeSet<_>>().len() > 64 {
-        return Err("Invalid search budget".into());
+pub struct PreparedQuery {
+    terms: Rc<QueryTerms>,
+    mode: String,
+    top_k: usize,
+    filters: Vec<Filter>,
+}
+
+impl PreparedQuery {
+    #[doc = "# Errors\nRejects invalid top-k, match mode or term budgets."]
+    pub fn new(
+        statistics: Statistics,
+        text: &str,
+        mode: String,
+        top_k: usize,
+        filters: Vec<Filter>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            terms: Rc::new(QueryTerms::new(statistics, text, &mode, top_k)?),
+            mode,
+            top_k,
+            filters,
+        })
     }
-    if mode != "any" && mode != "all" && mode != "phrase" {
-        return Err("Unknown match mode".into());
+
+    #[doc = "# Errors\nRejects invalid filter attributes or tombstone rows."]
+    pub fn ranker(&self, header: impl Into<Rc<Header>>, dead: &[u32]) -> Result<Search, String> {
+        Search::with_terms(
+            header.into(),
+            self.terms.clone(),
+            &self.mode,
+            self.top_k,
+            dead,
+            &self.filters,
+        )
     }
-    if mode == "phrase" && words.len() > 64 {
-        return Err("Phrase exceeds budget".into());
-    }
-    Ok(())
 }
 
 impl Search {
@@ -1403,14 +1441,9 @@ impl Search {
         filters: &[Filter],
     ) -> Result<Self, String> {
         let header = header.into();
-        let words: Vec<String> = normalize_text(text)
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect();
-        validate_search_budget(&words, mode, top_k)?;
         Self::with_terms(
             header,
-            Rc::new(QueryTerms::new(statistics, words, mode)),
+            Rc::new(QueryTerms::new(statistics, text, mode, top_k)?),
             mode,
             top_k,
             dead,
@@ -1926,10 +1959,9 @@ pub fn bloom_filter_many<'a>(
 #[cfg(target_arch = "wasm32")]
 pub mod wasm {
     use super::{
-        BlockMeta, BuiltSegment, Document, DocumentMeta, Filter, Header, MAX_BYTES, QueryTerms,
-        Range, Search, SelectedAttributes, Statistics, TermMeta, TermScorer, append, bloom_build,
+        BlockMeta, BuiltSegment, Document, DocumentMeta, Filter, Header, MAX_BYTES, Range, Search,
+        SelectedAttributes, Statistics, TermMeta, TermScorer, append, bloom_build,
         bloom_filter_many, build, decode_page, document_terms, matches, parse_header,
-        validate_search_budget,
     };
     use serde::{Deserialize, Serialize};
     use std::cell::RefCell;
@@ -2925,15 +2957,10 @@ pub mod wasm {
         ) -> Result<Ranker, JsValue> {
             let dead: Vec<u32> = serde_json::from_str(dead)
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
-            let search = Search::with_terms(
-                self.header.clone(),
-                query.terms.clone(),
-                &query.mode,
-                query.top_k,
-                &dead,
-                &query.filters,
-            )
-            .map_err(|cause| JsValue::from_str(&cause))?;
+            let search = query
+                .query
+                .ranker(self.header.clone(), &dead)
+                .map_err(|cause| JsValue::from_str(&cause))?;
             Ok(Ranker { search })
         }
 
@@ -3138,10 +3165,7 @@ pub mod wasm {
 
     #[wasm_bindgen]
     pub struct PreparedQuery {
-        terms: Rc<QueryTerms>,
-        mode: String,
-        top_k: usize,
-        filters: Vec<Filter>,
+        query: super::PreparedQuery,
     }
 
     #[wasm_bindgen]
@@ -3156,18 +3180,15 @@ pub mod wasm {
                     "Prepared query requires empty segment tombstones",
                 ));
             }
-            let words = crate::normalize_text(&input.text)
-                .split_whitespace()
-                .map(str::to_owned)
-                .collect::<Vec<_>>();
-            validate_search_budget(&words, &input.mode, input.top_k)
-                .map_err(|cause| JsValue::from_str(&cause))?;
-            Ok(Self {
-                terms: Rc::new(QueryTerms::new(input.statistics, words, &input.mode)),
-                mode: input.mode,
-                top_k: input.top_k,
-                filters: input.filters,
-            })
+            let query = super::PreparedQuery::new(
+                input.statistics,
+                &input.text,
+                input.mode,
+                input.top_k,
+                input.filters,
+            )
+            .map_err(|cause| JsValue::from_str(&cause))?;
+            Ok(Self { query })
         }
     }
 

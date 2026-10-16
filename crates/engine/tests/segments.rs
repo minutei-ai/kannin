@@ -785,3 +785,78 @@ fn decoded_term_maps_reject_invalid_entries_and_object_framing()
     }
     Ok(())
 }
+
+#[test]
+fn prepared_queries_reuse_global_terms_without_retaining_segment_tombstones()
+-> Result<(), Box<dyn std::error::Error>> {
+    let sources = [
+        segment::build(vec![
+            document("a", "alpha beta alpha"),
+            document("b", "beta alpha"),
+            document("c", "alpha beta"),
+        ])?,
+        segment::build(vec![
+            document("d", "beta beta"),
+            document("e", "alpha beta alpha"),
+            document("f", "alpha"),
+        ])?,
+    ];
+    for mode in ["any", "all", "phrase"] {
+        for documents in [6, 19] {
+            let global = Statistics {
+                documents,
+                title_length: 0,
+                body_length: 15,
+                frequencies: BTreeMap::from([
+                    (String::from("alpha"), 5),
+                    (String::from("beta"), 5),
+                ]),
+            };
+            let prepared = segment::PreparedQuery::new(
+                global.clone(),
+                "alpha beta alpha",
+                mode.into(),
+                10,
+                Vec::new(),
+            )?;
+            for (source, dead) in sources.iter().zip([vec![0], vec![1]]) {
+                let (header, base) = segment::parse_header(&source.bytes)?;
+                for dead in [dead, Vec::new()] {
+                    let mut normal = Search::new(
+                        header.clone(),
+                        global.clone(),
+                        "alpha beta alpha",
+                        mode,
+                        10,
+                        &dead,
+                        &[],
+                    )?;
+                    let mut shared = prepared.ranker(header.clone(), &dead)?;
+                    for term in ["alpha", "beta"] {
+                        if let Some(metadata) = header.terms.get(term) {
+                            for block in &metadata.blocks {
+                                let start = base + block.data.offset as usize;
+                                let bytes =
+                                    &source.bytes[start..start + block.data.length as usize];
+                                normal.add(term, bytes)?;
+                                shared.add(term, bytes)?;
+                            }
+                        }
+                    }
+                    let expected = normal
+                        .finish()?
+                        .into_iter()
+                        .map(|hit| (hit.row, hit.score.to_bits()))
+                        .collect::<Vec<_>>();
+                    let actual = shared
+                        .finish()?
+                        .into_iter()
+                        .map(|hit| (hit.row, hit.score.to_bits()))
+                        .collect::<Vec<_>>();
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+    }
+    Ok(())
+}

@@ -3673,3 +3673,20 @@ Ingress was GRU, with Smart Placement observed as `local-GRU`. VM setup alone to
 The six native tests compare full-segment/range ranking, including filters, tombstones, `all`, `phrase` and cutoffs. They also verify bucket isolation, warm reuse, concurrent acquisition sharing, cancellation without duplicating a producer, eviction while handles remain live, and extreme posting offsets without integer overflow. The image builds from locked Rust source. General production API integration, live manifest/compaction leases, complete-row and hybrid native checks, sustained concurrency and billing remain gates.
 
 The experimental Worker, DO container binding and image resource were destroyed after explicit Container stops. The canonical manifest remained byte-identical with one million documents, sequence 2000 and 200 segments. Production remained on WASM version `f1148942-62ae-4cd5-a719-b22dc6f0ad40` with Smart Placement and unchanged R2 binding/lifecycle. No production routing cutover was made.
+
+## Sharing compiled terms across native segments
+
+WASM and the native process now use one engine-owned query compiler. Normalization, unique-term budgets, global score constants and phrase order compile once per native request of up to eight sources. Segment rankers share immutable compiled terms while applying their current tombstones and filters separately. The plan lives for the request, so changing global live statistics compiles a new plan. The WASM constructor and ranking API remain unchanged.
+
+The million-document HTTP comparison used two local cohorts in reversed order, identical source-built images apart from the change, 0.25 vCPU and one GiB. Each selector/variant ran 24 requests per cohort; excluding four warmups per cohort leaves forty warm observations per cell. All 192 responses preserved oracle IDs and exact scores. Both variants used the same precomputed inputs, canonical header/posting ranges, source concurrency and three/nine ranking HTTP batches.
+
+| Warm local HTTP  | Before p50/p95 ms | Shared compiler p50/p95 ms |
+| ---------------- | ----------------: | -------------------------: |
+| Sixteen terms    |       4.12 / 6.86 |                3.20 / 5.21 |
+| Sixty-four terms |     19.50 / 80.95 |              14.26 / 71.04 |
+
+Median reductions were about 22% and 27%. These are local observations, not Cloudflare HTTP or sustained-load results. Cold acquisition still dominates first queries; two starts per variant/selector do not establish a cold-latency gain. The private kernel-only paired comparison excludes source acquisition and HTTP; quarter-CPU scheduling still creates long wall-time tails, so elapsed intervals are not CPU billing measurements.
+
+The full 300-query WASM SciFact report remained identical, retaining nDCG@10 0.6730619695232347, recall@10 0.7956666666666666 and MRR@10 0.641808201058201. A source-built native Container evaluated the same 300 queries through its HTTP protocol: IDs, order and scores matched WASM exactly. All 3,000 selected document intervals decoded with the existing WASM checksum-validating codec and matched corpus IDs, titles and text. This covers a fixed corpus without mutations or vectors; it does not prove live revision reconciliation, sequence barriers or hybrid routing through the native process.
+
+A new engine regression reuses compiled terms across different headers, tombstones, modes and global document counts, checking score bits against independent compilation. No production routing cutover or Cloudflare deployment was performed for this change.

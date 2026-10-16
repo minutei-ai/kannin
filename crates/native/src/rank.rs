@@ -1,10 +1,10 @@
 use crate::{
     error::Error,
-    protocol::{Cutoff, Hit, Metrics, Query, Request, Response, Segment},
+    protocol::{Cutoff, Hit, Metrics, Request, Response, Segment},
     reader::Reader,
 };
 use futures_util::{StreamExt, TryStreamExt, stream};
-use raio_engine::segment::{BlockMeta, Search};
+use raio_engine::segment::{BlockMeta, PreparedQuery, Search};
 use std::{cell::RefCell, rc::Rc, sync::Arc, time::Instant};
 use tokio::sync::Semaphore;
 
@@ -40,13 +40,23 @@ impl Ranker {
     ) -> futures_util::future::LocalBoxFuture<'_, Result<Response, Rc<Error>>> {
         Box::pin(async move {
             Self::validate(&input).map_err(Rc::new)?;
+            let started = Instant::now();
+            let query = PreparedQuery::new(
+                input.query.statistics,
+                &input.query.text,
+                input.query.mode,
+                input.query.top_k,
+                input.query.filters,
+            )
+            .map_err(|error| Rc::new(Error::Invalid(error)))?;
             let metrics = Rc::new(RefCell::new(Metrics::default()));
+            metrics.borrow_mut().prepare_ms = started.elapsed().as_secs_f64() * 1000.0;
             let segments = stream::iter(input.segments.iter())
                 .map(|segment| {
                     self.segment(
                         &input.bucket,
                         segment,
-                        &input.query,
+                        &query,
                         input.cutoff.as_ref(),
                         metrics.clone(),
                     )
@@ -182,7 +192,7 @@ impl Ranker {
         &'a self,
         bucket: &'a str,
         segment: &'a Segment,
-        query: &'a Query,
+        query: &'a PreparedQuery,
         cutoff: Option<&'a Cutoff>,
         metrics: Rc<RefCell<Metrics>>,
     ) -> futures_util::future::LocalBoxFuture<'a, Result<Vec<Hit>, Rc<Error>>> {
@@ -195,16 +205,9 @@ impl Ranker {
                 .map_err(|error| Rc::new(Error::Acquire(error)))?;
             let started = Instant::now();
             let header = self.reader.header(bucket, segment, &metrics).await?;
-            let mut search = Search::new(
-                header.clone(),
-                query.statistics.clone(),
-                &query.text,
-                &query.mode,
-                query.top_k,
-                &segment.dead,
-                &query.filters,
-            )
-            .map_err(|error| Rc::new(Error::Invalid(error)))?;
+            let mut search = query
+                .ranker(header.clone(), &segment.dead)
+                .map_err(|error| Rc::new(Error::Invalid(error)))?;
             {
                 let mut measured = metrics.borrow_mut();
                 measured.prepare_ms = started

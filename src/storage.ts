@@ -1180,8 +1180,8 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
         sourceApiHits: 0,
         sourceFallbacks: 0,
       };
-      const windows = Array.from({ length: Math.ceil(ranges.length / 16) }, (_, index) =>
-        ranges.slice(index * 16, index * 16 + 16),
+      const windows = Array.from({ length: Math.ceil(ranges.length / 8) }, (_, index) =>
+        ranges.slice(index * 8, index * 8 + 8),
       );
       const batches = yield* Effect.forEach(
         windows,

@@ -3,7 +3,8 @@ import { Effect, Schema } from "effect";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { QueryResult, StoredOverviewBatch } from "../src/protocol";
+import { crc32, deflateSync, inflateSync } from "node:zlib";
+import { CorrelatedOverview, QueryResult, Root, StoredOverviewBatch } from "../src/protocol";
 import { initSync, pack, unpack } from "../dist/wasm/raio_engine";
 import { document, request, startWorker, textQuery, write } from "./harness";
 
@@ -50,7 +51,7 @@ async function fixture() {
 }
 
 async function seed(worker: Awaited<ReturnType<typeof startWorker>>, namespace = "batch") {
-  for (const index of Array.from({ length: 9 }, (_, i) => i))
+  for (const index of Array.from({ length: 8 }, (_, i) => i))
     expect(
       (
         await request(
@@ -76,6 +77,100 @@ async function seed(worker: Awaited<ReturnType<typeof startWorker>>, namespace =
   }
   throw new Error("No batch object");
 }
+
+test("oversized combined sources recover through admissible physical batches", async () => {
+  await using instance = await fixture();
+  const { worker } = instance;
+  for (const index of Array.from({ length: 16 }, (_, i) => i))
+    expect(
+      (
+        await request(
+          worker,
+          "large-overviews",
+          "write",
+          write([document(String(index), `alpha unique${index}`)]),
+        )
+      ).status,
+    ).toBe(200);
+  const bucket = await worker.getR2Bucket("STORAGE");
+  const object = await bucket.get("namespaces/large-overviews/root.json");
+  if (object === null) throw new Error("Missing manifest");
+  const root = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
+  const sources = [];
+  for (const segment of root.segments) {
+    const key = `cache/correlated-v2/${segment.key}`;
+    const cached = await bucket.get(key);
+    if (cached === null) throw new Error("Missing correlated source");
+    const source = Schema.decodeSync(Schema.fromJsonString(CorrelatedOverview))(
+      await cached.text(),
+    );
+    const decoded = inflateSync(source.overview.subarray(8));
+    const padded = new Uint8Array(30000).fill(32);
+    padded.set(decoded);
+    const compressed = deflateSync(padded, { level: 0 });
+    const overview = new Uint8Array(8 + compressed.byteLength);
+    const frame = new DataView(overview.buffer);
+    frame.setUint32(0, padded.byteLength, true);
+    frame.setUint32(4, crc32(padded), true);
+    overview.set(compressed, 8);
+    const replacement = { ...source, overview };
+    sources.push(replacement);
+    await bucket.put(
+      key,
+      Schema.encodeSync(Schema.fromJsonString(CorrelatedOverview))(replacement),
+    );
+  }
+  const first = sources[0];
+  if (first === undefined) throw new Error("Missing physical source");
+  const full = Schema.encodeSync(Schema.fromJsonString(StoredOverviewBatch))({
+    bucket: first.bucket,
+    ranges: sources.map((source) => source.source),
+    overviews: sources.map((source) => source.overview),
+  });
+  expect(new TextEncoder().encode(full).byteLength).toBeGreaterThan(512 * 1024);
+  const references: Array<typeof QueryResult.Type> = [];
+  for (const pass of [0, 1]) {
+    expect((await request(worker, "large-overviews", "rebuild", {})).status).toBe(200);
+    const response = await request(
+      worker,
+      "large-overviews",
+      "query",
+      textQuery(`alpha missing${pass}`),
+    );
+    expect(response.status).toBe(200);
+    const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+    references.push(result);
+    const reference = references[0];
+    if (reference === undefined) throw new Error("Missing original result");
+    expect(result).toEqual(reference);
+    expect(result.sequence).toBe(16);
+    expect(result.rows.map((row) => row.id)).toEqual(
+      Array.from({ length: 16 }, (_, i) => String(i))
+        .toSorted()
+        .slice(0, 10),
+    );
+    for (const attempt of Array.from({ length: 50 }, (_, i) => i)) {
+      const objects = await bucket.list({ prefix: "cache/correlated-batches-v1/" });
+      if (objects.objects.length >= pass + 1 || attempt === 49) break;
+      await Effect.runPromise(Effect.sleep("10 millis"));
+    }
+  }
+  const persisted = await bucket.list({ prefix: "cache/correlated-batches-v1/" });
+  expect(persisted.objects).toHaveLength(2);
+  expect((await request(worker, "large-overviews", "rebuild", {})).status).toBe(200);
+  const recovered = await request(
+    worker,
+    "large-overviews",
+    "query",
+    textQuery("alpha recoveredmissing"),
+  );
+  expect(recovered.status).toBe(200);
+  const reference = references[0];
+  if (reference === undefined) throw new Error("Missing original result");
+  expect(Schema.decodeUnknownSync(QueryResult)(await recovered.json())).toEqual(reference);
+  expect(recovered.headers.get("server-timing")).toContain('desc="reads=2 hits=2');
+  expect(recovered.headers.get("server-timing")).toContain("reads=0 hits=0 bytes=0 batch_peak=0");
+});
 
 for (const variant of [
   "valid",
@@ -123,7 +218,7 @@ for (const variant of [
       expect(response.headers.get("server-timing")).toContain(
         "reads=0 hits=0 bytes=0 batch_peak=0",
       );
-    } else expect(response.headers.get("server-timing")).toContain("reads=9 hits=9");
+    } else expect(response.headers.get("server-timing")).toContain("reads=8 hits=8");
   }, 15000);
 }
 
@@ -261,7 +356,7 @@ test("a persisted batch promotes into the faster overview Cache API tier", async
   const cached = await request(worker, "batch", "query", textQuery("alpha secondpromotion"));
   expect(cached.status).toBe(200);
   expect(Schema.decodeUnknownSync(QueryResult)(await cached.json())).toEqual(reference);
-  expect(cached.headers.get("server-timing")).toContain('desc="memory=0 api=9"');
+  expect(cached.headers.get("server-timing")).toContain('desc="memory=0 api=8"');
   expect(cached.headers.get("server-timing")).toContain(
     'catalog_batch_r2_sum;dur=0;desc="reads=0 hits=0',
   );

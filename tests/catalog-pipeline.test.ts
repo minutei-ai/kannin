@@ -40,7 +40,7 @@ test("catalog reads refill available slots while a prior R2 read is pending", as
     await worker.dispose();
   });
   const namespace = "catalog-pipeline";
-  for (const index of Array.from({ length: 9 }, (_, ordinal) => ordinal))
+  for (const index of Array.from({ length: 8 }, (_, ordinal) => ordinal))
     expect(
       (
         await request(
@@ -55,11 +55,11 @@ test("catalog reads refill available slots while a prior R2 read is pending", as
   expect(response.status).toBe(200);
   const first = Schema.decodeUnknownSync(QueryResult)(await response.json());
   expect(first.rows.map((row) => row.id)).toEqual(
-    Array.from({ length: 9 }, (_, index) => String(index)),
+    Array.from({ length: 8 }, (_, index) => String(index)),
   );
-  expect(response.headers.get("server-timing")).toContain("reads=9 hits=9");
+  expect(response.headers.get("server-timing")).toContain("reads=8 hits=8");
   const state = await fetch(new URL("/fixture/state", await worker.ready));
-  expect(state.headers.get("x-fixture-started")).toBe("9");
+  expect(state.headers.get("x-fixture-started")).toBe("8");
   expect(state.headers.get("x-fixture-active")).toBe("0");
   expect(state.headers.get("x-fixture-peak")).toBe("4");
   expect(state.headers.get("x-fixture-refilled")).toBe("true");
@@ -69,7 +69,7 @@ test("catalog reads refill available slots while a prior R2 read is pending", as
   expect(
     Schema.decodeUnknownSync(QueryResult)(await resident.json()).rows.map((row) => row.id),
   ).toEqual(["2"]);
-  expect(resident.headers.get("server-timing")).toContain('desc="memory=9 api=0"');
+  expect(resident.headers.get("server-timing")).toContain('desc="memory=8 api=0"');
   const reused = await fetch(new URL("/fixture/state", await worker.ready));
   expect(reused.headers.get("x-fixture-term-matches")).toBe("1");
   const repeated = await request(worker, namespace, "query", textQuery("alpha", 10));
@@ -80,5 +80,5 @@ test("catalog reads refill available slots while a prior R2 read is pending", as
   expect(
     Schema.decodeUnknownSync(QueryResult)(await rehydrated.json()).rows.map((row) => row.id),
   ).toEqual(["1"]);
-  expect(rehydrated.headers.get("server-timing")).toContain('desc="memory=0 api=9"');
+  expect(rehydrated.headers.get("server-timing")).toContain('desc="memory=0 api=8"');
 }, 15000);

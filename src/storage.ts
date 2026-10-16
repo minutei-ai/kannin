@@ -646,6 +646,9 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
         fallbackMs: 0,
         publishMs: 0,
         entryMs: 0,
+        keyMs: 0,
+        cacheOpenMs: 0,
+        cacheMatchMs: 0,
         totalMs: 0,
       };
       const inspected = yield* Effect.forEach(
@@ -932,6 +935,9 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
         decodeMs: 0,
         sourceTotalMs: 0,
         sourceEntryMs: 0,
+        sourceKeyMs: 0,
+        sourceCacheOpenMs: 0,
+        sourceCacheMatchMs: 0,
         sourcePublishMs: 0,
         sourceCacheMs: 0,
         sourceR2Ms: 0,
@@ -1050,6 +1056,9 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
                   metrics.originResponses += 1;
                   metrics.sourceTotalMs += telemetry.totalMs;
                   metrics.sourceEntryMs += telemetry.entryMs;
+                  metrics.sourceKeyMs += telemetry.keyMs;
+                  metrics.sourceCacheOpenMs += telemetry.cacheOpenMs;
+                  metrics.sourceCacheMatchMs += telemetry.cacheMatchMs;
                   metrics.sourcePublishMs += telemetry.publishMs;
                   metrics.sourceCacheMs += telemetry.overviewCacheMs;
                   metrics.sourceR2Ms += telemetry.r2Ms;
@@ -1113,6 +1122,9 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
           `catalog_decode_sum;dur=${metrics.decodeMs}`,
           `catalog_origin_sum;dur=${metrics.sourceTotalMs}`,
           `catalog_entry_sum;dur=${metrics.sourceEntryMs}`,
+          `catalog_key_sum;dur=${metrics.sourceKeyMs}`,
+          `catalog_cache_open_sum;dur=${metrics.sourceCacheOpenMs}`,
+          `catalog_cache_match_sum;dur=${metrics.sourceCacheMatchMs}`,
           `catalog_publish_sum;dur=${metrics.sourcePublishMs}`,
           `catalog_source_cache_sum;dur=${metrics.sourceCacheMs};desc="memory=${metrics.sourceMemoryHits} api=${metrics.sourceApiHits}"`,
           `catalog_source_r2_sum;dur=${metrics.sourceR2Ms};desc="reads=${metrics.sourceR2Reads} hits=${metrics.sourceR2Hits} bytes=${metrics.sourceR2Bytes} batch_peak=${metrics.sourceR2Peak}"`,

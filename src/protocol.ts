@@ -361,6 +361,9 @@ export const CatalogTelemetry = Schema.Struct({
   fallbackMs: Schema.Finite,
   publishMs: Schema.Finite,
   entryMs: Schema.Finite,
+  keyMs: Schema.Finite,
+  cacheOpenMs: Schema.Finite,
+  cacheMatchMs: Schema.Finite,
   totalMs: Schema.Finite,
 });
 export const TermCatalogBatch = Schema.Array(TermCatalog).check(Schema.isBetweenLength(1, 16));

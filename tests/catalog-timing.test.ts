@@ -44,6 +44,8 @@ test("catalog intervals stay request-local and cached origin measurements are no
   expect(Schema.decodeUnknownSync(QueryResult)(await cached.json())).toEqual(expected);
   expect(cached.headers.get("server-timing")).toContain("api_hits=1 origins=0");
   expect(cached.headers.get("server-timing")).toContain("reads=0 hits=0 bytes=0");
+  for (const phase of ["key", "cache_open", "cache_match"])
+    expect(cached.headers.get("server-timing")).toContain(`catalog_${phase}_sum;dur=0`);
 });
 
 test("cold catalog summaries overlap at most four R2 bodies and preserve source order", async () => {

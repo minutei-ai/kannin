@@ -240,15 +240,19 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
       "selector",
       await sha256(`${encodedTerms}\0${this.ctx.props.filters}`),
     );
+    const keyedAt = Effect.runSync(Clock.currentTimeNanos);
     const cache = await Effect.runPromise(
       Effect.tryPromise(() => caches.open("raio-terms-v6")).pipe(
         Effect.orElseSucceed(() => undefined),
       ),
     );
+    const openedAt = Effect.runSync(Clock.currentTimeNanos);
+    const lookup = { endedAt: openedAt };
     if (cache !== undefined) {
       const cached = await Effect.runPromise(
         Effect.tryPromise(() => cache.match(cacheKey)).pipe(Effect.orElseSucceed(() => undefined)),
       );
+      lookup.endedAt = Effect.runSync(Clock.currentTimeNanos);
       if (cached !== undefined) {
         const response = new Response(cached.body, cached);
         response.headers.delete("cf-cache-status");
@@ -266,6 +270,9 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
               encodeCatalogTelemetry({
                 ...telemetry,
                 entryMs: Number(entryEnded - entryStarted) / 1e6,
+                keyMs: Number(keyedAt - entryStarted) / 1e6,
+                cacheOpenMs: Number(openedAt - keyedAt) / 1e6,
+                cacheMatchMs: Number(lookup.endedAt - openedAt) / 1e6,
               }),
             ]);
           }),

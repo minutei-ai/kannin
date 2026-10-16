@@ -214,7 +214,7 @@ test("term projection batches preserve global frequencies and filter eligibility
   const acquired = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(acquired.termRequests - before.termRequests).toBe(17);
+  expect(acquired.termRequests - before.termRequests).toBe(9);
   expect(acquired.termReads - before.termReads).toBe(129);
   const filtered = Schema.decodeUnknownSync(QueryResult)(
     await (
@@ -233,7 +233,7 @@ test("term projection batches preserve global frequencies and filter eligibility
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.termRequests - acquired.termRequests).toBe(17);
+  expect(after.termRequests - acquired.termRequests).toBe(9);
   expect(after.termReads - acquired.termReads).toBe(129);
   expect(after.termBytes - acquired.termBytes).toBeLessThan(
     (acquired.termBytes - before.termBytes) / 2,
@@ -252,7 +252,7 @@ test("term projection batches preserve global frequencies and filter eligibility
   const changed = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(changed.termRequests - after.termRequests).toBe(17);
+  expect(changed.termRequests - after.termRequests).toBe(9);
   expect(changed.termCacheBytes).toBeLessThanOrEqual(4 * 1024 * 1024);
   const repeat = Schema.decodeUnknownSync(QueryResult)(
     await (

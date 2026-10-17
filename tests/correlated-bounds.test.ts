@@ -121,7 +121,9 @@ test("cold queries prune equivalent segments and cache loss preserves exact rows
       expect(response.status).toBe(200);
     }
     const bucket = await worker.getR2Bucket("STORAGE");
-    const objects = await bucket.list({ prefix: `cache/correlated-v2/namespaces/${namespace}/` });
+    const objects = await bucket.list({
+      prefix: `cache/correlated-pool-v1/namespaces/${namespace}/`,
+    });
     expect(objects.objects).toHaveLength(12);
     if (variant === "absent") await bucket.delete(objects.objects.map((object) => object.key));
     if (variant === "corrupt" || variant === "misbound")

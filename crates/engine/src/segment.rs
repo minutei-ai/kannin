@@ -2080,7 +2080,7 @@ pub mod wasm {
         bounds
     }
 
-    #[derive(Serialize, Deserialize)]
+    #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
     struct TermSummary {
         df: u32,
         bounds: Vec<(u32, u32, u32, u32)>,
@@ -2303,41 +2303,120 @@ pub mod wasm {
         partitions: Option<Vec<BTreeMap<String, TermSummary>>>,
     }
 
-    struct OverviewBounds<'a>(&'a [BlockMeta]);
+    const SUMMARY_POOL_BYTES: usize = 1024 * 1024;
 
-    impl Serialize for OverviewBounds<'_> {
-        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            serializer.collect_seq(summary_bounds(self.0))
+    #[derive(Default)]
+    struct SummaryPool {
+        entries: BTreeMap<TermSummary, u32>,
+        bytes: usize,
+    }
+
+    impl SummaryPool {
+        fn intern(&mut self, summary: &TermSummary) -> Option<u32> {
+            if let Some(index) = self.entries.get(summary) {
+                return Some(*index);
+            }
+            let charge = size_of::<TermSummary>()
+                + summary.bounds.capacity() * size_of::<(u32, u32, u32, u32)>()
+                + 192;
+            if charge > SUMMARY_POOL_BYTES.saturating_sub(self.bytes) {
+                return None;
+            }
+            let index = u32::try_from(self.entries.len()).ok()?;
+            self.entries.insert(summary.clone(), index);
+            self.bytes += charge;
+            Some(index)
         }
     }
 
-    #[derive(Serialize)]
-    struct OverviewSummary<'a> {
-        df: u32,
-        bounds: OverviewBounds<'a>,
+    struct OverviewDictionary<'a> {
+        terms: &'a BTreeMap<String, TermMeta>,
+        pool: &'a RefCell<SummaryPool>,
     }
-
-    struct OverviewDictionary<'a>(&'a BTreeMap<String, TermMeta>);
 
     impl Serialize for OverviewDictionary<'_> {
         fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            serializer.collect_map(self.0.iter().map(|(term, meta)| {
-                (
-                    term,
-                    OverviewSummary {
-                        df: meta.df,
-                        bounds: OverviewBounds(&meta.blocks),
-                    },
-                )
+            use serde::ser::SerializeMap;
+            let mut map = serializer.serialize_map(Some(self.terms.len()))?;
+            for (term, metadata) in self.terms {
+                let summary = TermSummary::from(metadata);
+                match self.pool.borrow_mut().intern(&summary) {
+                    Some(index) => map.serialize_entry(term, &index)?,
+                    None => map.serialize_entry(term, &summary)?,
+                }
+            }
+            map.end()
+        }
+    }
+
+    struct OverviewPartitions<'a> {
+        partitions: &'a [BTreeMap<String, TermSummary>],
+        pool: &'a RefCell<SummaryPool>,
+    }
+
+    struct OverviewPartition<'a> {
+        terms: &'a BTreeMap<String, TermSummary>,
+        pool: &'a RefCell<SummaryPool>,
+    }
+
+    impl Serialize for OverviewPartitions<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.collect_seq(self.partitions.iter().map(|terms| OverviewPartition {
+                terms,
+                pool: self.pool,
             }))
         }
     }
 
-    #[derive(Serialize)]
+    impl Serialize for OverviewPartition<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::SerializeMap;
+            let mut map = serializer.serialize_map(Some(self.terms.len()))?;
+            for (term, summary) in self.terms {
+                match self.pool.borrow_mut().intern(summary) {
+                    Some(index) => map.serialize_entry(term, &index)?,
+                    None => map.serialize_entry(term, summary)?,
+                }
+            }
+            map.end()
+        }
+    }
+
     struct DirectoryOverview<'a> {
-        dictionary: OverviewDictionary<'a>,
+        header: &'a Header,
         eligibility: OverviewEligibility<'a>,
-        partitions: Option<Vec<BTreeMap<String, TermSummary>>>,
+        partitions: Option<&'a [BTreeMap<String, TermSummary>]>,
+    }
+
+    impl Serialize for DirectoryOverview<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::SerializeTuple;
+            let pool = RefCell::new(SummaryPool::default());
+            let mut tuple = serializer.serialize_tuple(4)?;
+            tuple.serialize_element(&OverviewDictionary {
+                terms: &self.header.terms,
+                pool: &pool,
+            })?;
+            tuple.serialize_element(&self.eligibility)?;
+            tuple.serialize_element(&self.partitions.map(|partitions| OverviewPartitions {
+                partitions,
+                pool: &pool,
+            }))?;
+            let pool = pool.into_inner();
+            let mut summaries: Vec<_> = pool
+                .entries
+                .into_iter()
+                .map(|(summary, index)| (index, summary))
+                .collect();
+            summaries.sort_unstable_by_key(|(index, _)| *index);
+            tuple.serialize_element(
+                &summaries
+                    .into_iter()
+                    .map(|(_, summary)| summary)
+                    .collect::<Vec<_>>(),
+            )?;
+            tuple.end()
+        }
     }
 
     struct OverviewEligibility<'a>(BTreeMap<&'a str, (&'a serde_json::value::RawValue, u32, u32)>);
@@ -2350,6 +2429,11 @@ pub mod wasm {
 
     struct SelectedTerms<'a> {
         requested: &'a BTreeSet<String>,
+    }
+
+    struct IndexedTerms {
+        selected: BTreeMap<String, SummaryReference>,
+        maximum: Option<u32>,
     }
 
     struct SelectedTerm<'a>(&'a BTreeSet<String>);
@@ -2404,8 +2488,50 @@ pub mod wasm {
         _bounds: (),
     }
 
+    enum SummaryReference {
+        Index(u32),
+        Inline(TermSummary),
+        Discarded,
+    }
+
+    struct SelectedSummary(bool);
+
+    impl<'de> serde::de::DeserializeSeed<'de> for SelectedSummary {
+        type Value = SummaryReference;
+
+        fn deserialize<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_any(self)
+        }
+    }
+
+    impl<'de> serde::de::Visitor<'de> for SelectedSummary {
+        type Value = SummaryReference;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an unsigned summary index or an inline term summary")
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+            Ok(SummaryReference::Index(
+                u32::try_from(value).map_err(E::custom)?,
+            ))
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+            let deserializer = serde::de::value::MapAccessDeserializer::new(map);
+            if self.0 {
+                return TermSummary::deserialize(deserializer).map(SummaryReference::Inline);
+            }
+            DiscardedSummary::deserialize(deserializer)?;
+            Ok(SummaryReference::Discarded)
+        }
+    }
+
     impl<'de> serde::de::DeserializeSeed<'de> for SelectedTerms<'_> {
-        type Value = BTreeMap<String, TermSummary>;
+        type Value = IndexedTerms;
 
         fn deserialize<D: serde::Deserializer<'de>>(
             self,
@@ -2416,10 +2542,10 @@ pub mod wasm {
     }
 
     impl<'de> serde::de::Visitor<'de> for SelectedTerms<'_> {
-        type Value = BTreeMap<String, TermSummary>;
+        type Value = IndexedTerms;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("a term summary dictionary")
+            formatter.write_str("a term dictionary of indices or inline summaries")
         }
 
         fn visit_map<A: serde::de::MapAccess<'de>>(
@@ -2427,24 +2553,18 @@ pub mod wasm {
             mut map: A,
         ) -> Result<Self::Value, A::Error> {
             let mut selected = BTreeMap::new();
+            let mut maximum = None;
             while let Some(term) = map.next_key_seed(SelectedTerm(self.requested))? {
+                let summary = map.next_value_seed(SelectedSummary(term.is_some()))?;
+                if let SummaryReference::Index(index) = summary {
+                    maximum = Some(maximum.map_or(index, |previous: u32| previous.max(index)));
+                }
                 if let Some(term) = term {
-                    let summary = map.next_value::<TermSummary>()?;
                     selected.insert(term, summary);
-                } else {
-                    map.next_value::<DiscardedSummary>()?;
                 }
             }
-            Ok(selected)
+            Ok(IndexedTerms { selected, maximum })
         }
-    }
-
-    #[derive(Deserialize)]
-    #[serde(field_identifier, rename_all = "lowercase")]
-    enum OverviewField {
-        Dictionary,
-        Eligibility,
-        Partitions,
     }
 
     struct SelectedGroup<'a>(&'a BTreeSet<&'a str>);
@@ -2561,7 +2681,7 @@ pub mod wasm {
     struct SelectedPartitions<'a>(&'a BTreeSet<String>);
 
     impl<'de> serde::de::DeserializeSeed<'de> for SelectedPartitions<'_> {
-        type Value = Option<Vec<BTreeMap<String, TermSummary>>>;
+        type Value = Option<Vec<IndexedTerms>>;
 
         fn deserialize<D: serde::Deserializer<'de>>(
             self,
@@ -2572,7 +2692,7 @@ pub mod wasm {
     }
 
     impl<'de> serde::de::Visitor<'de> for SelectedPartitions<'_> {
-        type Value = Option<Vec<BTreeMap<String, TermSummary>>>;
+        type Value = Option<Vec<IndexedTerms>>;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             formatter.write_str("null or one to 32 term summary partitions")
@@ -2614,6 +2734,49 @@ pub mod wasm {
         filters: &'a [Filter],
     }
 
+    struct SelectedSummaries<'a>(&'a BTreeSet<u32>);
+
+    impl<'de> serde::de::DeserializeSeed<'de> for SelectedSummaries<'_> {
+        type Value = (BTreeMap<u32, TermSummary>, u32);
+
+        fn deserialize<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_seq(self)
+        }
+    }
+
+    impl<'de> serde::de::Visitor<'de> for SelectedSummaries<'_> {
+        type Value = (BTreeMap<u32, TermSummary>, u32);
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a validated summary pool")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut selected = BTreeMap::new();
+            let mut index = 0u32;
+            loop {
+                if self.0.contains(&index) {
+                    let Some(summary) = sequence.next_element::<TermSummary>()? else {
+                        break;
+                    };
+                    selected.insert(index, summary);
+                } else if sequence.next_element::<DiscardedSummary>()?.is_none() {
+                    break;
+                }
+                index = index
+                    .checked_add(1)
+                    .ok_or_else(|| serde::de::Error::custom("Summary count overflow"))?;
+            }
+            Ok((selected, index))
+        }
+    }
+
     impl<'de> serde::de::DeserializeSeed<'de> for SelectedOverview<'_> {
         type Value = Overview;
 
@@ -2621,7 +2784,7 @@ pub mod wasm {
             self,
             deserializer: D,
         ) -> Result<Self::Value, D::Error> {
-            deserializer.deserialize_map(self)
+            deserializer.deserialize_tuple(4, self)
         }
     }
 
@@ -2629,50 +2792,81 @@ pub mod wasm {
         type Value = Overview;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("a segment overview")
+            formatter.write_str("term indices, eligibility, partitions and summary pool")
         }
 
-        fn visit_map<A: serde::de::MapAccess<'de>>(
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
             self,
-            mut map: A,
+            mut sequence: A,
         ) -> Result<Self::Value, A::Error> {
-            let mut dictionary = None;
-            let mut minimum = None;
-            let mut eligibility = None;
-            let mut partitions = None;
-            while let Some(field) = map.next_key::<OverviewField>()? {
-                match field {
-                    OverviewField::Dictionary => {
-                        if dictionary.is_some() {
-                            return Err(serde::de::Error::duplicate_field("dictionary"));
-                        }
-                        dictionary = Some(map.next_value_seed(SelectedTerms {
-                            requested: self.requested,
-                        })?);
-                    }
-                    OverviewField::Partitions => {
-                        if partitions.is_some() {
-                            return Err(serde::de::Error::duplicate_field("partitions"));
-                        }
-                        partitions = Some(map.next_value_seed(SelectedPartitions(self.requested))?);
-                    }
-                    OverviewField::Eligibility => {
-                        if minimum.is_some() {
-                            return Err(serde::de::Error::duplicate_field("eligibility"));
-                        }
-                        let selected = map.next_value_seed(EligibleGroups(self.filters))?;
-                        minimum = Some(selected.minimum);
-                        eligibility = selected.projection;
-                    }
-                }
+            let dictionary = sequence
+                .next_element_seed(SelectedTerms {
+                    requested: self.requested,
+                })?
+                .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+            let eligibility = sequence
+                .next_element_seed(EligibleGroups(self.filters))?
+                .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+            let partitions = sequence
+                .next_element_seed(SelectedPartitions(self.requested))?
+                .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
+            let requested = dictionary
+                .selected
+                .values()
+                .chain(
+                    partitions
+                        .iter()
+                        .flatten()
+                        .flat_map(|partition| partition.selected.values()),
+                )
+                .filter_map(|summary| match summary {
+                    SummaryReference::Index(index) => Some(*index),
+                    SummaryReference::Inline(_) | SummaryReference::Discarded => None,
+                })
+                .collect();
+            let (summaries, count) = sequence
+                .next_element_seed(SelectedSummaries(&requested))?
+                .ok_or_else(|| serde::de::Error::invalid_length(3, &self))?;
+            if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(serde::de::Error::invalid_length(5, &self));
             }
+            let maximum = dictionary
+                .maximum
+                .into_iter()
+                .chain(
+                    partitions
+                        .iter()
+                        .flatten()
+                        .filter_map(|partition| partition.maximum),
+                )
+                .max();
+            if maximum.is_some_and(|index| index >= count) {
+                return Err(serde::de::Error::custom("Invalid summary index"));
+            }
+            let resolve =
+                |indexed: IndexedTerms| -> Result<BTreeMap<String, TermSummary>, A::Error> {
+                    indexed
+                        .selected
+                        .into_iter()
+                        .map(|(term, summary)| {
+                            let summary = match summary {
+                                SummaryReference::Index(index) => summaries.get(&index).cloned(),
+                                SummaryReference::Inline(summary) => Some(summary),
+                                SummaryReference::Discarded => None,
+                            };
+                            summary
+                                .map(|summary| (term, summary))
+                                .ok_or_else(|| serde::de::Error::custom("Missing selected summary"))
+                        })
+                        .collect()
+                };
             Ok(Overview {
-                dictionary: dictionary
-                    .ok_or_else(|| serde::de::Error::missing_field("dictionary"))?,
-                eligibility,
-                minimum: minimum.ok_or_else(|| serde::de::Error::missing_field("eligibility"))?,
+                dictionary: resolve(dictionary)?,
+                minimum: eligibility.minimum,
+                eligibility: eligibility.projection,
                 partitions: partitions
-                    .ok_or_else(|| serde::de::Error::missing_field("partitions"))?,
+                    .map(|partitions| partitions.into_iter().map(resolve).collect())
+                    .transpose()?,
             })
         }
     }
@@ -2762,7 +2956,7 @@ pub mod wasm {
 
     fn encode_overview(
         header: &Header,
-        partitions: Option<Vec<BTreeMap<String, TermSummary>>>,
+        partitions: Option<&[BTreeMap<String, TermSummary>]>,
     ) -> Result<Vec<u8>, String> {
         let mut eligibility = BTreeMap::new();
         for document in &header.documents {
@@ -2779,7 +2973,7 @@ pub mod wasm {
             lengths.2 = lengths.2.min(document.body_length);
         }
         let json = serde_json::to_vec(&DirectoryOverview {
-            dictionary: OverviewDictionary(&header.terms),
+            header,
             eligibility: OverviewEligibility(eligibility),
             partitions,
         })
@@ -2869,7 +3063,7 @@ pub mod wasm {
                 }
             }
         }
-        let encoded = encode_overview(&header, Some(partitions))?;
+        let encoded = encode_overview(&header, Some(&partitions))?;
         if encoded.len() > 1024 * 1024 {
             return Ok(None);
         }

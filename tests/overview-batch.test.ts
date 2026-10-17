@@ -68,7 +68,7 @@ async function seed(worker: Awaited<ReturnType<typeof startWorker>>, namespace =
   const bucket = await worker.getR2Bucket("STORAGE");
   for (const attempt of Array.from({ length: 100 }, (_, i) => i)) {
     const objects = await bucket.list({
-      prefix: `cache/correlated-batches-v1/namespaces/${namespace}/`,
+      prefix: `cache/correlated-pool-batches-v1/namespaces/${namespace}/`,
     });
     const first = objects.objects[0];
     if (first !== undefined) return { reference, bucket, key: first.key };
@@ -98,7 +98,7 @@ test("oversized combined sources recover through admissible physical batches", a
   const root = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
   const sources = [];
   for (const segment of root.segments) {
-    const key = `cache/correlated-v2/${segment.key}`;
+    const key = `cache/correlated-pool-v1/${segment.key}`;
     const cached = await bucket.get(key);
     if (cached === null) throw new Error("Missing correlated source");
     const source = Schema.decodeSync(Schema.fromJsonString(CorrelatedOverview))(
@@ -150,12 +150,12 @@ test("oversized combined sources recover through admissible physical batches", a
         .slice(0, 10),
     );
     for (const attempt of Array.from({ length: 50 }, (_, i) => i)) {
-      const objects = await bucket.list({ prefix: "cache/correlated-batches-v1/" });
+      const objects = await bucket.list({ prefix: "cache/correlated-pool-batches-v1/" });
       if (objects.objects.length >= pass + 1 || attempt === 49) break;
       await Effect.runPromise(Effect.sleep("10 millis"));
     }
   }
-  const persisted = await bucket.list({ prefix: "cache/correlated-batches-v1/" });
+  const persisted = await bucket.list({ prefix: "cache/correlated-pool-batches-v1/" });
   expect(persisted.objects).toHaveLength(2);
   expect((await request(worker, "large-overviews", "rebuild", {})).status).toBe(200);
   const recovered = await request(
@@ -299,14 +299,16 @@ test("failed R2 batch publication preserves rows and a later request can publish
   expect(first.status).toBe(200);
   const reference = Schema.decodeUnknownSync(QueryResult)(await first.json());
   const bucket = await worker.getR2Bucket("STORAGE");
-  expect((await bucket.list({ prefix: "cache/correlated-batches-v1/" })).objects).toHaveLength(0);
+  expect((await bucket.list({ prefix: "cache/correlated-pool-batches-v1/" })).objects).toHaveLength(
+    0,
+  );
   await fetch(new URL("/fixture/normal", await worker.ready));
   expect((await request(worker, "publication", "rebuild", {})).status).toBe(200);
   const recovered = await request(worker, "publication", "query", textQuery("alpha missing"));
   expect(recovered.status).toBe(200);
   expect(Schema.decodeUnknownSync(QueryResult)(await recovered.json())).toEqual(reference);
   for (const attempt of Array.from({ length: 100 }, (_, i) => i)) {
-    if ((await bucket.list({ prefix: "cache/correlated-batches-v1/" })).objects.length === 1)
+    if ((await bucket.list({ prefix: "cache/correlated-pool-batches-v1/" })).objects.length === 1)
       return;
     if (attempt === 99) throw new Error("Publication did not recover");
     await Effect.runPromise(Effect.sleep("10 millis"));

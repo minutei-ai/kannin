@@ -34,7 +34,7 @@ export class Terms extends Catalogs {
       const get = this.env.STORAGE.get.bind(this.env.STORAGE);
       Object.defineProperty(this.env.STORAGE, "get", {
         value: async (...args: Parameters<R2Bucket["get"]>) => {
-          if (!args[0].startsWith("cache/correlated-v2/")) return get(...args);
+          if (!args[0].startsWith("cache/correlated-pool-v1/")) return get(...args);
           state.started += 1;
           state.active += 1;
           state.peak = Math.max(state.peak, state.active);

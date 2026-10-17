@@ -10,6 +10,7 @@ import {
   segment_bloom_filter_many,
   segment_term_bounds,
   segment_overview_project,
+  segment_correlated_overview,
   segment_document,
   Segment,
   Directory,
@@ -28,6 +29,7 @@ import {
   ProjectedTermCatalog,
   EligibilityProjection,
   TermSummaries,
+  TermSummary,
   EligibleMinimum,
   RankingInput,
   SegmentHits,
@@ -227,28 +229,36 @@ test("shared attribute groups preserve minima across operators and different doc
   segment.free();
 });
 
-test("overview projection validates unrequested values and rejects malformed root fields", () => {
+test("overview projection validates every pool entry and reference before selecting terms", () => {
   for (const json of [
-    '{"dictionary":{"unused":{"df":"bad","bounds":[]}},"eligibility":[[{},0,0]]}',
-    '{"dictionary":{"unused":{"df":1,"bounds":[[0,1,0,-1]]}},"eligibility":[[{},0,0]]}',
-    '{"dictionary":{"unused":{"df":1,"bounds":[[0,1,0]]}},"eligibility":[[{},0,0]]}',
-    '{"dictionary":{"unused":{"df":1,"bounds":[[0,1,0,1,0]]}},"eligibility":[[{},0,0]]}',
-    '{"dictionary":{"unused":{"df":1,"bounds":[[0,1,0,4294967296]]}},"eligibility":[[{},0,0]]}',
-    '{"dictionary":{"unused":{"df":1}},"eligibility":[[{},0,0]]}',
-    '{"dictionary":{"unused":{"df":1,"bounds":[],"bounds":[]}},"eligibility":[[{},0,0]]}',
-    '{"dictionary":{},"dictionary":{},"eligibility":[[{},0,0]]}',
-    '{"dictionary":{},"eligibility":[[{},0,0]],"eligibility":[[{},0,0]]}',
-    '{"dictionary":{},"eligibility":[["invalid",0,0]]}',
-    '{"dictionary":{},"eligibility":[[[],0,0]]}',
-    '{"dictionary":{},"eligibility":[[{"unused":1e400},0,0]]}',
-    '{"dictionary":{},"eligibility":[[{"unused":"\\ud800"},0,0]]}',
-    '{"dictionary":{},"eligibility":[[{},0,-1]]}',
-    '{"dictionary":{},"eligibility":[[{},0,0,0]]}',
-    '{"dictionary":{},"eligibility":[]}',
-    '{"dictionary":{}}',
-    '{"dictionary":{},"minimum":null,"eligibility":[[{},0,0]]}',
-    '{"dictionary":{},"eligibility":[[{},0,0]],"unknown":true}',
-    '{"dictionary":{},"eligibility":[[{},0,0]]} trailing',
+    '[{"unused":0},[[{},0,0]],null,[{"df":"bad","bounds":[]}]]',
+    '[{"unused":0},[[{},0,0]],null,[{"df":1,"bounds":[[0,1,0,-1]]}]]',
+    '[{"unused":0},[[{},0,0]],null,[{"df":1,"bounds":[[0,1,0]]}]]',
+    '[{"unused":0},[[{},0,0]],null,[{"df":1,"bounds":[[0,1,0,1,0]]}]]',
+    '[{"unused":0},[[{},0,0]],null,[{"df":1,"bounds":[[0,1,0,4294967296]]}]]',
+    '[{"unused":0},[[{},0,0]],null,[{"df":1}]]',
+    '[{"unused":0},[[{},0,0]],null,[{"df":1,"bounds":[],"bounds":[]}]]',
+    '[{"unused":1},[[{},0,0]],null,[{"df":1,"bounds":[]}]]',
+    '[{"unused":-1},[[{},0,0]],null,[]]',
+    '[{"unused":0.5},[[{},0,0]],null,[]]',
+    '[{"unused":4294967296},[[{},0,0]],null,[]]',
+    '[{},[["invalid",0,0]],null,[]]',
+    "[{},[[[],0,0]],null,[]]",
+    '[{},[[{"unused":1e400},0,0]],null,[]]',
+    '[{},[[{"unused":"\\ud800"},0,0]],null,[]]',
+    "[{},[[{},0,-1]],null,[]]",
+    "[{},[[{},0,0,0]],null,[]]",
+    "[{},[],null,[]]",
+    "[{},[[{},0,0]],null]",
+    "[{},[[{},0,0]],null,[],0]",
+    "[{},[[{},0,0]],null,[]] trailing",
+    '{"dictionary":{},"eligibility":[[{},0,0]],"partitions":null}',
+    '[{},[[{},0,0]],null,[{"df":"bad","bounds":[]}]]',
+    '[{},[[{},0,0]],[{"unused":1}],[{"df":1,"bounds":[]}]]',
+    '[{"unused":1,"unused":0},[[{},0,0]],null,[{"df":1,"bounds":[]}]]',
+    '[{"unused":{"df":"bad","bounds":[]}},[[{},0,0]],null,[]]',
+    '[{"unused":{"df":1,"bounds":[[0,1,0,-1]]}},[[{},0,0]],null,[]]',
+    '[{"unused":{"df":1,"bounds":[],"bounds":[]}},[[{},0,0]],null,[]]',
   ]) {
     const data = new TextEncoder().encode(json);
     const compressed = deflateSync(data);
@@ -262,8 +272,7 @@ test("overview projection validates unrequested values and rejects malformed roo
 });
 
 test("overview projection rejects invalid UTF-8 inside unrequested dictionary keys", () => {
-  const json =
-    '{"dictionary":{"unused":{"df":1,"bounds":[]}},"eligibility":[[{},0,0]],"partitions":null}';
+  const json = '[{"unused":0},[[{},0,0]],null,[{"df":1,"bounds":[]}]]';
   for (const invalid of [[0x80], [0xc0, 0xaf], [0xed, 0xa0, 0x80], [0xf4, 0x90, 0x80, 0x80]]) {
     const data = new TextEncoder().encode(json);
     data.set(invalid, json.indexOf("unused"));
@@ -277,12 +286,65 @@ test("overview projection rejects invalid UTF-8 inside unrequested dictionary ke
   }
 });
 
+test("overview pool aliases and inline summaries preserve escaped duplicate keys", () => {
+  const json =
+    '[{"alias":0,"wanted":{"df":1,"bounds":[[0,1,0,1]]},"w\\u0061nted":0},[[{},0,0]],[{"alias":{"df":2,"bounds":[[0,1,0,1]]},"unused":0}],[{"df":2,"bounds":[[0,1,0,1]]}]]';
+  const data = new TextEncoder().encode(json);
+  const compressed = deflateSync(data);
+  const bytes = new Uint8Array(8 + compressed.byteLength);
+  const frame = new DataView(bytes.buffer);
+  frame.setUint32(0, data.byteLength, true);
+  frame.setUint32(4, crc32(data), true);
+  bytes.set(compressed, 8);
+  const projected = Schema.decodeSync(Schema.fromJsonString(TermCatalog))(
+    segment_overview_project(bytes, '["alias","wanted"]', "[]"),
+  );
+  const summary = { df: 2, bounds: [[0, 1, 0, 1]] } as const;
+  expect(projected.dictionary).toEqual({ alias: summary, wanted: summary });
+  expect(projected.partitions).toEqual([{ alias: summary }]);
+});
+
+test("bounded overview interning preserves inline summaries after the pool fills", () => {
+  const documents = Array.from({ length: 5000 }, (_, index) => ({
+    id: String(index).padStart(5, "0"),
+    title: "title ".repeat(index % 71),
+    text: `unique${index} ${"body ".repeat(Math.floor(index / 71))}`,
+    attributes: {},
+  }));
+  using segment = new Segment(JSON.stringify(documents));
+  using directory = new Directory(segment.bytes());
+  const overview = directory.overview();
+  const fields = Schema.decodeUnknownSync(Schema.Array(Schema.Unknown))(
+    JSON.parse(new TextDecoder().decode(inflateSync(overview.subarray(8)))),
+  );
+  const dictionary = Schema.decodeUnknownSync(Schema.Record(Schema.String, Schema.Unknown))(
+    fields[0],
+  );
+  const pool = Schema.decodeUnknownSync(Schema.Array(Schema.Unknown))(fields[3]);
+  expect(pool.length).toBeGreaterThan(0);
+  expect(pool.length).toBeLessThan(documents.length);
+  expect(Object.values(dictionary).some(Schema.is(Schema.Finite))).toBe(true);
+  expect(Object.values(dictionary).some(Schema.is(TermSummary))).toBe(true);
+  const correlated = segment_correlated_overview(segment.bytes());
+  if (correlated === undefined) throw new Error("Missing bounded correlated overview");
+  for (const source of [overview, correlated]) {
+    for (const terms of ['["unique0","unique4999"]', '["title","body","unique4500"]']) {
+      const projected = Schema.decodeSync(Schema.fromJsonString(TermCatalog))(
+        segment_overview_project(source, terms, "[]"),
+      );
+      expect(projected.dictionary).toEqual(
+        Schema.decodeSync(Schema.fromJsonString(TermSummaries))(directory.summary(terms)),
+      );
+    }
+  }
+});
+
 test("overview partitions validate every summary while projecting in one pass", () => {
   const summary = { df: 2, bounds: [[1, 1, 2, 4]] } as const;
   const terms = JSON.stringify(["wanted"]);
   const project = (partitions: string) => {
     const data = new TextEncoder().encode(
-      `{"dictionary":{},"eligibility":[[{},0,0]],"partitions":${partitions}}`,
+      `[{},[[{},0,0]],${partitions},[{"df":2,"bounds":[[1,1,2,4]]}]]`,
     );
     const compressed = deflateSync(data);
     const bytes = new Uint8Array(8 + compressed.byteLength);
@@ -296,7 +358,7 @@ test("overview partitions validate every summary while projecting in one pass", 
   };
   expect(project("null").partitions).toBeNull();
   for (const length of [1, 32]) {
-    const partitions = Array.from({ length }, () => ({ wanted: summary, unused: summary }));
+    const partitions = Array.from({ length }, () => ({ wanted: 0, unused: 0 }));
     expect(project(JSON.stringify(partitions)).partitions).toEqual(
       Array.from({ length }, () => ({ wanted: summary })),
     );
@@ -306,11 +368,10 @@ test("overview partitions validate every summary while projecting in one pass", 
     "{}",
     "[null]",
     JSON.stringify(Array.from({ length: 33 }, () => ({}))),
-    '[{"unused":{"df":"bad","bounds":[]}}]',
-    '[{"unused":{"df":1,"bounds":[[0,1,0,-1]]}}]',
-    '[{"unused":{"df":1,"bounds":[[0,1,0]]}}]',
-    '[{"unused":{"df":1,"bounds":[],"bounds":[]}}]',
-    '[{}, {"wanted":{"df":1,"bounds":[]}}] trailing',
+    '[{"unused":1}]',
+    '[{"unused":-1}]',
+    '[{"unused":0.5}]',
+    '[{}, {"wanted":0}] trailing',
   ]) {
     expect(() => project(partitions)).toThrow();
   }

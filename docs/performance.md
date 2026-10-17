@@ -3856,3 +3856,34 @@ A tighter workerd control loaded both engines into the same isolate and alternat
 Regression coverage now explicitly rejects four invalid UTF-8 forms inside an unrequested term key, using frames with valid compression, lengths and recomputed CRC. Ignored keys must remain validated during future projection optimizations.
 
 The final full gate passed 269 Bun/workerd tests and 51 Rust tests, strict Effect lint/types and native/WASM Clippy. Rebuilt Worker JavaScript and WASM were byte-identical to the pre-experiment artifacts. This diagnostic and regression-only change requires no new deployment and establishes no additional production speedup.
+
+## Shared term summaries for cold projection
+
+The candidate based on `952f9a1` interns equal physical frequency/bound summaries in disposable overview frames. A 5,000-document synthetic segment has 5,002 terms but only two distinct summaries; a 500-document SciFact segment has 11,597 terms and 6,363 distinct summaries. Readers can validate a shared summary once instead of repeating its fields for every term. A conservatively charged one-MiB temporary writer budget bounds interning; unmatched summaries serialize inline after admission fills. This budget includes tree entries, retained bounds and sorting scratch, and does not change retained cache quotas or establish whole-Worker peak memory.
+
+The private four-element frame payload contains dictionary references, physical eligibility groups, optional partition dictionaries and the summary pool. Readers validate every index, including unrequested and overwritten keys, every inline and pooled summary, escaped names, exact tuple arity, partition limits, finite attributes and framing/CRC. Only requested summaries are retained. The public projected catalog, canonical segments, manifests, live statistics and ranking formulas are unchanged. The cutover uses the `correlated-pool-v1` and `correlated-pool-batches-v1` R2 prefixes and v6 overview Cache API; old source frames are not read through a compatibility branch. Cache loss still reconstructs from canonical R2.
+
+A workerd component comparison loaded baseline and candidate WASM into the same isolate and alternated engine order over 24 paired rounds. Four warmup pairs were excluded, leaving twenty responses per variant/fixture. Every response performed twenty projections, preserving byte-identical projected JSON. The synthetic selector requested cloudflare, rust and unique42 with group 42; SciFact requested cancer, gene and mutant without a filter.
+
+| Twenty projections per response | Before median ms | Candidate median ms |
+| ------------------------------- | ---------------: | ------------------: |
+| 5,000 synthetic documents       |            63.42 |               22.55 |
+| 5,000 documents, 32 partitions  |            66.86 |               27.29 |
+| 500 SciFact documents           |           166.71 |              132.32 |
+
+A separate alternating construction control used the same warmup/sample counts. Each timed request performed three canonical-header/overview constructions; correlated construction consumed the complete canonical segment. The final output was projected and compared outside the timed request. Request medians changed 53.66 → 49.76 ms for the ordinary synthetic source, 70.68 → 66.59 for its correlated source and 102.93 → 109.39 for SciFact. The approximately 6% SciFact construction regression is a tradeoff; read acceleration does not imply cheaper writes. These are local client elapsed measurements, not native Cloudflare billed CPU.
+
+The complete-query comparison used the existing million-document R2 fixture, fresh workerd processes with empty Worker caches, three cohorts per variant/selector and reversed variant order in the middle cohort. Prepared physical source frames were available in both formats; candidate frames were converted from verified baseline summaries and validated through the new Rust reader. The 244 prepared objects changed only disposable local cache prefixes; the canonical manifest stayed byte-identical at sequence 2000 with 200 segments. Each process performed an initial and repeated query; all 48 complete responses preserved IDs, exact scores, attributes, revisions and sequence.
+
+| First complete local query | Before median ms | Candidate median ms |
+| -------------------------- | ---------------: | ------------------: |
+| Sixteen rare terms         |          1082.47 |             1052.23 |
+| Sixty-four rare terms      |          2137.94 |             2154.47 |
+| Dense, group 72            |          1874.64 |             1410.01 |
+| Dense, group 43            |          1833.93 |             1411.89 |
+
+Dense medians improved about 25% and 23%, consistently across the three cohorts. Rare controls were roughly stable, with individual regressions and only three initial observations per cell. This does not establish tail percentiles, fully cold R2, native Cloudflare speedup or Turbopuffer parity.
+
+A separate cache-loss control redirected only disposable source/batch prefixes to fresh private keys while retaining the same canonical dataset. Two cohorts reversed engine order and verified all 200 summaries were reconstructed with zero correlated-cache hits. Complete initial responses matched. Before/candidate times were 10.81/10.61 seconds and 11.04/10.86 seconds. These remain expensive reconstructions; the prepared-frame table must not be presented as complete cache-loss latency. Observed WASM buffers reached 27,983,872 bytes in both variants, excluding JavaScript/native allocations and other isolates.
+
+The complete local gate passed 271 Bun/workerd tests and 51 Rust tests, including mixed inline/index dictionaries, escaped duplicate keys, unrequested bad references and pool overflow through ordinary and correlated writers. Strict Effect lint/types, formatting and native/WASM Clippy passed without suppressions. The complete 300-query SciFact report remained identical, including ordered results and aggregate metrics. Native Cloudflare validation of this encoding is pending.

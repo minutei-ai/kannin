@@ -910,7 +910,7 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
         telemetry.totalMs = Number((yield* Clock.currentTimeNanos) - started) / 1e6;
         return { catalogs: hits.map((hit) => hit.catalog), telemetry };
       }
-      const cacheKey = new URL("https://overviews.internal/batch-v5");
+      const cacheKey = new URL("https://overviews.internal/batch-v6");
       cacheKey.searchParams.set("bucket", env.STORAGE_CACHE_SCOPE);
       const encodedRanges = yield* Schema.encodeEffect(
         Schema.fromJsonString(TermProjectionProps.fields.ranges),
@@ -918,7 +918,7 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
       const rangesDigest = yield* Effect.tryPromise(() => sha256(encodedRanges));
       cacheKey.searchParams.set("ranges", rangesDigest);
       const cacheStarted = yield* Clock.currentTimeNanos;
-      const cache = yield* Effect.tryPromise(() => caches.open("raio-overview-batches-v5")).pipe(
+      const cache = yield* Effect.tryPromise(() => caches.open("raio-overview-batches-v6")).pipe(
         Effect.orElseSucceed(() => undefined),
       );
       if (cache !== undefined) {
@@ -981,7 +981,7 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
       const first = ranges[0];
       const batch = { key: Option.none<string>() };
       if (first !== undefined && ranges.length >= 8) {
-        const identity = `cache/correlated-batches-v1/${first.key}/${rangesDigest}`;
+        const identity = `cache/correlated-pool-batches-v1/${first.key}/${rangesDigest}`;
         batch.key = Option.some(identity);
         const fetchedAt = yield* Clock.currentTimeNanos;
         const acquired = yield* Effect.tryPromise(() =>
@@ -1058,7 +1058,7 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
                 telemetry.r2Peak = Math.max(telemetry.r2Peak, r2Activity.count);
                 const r2Started = yield* Clock.currentTimeNanos;
                 const cached = yield* Effect.acquireUseRelease(
-                  Effect.tryPromise(() => env.STORAGE.get(`cache/correlated-v2/${input.key}`)),
+                  Effect.tryPromise(() => env.STORAGE.get(`cache/correlated-pool-v1/${input.key}`)),
                   (object) =>
                     Effect.gen(function* () {
                       if (object === null || object.size > 2 * 1024 * 1024) return undefined;
@@ -1554,7 +1554,7 @@ export const storeSegmentCaches = Effect.fn("kannin.storeSegmentCaches")(
         overview,
       });
       yield* Effect.tryPromise(() =>
-        env.STORAGE.put(`cache/correlated-v2/${key}`, encoded, {
+        env.STORAGE.put(`cache/correlated-pool-v1/${key}`, encoded, {
           httpMetadata: { contentType: "application/json" },
         }),
       );

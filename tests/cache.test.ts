@@ -423,8 +423,8 @@ test("corrupted compressed overview cache falls back to verified immutable sourc
   const manifest = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
   const segment = manifest.segments[0];
   if (segment === undefined) throw new Error("Missing segment");
-  const cache = await (await worker.getCaches()).open("raio-overview-batches-v5");
-  const key = new URL("https://overviews.internal/batch-v5");
+  const cache = await (await worker.getCaches()).open("raio-overview-batches-v6");
+  const key = new URL("https://overviews.internal/batch-v6");
   key.searchParams.set("bucket", "raio-test");
   const ranges = Schema.encodeSync(Schema.fromJsonString(TermProjectionProps.fields.ranges))([
     { key: segment.key, headerBytes: segment.headerBytes },
@@ -964,7 +964,9 @@ test("a prior segment cutoff rejects noncompetitive posting pages before acquisi
     expect((await request(worker, namespace, "write", write(rows))).status).toBe(200);
   }
   const bucket = await worker.getR2Bucket("STORAGE");
-  const derived = await bucket.list({ prefix: `cache/correlated-v2/namespaces/${namespace}/` });
+  const derived = await bucket.list({
+    prefix: `cache/correlated-pool-v1/namespaces/${namespace}/`,
+  });
   await bucket.delete(derived.objects.map((object) => object.key));
   for (const match of ["any", "all", "phrase"] as const) {
     const response = await request(worker, namespace, "query", {

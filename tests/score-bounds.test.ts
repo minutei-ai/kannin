@@ -80,7 +80,7 @@ test("learned segment bounds prune dense repeats without caching result rows", a
       ),
     );
   const bucket = await worker.getR2Bucket("STORAGE");
-  const cached = await bucket.list({ prefix: `cache/correlated-v2/namespaces/${namespace}/` });
+  const cached = await bucket.list({ prefix: `cache/correlated-pool-v1/namespaces/${namespace}/` });
   await bucket.delete(cached.objects.map((object) => object.key));
   const input = textQuery("alpha beta gamma delta", 3);
   const cold = await request(worker, namespace, "query", input);

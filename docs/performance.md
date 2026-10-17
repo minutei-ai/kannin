@@ -4135,3 +4135,20 @@ Before/after cohorts used baseline `e6ad9950-8de2-48ed-9f0e-6a0787b25c02` and th
 Ingress was GRU. Measured baseline placement was remote-IAD; the candidate was remote-EWR except one sixteen-term response at local-GRU. Placement and cache state differ, and latency/CPU outcomes are mixed, so this cohort does not isolate a uniform native speedup. CPU includes only the exact-ray SearchNamespace events, not every bound Worker. All 32 captured candidate coordinator events completed successfully on the deployed version.
 
 After all queries, a native R2 read confirmed the original canonical manifest byte-identical: one million documents, sequence 2000 and 200 immutable segments. No new native benchmark namespace was created in this run.
+
+## Canonical parser investigation
+
+A fresh workerd profile of source `07aa58f` used the same million-document fixture, fresh processes and all three derived R2 prefixes verified empty before each query. The rare-term and dense sampled intervals were 3.48 and 5.73 seconds. Inclusive canonical header parsing occupied approximately 1.34 and 2.72 seconds; Serde JSON decoding accounted for 1.14 and 2.25 seconds within those stacks. These are diagnostic sampled intervals, including idle time, not billed CPU or independent values to add together.
+
+Two isolated WASM prototypes tested simd-json 0.18.1 and sonic-rs 0.5.10 against the actual Header type. Both rejected its preserved RawValue attributes, so neither is a compatible direct replacement in this engine. simd-json documents wasm SIMD support, but that capability alone does not establish compatibility with a particular Serde contract. See [simd-json](https://docs.rs/simd-json/0.18.1/simd_json/) and its [RawValue issue](https://github.com/simd-lite/simd-json/issues/365).
+
+A hybrid prototype preserved Serde JSON for attributes and used simd-json only for the numeric term dictionary. On a 1,724,981-byte header JSON fixture, 24 alternating rounds with four warmup rounds excluded left twenty observations per variant. Median decode time increased **8.82 → 11.21 ms**. WASM linear-memory capacity after the loop increased **4,456,448 → 15,073,280 bytes**; this is not a whole-Worker heap measurement. The hybrid was rejected. Its dependency and code changes stayed outside the repository.
+
+A separate probe of the current release WASM compared strict canonical header acquisition with the existing validated compact directory codec. It checked all 5,000 document metadata rows and two selected term projections for equality before timing. The same alternating 24-round protocol, excluding four warmups, observed:
+
+| Representation                   | Encoded bytes | Median acquisition | Decoded directory heap |
+| -------------------------------- | ------------: | -----------------: | ---------------------: |
+| Canonical header                 |     1,724,997 |           10.58 ms |        1,018,841 bytes |
+| Existing compact directory frame |       109,271 |            7.94 ms |        1,018,841 bytes |
+
+This probe ran in Bun/V8 with release WASM, not workerd or Cloudflare. It isolates reader work and encoded size; it does not include R2 latency, writes, migration, subsequent ranking or a complete search. It supports investigating a compact canonical representation rather than replacing the parser blindly. No canonical format or production runtime changed in this investigation; an eventual format change still requires explicit migration and full-query verification.

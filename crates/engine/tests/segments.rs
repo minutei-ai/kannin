@@ -842,3 +842,58 @@ fn prepared_queries_reuse_global_terms_without_retaining_segment_tombstones()
     }
     Ok(())
 }
+
+#[test]
+fn retained_directories_release_unused_document_capacity() -> Result<(), Box<dyn std::error::Error>>
+{
+    for count in [513, 5000] {
+        let built = segment::build(
+            (0..count)
+                .map(|index| document(format!("{index:05}"), format!("alpha unique{index}")))
+                .collect(),
+        )?;
+        let expected = serde_json::to_string(&built.header)?;
+        let (canonical, length) = segment::parse_header(&built.bytes)?;
+        let frame = segment::compress_directory(&built.bytes[..length])?;
+        let compressed = segment::parse_compressed_directory(&frame, length)?;
+        for directory in [canonical, compressed] {
+            assert_eq!(serde_json::to_string(&directory)?, expected);
+            assert_eq!(directory.documents.len(), count);
+            assert_eq!(directory.documents.capacity(), count);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn compact_term_dictionary_preserves_map_order_duplicates_and_lookup()
+-> Result<(), Box<dyn std::error::Error>> {
+    let encoded = r#"{"z":{"df":1,"blocks":[]},"a":{"df":2,"blocks":[]},"é":{"df":3,"blocks":[]},"z":{"df":4,"blocks":[]}}"#;
+    let mut expected: BTreeMap<String, segment::TermMeta> = serde_json::from_str(encoded)?;
+    let mut actual: segment::TermDictionary = serde_json::from_str(encoded)?;
+    assert_eq!(actual.len(), expected.len());
+    assert!(!actual.is_empty());
+    assert_eq!(serde_json::to_vec(&actual)?, serde_json::to_vec(&expected)?);
+    for term in ["", "a", "b", "z", "é", "missing"] {
+        assert_eq!(
+            serde_json::to_vec(&actual.get(term))?,
+            serde_json::to_vec(&expected.get(term))?,
+        );
+    }
+    actual.get_mut("a").ok_or("Missing dictionary entry")?.df = 9;
+    expected.get_mut("a").ok_or("Missing oracle entry")?.df = 9;
+    assert_eq!(serde_json::to_vec(&actual)?, serde_json::to_vec(&expected)?);
+    assert_eq!(
+        actual.keys().collect::<Vec<_>>(),
+        expected.keys().collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        actual.values().map(|term| term.df).collect::<Vec<_>>(),
+        expected.values().map(|term| term.df).collect::<Vec<_>>(),
+    );
+    let empty: segment::TermDictionary = serde_json::from_str("{}")?;
+    assert!(empty.is_empty());
+    assert!(empty.get("a").is_none());
+    assert_eq!(serde_json::to_string(&empty)?, "{}");
+    Ok(())
+}

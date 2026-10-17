@@ -181,7 +181,13 @@ fn ranged_ranking_matches_full_segment_with_filters_tombstones_and_cutoffs() -> 
             )?;
             let (_, offset) = segment::parse_header(&fixture.bytes)?;
             for term in ["alpha", "beta"] {
-                for block in &fixture.header.terms[term].blocks {
+                for block in &fixture
+                    .header
+                    .terms
+                    .get(term)
+                    .ok_or("Missing fixture term")?
+                    .blocks
+                {
                     let start = offset + usize::try_from(block.data.offset)?;
                     oracle.add(
                         term,

@@ -65,51 +65,114 @@ pub struct TermMeta {
     pub blocks: Box<[BlockMeta]>,
 }
 
+#[derive(Clone, Default)]
+pub struct TermDictionary {
+    entries: Box<[(String, TermMeta)]>,
+}
+
+impl TermDictionary {
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[must_use]
+    pub fn get(&self, term: &str) -> Option<&TermMeta> {
+        self.entries
+            .binary_search_by(|(key, _)| key.as_str().cmp(term))
+            .ok()
+            .map(|index| &self.entries[index].1)
+    }
+
+    pub fn get_mut(&mut self, term: &str) -> Option<&mut TermMeta> {
+        self.entries
+            .binary_search_by(|(key, _)| key.as_str().cmp(term))
+            .ok()
+            .map(|index| &mut self.entries[index].1)
+    }
+
+    #[must_use]
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&String, &TermMeta)> {
+        self.entries.iter().map(|(term, metadata)| (term, metadata))
+    }
+
+    #[must_use]
+    pub fn keys(&self) -> impl ExactSizeIterator<Item = &String> {
+        self.entries.iter().map(|(term, _)| term)
+    }
+
+    #[must_use]
+    pub fn values(&self) -> impl ExactSizeIterator<Item = &TermMeta> {
+        self.entries.iter().map(|(_, metadata)| metadata)
+    }
+}
+
+impl<'a> IntoIterator for &'a TermDictionary {
+    type Item = &'a (String, TermMeta);
+    type IntoIter = std::slice::Iter<'a, (String, TermMeta)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
+}
+
+impl Serialize for TermDictionary {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(self.iter())
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Header {
     #[serde(skip)]
     filter_masks: RefCell<FilterMasks>,
     pub version: u32,
     pub documents: Vec<DocumentMeta>,
-    #[serde(deserialize_with = "deserialize_term_map")]
-    pub terms: BTreeMap<String, TermMeta>,
+    pub terms: TermDictionary,
     pub total_title_length: u64,
     pub total_body_length: u64,
 }
 
-fn deserialize_term_map<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<BTreeMap<String, TermMeta>, D::Error> {
-    struct Terms;
+impl<'de> Deserialize<'de> for TermDictionary {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Terms;
 
-    impl<'de> serde::de::Visitor<'de> for Terms {
-        type Value = BTreeMap<String, TermMeta>;
+        impl<'de> serde::de::Visitor<'de> for Terms {
+            type Value = TermDictionary;
 
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("a term dictionary")
-        }
-
-        fn visit_map<A: serde::de::MapAccess<'de>>(
-            self,
-            mut map: A,
-        ) -> Result<Self::Value, A::Error> {
-            let mut entries = Vec::<(String, TermMeta)>::new();
-            while let Some(entry) = map.next_entry()? {
-                entries.push(entry);
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a term dictionary")
             }
-            entries.sort_by(|left, right| left.0.cmp(&right.0));
-            entries.dedup_by(|later, earlier| {
-                if later.0 != earlier.0 {
-                    return false;
-                }
-                std::mem::swap(&mut later.1, &mut earlier.1);
-                true
-            });
-            Ok(entries.into_iter().collect())
-        }
-    }
 
-    deserializer.deserialize_map(Terms)
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut entries = Vec::<(String, TermMeta)>::new();
+                while let Some(entry) = map.next_entry()? {
+                    entries.push(entry);
+                }
+                entries.sort_by(|left, right| left.0.cmp(&right.0));
+                entries.dedup_by(|later, earlier| {
+                    if later.0 != earlier.0 {
+                        return false;
+                    }
+                    std::mem::swap(&mut later.1, &mut earlier.1);
+                    true
+                });
+                Ok(TermDictionary {
+                    entries: entries.into_boxed_slice(),
+                })
+            }
+        }
+
+        deserializer.deserialize_map(Terms)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -241,8 +304,7 @@ impl Header {
                 .iter()
                 .map(|doc| doc.id.capacity() + doc.attributes.get().len() + 32)
                 .sum::<usize>();
-        let terms = (self.terms.len() / 4 + 1)
-            * (11 * (size_of::<String>() + size_of::<TermMeta>()) + 12 * size_of::<usize>() + 32)
+        let terms = self.terms.entries.len() * size_of::<(String, TermMeta)>()
             + self
                 .terms
                 .iter()
@@ -585,8 +647,8 @@ fn encode_terms(
     payload: &mut Vec<u8>,
     metadata: &[DocumentMeta],
     lists: BTreeMap<String, Vec<Posting>>,
-) -> Result<BTreeMap<String, TermMeta>, String> {
-    let mut terms = BTreeMap::new();
+) -> Result<TermDictionary, String> {
+    let mut terms = Vec::with_capacity(lists.len());
     for (term, postings) in lists {
         let mut blocks = Vec::with_capacity(postings.len().div_ceil(BLOCK_SIZE));
         for chunk in postings.chunks(BLOCK_SIZE) {
@@ -624,15 +686,17 @@ fn encode_terms(
                 data,
             });
         }
-        terms.insert(
+        terms.push((
             term,
             TermMeta {
                 df: u32::try_from(postings.len()).map_err(|cause| cause.to_string())?,
                 blocks: blocks.into_boxed_slice(),
             },
-        );
+        ));
     }
-    Ok(terms)
+    Ok(TermDictionary {
+        entries: terms.into_boxed_slice(),
+    })
 }
 
 #[doc = "# Errors\nRejects empty or duplicate documents, wire-size overflow, serialization errors, and segments beyond the size budget."]
@@ -738,8 +802,9 @@ pub fn parse_header(bytes: &[u8]) -> Result<(Header, usize), String> {
         return Err("Header integrity check failed".into());
     }
     let text = std::str::from_utf8(json).map_err(|cause| cause.to_string())?;
-    let header: Header = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let mut header: Header = serde_json::from_str(text).map_err(|e| e.to_string())?;
     validate_header(&header)?;
+    header.documents.shrink_to_fit();
     Ok((header, 16 + length))
 }
 
@@ -817,7 +882,7 @@ impl Serialize for DirectoryBlocks<'_> {
     }
 }
 
-struct DirectoryTerms<'a>(&'a BTreeMap<String, TermMeta>);
+struct DirectoryTerms<'a>(&'a TermDictionary);
 
 impl Serialize for DirectoryTerms<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -902,8 +967,9 @@ pub fn parse_compressed_directory(bytes: &[u8], expected: usize) -> Result<Heade
     if decoded.len() != compact_length || verified.finalize() != checksum {
         return Err("Compressed directory integrity check failed".into());
     }
-    let header: Header = serde_json::from_slice(&decoded).map_err(|cause| cause.to_string())?;
+    let mut header: Header = serde_json::from_slice(&decoded).map_err(|cause| cause.to_string())?;
     validate_header(&header)?;
+    header.documents.shrink_to_fit();
     Ok(header)
 }
 
@@ -2054,7 +2120,7 @@ pub fn bloom_filter_many<'a>(
 pub mod wasm {
     use super::{
         BlockMeta, BuiltSegment, Document, DocumentMeta, Filter, Header, MAX_BYTES, Range, Search,
-        SelectedAttributes, Statistics, TermMeta, TermScorer, append, bloom_build,
+        SelectedAttributes, Statistics, TermDictionary, TermMeta, TermScorer, append, bloom_build,
         bloom_filter_many, build, decode_page, document_terms, matches, parse_header,
     };
     use serde::{Deserialize, Serialize};
@@ -2330,7 +2396,7 @@ pub mod wasm {
     }
 
     struct OverviewDictionary<'a> {
-        terms: &'a BTreeMap<String, TermMeta>,
+        terms: &'a TermDictionary,
         pool: &'a RefCell<SummaryPool>,
     }
 

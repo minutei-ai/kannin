@@ -3997,3 +3997,24 @@ A Cloudflare provenance check created a fresh 4,000-document namespace for each 
 The final local gate passed 276 Bun/workerd tests and 51 Rust tests, including producer preparation, compaction, fresh readers, deletion/reset and explicit cold-cache recovery. Formatting, strict Effect lint/types and native/WASM Clippy passed. The entire 300-query SciFact report remained byte-identical.
 
 Alchemy profile minutei deployed source `a84d5c4` as version `cd7b084f-e51c-4a15-a924-5884d01d8207`, verified at 100% traffic with Smart Placement and unchanged R2 binding/lifecycle rules. The mandatory vector metadata migration completed; ANN recall was not remeasured. Separate full-API before/after cohorts preserved all sixty-four complete million-document responses and sequence 2000. The canonical million-document root remained byte-identical after these queries and the synthetic namespace cleanup. Those API cohorts verify behavior rather than a matched native latency improvement.
+
+## Compact retained Rust directories
+
+The Rust directory now retains sorted term entries in a boxed slice instead of rebuilding a balanced tree after deserialization. Lookup uses exact binary search. Validated document vectors release spare capacity. Stable duplicate-key handling, canonical bytes, compressed directory frames, CRC checks, live statistics, filters and ranking remain unchanged. The decoded-directory cache stays at twenty MiB; accounting follows the actual retained representation.
+
+A baseline inspector capture of ten repeated sixty-four-term queries attributed about 694 of 959 sampled milliseconds inclusively to compressed-directory reconstruction. This is diagnostic sampling, not billed CPU. Five alternating paired local workerd cohorts then ran twenty mixed rounds over the same million-document fixture. Eight rounds per cohort were warmup, leaving sixty observations per selector/variant. All 800 complete responses matched IDs, exact scores, attributes, revisions and sequence 2000.
+
+| Selector              | Baseline median of cohort medians | Candidate |
+| --------------------- | --------------------------------: | --------: |
+| Sixteen rare terms    |                          66.00 ms |   6.77 ms |
+| Sixty-four rare terms |                         180.37 ms | 143.54 ms |
+| Dense group 72        |                           7.56 ms |   7.48 ms |
+| Dense group 43        |                           7.67 ms |   7.44 ms |
+
+All pairs remain included. The first sixty-four-term pair regressed 180.37 → 265.87 ms; later pairs improved, with the final two closer to ten percent. These figures do not establish universal gains or tail latency. In the first mixed cohort, decoded-directory hits increased 289 → 383, while encoded-only hits fell 215 → 121. Retained directory charges decreased 20,316,010 → 19,916,333 bytes, but WASM linear-memory high-water increased **27,328,512 → 31,588,352 bytes**. Smaller retained headers are not evidence of a lower whole-Worker memory peak.
+
+Cold controls used fresh workerd processes, empty Worker caches and the existing R2 fixture, with three paired cohorts per selector. All 48 complete initial/repeated responses matched. Initial medians were 977.55/952.89 ms for sixteen terms, 1741.06/1732.82 for sixty-four, 1222.31/1184.24 for dense group 72 and 1157.07/1151.19 for group 43. These changes are small and do not establish a cold-read speedup. A separate control redirected all disposable overview-batch, individual-summary and directory prefixes to fresh empty keys. All sixteen complete initial/repeated responses matched, with zero initial batch, individual-summary or directory-frame hits. Initial sixty-four-term reads were 4501.69/4480.53 and 4588.43/4535.73 ms; dense group 43 was 11799.89/11831.60 and 11616.64/11434.81 ms. Local filesystem and R2-emulator caches could remain warm in both controls.
+
+Canonical segments, header JSON and compressed directory bytes were identical between the two WASMs for a 500-document corpus and a separate Unicode, escaped-key, title and vector fixture. Existing million-document artifacts remained readable without a format cutover.
+
+A separate cold-read experiment replaced serialized eligibility keys with structured keys. An isolated twenty-projection workerd control measured 60.97/62.99 ms, 38.12/36.62 ms and 76.77/75.84 ms across three fixtures. Forty-eight complete initial/repeated API responses also matched, but end-to-end gains were inconsistent. That experiment was discarded and is absent from the deployed runtime.

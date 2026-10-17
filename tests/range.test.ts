@@ -167,7 +167,7 @@ test("directories above cache admission retain the existing forty-MiB validation
     Schema.encodeSync(Schema.fromJsonString(SegmentHeader))({
       ...original,
       terms: Object.fromEntries(
-        Array.from({ length: 200000 }, (_, index) => [`term${index}`, { df: 0, blocks: [] }]),
+        Array.from({ length: 440000 }, (_, index) => [`term${index}`, { df: 0, blocks: [] }]),
       ),
     }),
   );

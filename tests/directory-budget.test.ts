@@ -331,7 +331,7 @@ test("rejected cache admission shares a validated directory only for active read
   const metadata = expected.terms('["unique3711"]');
   const capacity = Math.floor((20 * 1024 * 1024) / expected.heap_bytes());
   expect(capacity).toBeGreaterThan(0);
-  expect(capacity).toBeLessThan(16);
+  expect(capacity).toBeLessThan(32);
   const inputs = Array.from({ length: capacity + 1 }, (_, index) => ({
     key: `namespaces/directory-active/segments/blob-${index}.rsix`,
     offset: 0,

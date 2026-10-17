@@ -139,6 +139,12 @@ async function probe(request: Request, env: Env) {
     state.failDirectoryWrites = true;
     return new Response(null, { status: 204 });
   }
+  if (new URL(request.url).pathname === "/late-frame") {
+    state.cacheDelay = 0;
+    state.directoryBodyDelay = 320;
+    state.bodyDelay = 1000;
+    return new Response(null, { status: 204 });
+  }
   if (new URL(request.url).pathname === "/cache-stall") {
     state.directoryBodyDelay = 1600;
     return new Response(null, { status: 204 });

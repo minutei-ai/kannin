@@ -5,6 +5,7 @@ import {
   Cause,
   Clock,
   Effect,
+  Fiber,
   Match,
   Option,
   Schema,
@@ -77,7 +78,8 @@ import {
 import {
   range,
   publishQueryCache,
-  readDirectoryFrame,
+  acquireDirectoryFrame,
+  waitDirectoryFrame,
   publishDirectoryFrame,
   withDirectory,
   readTermCatalogs,
@@ -146,50 +148,110 @@ export class Segments extends WorkerEntrypoint<Env, typeof SegmentCacheProps.Typ
         return response;
       }
     }
-    if (url.pathname === "/directory-v2") {
-      const frame = await Effect.runPromise(readDirectoryFrame(input.key, input.length));
-      if (Option.isSome(frame)) {
-        const response = new Response(new Uint8Array(frame.value), {
-          headers: {
-            "content-type": "application/octet-stream",
-            "cache-control": "public, max-age=31536000, immutable",
-            "content-length": String(frame.value.byteLength),
-            "x-raio-cache": "r2-directory-hit",
+    const storage = this.env.STORAGE;
+    const context = this.ctx;
+    const response = await Effect.runPromise(
+      Effect.gen(function* () {
+        const canonical = Effect.acquireUseRelease(
+          Effect.tryPromise(() =>
+            storage.get(input.key, { range: { offset: input.offset, length: input.length } }),
+          ),
+          (object) =>
+            Effect.gen(function* () {
+              if (object === null)
+                return new Response(null, {
+                  status: 404,
+                  headers: { "cache-control": "no-store" },
+                });
+              const bytes = yield* Effect.tryPromise(() => object.arrayBuffer()).pipe(
+                Effect.uninterruptible,
+              );
+              if (bytes.byteLength !== input.length)
+                return new Response(null, {
+                  status: 503,
+                  headers: { "cache-control": "no-store" },
+                });
+              const encoded = yield* Effect.try(() =>
+                Match.value(url.pathname).pipe(
+                  Match.when("/directory-v2", () =>
+                    directory_compress(new Uint8Array(bytes)).slice(),
+                  ),
+                  Match.orElse(() => bytes),
+                ),
+              );
+              if (url.pathname === "/directory-v2")
+                publishDirectoryFrame(input.key, input.length, new Uint8Array(encoded), context);
+              return new Response(encoded, {
+                headers: {
+                  "content-type": "application/octet-stream",
+                  "cache-control": "public, max-age=31536000, immutable",
+                  "content-length": String(encoded.byteLength),
+                  etag: object.httpEtag,
+                },
+              });
+            }),
+          (object) => {
+            if (object === null || object.bodyUsed) return Effect.void;
+            return Effect.tryPromise(() => object.body.cancel()).pipe(Effect.ignore);
           },
-        });
-        if (cache !== undefined)
-          this.ctx.waitUntil(
-            Effect.runPromise(
-              Effect.tryPromise(() => cache.put(cacheKey, response.clone())).pipe(Effect.ignore),
+        );
+        if (url.pathname !== "/directory-v2") return yield* canonical;
+        const reader = yield* acquireDirectoryFrame(input.key, input.length);
+        const observed = yield* waitDirectoryFrame(reader);
+        const cached = Fiber.join(reader).pipe(
+          Effect.map(
+            Option.map(
+              (bytes) =>
+                new Response(new Uint8Array(bytes), {
+                  headers: {
+                    "content-type": "application/octet-stream",
+                    "cache-control": "public, max-age=31536000, immutable",
+                    "content-length": String(bytes.byteLength),
+                    "x-raio-cache": "r2-directory-hit",
+                  },
+                }),
             ),
-          );
-        return response;
-      }
-    }
-    const object = await this.env.STORAGE.get(input.key, {
-      range: { offset: input.offset, length: input.length },
-    });
-    if (object === null)
-      return new Response(null, { status: 404, headers: { "cache-control": "no-store" } });
-    const bytes = await object.arrayBuffer();
-    if (bytes.byteLength !== input.length)
-      return new Response(null, { status: 503, headers: { "cache-control": "no-store" } });
-    const encoded = Match.value(url.pathname).pipe(
-      Match.when("/directory-v2", () => directory_compress(new Uint8Array(bytes)).slice()),
-      Match.orElse(() => bytes),
+          ),
+        );
+        if (Option.isSome(observed)) {
+          const result = yield* cached;
+          if (Option.isSome(result)) return result.value;
+          return yield* canonical;
+        }
+        return yield* Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const fallback = yield* Effect.forkDetach(restore(canonical));
+            context.waitUntil(
+              new Promise<void>((resolve) => fallback.addObserver(() => resolve())),
+            );
+            return yield* restore(
+              Effect.race(
+                Fiber.join(fallback),
+                cached.pipe(
+                  Effect.flatMap(
+                    Option.match({
+                      onSome: Effect.succeed,
+                      onNone: () => Fiber.join(fallback),
+                    }),
+                  ),
+                ),
+              ),
+            ).pipe(
+              Effect.ensuring(
+                Effect.gen(function* () {
+                  const stopped = yield* Effect.forkDetach(Fiber.interruptAll([reader, fallback]));
+                  context.waitUntil(
+                    new Promise<void>((resolve) => stopped.addObserver(() => resolve())),
+                  );
+                }),
+              ),
+            );
+          }),
+        );
+      }),
     );
-    if (url.pathname === "/directory-v2")
-      publishDirectoryFrame(input.key, input.length, new Uint8Array(encoded), this.ctx);
-    const response = new Response(encoded, {
-      headers: {
-        "content-type": "application/octet-stream",
-        "cache-control": "public, max-age=31536000, immutable",
-        "content-length": String(encoded.byteLength),
-        etag: object.httpEtag,
-      },
-    });
-    if (cache !== undefined)
-      this.ctx.waitUntil(
+    if (cache !== undefined && response.ok)
+      context.waitUntil(
         Effect.runPromise(
           Effect.tryPromise(() => cache.put(cacheKey, response.clone())).pipe(Effect.ignore),
         ),

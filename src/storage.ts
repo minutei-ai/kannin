@@ -95,6 +95,8 @@ const SMALL_RANGE_LIMIT = 64 * 1024;
 const SMALL_RANGE_BODY_UNIT = 64 * 1024;
 const smallRangeReads = Semaphore.makeUnsafe(64);
 const MAX_DIRECTORY_FALLBACK_LENGTH = 2 * 1024 * 1024;
+const MAX_DIRECTORY_CACHE_LENGTH = 4 * 1024 * 1024;
+const MAX_DIRECTORY_CACHE_BYTES = MAX_DIRECTORY_FALLBACK_LENGTH + 8192;
 const directoryFallbackReads = Semaphore.makeUnsafe(1);
 const directoryCacheReads = Semaphore.makeUnsafe(1);
 const budget = { bytes: 0, payloadBytes: 0 };
@@ -348,10 +350,11 @@ function rememberDirectory(
   decodedBudget.bytes = remaining.bytes + bytes;
 }
 
-export const readDirectoryFrame = Effect.fn("kannin.readDirectoryFrame")(
+export const acquireDirectoryFrame = Effect.fn("kannin.acquireDirectoryFrame")(
   (key: string, length: number) =>
     Effect.gen(function* () {
-      if (length > MAX_DIRECTORY_FALLBACK_LENGTH) return Option.none<Uint8Array>();
+      if (length > MAX_DIRECTORY_CACHE_LENGTH)
+        return yield* Effect.forkDetach(Effect.succeed(Option.none<Uint8Array>()));
       const acquisition = directoryCacheReads.withPermitsIfAvailable(1)(
         Effect.gen(function* () {
           reads.directoryR2CacheReads += 1;
@@ -363,7 +366,7 @@ export const readDirectoryFrame = Effect.fn("kannin.readDirectoryFrame")(
             Schema.fromJsonString(TermProjectionRange),
           )(object.customMetadata?.source).pipe(Effect.option);
           if (
-            object.size > length + 8192 ||
+            object.size > Math.min(length + 8192, MAX_DIRECTORY_CACHE_BYTES) ||
             Option.isNone(source) ||
             source.value.key !== key ||
             source.value.headerBytes !== length
@@ -387,19 +390,31 @@ export const readDirectoryFrame = Effect.fn("kannin.readDirectoryFrame")(
           return checked;
         }).pipe(Effect.uninterruptible),
       );
-      const acquired = yield* Effect.uninterruptibleMask((restore) =>
+      return yield* Effect.uninterruptible(
         Effect.gen(function* () {
-          const reader = yield* Effect.forkDetach(acquisition);
+          const reader = yield* Effect.forkDetach(
+            acquisition.pipe(
+              Effect.map(Option.flatten),
+              Effect.orElseSucceed(() => Option.none<Uint8Array>()),
+            ),
+          );
           waitUntil(new Promise<void>((resolve) => reader.addObserver(() => resolve())));
-          return yield* restore(Fiber.join(reader)).pipe(Effect.timeoutOption("250 millis"));
+          return reader;
         }),
       );
-      if (Option.isNone(acquired)) {
-        reads.directoryR2CacheTimeouts += 1;
-        return Option.none<Uint8Array>();
-      }
-      return Option.flatten(acquired.value);
-    }).pipe(Effect.orElseSucceed(() => Option.none<Uint8Array>())),
+    }),
+);
+
+export const waitDirectoryFrame = Effect.fn("kannin.waitDirectoryFrame")(
+  (reader: Fiber.Fiber<Option.Option<Uint8Array>>) =>
+    Fiber.join(reader).pipe(
+      Effect.timeoutOption("250 millis"),
+      Effect.tap((result) =>
+        Effect.sync(() => {
+          if (Option.isNone(result)) reads.directoryR2CacheTimeouts += 1;
+        }),
+      ),
+    ),
 );
 
 export function publishDirectoryFrame(
@@ -408,7 +423,11 @@ export function publishDirectoryFrame(
   bytes: Uint8Array,
   ctx?: ExecutionContext | DurableObjectState,
 ) {
-  if (length > MAX_DIRECTORY_FALLBACK_LENGTH) return false;
+  if (
+    length > MAX_DIRECTORY_CACHE_LENGTH ||
+    bytes.byteLength > Math.min(length + 8192, MAX_DIRECTORY_CACHE_BYTES)
+  )
+    return false;
   const identity = `cache/directory-v2/${key}/${length}`;
   const published = publishQueryCache(
     `${env.STORAGE_CACHE_SCOPE}:${identity}`,
@@ -558,7 +577,8 @@ export async function range(
       },
     ).pipe(Effect.uninterruptible);
     const directoryRecovery = Effect.gen(function* () {
-      const frame = yield* readDirectoryFrame(key, length);
+      const reader = yield* acquireDirectoryFrame(key, length);
+      const frame = Option.flatten(yield* waitDirectoryFrame(reader));
       if (Option.isSome(frame)) return frame.value;
       return yield* fallback;
     });
@@ -1540,7 +1560,7 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
 export const storeSegmentCaches = Effect.fn("kannin.storeSegmentCaches")(
   (key: string, headerBytes: number, bytes: Uint8Array) =>
     Effect.gen(function* () {
-      if (headerBytes <= MAX_DIRECTORY_FALLBACK_LENGTH) {
+      if (headerBytes <= MAX_DIRECTORY_CACHE_LENGTH) {
         const frame = yield* Effect.try(() =>
           directory_compress(bytes.subarray(0, headerBytes)).slice(),
         );

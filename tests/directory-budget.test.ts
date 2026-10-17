@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { Effect, Schema } from "effect";
+import { Effect, Match, Schema } from "effect";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -637,12 +637,107 @@ test("directory bodies above two MiB preserve the cached acquisition path", asyn
   expect(state.headers.get("x-r2-started")).toBe("0");
 }, 15000);
 
-test("R2 directory publication includes exactly two MiB and excludes the next byte", async () => {
+test("a late validated directory wins while the losing canonical body retains its lifetime", async () => {
+  await using active = await fixture();
+  const worker = active.worker;
+  const bucket = await worker.getR2Bucket("STORAGE");
+  const built = directoryWithLength(4 * 1024 * 1024);
+  const encoded = new Uint8Array(directory_compress(built.bytes.subarray(0, built.length)));
+  const key = "namespaces/directory-late/segments/late.rsix";
+  await bucket.put(key, built.bytes);
+  await bucket.put(`cache/directory-v2/${key}/${built.length}`, encoded, {
+    customMetadata: {
+      source: Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))({
+        key,
+        headerBytes: built.length,
+      }),
+    },
+  });
+  expect((await fetch(new URL("/late-frame", await worker.ready))).status).toBe(204);
+  expect((await fetch(new URL("/cache-write-failure", await worker.ready))).status).toBe(204);
+  const started = performance.now();
+  const response = await fetch(new URL("/origin", await worker.ready), {
+    method: "POST",
+    body: Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
+      key,
+      offset: 0,
+      length: built.length,
+      count: 1,
+    }),
+  });
+  expect(response.status).toBe(200);
+  expect(new Uint8Array(await response.arrayBuffer())).toEqual(encoded);
+  expect(response.headers.get("x-raio-cache")).toBe("r2-directory-hit");
+  expect(performance.now() - started).toBeLessThan(900);
+  const pending = await fetch(new URL("/state", await worker.ready));
+  expect(pending.headers.get("x-r2-active")).toBe("1");
+  expect(pending.headers.get("x-r2-peak")).toBe("2");
+  for (const attempt of Array.from({ length: 40 }, (_, index) => index)) {
+    const settled = await fetch(new URL("/state", await worker.ready));
+    if (settled.headers.get("x-r2-active") === "0") {
+      expect(settled.headers.get("x-rejected-writes")).toBe("0");
+      return;
+    }
+    if (attempt === 39) throw new Error("Losing canonical body did not settle");
+    await Effect.runPromise(Effect.sleep("50 millis"));
+  }
+}, 15000);
+
+test("large directory caches bound compressed bodies and recover oversized frames", async () => {
+  await using active = await fixture();
+  const worker = active.worker;
+  const bucket = await worker.getR2Bucket("STORAGE");
+  const built = directoryWithLength(4 * 1024 * 1024);
+  const encoded = new Uint8Array(directory_compress(built.bytes.subarray(0, built.length)));
+  expect((await fetch(new URL("/fast-origin", await worker.ready))).status).toBe(204);
+  for (const kind of ["valid", "oversized"] as const) {
+    const key = `namespaces/directory-large/segments/${kind}.rsix`;
+    await bucket.put(key, built.bytes);
+    await bucket.put(
+      `cache/directory-v2/${key}/${built.length}`,
+      Match.value(kind).pipe(
+        Match.when("valid", () => encoded),
+        Match.orElse(() => new Uint8Array(2 * 1024 * 1024 + 8193)),
+      ),
+      {
+        customMetadata: {
+          source: Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))({
+            key,
+            headerBytes: built.length,
+          }),
+        },
+      },
+    );
+    const response = await fetch(new URL("/origin", await worker.ready), {
+      method: "POST",
+      body: Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
+        key,
+        offset: 0,
+        length: built.length,
+        count: 1,
+      }),
+    });
+    expect(response.status).toBe(200);
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(encoded);
+    const state = await fetch(new URL("/state", await worker.ready));
+    if (kind === "valid") {
+      expect(response.headers.get("x-raio-cache")).toBe("r2-directory-hit");
+      expect(state.headers.get("x-canonical-reads")).toBe("0");
+      expect(state.headers.get("x-r2-started")).toBe("1");
+    } else {
+      expect(response.headers.get("x-raio-cache")).toBeNull();
+      expect(state.headers.get("x-canonical-reads")).toBe("1");
+      expect(state.headers.get("x-r2-started")).toBe("2");
+    }
+  }
+}, 15000);
+
+test("R2 directory publication includes exactly four MiB and excludes the next byte", async () => {
   await using active = await fixture();
   const worker = active.worker;
   const bucket = await worker.getR2Bucket("STORAGE");
   for (const extra of [0, 1]) {
-    const built = directoryWithLength(2 * 1024 * 1024 + extra);
+    const built = directoryWithLength(4 * 1024 * 1024 + extra);
     const key = `namespaces/directory-boundary/segments/frame-${extra}.rsix`;
     const identity = `cache/directory-v2/${key}/${built.length}`;
     await bucket.put(key, built.bytes);

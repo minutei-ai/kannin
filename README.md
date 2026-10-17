@@ -15,6 +15,8 @@ With prepared R2 directories, a local first-read comparison over one million doc
 
 Directory admission now briefly waits for valid compressed frames instead of immediately reconstructing canonical headers under contention. Up to four small bodies share the original **2 MiB + 8,192-byte** encoded-body budget; a large frame consumes the permits. Sixteen attempts bound pending work, and concurrent cache failures release waiting attempts to canonical recovery. The WASM binary and storage formats are unchanged.
 
+The deployed candidate preserved **64 complete responses** in an existing-namespace Cloudflare probe, whose latency and coordinator CPU outcomes were mixed. A fresh 20,000-document first-read check preserved all 32 rows and demonstrated R2 directory reuse; its single before/after observation is not a latency guarantee. [Native validation](docs/performance.md#native-validation-of-directory-admission).
+
 An earlier deployed Rust change reduced warm Durable Object CPU medians **39.5 → 4 ms** and **102 → 80.5 ms** for sixteen/sixty-four rare terms. [Native measurements](docs/performance.md#cloudflare-validation-of-compact-retained-directories).
 
 An earlier edge load run at source `6c03e72`, using an acknowledged sequence barrier, checked 384 complete responses against a strong baseline:

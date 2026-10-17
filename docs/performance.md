@@ -4152,3 +4152,69 @@ A separate probe of the current release WASM compared strict canonical header ac
 | Existing compact directory frame |       109,271 |            7.94 ms |        1,018,841 bytes |
 
 This probe ran in Bun/V8 with release WASM, not workerd or Cloudflare. It isolates reader work and encoded size; it does not include R2 latency, writes, migration, subsequent ranking or a complete search. It supports investigating a compact canonical representation rather than replacing the parser blindly. No canonical format or production runtime changed in this investigation; an eventual format change still requires explicit migration and full-query verification.
+
+## Compact canonical header writer
+
+The canonical writer now reuses the compact JSON sequences already used by directory frames. The `RAIOSEG1` envelope, physical length and CRC checks remain intact, and the native Serde reader is unchanged. Public `header_json()` still returns named objects. New writes and ordinary compaction use the compact representation; deployment does not rewrite existing immutable indexes. No reader branch, dependency, root schema or mandatory data migration was added.
+
+Compatibility probes used both release WASM versions on 5,000-document and multilingual 64-document fixtures. The previous reader accepted the new segments and the new reader accepted previous segments. Public metadata, every document metadata row, all terms and posting/document payload bytes matched. The previous full Worker also completed eight strong initial/repeated responses over the converted million-document fixture, identical to the original layout's responses.
+
+### Controlled local index layout comparison
+
+The fixture preserves one million documents, 200 physical segments, sequence 2000, grouping, revisions, Blooms, tombstones, statistics and payloads. A separate R2-emulator persistence contains the tuple headers with updated physical offsets and immutable object identities. Its header JSON comes from the same Rust serializer used by the writer; existing optional summary payloads are rebound to the new identities. All 200 individual summaries and 49 batch summaries are retained, with no skipped batches. Every source's metadata was checked against the previous reader. SHA-256 verification after persistence confirmed all **178,998,305 payload bytes** identical across the 200 sources. The original fixture's manifest remained byte-identical.
+
+| Encoded component       |            Before |             After | Change |
+| ----------------------- | ----------------: | ----------------: | -----: |
+| Canonical headers       | 352,086,144 bytes | 123,149,840 bytes | −65.0% |
+| Complete index segments | 531,084,449 bytes | 302,148,145 bytes | −43.1% |
+
+These are segment bytes for this corpus, not total bucket usage or a billing measurement. Logs, receipts and derived cache artifacts are excluded.
+
+Four paired cohorts per selector start fresh workerd processes and verify all three derived R2 artifact prefixes empty before timing. Reconstruction during the query is allowed. The initial two pairs were extended by two more after a high first baseline observation; all original observations remain included. Each cell has four initial observations and a repeated response per process. All **32 complete responses** matched.
+
+| Derived artifacts initially absent | Median before | Median after | Change |
+| ---------------------------------- | ------------: | -----------: | -----: |
+| Sixty-four rare terms              |    3356.23 ms |   2635.37 ms | −21.5% |
+| Dense group 43                     |    5729.94 ms |   4453.59 ms | −22.3% |
+
+Rare-term initial pairs were 7021.78/3604.83, 3368.41/2642.63, 3313.08/2628.11 and 3344.05/2545.22 ms. Dense pairs were 5835.71/5505.22, 6323.27/4595.78, 5583.98/4248.23 and 5624.16/4311.39 ms. The first rare baseline is an outlier relative to the later observations; it was not discarded. Local filesystem and R2-emulator caches can remain warm, so these are process-cold controls, not proof of cold Cloudflare storage.
+
+Three additional pairs with prepared derived R2 artifacts checked **48 complete initial/repeated responses**, all identical. Their medians were mixed:
+
+| Prepared artifacts    | Median before | Median after |
+| --------------------- | ------------: | -----------: |
+| Sixteen rare terms    |     536.70 ms |    537.21 ms |
+| Sixty-four rare terms |     938.29 ms |    893.37 ms |
+| Dense group 72        |    1171.36 ms |   1130.43 ms |
+| Dense group 43        |    1120.12 ms |   1157.53 ms |
+
+Together with the previous-Worker compatibility control, **88 complete responses** matched. The header-layout result does not imply uniform latency improvement, sustained throughput, whole-Worker peak-memory bounds or Turbopuffer parity.
+
+Source `f1b6fef` passed **286 Bun/workerd tests and 54 Rust tests**, with 9,752 Bun assertions, formatting, strict Effect lint/types and native/WASM Clippy. The entire 300-query SciFact report remained byte-identical. Body-admission regressions use explicit two-MiB headers so their large-body classification survives representation changes; document-range fixtures now decode through the native Directory API instead of assuming named on-disk JSON.
+
+### Native validation of compact canonical writes
+
+Alchemy profile minutei deployed `f1b6fef` as version `58af76e3-cd0c-44be-b2f7-401ca3aa5ab1`, verified at 100% traffic with Smart Placement, the same physical R2 binding and unchanged cache lifecycle rules. The unconditional vector metadata migration completed across 44 namespaces and submitted 398 entries. ANN recall was not remeasured.
+
+A fresh namespace per version used forty 500-document writes followed by five explicit compactions, yielding five 4,000-document sources at sequence 40. A direct native R2 read checked all five frame prefixes against their manifest header lengths: the baseline sources used named JSON objects and the candidate sources used tuples. Source storage changed as follows:
+
+| Native 20,000-document fixture |     Before |     After |
+| ------------------------------ | ---------: | --------: |
+| Canonical header bytes         |  6,956,777 | 2,364,252 |
+| Complete index segment bytes   | 10,480,440 | 5,887,915 |
+| Posting/document payload bytes |  3,523,663 | 3,523,663 |
+
+Each namespace ran its first thirty-two-term strong query with top-k 100 after one second for optional cache publication, an untimed rebuild and initial metadata capture. All 32 rows, scores, revisions, attributes and sequence matched. HTTP times were **1825.06 / 1912.48 ms**, both remote-EWR with GRU ingress. One observation per version, with prepared derived artifacts, does not establish a native latency gain. Both canaries were reset to sequence 41 and verified empty with no vector outbox; all 45 source objects per namespace were marked for retirement. Physical deletion remains subject to the normal grace period and subsequent collection.
+
+A separate control on the existing million-document index retained its original objects and header layout. Before/after versions each ran eight mixed rounds of four strong selectors, with coordinator rebuild before every query and fresh equivalent predicates. All **64 complete responses** matched. Two warmup rounds are excluded from HTTP medians, leaving six observations per cell. This is backward-read validation on existing data, not a native comparison of rewritten compact versus object indexes.
+
+| Existing index selector | HTTP median before/after | Paired coordinator CPU before/after | CPU pairs |
+| ----------------------- | -----------------------: | ----------------------------------: | --------: |
+| Sixteen rare terms      |       430.40 / 430.47 ms |                        166 / 159 ms |         5 |
+| Sixty-four rare terms   |       601.78 / 715.68 ms |                        290 / 287 ms |         6 |
+| Dense group 72          |       437.30 / 529.91 ms |                        101 / 103 ms |         5 |
+| Dense group 43          |       434.39 / 489.68 ms |                        100 / 104 ms |         5 |
+
+Coordinator CPU joins the exact response CF-Ray to SearchNamespace events. Three candidate events remained unavailable and were excluded from CPU pairs, never counted as zero. All 29 captured candidate events completed successfully on the deployed version. GRU ingress served every query; measured placement was remote-EWR except one candidate dense-group-72 response at local-GRU. HTTP medians increased in three selectors while CPU moved in both directions. This cache-sensitive control does not isolate a uniform native speedup and does not measure CPU in every bound Worker.
+
+After all native queries, the original million-document R2 manifest remained byte-identical at sequence 2000 with 200 segments. The compact layout's production evidence is the directly inspected fresh canary; existing index objects were preserved.

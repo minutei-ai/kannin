@@ -80,7 +80,6 @@ export const Worker = Cloudflare.Worker(
         default: { cache: { enabled: false } },
         Segments: { cache: { enabled: true } },
         Terms: { cache: { enabled: true } },
-        KanninRpc: { cache: { enabled: false } },
       },
       compatibility: { date: "2026-10-01" },
       env: {

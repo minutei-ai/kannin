@@ -845,6 +845,18 @@ fn validate_header(header: &Header) -> Result<(), String> {
 
 const DIRECTORY_MAGIC: &[u8; 8] = b"RAIODIR2";
 
+#[doc = "# Errors\nRejects invalid canonical headers, mismatched lengths, trailing bytes and directory size limits."]
+pub fn parse_directory(bytes: &[u8], expected: usize) -> Result<Header, String> {
+    if bytes.len() != expected || bytes.len() > MAX_BYTES {
+        return Err("Directory must contain exactly one complete header".into());
+    }
+    let (header, length) = parse_header(bytes)?;
+    if length != expected {
+        return Err("Directory must contain exactly one complete header".into());
+    }
+    Ok(header)
+}
+
 struct DirectoryDocuments<'a>(&'a [DocumentMeta]);
 
 impl Serialize for DirectoryDocuments<'_> {
@@ -896,10 +908,8 @@ impl Serialize for DirectoryTerms<'_> {
 
 #[doc = "# Errors\nRejects invalid or incomplete canonical headers and directory size limits."]
 pub fn compress_directory(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let (header, length) = parse_header(bytes)?;
-    if length != bytes.len() || length > MAX_BYTES {
-        return Err("Directory must contain exactly one complete header".into());
-    }
+    let header = parse_directory(bytes, bytes.len())?;
+    let length = bytes.len();
     let compact = serde_json::to_vec(&(
         header.version,
         DirectoryDocuments(&header.documents),
@@ -3188,6 +3198,15 @@ pub mod wasm {
         #[doc = "# Errors\nRejects invalid compressed frames or canonical headers and mismatched expected lengths."]
         pub fn compressed(bytes: &[u8], expected: u32) -> Result<Self, JsValue> {
             let header = super::parse_compressed_directory(bytes, expected as usize)
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            Ok(Self {
+                header: Rc::new(header),
+            })
+        }
+
+        #[doc = "# Errors\nRejects invalid canonical headers, trailing bytes and mismatched expected lengths."]
+        pub fn canonical(bytes: &[u8], expected: u32) -> Result<Self, JsValue> {
+            let header = super::parse_directory(bytes, expected as usize)
                 .map_err(|cause| JsValue::from_str(&cause))?;
             Ok(Self {
                 header: Rc::new(header),

@@ -2,6 +2,7 @@ import {
   Array as EffectArray,
   Cause,
   Clock,
+  Exit,
   Effect,
   Fiber,
   Match,
@@ -98,6 +99,8 @@ const MAX_DIRECTORY_FALLBACK_LENGTH = 2 * 1024 * 1024;
 const MAX_DIRECTORY_CACHE_LENGTH = 4 * 1024 * 1024;
 const MAX_DIRECTORY_CACHE_BYTES = MAX_DIRECTORY_FALLBACK_LENGTH + 8192;
 const directoryFallbackReads = Semaphore.makeUnsafe(1);
+const CANONICAL_HEADER_UNIT = 64 * 1024;
+const canonicalHeaderReads = Semaphore.makeUnsafe(128);
 const DIRECTORY_CACHE_UNITS = 4;
 const DIRECTORY_CACHE_UNIT = MAX_DIRECTORY_CACHE_BYTES / DIRECTORY_CACHE_UNITS - 8192;
 const directoryCacheReads = Semaphore.makeUnsafe(DIRECTORY_CACHE_UNITS);
@@ -121,7 +124,12 @@ const MAX_ADMISSION_BYTES = 1024 * 1024;
 const directories = new Map<string, { directory: Directory; bytes: number; headerBytes: number }>();
 const activeDirectories = new Map<
   string,
-  { readers: number; directory: Directory | undefined; fingerprint: ArrayBuffer | undefined }
+  {
+    readers: number;
+    directory: Directory | undefined;
+    fingerprint: ArrayBuffer | undefined;
+    canonical: Option.Option<Promise<Exit.Exit<void, Cause.UnknownError | Rejected>>>;
+  }
 >();
 const decodedBudget = { bytes: 0 };
 const MAX_DECODED_BYTES = 40 * 1024 * 1024;
@@ -706,38 +714,149 @@ export async function range(
   return shared;
 }
 
-async function acquireDirectory(key: string, headerBytes: number) {
-  const identity = `${env.STORAGE_CACHE_SCOPE}:${key}`;
-  const admissionIdentity = `${identity}/0/${headerBytes}/directory-v2`;
-  const cached = directories.get(identity);
-  if (cached !== undefined) {
-    noteDirectoryRequest(admissionIdentity);
-    reads.directoryCacheHits += 1;
-    directories.delete(identity);
-    directories.set(identity, cached);
-    return cached.directory.retain();
-  }
-  const retained = activeDirectories.get(admissionIdentity);
-  if (retained?.directory !== undefined) {
-    noteDirectoryRequest(admissionIdentity);
-    return retained.directory.retain();
-  }
-  const bytes = await range(key, 0, headerBytes, true);
-  const concurrent = directories.get(identity);
-  if (concurrent !== undefined) return concurrent.directory.retain();
-  const active = activeDirectories.get(admissionIdentity);
-  if (active?.directory !== undefined) return active.directory.retain();
-  const decoded = Directory.compressed(bytes, headerBytes);
-  if (decoded.heap_bytes() > MAX_DECODED_BYTES) {
-    decoded.free();
-    throw new Rejected({
-      status: 503,
-      message: "Segment directory exceeds the decoded-memory budget",
-    });
-  }
-  rememberDirectory(identity, headerBytes, decoded);
-  return decoded;
-}
+const acquireDirectory = Effect.fn("kannin.acquireDirectory")(
+  (key: string, headerBytes: number, canonical: boolean) =>
+    Effect.gen(function* () {
+      const identity = `${env.STORAGE_CACHE_SCOPE}:${key}`;
+      const admissionIdentity = `${identity}/0/${headerBytes}/directory-v2`;
+      const cached = directories.get(identity);
+      if (cached !== undefined) {
+        noteDirectoryRequest(admissionIdentity);
+        reads.directoryCacheHits += 1;
+        directories.delete(identity);
+        directories.set(identity, cached);
+        return cached.directory.retain();
+      }
+      const retained = activeDirectories.get(admissionIdentity);
+      if (retained?.directory !== undefined) {
+        noteDirectoryRequest(admissionIdentity);
+        return retained.directory.retain();
+      }
+      if (canonical && retained !== undefined && Option.isSome(retained.canonical)) {
+        const completion = retained.canonical.value;
+        const exit = yield* Effect.promise(() => completion);
+        yield* exit;
+        const shared = activeDirectories.get(admissionIdentity)?.directory;
+        if (shared === undefined)
+          return yield* new Rejected({
+            status: 503,
+            message: "Canonical directory acquisition did not retain metadata",
+          });
+        return shared.retain();
+      }
+      const acquire = Effect.gen(function* () {
+        const frame = yield* Effect.gen(function* () {
+          if (!canonical) return Option.none<Uint8Array>();
+          return yield* acquireDirectoryFrame(key, headerBytes).pipe(
+            Effect.flatMap(waitDirectoryFrame),
+            Effect.map(Option.flatten),
+          );
+        });
+        if (Option.isSome(frame)) {
+          const recovered =
+            activeDirectories.get(admissionIdentity)?.directory ??
+            directories.get(identity)?.directory;
+          if (recovered !== undefined) return recovered.retain();
+        }
+        const decode = Effect.gen(function* () {
+          const bytes = yield* Effect.gen(function* () {
+            if (Option.isSome(frame)) return frame.value;
+            if (!canonical)
+              return yield* Effect.tryPromise({
+                try: () => range(key, 0, headerBytes, true),
+                catch: (cause) => {
+                  if (Schema.is(Rejected)(cause)) return cause;
+                  return new Cause.UnknownError(cause);
+                },
+              });
+            noteDirectoryRequest(admissionIdentity);
+            reads.rangeR2FallbackReads += 1;
+            reads.directoryR2FallbackReads += 1;
+            return yield* Effect.acquireUseRelease(
+              Effect.tryPromise(() =>
+                env.STORAGE.get(key, { range: { offset: 0, length: headerBytes } }),
+              ),
+              (object) =>
+                Effect.gen(function* () {
+                  if (object === null)
+                    return yield* new Rejected({
+                      status: 503,
+                      message: "Committed R2 segment unavailable",
+                    });
+                  const body = yield* Effect.tryPromise(() => object.arrayBuffer());
+                  reads.rangeR2FallbackBytes += body.byteLength;
+                  reads.directoryR2FallbackBytes += body.byteLength;
+                  if (body.byteLength !== headerBytes)
+                    return yield* new Rejected({
+                      status: 503,
+                      message: "R2 range returned a truncated segment",
+                    });
+                  return new Uint8Array(body);
+                }),
+              (object) => {
+                if (object === null || object.bodyUsed) return Effect.void;
+                return Effect.tryPromise(() => object.body.cancel()).pipe(Effect.ignore);
+              },
+            ).pipe(Effect.uninterruptible);
+          });
+          if (!canonical) {
+            const concurrent = directories.get(identity);
+            if (concurrent !== undefined) return concurrent.directory.retain();
+            const active = activeDirectories.get(admissionIdentity);
+            if (active?.directory !== undefined) return active.directory.retain();
+          }
+          const decoded = yield* Effect.try(() => {
+            if (canonical && Option.isNone(frame)) return Directory.canonical(bytes, headerBytes);
+            return Directory.compressed(bytes, headerBytes);
+          });
+          if (decoded.heap_bytes() > MAX_DECODED_BYTES) {
+            decoded.free();
+            return yield* new Rejected({
+              status: 503,
+              message: "Segment directory exceeds the decoded-memory budget",
+            });
+          }
+          rememberDirectory(identity, headerBytes, decoded);
+          return decoded;
+        });
+        if (!canonical || Option.isSome(frame)) return yield* decode;
+        return yield* canonicalHeaderReads
+          .withPermitsIfAvailable(Math.ceil(headerBytes / CANONICAL_HEADER_UNIT))(
+            decode.pipe(Effect.uninterruptible),
+          )
+          .pipe(
+            Effect.repeat({
+              while: Option.isNone,
+              schedule: Schedule.min([
+                Schedule.exponential("1 millis"),
+                Schedule.spaced("16 millis"),
+              ]).pipe(Schedule.upTo({ duration: "2 seconds" })),
+            }),
+            Effect.flatMap(
+              Option.match({
+                onSome: Effect.succeed,
+                onNone: () =>
+                  new Rejected({
+                    status: 503,
+                    message: "Canonical directory admission unavailable",
+                  }),
+              }),
+            ),
+          );
+      });
+      if (canonical) {
+        if (retained === undefined) return yield* acquire;
+        const completion = Promise.withResolvers<Exit.Exit<void, Cause.UnknownError | Rejected>>();
+        retained.canonical = Option.some(completion.promise);
+        return yield* acquire.pipe(
+          Effect.onExit((exit) =>
+            Effect.sync(() => completion.resolve(Exit.map(exit, () => undefined))),
+          ),
+        );
+      }
+      return yield* acquire;
+    }),
+);
 
 export const withDirectory = Effect.fn("raio.withDirectory")(
   <A, E, R>(
@@ -745,6 +864,7 @@ export const withDirectory = Effect.fn("raio.withDirectory")(
     headerBytes: number,
     use: (directory: Directory) => Effect.Effect<A, E, R>,
     permits?: Semaphore.Semaphore,
+    canonical = false,
   ) =>
     Effect.acquireUseRelease(
       Effect.sync(() => {
@@ -754,20 +874,23 @@ export const withDirectory = Effect.fn("raio.withDirectory")(
           existing.readers += 1;
           return { identity, active: existing };
         }
-        const active = { readers: 1, directory: undefined, fingerprint: undefined };
+        const active = {
+          readers: 1,
+          directory: undefined,
+          fingerprint: undefined,
+          canonical: Option.none<Promise<Exit.Exit<void, Cause.UnknownError | Rejected>>>(),
+        };
         if (activeDirectories.size < MAX_PENDING_RANGES) activeDirectories.set(identity, active);
         return { identity, active };
       }),
       () =>
         Effect.acquireUseRelease(
           Effect.gen(function* () {
-            const acquire = Effect.tryPromise({
-              try: () => acquireDirectory(key, headerBytes),
-              catch: (cause) => {
-                if (Schema.is(Rejected)(cause)) return cause;
-                return new Cause.UnknownError(cause);
-              },
-            });
+            const acquire = acquireDirectory(
+              key,
+              headerBytes,
+              canonical && headerBytes <= MAX_DIRECTORY_CACHE_LENGTH,
+            );
             if (permits === undefined) return yield* acquire;
             return yield* permits.withPermit(acquire);
           }),
@@ -1246,23 +1369,28 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
               const projection =
                 derived ??
                 (yield* fallbackReads.withPermits(1)(
-                  withDirectory(input.key, input.headerBytes, (directory) =>
-                    Effect.gen(function* () {
-                      telemetry.fallbackDirectories += 1;
-                      const dictionary = yield* Effect.try(() => directory.summary(terms)).pipe(
-                        Effect.flatMap(decodeTermSummaries),
-                      );
-                      const minimum = yield* Effect.try(() => directory.minimum(filters)).pipe(
-                        Effect.flatMap(decodeEligibleMinimum),
-                      );
-                      const bytes = yield* Effect.try(() => directory.overview()).pipe(
-                        Effect.orElseSucceed(() => undefined),
-                      );
-                      return {
-                        bytes,
-                        catalog: { dictionary, minimum, partitions: null, eligibility: null },
-                      };
-                    }),
+                  withDirectory(
+                    input.key,
+                    input.headerBytes,
+                    (directory) =>
+                      Effect.gen(function* () {
+                        telemetry.fallbackDirectories += 1;
+                        const dictionary = yield* Effect.try(() => directory.summary(terms)).pipe(
+                          Effect.flatMap(decodeTermSummaries),
+                        );
+                        const minimum = yield* Effect.try(() => directory.minimum(filters)).pipe(
+                          Effect.flatMap(decodeEligibleMinimum),
+                        );
+                        const bytes = yield* Effect.try(() => directory.overview()).pipe(
+                          Effect.orElseSucceed(() => undefined),
+                        );
+                        return {
+                          bytes,
+                          catalog: { dictionary, minimum, partitions: null, eligibility: null },
+                        };
+                      }),
+                    undefined,
+                    true,
                   ),
                 ));
               if (derived === undefined)

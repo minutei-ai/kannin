@@ -191,6 +191,8 @@ async function probe(request: Request, env: Env) {
         "x-rejected-writes": String(state.rejectedWrites),
         "x-directory-parses": String(state.directoryParses),
         "x-directory-r2-reads": String(cacheUsage().directoryR2CacheReads),
+        "x-directory-r2-bytes": String(cacheUsage().directoryR2CacheBytes),
+        "x-directory-publications": String(cacheUsage().directoryR2CachePublications),
       },
     });
   const input = Schema.decodeUnknownSync(DirectoryBudgetInput)(await request.json());
@@ -204,22 +206,38 @@ async function probe(request: Request, env: Env) {
     if (Option.isNone(result)) return new Response(null, { status: 503 });
     return new Response(new Uint8Array(result.value));
   }
-  if (new URL(request.url).pathname === "/decoded") {
+  if (
+    new URL(request.url).pathname === "/decoded" ||
+    new URL(request.url).pathname === "/decoded-canonical"
+  ) {
     const before = cacheUsage();
     const responses = await Effect.runPromise(
       Effect.forEach(
         Array.from({ length: input.count }, () => input),
         (entry) =>
-          withDirectory(entry.key, entry.length, (directory) =>
-            Effect.sync(() => {
-              const after = cacheUsage();
-              return new Response(directory.terms('["unique3711"]'), {
-                headers: {
-                  "x-directory-hits": String(after.directoryCacheHits - before.directoryCacheHits),
-                  "x-directory-bytes": String(after.directoryCacheChargedBytes),
-                },
-              });
-            }),
+          withDirectory(
+            entry.key,
+            entry.length,
+            (directory) =>
+              Effect.sync(() => {
+                const after = cacheUsage();
+                return new Response(directory.terms('["unique3711"]'), {
+                  headers: {
+                    "x-directory-hits": String(
+                      after.directoryCacheHits - before.directoryCacheHits,
+                    ),
+                    "x-directory-bytes": String(after.directoryCacheChargedBytes),
+                  },
+                });
+              }).pipe(
+                Effect.tap(() => {
+                  if (new URL(request.url).pathname === "/decoded-canonical")
+                    return Effect.tryPromise(() => env.STORAGE.head(entry.key)).pipe(Effect.asVoid);
+                  return Effect.void;
+                }),
+              ),
+            undefined,
+            new URL(request.url).pathname === "/decoded-canonical",
           ),
         { concurrency: "unbounded" },
       ),

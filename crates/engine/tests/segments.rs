@@ -625,6 +625,21 @@ fn compressed_directories_preserve_headers_and_reject_frame_corruption()
             .collect(),
     )?;
     let (original, length) = segment::parse_header(&built.bytes)?;
+    let canonical = segment::parse_directory(&built.bytes[..length], length)?;
+    assert_eq!(
+        serde_json::to_value(&original)?,
+        serde_json::to_value(canonical)?
+    );
+    assert!(segment::parse_directory(&built.bytes, built.bytes.len()).is_err());
+    assert!(segment::parse_directory(&built.bytes[..length], length + 1).is_err());
+    for end in 0..length {
+        assert!(segment::parse_directory(&built.bytes[..end], length).is_err());
+    }
+    for index in [0, 8, 12, 16, length - 1] {
+        let mut damaged = built.bytes[..length].to_vec();
+        damaged[index] ^= 1;
+        assert!(segment::parse_directory(&damaged, length).is_err());
+    }
     let encoded = segment::compress_directory(&built.bytes[..length])?;
     let decoded = segment::parse_compressed_directory(&encoded, length)?;
     assert_eq!(

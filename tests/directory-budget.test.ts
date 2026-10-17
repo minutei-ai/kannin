@@ -152,7 +152,7 @@ test("R2 directory frames recover cold readers with compressed bytes across isol
   });
   await cacheFrame(second.worker, key, length, frame);
   const recovered = await fetch(await second.worker.ready, { method: "POST", body: input });
-  expect(recovered.status).toBe(200);
+  expect(recovered.status, await recovered.clone().text()).toBe(200);
   expect(new Uint8Array(await recovered.arrayBuffer())).toEqual(frame);
   expect(recovered.headers.get("x-fallbacks")).toBe("0");
   expect(recovered.headers.get("x-fallback-bytes")).toBe("0");
@@ -327,6 +327,215 @@ test("segment origins validate R2 frames before publishing the native Cache API 
   }
 });
 
+test("canonical catalog acquisition retains validated metadata without rebuilding directory frames", async () => {
+  await using active = await fixture();
+  const worker = active.worker;
+  expect((await fetch(new URL("/fast-origin", await worker.ready))).status).toBe(204);
+  const key = "namespaces/canonical-catalog/segments/source.rsix";
+  await (await worker.getR2Bucket("STORAGE")).put(key, canonical);
+  const response = await fetch(new URL("/decoded-canonical", await worker.ready), {
+    method: "POST",
+    body: Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
+      key,
+      offset: 0,
+      length,
+      count: 8,
+    }),
+  });
+  expect(response.status).toBe(200);
+  using expected = new Directory(canonical);
+  expect(await response.text()).toBe(expected.terms('["unique3711"]'));
+  const state = await fetch(new URL("/state", await worker.ready));
+  expect(state.headers.get("x-directory-parses")).toBe("0");
+  expect(state.headers.get("x-directory-publications")).toBe("0");
+  expect(state.headers.get("x-canonical-reads")).toBe("1");
+});
+
+test("catalog recovery reuses a surviving compressed R2 directory before canonical bytes", async () => {
+  await using active = await fixture();
+  const worker = active.worker;
+  const key = "namespaces/canonical-partial-loss/segments/source.rsix";
+  const bucket = await worker.getR2Bucket("STORAGE");
+  await bucket.put(key, canonical);
+  await bucket.put(`cache/directory-v2/${key}/${length}`, frame, {
+    customMetadata: {
+      source: Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))({
+        key,
+        headerBytes: length,
+      }),
+    },
+  });
+  const response = await fetch(new URL("/decoded-canonical", await worker.ready), {
+    method: "POST",
+    body: Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
+      key,
+      offset: 0,
+      length,
+      count: 1,
+    }),
+  });
+  expect(response.status, await response.clone().text()).toBe(200);
+  using expected = new Directory(canonical);
+  expect(await response.text()).toBe(expected.terms('["unique3711"]'));
+  const state = await fetch(new URL("/state", await worker.ready));
+  expect(state.headers.get("x-canonical-reads")).toBe("0");
+  expect(state.headers.get("x-directory-r2-bytes")).toBe(String(frame.byteLength));
+  expect(state.headers.get("x-directory-parses")).toBe("1");
+  expect(state.headers.get("x-directory-publications")).toBe("0");
+});
+
+test("canonical metadata acquisition shares one R2 body across native requests", async () => {
+  await using active = await fixture();
+  const worker = active.worker;
+  const key = "namespaces/canonical-concurrent/segments/source.rsix";
+  await (await worker.getR2Bucket("STORAGE")).put(key, canonical);
+  const origin = await worker.ready;
+  const responses = await Promise.all(
+    Array.from({ length: 8 }, () =>
+      fetch(new URL("/decoded-canonical", origin), {
+        method: "POST",
+        body: Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
+          key,
+          offset: 0,
+          length,
+          count: 1,
+        }),
+      }),
+    ),
+  );
+  using expected = new Directory(canonical);
+  for (const response of responses) {
+    const body = await response.text();
+    expect(response.status, body).toBe(200);
+    expect(body).toBe(expected.terms('["unique3711"]'));
+  }
+  const state = await fetch(new URL("/state", await worker.ready));
+  expect(state.headers.get("x-canonical-reads")).toBe("1");
+  expect(state.headers.get("x-directory-publications")).toBe("0");
+});
+
+test("failed canonical metadata acquisition releases shared readers for recovery", async () => {
+  await using active = await fixture();
+  const worker = active.worker;
+  const origin = await worker.ready;
+  const bucket = await worker.getR2Bucket("STORAGE");
+  const key = "namespaces/canonical-failure/segments/source.rsix";
+  const damaged = new Uint8Array(canonical);
+  damaged[12] = (damaged[12] ?? 0) ^ 1;
+  await bucket.put(key, damaged);
+  const input = Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
+    key,
+    offset: 0,
+    length,
+    count: 1,
+  });
+  const failures = await Promise.all(
+    Array.from({ length: 4 }, () =>
+      fetch(new URL("/decoded-canonical", origin), { method: "POST", body: input }),
+    ),
+  );
+  for (const response of failures) {
+    expect(response.status).toBe(500);
+    await response.text();
+  }
+  await bucket.put(key, canonical);
+  const recovered = await fetch(new URL("/decoded-canonical", origin), {
+    method: "POST",
+    body: input,
+  });
+  expect(recovered.status, await recovered.clone().text()).toBe(200);
+  using expected = new Directory(canonical);
+  expect(await recovered.text()).toBe(expected.terms('["unique3711"]'));
+  const state = await fetch(new URL("/state", origin));
+  expect(state.headers.get("x-canonical-reads")).toBe("2");
+  expect(state.headers.get("x-r2-active")).toBe("0");
+});
+
+test("canonical metadata admission bounds overlapping raw header bodies", async () => {
+  await using active = await fixture();
+  const worker = active.worker;
+  const origin = await worker.ready;
+  const boundary = directoryWithLength(4 * 1024 * 1024);
+  const keys = Array.from(
+    { length: 4 },
+    (_, index) => `namespaces/canonical-quota/segments/${index}.rsix`,
+  );
+  const bucket = await worker.getR2Bucket("STORAGE");
+  for (const key of keys) await bucket.put(key, boundary.bytes);
+  const responses = await Promise.all(
+    keys.map((key) =>
+      fetch(new URL("/decoded-canonical", origin), {
+        method: "POST",
+        body: Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
+          key,
+          offset: 0,
+          length: boundary.length,
+          count: 1,
+        }),
+      }),
+    ),
+  );
+  using expected = new Directory(boundary.bytes);
+  for (const response of responses) {
+    const body = await response.text();
+    expect(response.status, body).toBe(200);
+    expect(body).toBe(expected.terms('["unique3711"]'));
+  }
+  const state = await fetch(new URL("/state", origin));
+  expect(state.headers.get("x-canonical-reads")).toBe("4");
+  expect(Number(state.headers.get("x-r2-peak"))).toBeLessThanOrEqual(2);
+  expect(state.headers.get("x-r2-active")).toBe("0");
+});
+
+test("slow compressed frame waits leave canonical body admission available", async () => {
+  await using active = await fixture();
+  const worker = active.worker;
+  const origin = await worker.ready;
+  expect((await fetch(new URL("/cache-stall", origin))).status).toBe(204);
+  const boundary = directoryWithLength(4 * 1024 * 1024);
+  const compressed = new Uint8Array(
+    directory_compress(boundary.bytes.subarray(0, boundary.length)),
+  );
+  const keys = Array.from(
+    { length: 16 },
+    (_, index) => `namespaces/canonical-frame-waits/segments/${index}.rsix`,
+  );
+  const bucket = await worker.getR2Bucket("STORAGE");
+  for (const key of keys) {
+    await bucket.put(key, boundary.bytes);
+    await bucket.put(`cache/directory-v2/${key}/${boundary.length}`, compressed, {
+      customMetadata: {
+        source: Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))({
+          key,
+          headerBytes: boundary.length,
+        }),
+      },
+    });
+  }
+  const responses = await Promise.all(
+    keys.map((key) =>
+      fetch(new URL("/decoded-canonical", origin), {
+        method: "POST",
+        signal: AbortSignal.timeout(10000),
+        body: Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
+          key,
+          offset: 0,
+          length: boundary.length,
+          count: 1,
+        }),
+      }),
+    ),
+  );
+  using expected = new Directory(boundary.bytes);
+  for (const response of responses) {
+    const body = await response.text();
+    expect(response.status, body).toBe(200);
+    expect(body).toBe(expected.terms('["unique3711"]'));
+  }
+  const state = await fetch(new URL("/state", origin));
+  expect(Number(state.headers.get("x-canonical-reads"))).toBeGreaterThan(0);
+}, 20000);
+
 test("distinct directory frames briefly share body admission before canonical fallback", async () => {
   await using active = await fixture();
   const worker = active.worker;
@@ -450,7 +659,7 @@ for (const sample of [
         count: 1,
       }),
     });
-    expect(recovered.status).toBe(200);
+    expect(recovered.status, await recovered.clone().text()).toBe(200);
     expect(new Uint8Array(await recovered.arrayBuffer())).toEqual(sample.frame);
     const settled = await fetch(new URL("/state", origin));
     expect(settled.headers.get("x-r2-started")).toBe(String(sample.active + 1));

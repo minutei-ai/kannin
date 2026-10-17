@@ -4062,7 +4062,7 @@ The final local workerd comparison used fresh processes, empty Worker caches and
 
 Every sparse pair improved. Dense controls varied and do not establish a gain: group 43's first pair regressed 1242.30 → 1557.18 ms and remains included. There are only three initial observations per cell. In the first sparse cohort, R2 directory hits increased 4 → 12 and 5 → 20. Corresponding WASM linear-memory high-water changed 21,692,416 → 20,185,088 bytes and 30,408,704 → 26,214,400 bytes. These observations do not establish total Worker peak memory or billing.
 
-An early wait-only variant regressed artifact-loss recovery. The failure-generation policy reduced that regression but did not eliminate it. The final loss control redirected all three disposable directory, individual-summary and overview-batch prefixes to fresh keys. Native R2 listing proved each prefix empty before the query timer. Rebuilding and reusing derived artifacts during the query remained allowed. All **16 complete initial/repeated responses** matched across two paired cohorts and two selectors. Initial baseline/candidate times were 4397.81/4594.16 and 4397.42/4785.32 ms for sixty-four rare terms, and 11084.44/12062.49 and 11542.45/11847.57 ms for dense group 43. Recovery was approximately 3–9% slower in these comparisons; this remains a performance gap. Local filesystem and R2-emulator caches could stay warm in both prepared and loss controls.
+An early wait-only variant regressed artifact-loss recovery. The failure-generation policy reduced that regression but did not eliminate it. The final loss control redirected all three disposable directory, individual-summary and overview-batch prefixes to fresh keys. Native R2 listing proved each prefix empty before the query timer. Rebuilding and reusing derived artifacts during the query remained allowed. All **16 complete initial/repeated responses** matched across two paired cohorts and two selectors. Initial baseline/candidate times were 4397.81/4594.16 and 4397.42/4785.32 ms for sixty-four rare terms, and 11084.44/12062.49 and 11542.45/11847.57 ms for dense group 43. Recovery in that source was approximately 3–9% slower in these comparisons; the later direct canonical catalog recovery below addresses this regression. Local filesystem and R2-emulator caches could stay warm in both prepared and loss controls.
 
 The WASM binary and canonical/derived storage formats are unchanged. Regression tests cover concurrent valid directories, missing-source bypass, small/large body admission, expiry without late reads, permit recovery and the existing corruption/canonical recovery cases.
 
@@ -4084,3 +4084,54 @@ Before/after Cloudflare cohorts compared baseline version `546e16ef-01ca-475d-86
 CPU joins the exact response CF-Ray to SearchNamespace events. Two baseline events were unavailable and were excluded from CPU pairs rather than treated as zero. Every captured candidate event used the deployed version and completed successfully. This cache-sensitive cohort shows mixed native latency and CPU outcomes; it does not establish a uniform speedup or measure CPU in every bound Worker.
 
 A separate first-read check created a fresh 20,000-document namespace per version through forty 500-document writes, then five explicit compactions, producing five 4,000-document sources at sequence 40. After one second for optional publication and an untimed rebuild, each ran its first thirty-two-term strong query with top-k 100. All 32 returned rows, exact scores, attributes, revisions and sequence matched. HTTP times were 2270.51/2022.87 ms, both remote-IAD with GRU ingress. One observation per version does not isolate a latency improvement. Candidate counters measured from before the query recorded four R2 directory-origin responses and one direct R2 directory hit, with zero directory publications. Baseline counters included compaction and cannot support a paired origin-count comparison. Both namespaces were reset to sequence 41 and verified empty with no vector outbox. Collection marked all 45 source objects per namespace for retirement, with no pinned or immediately deleted objects; physical deletion remains subject to the normal grace period and later collection.
+
+## Direct canonical catalog recovery
+
+The preceding admission change left all-derived-cache-loss recovery slower. A CPU profile of that recovery over the same million-document fixture attributed about 6.1 seconds of a 12.8-second dense sample to directory compression, including canonical header parsing, followed by about 2.4 seconds parsing the compressed directory. These are inclusive sampled stacks and must not be added as independent CPU totals.
+
+Catalog fallback first attempts the existing bounded compressed R2 directory acquisition, preserving its smaller transfer when overview caches alone are missing. If no valid frame is available, it reads a canonical header directly and validates it once in Rust before projecting the catalog. It avoids making and reparsing an intermediate compressed directory. Headers up to four MiB qualify; larger headers retain the previous path. Compressed-frame waits do not occupy canonical body admission. Raw body admission is limited to eight MiB in 64 KiB units, held through body settlement and validation. Pending readers of one source share completion and retain independent directory references. Existing decoded-cache quotas, ranking semantics and persistent formats are unchanged.
+
+### Local first-read controls
+
+Baseline `e07ef0a` and candidate use the same local R2 fixture: one million documents, 200 immutable segments and committed sequence 2000. Each variant starts a new workerd process with empty Worker caches. The loss control rewrites all three derived artifact prefixes to independent fresh prefixes and verifies them empty through native R2.list before timing. Reconstruction and reuse during the query remain enabled. Two pairs alternate variant order, with a complete initial and repeated response in every cell.
+
+| All derived artifacts initially absent | Median before | Median after | Change |
+| -------------------------------------- | ------------: | -----------: | -----: |
+| Sixty-four rare terms                  |    4735.79 ms |   3373.39 ms | −28.8% |
+| Dense group 43                         |   11730.32 ms |   5508.94 ms | −53.0% |
+
+Initial paired times were 4827.68/3332.53 and 4643.89/3414.26 ms for rare terms; 11992.56/5445.45 and 11468.09/5572.43 ms for dense group 43. All **16 complete responses** matched in IDs, scores, attributes, revisions and committed sequence.
+
+A partial-loss control removes only the two overview artifact families and verifies that all 200 compressed R2 directory frames remain present before timing. The same two-pair protocol preserved all **16 complete responses**. Rare-term median changed **3291.85 → 2392.60 ms** and dense group 43 **8711.53 → 5132.11 ms**. The surviving frame is validated once and its retained Rust directory reused; no canonical header is needed. A workerd boundary test independently checks the exact compressed-byte count, one parse and zero canonical reads.
+
+An independent prepared-directory control keeps the derived R2 artifacts and still starts fresh workerd processes. Three pairs per selector, alternating variant order, checked **48 complete initial/repeated responses**, all identical.
+
+| Prepared derived R2 artifacts | Median before | Median after |
+| ----------------------------- | ------------: | -----------: |
+| Sixteen rare terms            |     534.83 ms |    545.98 ms |
+| Sixty-four rare terms         |     895.58 ms |    893.59 ms |
+| Dense group 72                |    1107.66 ms |   1134.01 ms |
+| Dense group 43                |    1139.55 ms |   1127.07 ms |
+
+The prepared controls show small mixed differences, not a general speedup. Filesystem and R2-emulator caches could remain warm in either control; these results do not measure fully cold Cloudflare storage or Turbopuffer parity.
+
+Canonical segment bytes, header JSON, compressed directory bytes and selected document metadata remained byte-identical across the old and new WASM for 500-document and multilingual 64-document controls. The WASM binary changes to expose strict canonical directory acquisition; no storage format migration is introduced.
+
+Source `07aa58f` passed **286 Bun/workerd tests and 53 Rust tests**, with 9,752 Bun assertions, formatting, strict Effect lint/types and native/WASM Clippy. Regressions cover canonical framing and checksum failures, same-source coalescing within and across requests, native R2 I/O after shared completion, failure cleanup, raw-body quota, surviving compressed frames and sixteen readers with stalled compressed sources. The entire 300-query SciFact report remained byte-identical to the trusted baseline.
+
+### Native validation of direct catalog recovery
+
+Alchemy profile minutei deployed `07aa58f` as version `3722c4ae-fa03-440a-b040-579c77ef9816`, verified at 100% traffic with Smart Placement, unchanged physical R2 binding and unchanged cache lifecycle rules. The unconditional vector metadata migration completed across 43 namespaces and submitted 398 entries; broad ANN recall was not remeasured.
+
+Before/after cohorts used baseline `e6ad9950-8de2-48ed-9f0e-6a0787b25c02` and the candidate. Each ran eight mixed rounds of four strong selectors over the existing million-document namespace, rebuilding coordinator memory before every query and using fresh equivalent predicates. Rebuild time was excluded. Excluding two warmup rounds leaves six HTTP observations and six exact-ray coordinator CPU pairs per cell. All **64 complete responses** matched. R2 artifacts and other Worker caches could remain warm; this does not reproduce the local all-derived-artifacts-absent control.
+
+| Selector              | HTTP median before/after | Coordinator CPU median before/after | CPU pairs |
+| --------------------- | -----------------------: | ----------------------------------: | --------: |
+| Sixteen rare terms    |       449.71 / 450.26 ms |                        164 / 163 ms |         6 |
+| Sixty-four rare terms |       716.43 / 621.29 ms |                    301.5 / 295.5 ms |         6 |
+| Dense group 72        |       541.18 / 565.36 ms |                     99.5 / 101.5 ms |         6 |
+| Dense group 43        |       578.14 / 473.27 ms |                     99.5 / 111.5 ms |         6 |
+
+Ingress was GRU. Measured baseline placement was remote-IAD; the candidate was remote-EWR except one sixteen-term response at local-GRU. Placement and cache state differ, and latency/CPU outcomes are mixed, so this cohort does not isolate a uniform native speedup. CPU includes only the exact-ray SearchNamespace events, not every bound Worker. All 32 captured candidate coordinator events completed successfully on the deployed version.
+
+After all queries, a native R2 read confirmed the original canonical manifest byte-identical: one million documents, sequence 2000 and 200 immutable segments. No new native benchmark namespace was created in this run.

@@ -818,9 +818,10 @@ const readStoredOverviewBatch = Effect.fn("kannin.readStoredOverviewBatch")(
               .pipe(
                 Effect.repeat({
                   while: Option.isNone,
-                  schedule: Schedule.exponential("1 millis").pipe(
-                    Schedule.upTo({ duration: OVERVIEW_BATCH_BUDGET }),
-                  ),
+                  schedule: Schedule.min([
+                    Schedule.exponential("1 millis"),
+                    Schedule.spaced("16 millis"),
+                  ]).pipe(Schedule.upTo({ duration: OVERVIEW_BATCH_BUDGET })),
                 }),
               );
             return Option.getOrUndefined(acquired);

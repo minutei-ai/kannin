@@ -1,4 +1,4 @@
-import { Effect } from "effect";
+import { Clock, Effect } from "effect";
 import worker, { Terms as Catalogs } from "../src/worker";
 import type { Env } from "../alchemy.run";
 export { SearchNamespace, Segments } from "../src/worker";
@@ -10,6 +10,8 @@ const state = {
   headerActive: 0,
   bodyActive: 0,
   bodyCompleted: 0,
+  bodyReleasedAt: 0n,
+  bodyHandoffMs: 0,
   bodyPeak: 0,
   headerPeak: 0,
   apiEnabled: false,
@@ -72,6 +74,11 @@ export class Terms extends Catalogs {
           const read = object.arrayBuffer.bind(object);
           Object.defineProperty(object, "arrayBuffer", {
             value: () => {
+              if (state.bodyReleasedAt > 0n)
+                state.bodyHandoffMs = Math.max(
+                  state.bodyHandoffMs,
+                  Number(Effect.runSync(Clock.currentTimeNanos) - state.bodyReleasedAt) / 1e6,
+                );
               state.bodyActive += 1;
               state.bodyPeak = Math.max(state.bodyPeak, state.bodyActive);
               return Effect.runPromise(
@@ -83,7 +90,8 @@ export class Terms extends Catalogs {
                     }),
                   ),
                   Effect.ensuring(
-                    Effect.sync(() => {
+                    Effect.gen(function* () {
+                      state.bodyReleasedAt = yield* Clock.currentTimeNanos;
                       state.bodyActive -= 1;
                     }),
                   ),
@@ -109,7 +117,11 @@ export default {
     if (path === "/fixture/slow-headers") state.headerDelay = 80;
     if (path === "/fixture/api") state.apiEnabled = true;
     if (path === "/fixture/headers") state.headerDelay = 1600;
-    if (path === "/fixture/slow-body") state.bodyDelay = 80;
+    if (path === "/fixture/slow-body") {
+      state.bodyDelay = 300;
+      state.bodyReleasedAt = 0n;
+      state.bodyHandoffMs = 0;
+    }
     if (path === "/fixture/body") state.bodyDelay = 1600;
     if (path === "/fixture/fail-put") state.failPut = true;
     if (path.startsWith("/fixture/"))
@@ -119,6 +131,7 @@ export default {
           "x-header-active": String(state.headerActive),
           "x-body-active": String(state.bodyActive),
           "x-body-completed": String(state.bodyCompleted),
+          "x-body-handoff-ms": String(state.bodyHandoffMs),
           "x-body-peak": String(state.bodyPeak),
           "x-header-peak": String(state.headerPeak),
           "x-api-puts": String(state.apiPuts),

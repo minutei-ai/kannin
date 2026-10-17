@@ -4018,3 +4018,29 @@ Cold controls used fresh workerd processes, empty Worker caches and the existing
 Canonical segments, header JSON and compressed directory bytes were identical between the two WASMs for a 500-document corpus and a separate Unicode, escaped-key, title and vector fixture. Existing million-document artifacts remained readable without a format cutover.
 
 A separate cold-read experiment replaced serialized eligibility keys with structured keys. An isolated twenty-projection workerd control measured 60.97/62.99 ms, 38.12/36.62 ms and 76.77/75.84 ms across three fixtures. Forty-eight complete initial/repeated API responses also matched, but end-to-end gains were inconsistent. That experiment was discarded and is absent from the deployed runtime.
+
+### Cloudflare validation of compact retained directories
+
+Alchemy profile minutei deployed source `c57ad57` as version `546e16ef-01ca-475d-8642-5da61b7a1fc6`, verified at 100% traffic with Smart Placement and unchanged R2 binding/lifecycle. The baseline was `cd7b084f-e51c-4a15-a924-5884d01d8207`. The unconditional vector metadata migration completed; ANN recall was not remeasured. The million-document canonical root remained byte-identical after deployment and all queries.
+
+Warm cohorts ran twenty mixed rounds of four fixed strong selectors, excluding eight warmup rounds. All 160 complete API responses matched. CPU measurements join native SearchNamespace events to the exact response CF-Ray, with twelve measured observations per selector/variant. Every measured CPU event was available; six candidate warmup events were unavailable. All requests entered through GRU. Measured baseline placement was remote-IAD for 46 responses and local-GRU for two; every measured candidate response was remote-IAD.
+
+| Warm selector         | HTTP median before/after | Durable Object CPU median before/after |
+| --------------------- | -----------------------: | -------------------------------------: |
+| Sixteen rare terms    |       228.53 / 190.12 ms |                            39.5 / 4 ms |
+| Sixty-four rare terms |       312.89 / 276.64 ms |                          102 / 80.5 ms |
+| Dense group 72        |       187.57 / 191.88 ms |                               4 / 4 ms |
+| Dense group 43        |       187.06 / 195.88 ms |                             4.5 / 4 ms |
+
+A separate cold-memory probe ran eight mixed rounds per version, clearing namespace process caches through the authenticated rebuild operation before every query. Each used a fresh equivalent predicate; rebuild time was excluded. Other entrypoint caches, physical R2 and Cache API sources could stay warm. Two warmup rounds were excluded, leaving six HTTP observations per selector/variant. All 64 complete responses matched; all measured placement was remote-IAD with GRU ingress.
+
+| Namespace-memory cold selector | HTTP median before/after, n=6 | Paired Durable Object CPU median before/after | CPU pairs |
+| ------------------------------ | ----------------------------: | --------------------------------------------: | --------: |
+| Sixteen rare terms             |            487.03 / 487.07 ms |                                182.5 / 154 ms |         6 |
+| Sixty-four rare terms          |            710.65 / 614.36 ms |                                  365 / 281 ms |         5 |
+| Dense group 72                 |            601.61 / 556.53 ms |                                  120 / 108 ms |         5 |
+| Dense group 43                 |            581.57 / 612.70 ms |                                112.5 / 102 ms |         6 |
+
+The baseline lacked two cold-probe CPU events, so CPU comparisons use only matching round/selector pairs; missing events are never treated as zero. CPU covers the coordinator, not all bound Workers or total billing. Cold-memory CPU decreased in these observations, but HTTP did not improve for every selector. These small sequential cohorts do not establish fully cold Cloudflare storage latency, tail reliability, sustained capacity or Turbopuffer parity.
+
+The final local gate passed **276 Bun/workerd tests and 53 Rust tests**, with 9,634 Bun assertions, formatting, strict Effect lint/types and native/WASM Clippy. The entire 300-query SciFact report remained byte-identical: nDCG@10 0.6731, recall@10 0.7957 and MRR@10 0.6418.

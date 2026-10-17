@@ -9,7 +9,13 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 ## Performance
 
-**1,000,000 documents · deployed Cloudflare · GRU ingress · edge queries with an acknowledged sequence barrier**
+**1,000,000 documents · deployed Cloudflare · GRU ingress.**
+
+The latest Rust change keeps immutable directories compact within the existing 20 MiB decoded cache. In a strong-query probe with namespace memory cleared before every query, sixty-four rare terms measured HTTP median **711 → 614 ms** and paired Durable Object CPU **365 → 281 ms**. Sixteen terms stayed at **487 ms HTTP**, while CPU fell **182.5 → 154 ms**. Dense group 72 improved; group 43 regressed in HTTP latency. Each HTTP cell has six observations; CPU has five or six matched pairs. Other Cloudflare caches and R2 could remain warm. [Methods, controls and tradeoffs](docs/performance.md#cloudflare-validation-of-compact-retained-directories).
+
+With repeated fixed strong selectors, native Durable Object CPU medians changed **39.5 → 4 ms** for sixteen rare terms and **102 → 80.5 ms** for sixty-four, with twelve measured observations per cell. All **224 complete responses** across warm and cold-memory cohorts matched. Local WASM linear-memory high-water increased **27.3 → 31.6 MB**; these CPU gains do not establish lower whole-Worker memory or total billing.
+
+An earlier edge load run at source `6c03e72`, using an acknowledged sequence barrier, checked 384 complete responses against a strong baseline:
 
 | Concurrency | p50 ms | p95 ms | Requests/s |
 | ----------: | -----: | -----: | ---------: |
@@ -17,40 +23,11 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 |           4 |  53.89 | 291.66 |      42.04 |
 |          16 |  61.75 | 468.78 |      90.26 |
 
-The load run at source `6c03e72` checked **384 responses** against strong baseline rows, scores and sequence, with 128 requests per concurrency. All entered through GRU without snapshot coordinator fallback. Two 16-query probes with fresh selectors preserved complete pre-deploy results. These are cache-sensitive workload observations, not sustained-capacity guarantees. Edge freshness is weaker than strong consistency.
+Edge reads have weaker freshness than strong reads. These cache-sensitive observations are not sustained-capacity guarantees. Fully cold Cloudflare storage, cold-tail reliability, previous overload failures, peak whole-Worker heap and large-corpus ANN recall remain open. The experimental native container has not replaced production WASM. Earlier indexed comparisons measured Turbopuffer at 45–47 ms versus Kannin strong at 175–178 ms under different placement; parity is not established.
 
-Current strong-query probes use one million documents, GRU ingress and Smart Placement observed as `remote-MIA`. A fresh missing-field selector forces metadata acquisition; the eight-term control reuses that round's field model. Physical overview caches can stay warm.
+The entire 300-query SciFact report remains unchanged: **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10**.
 
-| Strong sequential query            | Before p50/p95 ms | Latest repeat p50/p95 ms |
-| ---------------------------------- | ----------------: | -----------------------: |
-| Fresh metadata selector, two terms |  787.38 / 1053.99 |         732.19 / 1017.82 |
-| Warm metadata, eight terms         |   331.85 / 454.66 |          339.67 / 476.96 |
-
-Source `d3caa42` removes a duplicate exact catalog cache and retains native Workers Cache. Its first post-deploy cohort was slower (796.96/1158.96 ms and 362.45/513.92 ms); the table shows its repeat. Each cohort measured twelve responses per selector after two warmup rounds, with identical complete results. A separate 100-pair workerd comparison after memory eviction reduced p50 from **121.55 to 87.61 ms**. These results do not establish fully cold R2 latency or a universal native gain. [Detailed measurements](docs/performance.md#removing-the-duplicate-exact-catalog-cache).
-
-The SIMD checksum backend reduced native Durable Object CPU p50 from **250 to 224 ms** for sixteen rare terms and **437 to 385 ms** for sixty-four terms, with identical results. HTTP p50 did not improve in that comparison. [CPU and latency evidence](docs/performance.md#simd-checksum-backend-on-the-existing-compressed-formats).
-
-An isolated native prototype now exercises the complete strong-text API: warm median **205/222 ms**, versus **542/619 ms** for its WASM baseline on sixteen/sixty-four-term selectors. All 48 complete responses matched. The first native request took **8.6 seconds**, so production routing, cold reliability, mutable-data contracts and cost remain delivery gates. [Method and limits](docs/performance.md#experimental-native-ranking-inside-the-complete-strong-text-api).
-
-The experimental native range reader transfers about **34% fewer source bytes** than complete segments in a million-document test and validates headers directly in Rust. It has not replaced the production WASM path. [Cold-read evidence and limits](docs/performance.md#native-cold-read-through-canonical-header-and-posting-ranges) · [native process](crates/native/README.md).
-
-Reusing validated R2 directories reduced local workerd directory-acquisition p50 from **44.16 to 29.15 ms** across 80 observations per variant, within the existing cache budget. This measures a cold in-memory directory with a prebuilt R2 frame. [Method and limits](docs/performance.md#reusing-validated-r2-directories).
-
-Decoded-directory admission now retains useful headers within the existing **20 MiB** budget. A repeated one-million-document Cloudflare cohort reduced strong-query median **472 → 350 ms** for sixteen terms and **650 → 552 ms** for sixty-four, preserving all 168 complete responses across cohorts. [Measurements and tradeoffs](docs/performance.md#retaining-useful-decoded-directories-within-the-worker-budget).
-
-Compact directory frames reduced first-query local medians with empty Worker caches from **1,273 → 1,103 ms** for sixteen rare terms and **2,483 → 2,033 ms** for sixty-four. All 48 complete responses matched. This uses three fresh workerd processes per variant/selector with an existing R2 dataset; it does not establish fully cold Cloudflare R2 latency. [Cold-read method and limits](docs/performance.md#compact-directory-frames-for-the-first-read).
-
-The deployed WASM API also retained all 168 complete responses across Cloudflare cohorts. Repeated warm strong-query medians fell from **347 → 234 ms** for sixteen rare terms and **475 → 304 ms** for sixty-four; dense-query tail outliers remain. [Production validation](docs/performance.md#cloudflare-validation-of-compact-directories).
-
-Publishing segments now prepares best-effort R2 overview batches. Local first-query medians over 32,000 documents changed **412 → 274 ms** for common terms and **691 → 499 ms** for filtered terms; all 60 responses matched. A Cloudflare first-read check replaced eight individual summary reads with one prepared batch. Already-prepared million-document controls stayed largely unchanged, and sparse queries varied. [Method and limits](docs/performance.md#preparing-overview-batches-during-publication) · [Directory reuse](docs/performance.md#larger-directory-backstops-and-late-frame-completion) · [Admission controls](docs/performance.md#bounding-overview-admission-retries).
-
-Borrowing unselected attribute keys reduced Cloudflare Durable Object CPU median from **31 to 25.5 ms** for a 64-attribute fixture, with all 44 complete responses unchanged. Local complete-query median improved **51.38 → 47.54 ms**; the ordinary two-attribute million-document cold-read control was largely unchanged. [Method and limits](docs/performance.md#borrowing-discarded-attribute-keys).
-
-Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10**, with the entire 300-query report unchanged. Twelve native Vectorize/hybrid checks preserved 105 complete rows and scores across three 100-vector fixtures; large-corpus ANN recall remains unmeasured.
-
-A subsequent rare/dense native sweep encountered five strong-query 503s with the Durable Object overload flag; later queries recovered without deployment, and the cause remains unresolved. Cold broad queries have reached the 30-second edge lease in earlier trials. Peak whole-Worker heap and cold-tail reliability remain open. The earlier fully indexed sequential comparison measured p50 **175–178 ms strong**, **127–130 ms edge** and **45–47 ms Turbopuffer strong**, with Kannin ingress in MIA and Turbopuffer in `aws-sa-east-1`. Different placement and consistency prevent a parity claim.
-
-[Measurements and earlier optimizations](docs/performance.md) · [contract comparison](docs/turbopuffer-contracts.md) · [ranking quality](docs/quality.md)
+[Measurements and experiments](docs/performance.md) · [contract comparison](docs/turbopuffer-contracts.md) · [ranking quality](docs/quality.md)
 
 ## Run
 
@@ -63,7 +40,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **262 Worker/tooling tests and 49 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **276 Worker/tooling tests and 53 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

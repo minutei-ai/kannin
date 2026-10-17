@@ -7,10 +7,12 @@ import {
   Root,
   VectorRebuildResult,
 } from "../src/protocol";
-import { document, request, startWorker, textQuery, write } from "./harness";
+import { document, request, textQuery, write } from "./harness";
+import { ageRetirementUploads, retentionFixture } from "./retention-fixture";
 
-const worker = await startWorker();
-afterAll(() => worker.dispose());
+const fixture = await retentionFixture();
+const worker = fixture.worker;
+afterAll(() => fixture[Symbol.asyncDispose]());
 
 async function collect(namespace: string) {
   const response = await request(worker, namespace, "collect", {});
@@ -21,6 +23,7 @@ async function collect(namespace: string) {
 async function mature(namespace: string) {
   const bucket = await worker.getR2Bucket("STORAGE", "raio");
   const markers = await bucket.list({ prefix: `namespaces/${namespace}/retired/` });
+  await ageRetirementUploads(worker, namespace);
   for (const marker of markers.objects) {
     const object = await bucket.get(marker.key);
     if (object === null) throw new Error("Missing retirement marker");
@@ -124,6 +127,21 @@ test("replacement of an orphan resets its grace instead of deleting a new object
   await bucket.put(key, "new");
   expect(await collect("replaced")).toMatchObject({ deleted: 0, marked: 1 });
   expect(await (await bucket.get(key))?.text()).toBe("new");
+});
+
+test("identical orphan replacement restarts retirement even when its ETag is unchanged", async () => {
+  const bucket = await worker.getR2Bucket("STORAGE", "raio");
+  const key = "namespaces/same-etag/segments/orphan.rsix";
+  const original = await bucket.put(key, "identical");
+  expect(await collect("same-etag")).toMatchObject({ marked: 1 });
+  await mature("same-etag");
+  const replacement = await bucket.put(key, "identical");
+  if (original === null || replacement === null) throw new Error("Missing uploaded orphan");
+  expect(replacement.etag).toBe(original.etag);
+  expect(replacement.version).not.toBe(original.version);
+  expect(replacement.uploaded.getTime()).toBeGreaterThan(original.uploaded.getTime());
+  expect(await collect("same-etag")).toMatchObject({ deleted: 0, marked: 1 });
+  expect(await (await bucket.get(key))?.text()).toBe("identical");
 });
 
 test("collection rejects ignored inputs and missing committed roots", async () => {

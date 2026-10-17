@@ -10,12 +10,13 @@ import {
   WriteResult,
 } from "../src/protocol";
 import { document, request, startWorker, textQuery, write } from "./harness";
+import { ageRetirementUploads, retentionFixture } from "./retention-fixture";
 
 test("a blocked query preserves its captured root while writes and reads progress and collection pins its segments", async () => {
-  const worker = await startWorker();
+  await using fixture = await retentionFixture();
+  const worker = fixture.worker;
   const backend = await worker.getWorker("vectors");
   await using cleanup = new AsyncDisposableStack();
-  cleanup.defer(() => worker.dispose());
   const entered = Promise.withResolvers<void>();
   const release = Promise.withResolvers<Response>();
   const gate = Bun.serve({
@@ -78,6 +79,7 @@ test("a blocked query preserves its captured root while writes and reads progres
   );
   expect(current.sequence).toBe(4);
   expect(current.rows.map((row) => row.id)).toEqual(["new"]);
+  await ageRetirementUploads(worker, namespace);
   const timestamp = Effect.runSync(Clock.currentTimeMillis) - 25 * 60 * 60 * 1000;
   for (const segment of root.segments) {
     const source = await bucket.get(segment.key);

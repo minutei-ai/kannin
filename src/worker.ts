@@ -1929,7 +1929,11 @@ export class SearchNamespace extends DurableObject<Env> {
             status: 503,
             message: "Retirement marker belongs to another segment",
           });
-        if (retirement.etag === object.etag && retirement.observedAt <= now) {
+        if (
+          retirement.etag === object.etag &&
+          retirement.observedAt >= object.uploaded.getTime() &&
+          retirement.observedAt <= now
+        ) {
           if (now - retirement.observedAt >= SEGMENT_RETIREMENT_MS) {
             await this.env.STORAGE.delete(object.key);
             await this.env.STORAGE.delete(markerKey);

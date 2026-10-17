@@ -3,7 +3,7 @@ import { Schema } from "effect";
 import { Response } from "miniflare";
 import { createHash } from "node:crypto";
 import { Root, QueryResult, Metadata, Health, TermProjectionProps } from "../src/protocol";
-import { document, request, startWorker, textQuery, write } from "./harness";
+import { document, request, startWorker, textQuery, write, evictWrittenOverviews } from "./harness";
 import { corpus } from "../tooling/corpus";
 
 const worker = await startWorker();
@@ -374,6 +374,7 @@ test("compressed overviews serve new selectors and filters after process evictio
       "write",
       write([document(String(index).padStart(2, "0"), "alpha beta gamma")]),
     );
+  await evictWrittenOverviews(worker, namespace);
   const first = Schema.decodeUnknownSync(QueryResult)(
     await (await request(worker, namespace, "query", textQuery("alpha beta"))).json(),
   );
@@ -968,6 +969,7 @@ test("a prior segment cutoff rejects noncompetitive posting pages before acquisi
     prefix: `cache/correlated-pool-v1/namespaces/${namespace}/`,
   });
   await bucket.delete(derived.objects.map((object) => object.key));
+  await evictWrittenOverviews(worker, namespace);
   for (const match of ["any", "all", "phrase"] as const) {
     const response = await request(worker, namespace, "query", {
       ...textQuery("alpha beta"),

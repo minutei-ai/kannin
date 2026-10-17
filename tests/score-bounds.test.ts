@@ -1,7 +1,7 @@
 import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
 import { Metadata, QueryResult } from "../src/protocol";
-import { document, request, startWorker, textQuery, write } from "./harness";
+import { document, request, startWorker, textQuery, write, evictWrittenOverviews } from "./harness";
 
 const worker = await startWorker();
 afterAll(() => worker.dispose());
@@ -82,6 +82,7 @@ test("learned segment bounds prune dense repeats without caching result rows", a
   const bucket = await worker.getR2Bucket("STORAGE");
   const cached = await bucket.list({ prefix: `cache/correlated-pool-v1/namespaces/${namespace}/` });
   await bucket.delete(cached.objects.map((object) => object.key));
+  await evictWrittenOverviews(worker, namespace);
   const input = textQuery("alpha beta gamma delta", 3);
   const cold = await request(worker, namespace, "query", input);
   const expected = Schema.decodeUnknownSync(QueryResult)(await cold.json());

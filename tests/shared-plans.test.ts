@@ -14,7 +14,7 @@ import {
   TextPlanIdentity,
 } from "../src/protocol";
 import { initSync, pack, unpack } from "../dist/wasm/raio_engine";
-import { document, request, startWorker, textQuery, write } from "./harness";
+import { document, request, startWorker, textQuery, write, evictWrittenOverviews } from "./harness";
 
 initSync({
   module: new WebAssembly.Module(
@@ -147,6 +147,7 @@ test("shared tightened plans survive fresh workerd instances and reject corrupt 
     prefix: `cache/correlated-pool-v1/namespaces/${namespace}/`,
   });
   await bucket.delete(derived.objects.map((object) => object.key));
+  await evictWrittenOverviews(active.worker, namespace);
   const query = textQuery("alpha beta gamma delta", 3);
   const first = await request(active.worker, namespace, "query", query);
   const expected = Schema.decodeUnknownSync(QueryResult)(await first.json());

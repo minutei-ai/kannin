@@ -1,6 +1,7 @@
 import { Miniflare } from "miniflare";
 import { join } from "node:path";
-import type { Write, Attributes } from "../src/protocol";
+import { Metadata, type Write, type Attributes } from "../src/protocol";
+import { Effect, Schema } from "effect";
 
 const root = join(import.meta.dir, "..");
 export async function startWorker(
@@ -124,6 +125,30 @@ export async function request(
     status: response.status,
     statusText: response.statusText,
   });
+}
+
+export async function evictWrittenOverviews(
+  worker: Awaited<ReturnType<typeof startWorker>>,
+  namespace: string,
+) {
+  const response = await request(worker, namespace, "metadata");
+  const metadata = Schema.decodeUnknownSync(Metadata)(await response.json());
+  const bucket = await worker.getR2Bucket("STORAGE");
+  const count = Math.floor(metadata.segments / 8);
+  for (const attempt of Array.from({ length: 100 }, (_, index) => index)) {
+    const batches = await bucket.list({
+      prefix: `cache/correlated-pool-batches-v1/namespaces/${namespace}/`,
+    });
+    if (batches.objects.length >= count) {
+      if (batches.objects.length > 0)
+        await bucket.delete(batches.objects.map((object) => object.key));
+      break;
+    }
+    if (attempt === 99) throw new Error("Writer batches did not settle before cache eviction");
+    await Effect.runPromise(Effect.sleep("10 millis"));
+  }
+  const rebuilt = await request(worker, namespace, "rebuild", {});
+  if (rebuilt.status !== 200) throw new Error("Failed to evict writer overview memory");
 }
 
 export function textQuery(text: string, topK = 10, filters: unknown[] = []) {

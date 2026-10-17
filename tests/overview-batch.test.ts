@@ -81,6 +81,7 @@ async function seed(worker: Awaited<ReturnType<typeof startWorker>>, namespace =
 test("oversized combined sources recover through admissible physical batches", async () => {
   await using instance = await fixture();
   const { worker } = instance;
+  await fetch(new URL("/fixture/fail-put", await worker.ready));
   for (const index of Array.from({ length: 16 }, (_, i) => i))
     expect(
       (
@@ -120,6 +121,7 @@ test("oversized combined sources recover through admissible physical batches", a
       Schema.encodeSync(Schema.fromJsonString(CorrelatedOverview))(replacement),
     );
   }
+  await fetch(new URL("/fixture/normal", await worker.ready));
   const first = sources[0];
   if (first === undefined) throw new Error("Missing physical source");
   const full = Schema.encodeSync(Schema.fromJsonString(StoredOverviewBatch))({

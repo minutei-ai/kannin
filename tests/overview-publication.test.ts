@@ -51,6 +51,7 @@ test("cold catalog publication does not delay rows or change subsequent results"
         )
       ).status,
     ).toBe(200);
+  expect((await request(worker, namespace, "rebuild", {})).status).toBe(200);
   const pending = request(worker, namespace, "query", {
     ...textQuery("alpha"),
     consistency: "edge-eventual",

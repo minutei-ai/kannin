@@ -51,6 +51,7 @@ test("catalog reads refill available slots while a prior R2 read is pending", as
         )
       ).status,
     ).toBe(200);
+  expect((await request(worker, namespace, "rebuild", {})).status).toBe(200);
   const response = await request(worker, namespace, "query", textQuery("alpha", 10));
   expect(response.status).toBe(200);
   const first = Schema.decodeUnknownSync(QueryResult)(await response.json());

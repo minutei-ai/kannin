@@ -1,7 +1,7 @@
 import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
 import { QueryResult } from "../src/protocol";
-import { document, request, startWorker, textQuery, write } from "./harness";
+import { document, request, startWorker, textQuery, write, evictWrittenOverviews } from "./harness";
 
 const worker = await startWorker();
 afterAll(() => worker.dispose());
@@ -19,6 +19,7 @@ test("catalog intervals stay request-local across concurrent queries and overvie
         )
       ).status,
     ).toBe(200);
+  expect((await request(worker, namespace, "rebuild", {})).status).toBe(200);
   const cold = await request(worker, namespace, "query", textQuery("alpha"));
   expect(cold.status).toBe(200);
   const expected = Schema.decodeUnknownSync(QueryResult)(await cold.json());
@@ -62,6 +63,7 @@ test("cold catalog summaries overlap at most four R2 bodies and preserve source 
         )
       ).status,
     ).toBe(200);
+  await evictWrittenOverviews(worker, namespace);
   const response = await request(worker, namespace, "query", textQuery("alpha", 10));
   expect(response.status).toBe(200);
   const result = Schema.decodeUnknownSync(QueryResult)(await response.json());

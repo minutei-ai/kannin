@@ -38,68 +38,71 @@ caches.open = async (name) => {
   };
   return cache;
 };
+function observeBucket(bucket: R2Bucket) {
+  if (!wrapped.has(bucket)) {
+    wrapped.add(bucket);
+    const get = bucket.get.bind(bucket);
+    const put = bucket.put.bind(bucket);
+    Object.defineProperty(bucket, "put", {
+      value: (...args: Parameters<R2Bucket["put"]>) => {
+        if (state.failPut && args[0].startsWith("cache/correlated-pool-batches-v1/"))
+          return Promise.reject(new Error("Injected batch publication failure"));
+        return put(...args);
+      },
+    });
+    Object.defineProperty(bucket, "get", {
+      value: async (...args: Parameters<R2Bucket["get"]>) => {
+        if (!args[0].startsWith("cache/correlated-pool-batches-v1/")) return get(...args);
+        state.gets += 1;
+        state.headerActive += 1;
+        state.headerPeak = Math.max(state.headerPeak, state.headerActive);
+        const object = await Effect.runPromise(
+          Effect.sleep(state.headerDelay).pipe(
+            Effect.andThen(Effect.tryPromise(() => get(...args))),
+            Effect.ensuring(
+              Effect.sync(() => {
+                state.headerActive -= 1;
+              }),
+            ),
+          ),
+        );
+        if (object === null || !("body" in object)) return object;
+        const read = object.arrayBuffer.bind(object);
+        Object.defineProperty(object, "arrayBuffer", {
+          value: () => {
+            state.bodyActive += 1;
+            state.bodyPeak = Math.max(state.bodyPeak, state.bodyActive);
+            return Effect.runPromise(
+              Effect.sleep(state.bodyDelay).pipe(
+                Effect.andThen(Effect.tryPromise(read)),
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    state.bodyCompleted += 1;
+                  }),
+                ),
+                Effect.ensuring(
+                  Effect.sync(() => {
+                    state.bodyActive -= 1;
+                  }),
+                ),
+              ),
+            );
+          },
+        });
+        return object;
+      },
+    });
+  }
+}
 export class Terms extends Catalogs {
   override async fetch(request: Request) {
-    const bucket = this.env.STORAGE;
-    if (!wrapped.has(bucket)) {
-      wrapped.add(bucket);
-      const get = bucket.get.bind(bucket);
-      const put = bucket.put.bind(bucket);
-      Object.defineProperty(bucket, "put", {
-        value: (...args: Parameters<R2Bucket["put"]>) => {
-          if (state.failPut && args[0].startsWith("cache/correlated-pool-batches-v1/"))
-            return Promise.reject(new Error("Injected batch publication failure"));
-          return put(...args);
-        },
-      });
-      Object.defineProperty(bucket, "get", {
-        value: async (...args: Parameters<R2Bucket["get"]>) => {
-          if (!args[0].startsWith("cache/correlated-pool-batches-v1/")) return get(...args);
-          state.gets += 1;
-          state.headerActive += 1;
-          state.headerPeak = Math.max(state.headerPeak, state.headerActive);
-          const object = await Effect.runPromise(
-            Effect.sleep(state.headerDelay).pipe(
-              Effect.andThen(Effect.tryPromise(() => get(...args))),
-              Effect.ensuring(
-                Effect.sync(() => {
-                  state.headerActive -= 1;
-                }),
-              ),
-            ),
-          );
-          if (object === null || !("body" in object)) return object;
-          const read = object.arrayBuffer.bind(object);
-          Object.defineProperty(object, "arrayBuffer", {
-            value: () => {
-              state.bodyActive += 1;
-              state.bodyPeak = Math.max(state.bodyPeak, state.bodyActive);
-              return Effect.runPromise(
-                Effect.sleep(state.bodyDelay).pipe(
-                  Effect.andThen(Effect.tryPromise(read)),
-                  Effect.tap(() =>
-                    Effect.sync(() => {
-                      state.bodyCompleted += 1;
-                    }),
-                  ),
-                  Effect.ensuring(
-                    Effect.sync(() => {
-                      state.bodyActive -= 1;
-                    }),
-                  ),
-                ),
-              );
-            },
-          });
-          return object;
-        },
-      });
-    }
+    observeBucket(this.env.STORAGE);
     return super.fetch(request);
   }
 }
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    observeBucket(env.STORAGE);
     const path = new URL(request.url).pathname;
     if (path === "/fixture/normal") {
       state.failPut = false;

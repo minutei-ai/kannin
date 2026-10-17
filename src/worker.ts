@@ -87,6 +87,7 @@ import {
   readTermProjections,
   buildSegment,
   storeSegmentCaches,
+  warmTermBatch,
   bloom,
   bloomCandidates,
   readDocument,
@@ -1717,6 +1718,8 @@ export class SearchNamespace extends DurableObject<Env> {
     } as const;
     await this.commit(manifest, current.etag);
     await this.persistReceipt(receipt);
+    if (input.upserts.length > 0)
+      await Effect.runPromise(warmTermBatch(manifest.segments, this.ctx));
     if (jobs.some((job) => job.sequence === sequence))
       await this.enqueue(namespace, { namespace, log: logKey, sequence });
     if (sequence % 16 === 0) await this.enqueueCompaction(namespace, manifest);
@@ -2107,6 +2110,7 @@ export class SearchNamespace extends DurableObject<Env> {
       });
     }
     await this.commit({ ...current.manifest, segments: retained }, current.etag);
+    if (documents.length > 0) await Effect.runPromise(warmTermBatch(retained, this.ctx));
     return Response.json({
       compacted: selected.length,
       segments: retained.length,

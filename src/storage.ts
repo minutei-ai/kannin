@@ -762,6 +762,63 @@ function rememberOverview(identity: string, bytes: Uint8Array) {
   overviewBudget.bytes += charge;
 }
 
+const storeOverviewBatch = Effect.fn("kannin.storeOverviewBatch")(
+  (key: string, encoded: string) =>
+    Effect.gen(function* () {
+      const bytes = new TextEncoder().encode(encoded);
+      if (bytes.byteLength > 512 * 1024) return;
+      const frame = yield* Effect.try(() => pack(encoded));
+      if (frame.byteLength > 512 * 1024) return;
+      const metadata = yield* Schema.encodeEffect(OverviewFrameMetadata)({
+        rawBytes: bytes.byteLength,
+      }).pipe(Effect.orDie);
+      yield* Effect.tryPromise(() =>
+        env.STORAGE.put(key, new Uint8Array(frame), { customMetadata: metadata }),
+      );
+    }),
+  Effect.asVoid,
+);
+
+export const warmTermBatch = Effect.fn("kannin.warmTermBatch")(
+  (segments: Readonly<typeof Root.Type.segments>, ctx: DurableObjectState) =>
+    Effect.gen(function* () {
+      if (segments.length % 8 !== 0) return;
+      const ranges = segments.slice(-8).map((segment) => ({
+        key: segment.key,
+        headerBytes: segment.headerBytes,
+      }));
+      const first = ranges[0];
+      if (first === undefined) return;
+      const overviews = ranges
+        .map((source) =>
+          overviewBuffers.get(`${env.STORAGE_CACHE_SCOPE}:${source.key}/${source.headerBytes}`),
+        )
+        .filter((bytes) => bytes !== undefined);
+      if (overviews.length !== ranges.length) return;
+      if (overviews.reduce((total, bytes) => total + bytes.byteLength, 0) > 384 * 1024) return;
+      const encoded = yield* encodeOverviewBatch({
+        bucket: env.STORAGE_CACHE_SCOPE,
+        ranges,
+        overviews,
+      });
+      const bytes = new TextEncoder().encode(encoded);
+      if (bytes.byteLength > 512 * 1024) return;
+      const encodedRanges = yield* Schema.encodeEffect(
+        Schema.fromJsonString(TermProjectionProps.fields.ranges),
+      )(ranges);
+      const digest = yield* Effect.tryPromise(() => sha256(encodedRanges));
+      const identity = new URL("https://overviews.internal/batch-v6");
+      identity.searchParams.set("bucket", env.STORAGE_CACHE_SCOPE);
+      identity.searchParams.set("ranges", digest);
+      publishQueryCache(
+        identity.href,
+        bytes.byteLength * 4 + identity.href.length * 4 + 128,
+        storeOverviewBatch(`cache/correlated-pool-batches-v1/${first.key}/${digest}`, encoded),
+        ctx,
+      );
+    }).pipe(Effect.orElseSucceed(() => undefined)),
+);
+
 const pendingOverviewBatches = new Map<
   string,
   Promise<Option.Option<Effect.Success<ReturnType<typeof readStoredOverviewBatch>>>>
@@ -1220,18 +1277,7 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
                   }),
                 ),
               ).pipe(Effect.ignore);
-            if (storedKey !== undefined && bytes.byteLength <= 512 * 1024) {
-              const frame = yield* Effect.try(() => pack(encoded));
-              if (frame.byteLength > 512 * 1024) return;
-              const metadata = yield* Schema.encodeEffect(OverviewFrameMetadata)({
-                rawBytes: bytes.byteLength,
-              }).pipe(Effect.orDie);
-              yield* Effect.tryPromise(() =>
-                env.STORAGE.put(storedKey, new Uint8Array(frame), {
-                  customMetadata: metadata,
-                }),
-              );
-            }
+            if (storedKey !== undefined) yield* storeOverviewBatch(storedKey, encoded);
           }),
           ctx,
         );
@@ -1579,6 +1625,7 @@ export const storeSegmentCaches = Effect.fn("kannin.storeSegmentCaches")(
           httpMetadata: { contentType: "application/json" },
         }),
       );
+      rememberOverview(`${env.STORAGE_CACHE_SCOPE}:${key}/${headerBytes}`, overview);
     }).pipe(Effect.orElseSucceed(() => undefined)),
 );
 

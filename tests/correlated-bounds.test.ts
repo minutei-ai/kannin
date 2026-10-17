@@ -17,7 +17,7 @@ import {
   CorrelatedOverview,
   SegmentHits,
 } from "../src/protocol";
-import { document, request, startWorker, textQuery, write } from "./harness";
+import { document, request, startWorker, textQuery, write, evictWrittenOverviews } from "./harness";
 
 initSync({
   module: new WebAssembly.Module(
@@ -146,6 +146,7 @@ test("cold queries prune equivalent segments and cache loss preserves exact rows
             ),
           );
       }
+    if (variant !== "present") await evictWrittenOverviews(worker, namespace);
     const response = await request(
       worker,
       namespace,

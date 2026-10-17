@@ -42,6 +42,8 @@ Compact directory frames reduced first-query local medians with empty Worker cac
 
 The deployed WASM API also retained all 168 complete responses across Cloudflare cohorts. Repeated warm strong-query medians fell from **347 → 234 ms** for sixteen rare terms and **475 → 304 ms** for sixty-four; dense-query tail outliers remain. [Production validation](docs/performance.md#cloudflare-validation-of-compact-directories).
 
+Shared term summaries reduced first-query local dense medians from **1.87 → 1.41 s** and **1.83 → 1.41 s**, using prepared R2 artifacts and empty Worker caches. The deployed Cloudflare repeat after namespace memory resets measured **781 → 636 ms** and **836 → 644 ms**; all 96 complete responses matched. Full cache-loss reconstruction still took about eleven seconds locally. [Methods, controls and tradeoffs](docs/performance.md#shared-term-summaries-for-cold-projection).
+
 Borrowing unselected attribute keys reduced Cloudflare Durable Object CPU median from **31 to 25.5 ms** for a 64-attribute fixture, with all 44 complete responses unchanged. Local complete-query median improved **51.38 → 47.54 ms**; the ordinary two-attribute million-document cold-read control was largely unchanged. [Method and limits](docs/performance.md#borrowing-discarded-attribute-keys).
 
 Independent SciFact evaluation retained **0.6731 nDCG@10**, **0.7957 recall@10** and **0.6418 MRR@10**, with the entire 300-query report unchanged. Twelve native Vectorize/hybrid checks preserved 105 complete rows and scores across three 100-vector fixtures; large-corpus ANN recall remains unmeasured.

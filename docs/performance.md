@@ -3944,3 +3944,32 @@ Server intervals improved about 9–22%; tool HTTP medians improved about 9–10
 The local gate passed 274 Bun/workerd tests and 51 Rust tests, including the late-frame regression and four-MiB publication boundary. Strict Effect lint/types, formatting and native/WASM Clippy passed without suppressions. The entire 300-query SciFact report remained byte-identical.
 
 Source `bebeaae` was deployed through Alchemy profile minutei as version `9b38a2be-8884-4fa8-bf75-b035d967fe49`, receiving 100% of traffic with Smart Placement. The R2 binding and cache lifecycle rules remained unchanged. The mandatory vector metadata rebuild completed across 39 namespaces and submitted 398 existing vectors with eventual visibility; ANN recall was not remeasured. Separate before/after full-API cohorts each ran 32 strong queries with namespace memory reset and fresh equivalent predicates. All 64 complete responses matched, and the canonical million-document root remained byte-identical. These API cohorts verify behavior and are not a matched cold-backend performance comparison.
+
+## Bounding overview admission retries
+
+Source `339d196` caps local overview-batch admission retries at sixteen milliseconds after the initial one/two/four/eight-millisecond delays. Batches retain eight sources, the shared four-MiB body-admission target, sixteen pending native sources and the original one-second foreground outcome. Unabortable bodies retain admission until completion. These retries do not issue additional R2 requests; they do increase local semaphore attempts under contention. CPU billing was not measured.
+
+A controlled local workerd comparison ran eight alternating paired rounds against the actual baseline/candidate Workers, using the same WASM. Each round reset namespace process memory, disabled projected/overview Cache API reuse and ran three complete strong queries concurrently. Each namespace had eight immutable segments and an existing valid batch padded to 512 KiB of decoded JSON. Injected R2 body delay was 300 ms. Admission charges two MiB per frame, so two bodies may overlap. Excluding the first round leaves seven group observations per variant.
+
+| Local contention measurement     | Before | Candidate |
+| -------------------------------- | -----: | --------: |
+| Three-query group median (ms)    | 899.57 |    801.78 |
+| Fixture body-handoff median (ms) |    187 |        99 |
+| Maximum active charged bodies    |      2 |         2 |
+
+Group time improved about 11%; all 48 complete responses matched and no body remained active after a group. The handoff interval runs from a preceding native body completion to a subsequent body invocation and includes remaining validation; it is not isolated semaphore idle time or CPU time. This intentionally padded, delayed fixture demonstrates contention behavior, not ordinary production latency.
+
+A separate million-document comparison used fresh workerd processes with empty Worker caches and existing R2 artifacts, three cohorts per variant/selector. All 48 initial/repeated responses matched exactly. Initial-query medians were:
+
+| Selector              | Before (ms) | Candidate (ms) |
+| --------------------- | ----------: | -------------: |
+| Sixteen rare terms    |    1,069.17 |       1,083.25 |
+| Sixty-four rare terms |    1,957.70 |       1,783.18 |
+| Dense group 72        |    1,285.36 |       1,207.75 |
+| Dense group 43        |    1,499.42 |       1,244.12 |
+
+The sixteen-term median regressed about 1%. Individual cohorts varied substantially, including dense group 43 changing 1,544 → 2,329 ms in the final pair; that pair remains included. These small cohorts do not establish a uniform gain or tails. A batch-loss control redirected only the disposable batch prefix to fresh keys, retaining individual correlated summaries and directories. Every initial observation verified zero batch hits, and all sixteen complete initial/repeated responses matched. Latency was not uniformly improved: dense group 43 changed 1,644 → 2,720 ms in one pair and 1,543 → 1,535 ms in the other. Missing-artifact performance, fully cold Cloudflare R2, total heap, billing and Turbopuffer parity remain unproven.
+
+The final local gate passed 274 Bun/workerd tests and 51 Rust tests, including the charged-body and original-deadline checks. Formatting, strict Effect lint/types and native/WASM Clippy passed. The entire 300-query SciFact report remained byte-identical.
+
+Alchemy profile minutei deployed source `339d196` as version `b28bb79f-5761-41d6-b78b-babf7953af19`, verified at 100% traffic with Smart Placement and unchanged R2 binding/lifecycle rules. The mandatory vector metadata migration completed; ANN recall was not remeasured. Before/after full-API cohorts preserved all 64 complete responses and sequence 2000. The million-document canonical root remained byte-identical after these queries. Those Cloudflare cohorts verify behavior; they do not establish a native latency improvement or matched cold-backend performance.

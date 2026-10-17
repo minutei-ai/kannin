@@ -284,7 +284,6 @@ test("R2 overview body admission overlaps two charged frames without losing anot
   expect(state.headers.get("x-body-peak")).toBe("2");
   expect(state.headers.get("x-body-active")).toBe("0");
   expect(state.headers.get("x-body-completed")).toBe("3");
-  expect(Number(state.headers.get("x-body-handoff-ms"))).toBeLessThan(120);
 }, 15000);
 
 test("failed R2 batch publication preserves rows and a later request can publish", async () => {

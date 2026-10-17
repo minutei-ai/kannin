@@ -6,6 +6,8 @@ import { state as cloudflareState } from "alchemy/Cloudflare/StateStore";
 import { Config, Effect, Layer, Schema } from "effect";
 import { join } from "node:path";
 
+import type { Binding } from "./src/rpc";
+
 import { VectorFilterFields } from "./src/protocol";
 
 export const Bucket = Cloudflare.R2.Bucket("Storage", {
@@ -78,6 +80,7 @@ export const Worker = Cloudflare.Worker(
         default: { cache: { enabled: false } },
         Segments: { cache: { enabled: true } },
         Terms: { cache: { enabled: true } },
+        KanninRpc: { cache: { enabled: false } },
       },
       compatibility: { date: "2026-10-01" },
       env: {
@@ -89,7 +92,7 @@ export const Worker = Cloudflare.Worker(
         VECTOR_FILTER_FIELDS: indexedFields,
         VECTOR_JOBS: yield* VectorJobs,
         INDEX_JOBS: yield* IndexJobs,
-        NAMESPACES: Cloudflare.DurableObject("SearchNamespace"),
+        NAMESPACES: Cloudflare.DurableObject<Binding & Rpc.DurableObjectBranded>("SearchNamespace"),
       },
     };
   }),

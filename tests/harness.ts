@@ -4,8 +4,7 @@ import { Metadata, type Write, type Attributes } from "../src/protocol";
 import { Effect, Schema } from "effect";
 
 const root = join(import.meta.dir, "..");
-export async function startWorker(
-  persistence?: string,
+export async function workerOptions(
   consumeQueues = false,
   artifactRoot = join(root, "dist/worker"),
   versionId = "kannin-local-test-version",
@@ -93,8 +92,19 @@ export async function startWorker(
       },
     ],
   };
+  return options;
+}
+
+export async function startWorker(
+  persistence?: string,
+  consumeQueues = false,
+  artifactRoot = join(root, "dist/worker"),
+  versionId = "kannin-local-test-version",
+) {
+  const options = await workerOptions(consumeQueues, artifactRoot, versionId);
   const worker = new Miniflare({
     ...options,
+    inspectorPort: 0,
     resourcePersistencePath: persistence,
     unsafeInspectDurableObjects: true,
   });

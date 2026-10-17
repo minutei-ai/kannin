@@ -39,6 +39,11 @@ import {
   Operation,
   Query,
   QueryResult,
+  RpcCommand,
+  NamespaceCommand,
+  type RpcValue,
+  RpcReply,
+  RebuildResult,
   Receipt,
   Rejected,
   Root,
@@ -63,11 +68,11 @@ import {
   VectorSelection,
   VectorCandidates,
   VectorCandidateFrame,
-  VectorRebuild,
+  type VectorRebuild,
   VectorRebuildSnapshot,
   VectorRebuildResult,
   NamespacePage,
-  Collection,
+  type Collection,
   CollectionResult,
   Retirement,
   IndexMessage,
@@ -1417,14 +1422,11 @@ async function query(
         active.evaluate(manifest, input, timings, () => textQuery(input, manifest, timings, ctx)),
       ),
     );
-    return Response.json(
-      encodeQueryResult({
-        rows,
-        sequence: manifest.sequence,
-        consistency: input.consistency ?? "strong",
-      }),
-      { headers: timings },
-    );
+    return encodeQueryResult({
+      rows,
+      sequence: manifest.sequence,
+      consistency: input.consistency ?? "strong",
+    });
   }
   const [text, vectors] = await Promise.all([
     textQuery(input, manifest, timings, ctx),
@@ -1444,14 +1446,11 @@ async function query(
       return 0;
     })
     .slice(0, input.topK);
-  return Response.json(
-    encodeQueryResult({
-      rows,
-      sequence: manifest.sequence,
-      consistency: "vectorize-eventual",
-    }),
-    { headers: timings },
-  );
+  return encodeQueryResult({
+    rows,
+    sequence: manifest.sequence,
+    consistency: "vectorize-eventual",
+  });
 }
 
 export class SearchNamespace extends DurableObject<Env> {
@@ -1591,13 +1590,11 @@ export class SearchNamespace extends DurableObject<Env> {
       const pending = current.manifest.vectorJobs.find((job) => job.sequence === receipt.sequence);
       if (pending !== undefined) await this.enqueue(namespace, { namespace, ...pending });
       if (receipt.sequence % 16 === 0) await this.enqueueCompaction(namespace, current.manifest);
-      return Response.json(
-        Schema.encodeSync(WriteResult)({
-          sequence: receipt.sequence,
-          requestId: input.requestId,
-          vectorSync: "queued",
-        }),
-      );
+      return Schema.encodeSync(WriteResult)({
+        sequence: receipt.sequence,
+        requestId: input.requestId,
+        vectorSync: "queued",
+      });
     }
     const prior = await locate(ids, current.manifest);
     const sequence = current.manifest.sequence + 1;
@@ -1723,13 +1720,11 @@ export class SearchNamespace extends DurableObject<Env> {
     if (jobs.some((job) => job.sequence === sequence))
       await this.enqueue(namespace, { namespace, log: logKey, sequence });
     if (sequence % 16 === 0) await this.enqueueCompaction(namespace, manifest);
-    return Response.json(
-      Schema.encodeSync(WriteResult)({
-        sequence,
-        requestId: input.requestId,
-        vectorSync: "queued",
-      }),
-    );
+    return Schema.encodeSync(WriteResult)({
+      sequence,
+      requestId: input.requestId,
+      vectorSync: "queued",
+    });
   }
 
   private async rebuildVectors(input: typeof VectorRebuild.Type) {
@@ -1839,9 +1834,8 @@ export class SearchNamespace extends DurableObject<Env> {
       submitted: vectors.length,
       complete,
     };
-    if (complete)
-      return Response.json(Schema.encodeSync(VectorRebuildResult)({ ...result, snapshot: null }));
-    return Response.json(Schema.encodeSync(VectorRebuildResult)(result));
+    if (complete) return Schema.encodeSync(VectorRebuildResult)({ ...result, snapshot: null });
+    return Schema.encodeSync(VectorRebuildResult)(result);
   }
 
   private async synchronizeVectors() {
@@ -1903,12 +1897,10 @@ export class SearchNamespace extends DurableObject<Env> {
         },
         current.etag,
       );
-    return Response.json(
-      Schema.encodeSync(VectorSyncResult)({
-        submitted: completed.size,
-        visibility: "vectorize-eventual",
-      }),
-    );
+    return Schema.encodeSync(VectorSyncResult)({
+      submitted: completed.size,
+      visibility: "vectorize-eventual",
+    });
   }
 
   private async collect(input: typeof Collection.Type) {
@@ -2018,10 +2010,8 @@ export class SearchNamespace extends DurableObject<Env> {
       counters.marked += 1;
     }
     if (page.truncated)
-      return Response.json(
-        Schema.encodeSync(CollectionResult)({ ...counters, cursor: page.cursor }),
-      );
-    return Response.json(Schema.encodeSync(CollectionResult)({ ...counters, cursor: null }));
+      return Schema.encodeSync(CollectionResult)({ ...counters, cursor: page.cursor });
+    return Schema.encodeSync(CollectionResult)({ ...counters, cursor: null });
   }
 
   private async compact() {
@@ -2038,7 +2028,7 @@ export class SearchNamespace extends DurableObject<Env> {
       budget.count += count;
     }
     if (selected.length < 2 && !selected.some((segment) => segment.dead.length))
-      return Response.json({ compacted: 0, segments: current.manifest.segments.length });
+      return { compacted: 0, segments: current.manifest.segments.length };
     const documents: Array<typeof StoredDocument.Type> = [];
     for (const segment of selected) {
       const dead = new Set(segment.dead);
@@ -2111,63 +2101,24 @@ export class SearchNamespace extends DurableObject<Env> {
     }
     await this.commit({ ...current.manifest, segments: retained }, current.etag);
     if (documents.length > 0) await Effect.runPromise(warmTermBatch(retained, this.ctx));
-    return Response.json({
+    return {
       compacted: selected.length,
       segments: retained.length,
       documents: documents.length,
-    });
+    };
   }
 
-  override fetch(request: Request) {
-    const parts = new URL(request.url).pathname.split("/");
-    const operation = parts.at(-1);
-    const namespace = parts[3];
-    if (!isNamespaceName(namespace))
-      return Promise.resolve(
-        Response.json(Schema.encodeSync(ErrorBody)({ error: "Invalid namespace" }), {
-          status: 400,
-        }),
-      );
-    if (this.namespace !== undefined && this.namespace !== namespace)
-      return Promise.resolve(
-        Response.json(Schema.encodeSync(ErrorBody)({ error: "Coordinator namespace mismatch" }), {
-          status: 403,
-        }),
-      );
-    this.namespace = namespace;
-    const queryTimings = new Headers();
-    const program = Effect.gen({ self: this }, function* () {
-      const started = yield* Clock.currentTimeNanos;
-      const body = { text: "" };
-      if (
-        operation === "write" ||
-        operation === "query" ||
-        operation === "vector-rebuild" ||
-        operation === "collect" ||
-        operation === "internal-vector-sync" ||
-        operation === "internal-compact"
-      )
-        body.text = yield* readBody(request);
-      if (
-        (operation === "compact" || operation === "vector-sync" || operation === "rebuild") &&
-        request.body !== null
-      ) {
-        const text = yield* readBody(request);
-        yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Struct({})), {
-          onExcessProperty: "error",
-        })(text).pipe(
-          Effect.mapError(
-            () => new Rejected({ status: 400, message: "This operation accepts no parameters" }),
-          ),
-        );
-      }
-      const result: { response: Response | undefined } = { response: undefined };
-      if (operation === "query") {
-        const input = yield* decodeQuery(body.text).pipe(
-          Effect.mapError(() => new Rejected({ status: 400, message: "Invalid query contract" })),
-        );
+  private perform(command: typeof NamespaceCommand.Type, queryTimings: Headers) {
+    const namespace = command.namespace;
+    return Effect.gen({ self: this }, function* () {
+      if (this.namespace !== undefined && this.namespace !== namespace)
+        return yield* new Rejected({ status: 403, message: "Coordinator namespace mismatch" });
+      this.namespace = namespace;
+      const result: { value: typeof RpcValue.Type | undefined } = { value: undefined };
+      if (command.operation === "query") {
+        const input = command.input;
         const queued = yield* Clock.currentTimeNanos;
-        result.response = yield* this.querySlots.withPermit(
+        result.value = yield* this.querySlots.withPermit(
           Effect.acquireUseRelease(
             this.semaphore.withPermit(
               Effect.gen({ self: this }, function* () {
@@ -2201,7 +2152,7 @@ export class SearchNamespace extends DurableObject<Env> {
                     queryTimings,
                     this.textExecutions,
                   );
-                  response.headers.append(
+                  queryTimings.append(
                     "server-timing",
                     `query_wait;dur=${wait},query_root;dur=${root}`,
                   );
@@ -2219,16 +2170,10 @@ export class SearchNamespace extends DurableObject<Env> {
           ),
         );
       } else
-        result.response = yield* this.semaphore.withPermit(
+        result.value = yield* this.semaphore.withPermit(
           Effect.gen({ self: this }, function* () {
-            if (operation === "write") {
-              const input = yield* Schema.decodeEffect(Schema.fromJsonString(Write), {
-                onExcessProperty: "error",
-              })(body.text).pipe(
-                Effect.mapError(
-                  () => new Rejected({ status: 400, message: "Invalid write contract" }),
-                ),
-              );
+            if (command.operation === "write") {
+              const input = command.input;
               return yield* Effect.tryPromise({
                 try: () => this.write(input, namespace),
                 catch: (cause) => {
@@ -2237,14 +2182,8 @@ export class SearchNamespace extends DurableObject<Env> {
                 },
               });
             }
-            if (operation === "vector-rebuild") {
-              const input = yield* Schema.decodeEffect(Schema.fromJsonString(VectorRebuild), {
-                onExcessProperty: "error",
-              })(body.text).pipe(
-                Effect.mapError(
-                  () => new Rejected({ status: 400, message: "Invalid rebuild cursor" }),
-                ),
-              );
+            if (command.operation === "vector-rebuild") {
+              const input = command.input;
               return yield* Effect.tryPromise({
                 try: () => this.rebuildVectors(input),
                 catch: (cause) => {
@@ -2253,14 +2192,8 @@ export class SearchNamespace extends DurableObject<Env> {
                 },
               });
             }
-            if (operation === "collect") {
-              const input = yield* Schema.decodeEffect(Schema.fromJsonString(Collection), {
-                onExcessProperty: "error",
-              })(body.text).pipe(
-                Effect.mapError(
-                  () => new Rejected({ status: 400, message: "Invalid collection cursor" }),
-                ),
-              );
+            if (command.operation === "collect") {
+              const input = command.input;
               return yield* Effect.tryPromise({
                 try: () => this.collect(input),
                 catch: (cause) => {
@@ -2269,7 +2202,7 @@ export class SearchNamespace extends DurableObject<Env> {
                 },
               });
             }
-            if (operation === "metadata") {
+            if (command.operation === "metadata") {
               const { manifest } = yield* Effect.tryPromise({
                 try: () => this.root(),
                 catch: (cause) => {
@@ -2277,19 +2210,17 @@ export class SearchNamespace extends DurableObject<Env> {
                   return new Cause.UnknownError(cause);
                 },
               });
-              return Response.json(
-                yield* Schema.encodeEffect(Metadata)({
-                  sequence: manifest.sequence,
-                  documents: manifest.documents,
-                  segments: manifest.segments.length,
-                  manifestEncodedBytes: new TextEncoder().encode(encodeRoot(manifest)).byteLength,
-                  wasmMemoryBytes: wasm.memory.buffer.byteLength,
-                  vectorOutbox: manifest.vectorJobs.length,
-                  cache: cacheUsage(),
-                }),
-              );
+              return yield* Schema.encodeEffect(Metadata)({
+                sequence: manifest.sequence,
+                documents: manifest.documents,
+                segments: manifest.segments.length,
+                manifestEncodedBytes: new TextEncoder().encode(encodeRoot(manifest)).byteLength,
+                wasmMemoryBytes: wasm.memory.buffer.byteLength,
+                vectorOutbox: manifest.vectorJobs.length,
+                cache: cacheUsage(),
+              });
             }
-            if (operation === "vector-sync")
+            if (command.operation === "vector-sync")
               return yield* Effect.tryPromise({
                 try: () => this.synchronizeVectors(),
                 catch: (cause) => {
@@ -2297,7 +2228,7 @@ export class SearchNamespace extends DurableObject<Env> {
                   return new Cause.UnknownError(cause);
                 },
               });
-            if (operation === "compact")
+            if (command.operation === "compact")
               return yield* Effect.tryPromise({
                 try: () => this.compact(),
                 catch: (cause) => {
@@ -2305,10 +2236,8 @@ export class SearchNamespace extends DurableObject<Env> {
                   return new Cause.UnknownError(cause);
                 },
               });
-            if (operation === "internal-compact") {
-              const message = yield* Schema.decodeEffect(Schema.fromJsonString(IndexMessage), {
-                onExcessProperty: "error",
-              })(body.text);
+            if (command.operation === "internal-compact") {
+              const message = command.input;
               if (message.namespace !== namespace)
                 return yield* new Rejected({
                   status: 400,
@@ -2321,17 +2250,7 @@ export class SearchNamespace extends DurableObject<Env> {
                   return new Cause.UnknownError(cause);
                 },
               });
-              const outcome = yield* Effect.tryPromise({
-                try: () => response.clone().json(),
-                catch: (cause) => {
-                  if (Schema.is(Rejected)(cause)) return cause;
-                  return new Cause.UnknownError(cause);
-                },
-              });
-              const progress = yield* Schema.decodeUnknownEffect(
-                Schema.Struct({ compacted: Schema.Int }),
-              )(outcome);
-              if (progress.compacted > 1) {
+              if (response.compacted > 1) {
                 const current = yield* Effect.tryPromise({
                   try: () => this.root(),
                   catch: (cause) => {
@@ -2349,10 +2268,8 @@ export class SearchNamespace extends DurableObject<Env> {
               }
               return response;
             }
-            if (operation === "internal-vector-sync") {
-              const message = yield* Schema.decodeEffect(Schema.fromJsonString(VectorMessage))(
-                body.text,
-              );
+            if (command.operation === "internal-vector-sync") {
+              const message = command.input;
               if (message.namespace !== namespace)
                 return yield* new Rejected({
                   status: 400,
@@ -2375,7 +2292,7 @@ export class SearchNamespace extends DurableObject<Env> {
                   submitted: 0,
                   visibility: "vectorize-eventual",
                 });
-                return Response.json(completed);
+                return completed;
               }
               return yield* Effect.tryPromise({
                 try: () => this.synchronizeVectors(),
@@ -2385,7 +2302,7 @@ export class SearchNamespace extends DurableObject<Env> {
                 },
               });
             }
-            if (operation === "rebuild") {
+            if (command.operation === "rebuild") {
               this.current = undefined;
               this.acknowledgedReceipt = undefined;
               clearImmutableCache(this.prefix);
@@ -2396,41 +2313,186 @@ export class SearchNamespace extends DurableObject<Env> {
                   return new Cause.UnknownError(cause);
                 },
               });
-              return Response.json({ sequence: manifest.sequence, rebuilt: true });
+              return yield* Schema.encodeEffect(RebuildResult)({
+                sequence: manifest.sequence,
+                rebuilt: true,
+              });
             }
             return yield* new Rejected({ status: 404, message: "Unknown operation" });
           }),
         );
-      const delivered = result.response;
-      const ended = yield* Clock.currentTimeNanos;
-      delivered.headers.append("server-timing", `raio;dur=${Number(ended - started) / 1e6}`);
-      return delivered;
-    }).pipe(
-      Effect.tapError((error) => {
-        if (Schema.is(Rejected)(error) && error.status < 500) return Effect.void;
-        return Effect.logError("kannin.namespace", Cause.fail(error), { namespace, operation });
-      }),
-      Effect.catch((error) => {
-        if (operation !== "query") {
-          this.current = undefined;
-          this.acknowledgedReceipt = undefined;
-        }
-        if (Schema.is(Rejected)(error))
+      if (result.value === undefined)
+        return yield* new Rejected({ status: 503, message: "Operation returned no result" });
+      return result.value;
+    });
+  }
+
+  async execute(input: typeof RpcCommand.Encoded): Promise<typeof RpcReply.Encoded> {
+    const timings = new Headers();
+    return Effect.runPromise(
+      Schema.decodeEffect(RpcCommand, { onExcessProperty: "error" })(input).pipe(
+        Effect.flatMap((command) => this.perform(command, timings)),
+        Effect.map((value) => Schema.encodeSync(RpcReply)({ _tag: "Success", value })),
+        Effect.tapError((error) => {
+          if (Schema.is(Rejected)(error) && error.status < 500) return Effect.void;
+          return Effect.logError("kannin.rpc", Cause.fail(error));
+        }),
+        Effect.catch((error) => {
+          if (input.operation !== "query") {
+            this.current = undefined;
+            this.acknowledgedReceipt = undefined;
+          }
+          if (Schema.is(Rejected)(error))
+            return Effect.succeed(Schema.encodeSync(RpcReply)({ _tag: "Failure", error }));
+          if (Schema.isSchemaError(error))
+            return Effect.succeed(
+              Schema.encodeSync(RpcReply)({
+                _tag: "Failure",
+                error: new Rejected({ status: 400, message: "Invalid RPC contract" }),
+              }),
+            );
           return Effect.succeed(
-            Response.json(Schema.encodeSync(ErrorBody)({ error: error.message }), {
-              status: error.status,
-              headers: queryTimings,
+            Schema.encodeSync(RpcReply)({
+              _tag: "Failure",
+              error: new Rejected({
+                status: 503,
+                message: "Storage or search backend unavailable",
+              }),
             }),
           );
-        return Effect.succeed(
-          Response.json(
-            Schema.encodeSync(ErrorBody)({ error: "Storage or search backend unavailable" }),
-            { status: 503, headers: queryTimings },
+        }),
+      ),
+    );
+  }
+
+  override fetch(request: Request) {
+    const parts = new URL(request.url).pathname.split("/");
+    const operation = parts.at(-1);
+    const namespace = parts[3];
+    const queryTimings = new Headers();
+    return Effect.runPromise(
+      Effect.gen({ self: this }, function* () {
+        const started = yield* Clock.currentTimeNanos;
+        if (!isNamespaceName(namespace))
+          return yield* new Rejected({ status: 400, message: "Invalid namespace" });
+        const body: { value: unknown } = { value: undefined };
+        if (
+          request.body !== null ||
+          operation === "write" ||
+          operation === "query" ||
+          operation === "collect" ||
+          operation === "vector-rebuild" ||
+          operation === "internal-compact" ||
+          operation === "internal-vector-sync"
+        ) {
+          const text = yield* readBody(request);
+          body.value = yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown))(text).pipe(
+            Effect.mapError(() => new Rejected({ status: 400, message: "Invalid JSON body" })),
+          );
+        }
+        const command = yield* Schema.decodeUnknownEffect(NamespaceCommand, {
+          onExcessProperty: "error",
+        })({ namespace, operation, input: body.value }).pipe(
+          Effect.mapError(
+            () => new Rejected({ status: 400, message: "Invalid operation contract" }),
           ),
         );
-      }),
+        const value = yield* this.perform(command, queryTimings);
+        const ended = yield* Clock.currentTimeNanos;
+        queryTimings.append("server-timing", `raio;dur=${Number(ended - started) / 1e6}`);
+        return Response.json(value, { headers: queryTimings });
+      }).pipe(
+        Effect.tapError((error) => {
+          if (Schema.is(Rejected)(error) && error.status < 500) return Effect.void;
+          return Effect.logError("kannin.namespace", Cause.fail(error), { namespace, operation });
+        }),
+        Effect.catch((error) => {
+          if (operation !== "query") {
+            this.current = undefined;
+            this.acknowledgedReceipt = undefined;
+          }
+          if (Schema.is(Rejected)(error))
+            return Effect.succeed(
+              Response.json(Schema.encodeSync(ErrorBody)({ error: error.message }), {
+                status: error.status,
+                headers: queryTimings,
+              }),
+            );
+          return Effect.succeed(
+            Response.json(
+              Schema.encodeSync(ErrorBody)({ error: "Storage or search backend unavailable" }),
+              { status: 503, headers: queryTimings },
+            ),
+          );
+        }),
+      ),
     );
-    return Effect.runPromise(program);
+  }
+}
+
+export class KanninRpc extends WorkerEntrypoint<Env> {
+  async execute(input: typeof RpcCommand.Encoded): Promise<typeof RpcReply.Encoded> {
+    const env = this.env;
+    const ctx = this.ctx;
+    return Effect.runPromise(
+      Schema.decodeEffect(RpcCommand, { onExcessProperty: "error" })(input).pipe(
+        Effect.mapError(() => new Rejected({ status: 400, message: "Invalid RPC contract" })),
+        Effect.flatMap(
+          Effect.fn("kannin.binding.execute")(function* (command: typeof RpcCommand.Type) {
+            if (command.operation === "query" && command.input.consistency === "edge-eventual") {
+              if (command.input.kind !== "text")
+                return yield* new Rejected({
+                  status: 400,
+                  message: "Edge consistency is supported for text queries only",
+                });
+              const manifest = yield* edgeSnapshot(
+                ctx,
+                env,
+                command.namespace,
+                command.input.minimumSequence ?? 0,
+                new Headers(),
+              );
+              if (manifest !== undefined) {
+                const value = yield* Effect.tryPromise({
+                  try: () => query(env, command.input, manifest, ctx, new Headers()),
+                  catch: (cause) => {
+                    if (Schema.is(Rejected)(cause)) return cause;
+                    return new Cause.UnknownError(cause);
+                  },
+                }).pipe(
+                  Effect.timeoutOrElse({
+                    duration: "30 seconds",
+                    orElse: () =>
+                      new Rejected({
+                        status: 504,
+                        message: "Edge query exceeded its 30-second snapshot lease",
+                      }),
+                  }),
+                );
+                return yield* Schema.encodeEffect(RpcReply)({ _tag: "Success", value });
+              }
+            }
+            const coordinator = env.NAMESPACES.get(env.NAMESPACES.idFromName(command.namespace));
+            return yield* Effect.tryPromise(async () => coordinator.execute(command));
+          }),
+        ),
+        Effect.catch((error) => {
+          if (Schema.is(Rejected)(error))
+            return Effect.succeed(Schema.encodeSync(RpcReply)({ _tag: "Failure", error }));
+          return Effect.logError("kannin.binding", Cause.fail(error)).pipe(
+            Effect.as(
+              Schema.encodeSync(RpcReply)({
+                _tag: "Failure",
+                error: new Rejected({
+                  status: 503,
+                  message: "Storage or search backend unavailable",
+                }),
+              }),
+            ),
+          );
+        }),
+      ),
+    );
   }
 }
 
@@ -3013,11 +3075,11 @@ export default {
                     ),
                 }),
               );
-              evaluated.headers.append(
+              queryTimings.append(
                 "server-timing",
                 `edge_snapshot;dur=${Number(snapshotEnded - snapshotStarted) / 1e6}`,
               );
-              return evaluated;
+              return Response.json(evaluated, { headers: queryTimings });
             }
             snapshotTimings.append(
               "server-timing",

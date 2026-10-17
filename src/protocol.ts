@@ -590,3 +590,74 @@ export const VectorCandidateFrame = Schema.Struct({
   observedAt: Schema.Finite,
   candidates: VectorCandidates.check(Schema.isMinLength(1)),
 });
+
+export const CompactResult = Schema.Struct({
+  compacted: Schema.Int,
+  segments: Schema.Int,
+  documents: Schema.optional(Schema.Int),
+});
+export const RebuildResult = Schema.Struct({
+  sequence: Schema.Int,
+  rebuilt: Schema.Literal(true),
+});
+export const RpcCommand = Schema.Union([
+  Schema.Struct({ namespace: NamespaceName, operation: Schema.Literal("write"), input: Write }),
+  Schema.Struct({ namespace: NamespaceName, operation: Schema.Literal("query"), input: Query }),
+  Schema.Struct({
+    namespace: NamespaceName,
+    operation: Schema.Literal("metadata"),
+    input: Schema.optional(Schema.Struct({})),
+  }),
+  Schema.Struct({
+    namespace: NamespaceName,
+    operation: Schema.Literal("compact"),
+    input: Schema.optional(Schema.Struct({})),
+  }),
+  Schema.Struct({
+    namespace: NamespaceName,
+    operation: Schema.Literal("collect"),
+    input: Collection,
+  }),
+  Schema.Struct({
+    namespace: NamespaceName,
+    operation: Schema.Literal("rebuild"),
+    input: Schema.optional(Schema.Struct({})),
+  }),
+  Schema.Struct({
+    namespace: NamespaceName,
+    operation: Schema.Literal("vector-sync"),
+    input: Schema.optional(Schema.Struct({})),
+  }),
+  Schema.Struct({
+    namespace: NamespaceName,
+    operation: Schema.Literal("vector-rebuild"),
+    input: VectorRebuild,
+  }),
+]);
+export const NamespaceCommand = Schema.Union([
+  RpcCommand,
+  Schema.Struct({
+    namespace: NamespaceName,
+    operation: Schema.Literal("internal-compact"),
+    input: IndexMessage,
+  }),
+  Schema.Struct({
+    namespace: NamespaceName,
+    operation: Schema.Literal("internal-vector-sync"),
+    input: VectorMessage,
+  }),
+]);
+export const RpcValue = Schema.Union([
+  QueryResult,
+  WriteResult,
+  Metadata,
+  CompactResult,
+  CollectionResult,
+  RebuildResult,
+  VectorSyncResult,
+  VectorRebuildResult,
+]);
+export const RpcReply = Schema.Union([
+  Schema.TaggedStruct("Success", { value: RpcValue }),
+  Schema.TaggedStruct("Failure", { error: Rejected }),
+]);

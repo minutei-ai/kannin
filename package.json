@@ -3,7 +3,20 @@
   "version": "0.1.0",
   "private": true,
   "license": "MIT",
+  "files": [
+    "src/sdk.ts",
+    "src/rpc.ts",
+    "src/protocol.ts",
+    "README.md",
+    "LICENSE",
+    "docs/sdk.md"
+  ],
   "type": "module",
+  "exports": {
+    ".": "./src/sdk.ts",
+    "./protocol": "./src/protocol.ts",
+    "./rpc": "./src/rpc.ts"
+  },
   "scripts": {
     "build": "bun tooling/build.ts",
     "test": "bun run build && bun run test:built",
@@ -21,9 +34,6 @@
     "quality": "bun run build && bun tooling/quality.ts",
     "typecheck": "tsc --noEmit"
   },
-  "dependencies": {
-    "effect": "4.0.4"
-  },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20261013.1",
     "@effect/platform-bun": "4.0.4",
@@ -33,11 +43,15 @@
     "@turbopuffer/turbopuffer": "2.11.0",
     "@types/bun": "1.4.2",
     "alchemy": "2.0.0-beta.83",
+    "effect": "4.0.4",
     "miniflare": "5.20261006.1-alpha",
     "oxfmt": "0.71.0",
     "oxlint": "1.86.0",
     "oxlint-tsgolint": "7.0.2003",
     "typescript": "7.0.2"
+  },
+  "peerDependencies": {
+    "effect": "^4.0.0"
   },
   "packageManager": "bun@1.4.3",
   "patchedDependencies": {

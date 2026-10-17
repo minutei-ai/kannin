@@ -1,7 +1,13 @@
-import { Effect, Match, Schema } from "effect";
+import { Effect, Match, Option, Schema } from "effect";
 import { exports } from "cloudflare:workers";
 import { Segments as CachedSegments, SearchNamespace as Namespace } from "../src/worker";
-import { range, cacheUsage, withDirectory } from "../src/storage";
+import {
+  range,
+  cacheUsage,
+  withDirectory,
+  acquireDirectoryFrame,
+  waitDirectoryFrame,
+} from "../src/storage";
 import type { Env } from "../alchemy.run";
 import { DirectoryBudgetInput } from "./range-contract";
 import { Directory } from "../dist/wasm/raio_engine";
@@ -15,6 +21,7 @@ const state = {
   cacheDelay: 5000,
   bodyDelay: 80,
   directoryBodyDelay: 80,
+  directoryHeaderDelay: 0,
   failDirectoryCache: false,
   failDirectoryWrites: false,
   rejectedWrites: 0,
@@ -88,6 +95,8 @@ async function probe(request: Request, env: Env) {
     });
     Object.defineProperty(env.STORAGE, "get", {
       value: async (...args: Parameters<R2Bucket["get"]>) => {
+        if (state.directoryHeaderDelay > 0 && args[0].startsWith("cache/directory-v2/"))
+          await Effect.runPromise(Effect.sleep(state.directoryHeaderDelay));
         if (state.failDirectoryCache && args[0].startsWith("cache/directory-v2/"))
           return Promise.reject(new Error("Injected directory cache read failure"));
         if (args[0].startsWith("namespaces/")) state.canonicalReads += 1;
@@ -153,6 +162,14 @@ async function probe(request: Request, env: Env) {
     state.cacheDelay = 0;
     return new Response(null, { status: 204 });
   }
+  if (new URL(request.url).pathname === "/frame-burst") {
+    state.directoryBodyDelay = 30;
+    return new Response(null, { status: 204 });
+  }
+  if (new URL(request.url).pathname === "/frame-absent") {
+    state.directoryHeaderDelay = 80;
+    return new Response(null, { status: 204 });
+  }
   if (new URL(request.url).pathname === "/race") {
     state.cacheDelay = 400;
     state.bodyDelay = 1600;
@@ -173,9 +190,20 @@ async function probe(request: Request, env: Env) {
         "x-canonical-reads": String(state.canonicalReads),
         "x-rejected-writes": String(state.rejectedWrites),
         "x-directory-parses": String(state.directoryParses),
+        "x-directory-r2-reads": String(cacheUsage().directoryR2CacheReads),
       },
     });
   const input = Schema.decodeUnknownSync(DirectoryBudgetInput)(await request.json());
+  if (new URL(request.url).pathname === "/frame") {
+    const result = await Effect.runPromise(
+      acquireDirectoryFrame(input.key, input.length).pipe(
+        Effect.flatMap(waitDirectoryFrame),
+        Effect.map(Option.flatten),
+      ),
+    );
+    if (Option.isNone(result)) return new Response(null, { status: 503 });
+    return new Response(new Uint8Array(result.value));
+  }
   if (new URL(request.url).pathname === "/decoded") {
     const before = cacheUsage();
     const responses = await Effect.runPromise(

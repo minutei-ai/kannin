@@ -4044,3 +4044,24 @@ A separate cold-memory probe ran eight mixed rounds per version, clearing namesp
 The baseline lacked two cold-probe CPU events, so CPU comparisons use only matching round/selector pairs; missing events are never treated as zero. CPU covers the coordinator, not all bound Workers or total billing. Cold-memory CPU decreased in these observations, but HTTP did not improve for every selector. These small sequential cohorts do not establish fully cold Cloudflare storage latency, tail reliability, sustained capacity or Turbopuffer parity.
 
 The final local gate passed **276 Bun/workerd tests and 53 Rust tests**, with 9,634 Bun assertions, formatting, strict Effect lint/types and native/WASM Clippy. The entire 300-query SciFact report remained byte-identical: nDCG@10 0.6731, recall@10 0.7957 and MRR@10 0.6418.
+
+## Bounded admission before directory reconstruction
+
+The previous directory reader tried its single body permit once. Concurrent misses immediately rebuilt the canonical header even when an existing compressed R2 directory would soon become available. A first-read inspector capture over the million-document fixture attributed about 766 of 1,841 sampled milliseconds inclusively to directory compression. A bounded-admission variant using the same diagnostic WASM reduced the sampled interval to 1,117 ms, with no compression samples. These are diagnostic CPU samples, not billed CPU or a latency benchmark.
+
+Admission now retains at most sixteen attempts. Four weighted permits allow small bodies to overlap while a large header consumes every permit. Quantization includes each body's 8,192-byte allowance, keeping the sum of admitted encoded-body limits within the existing **2 MiB + 8,192 bytes** cap. Native nonqueued retries start at one millisecond and cap at sixteen milliseconds within the nominal 250 ms foreground budget. An unsuccessful lookup advances a process-local failure generation, causing attempts already waiting behind it to take canonical recovery. Later requests may try again; this retains no negative search state. Active bodies and validation retain their permits through actual settlement and native waitUntil.
+
+The final local workerd comparison used fresh processes, empty Worker caches and the same existing million-document R2 fixture with prepared directory frames. Three paired cohorts per selector alternated variant order in the middle cohort. Each process ran an initial query and one repetition. All **48 complete responses** matched IDs, exact scores, attributes, revisions and sequence 2000. No owned build, test or other benchmark ran concurrently with these measurements.
+
+| Initial selector      | Baseline median | Candidate median |
+| --------------------- | --------------: | ---------------: |
+| Sixteen rare terms    |       940.78 ms |        559.91 ms |
+| Sixty-four rare terms |      1750.71 ms |        898.13 ms |
+| Dense group 72        |      1137.85 ms |       1213.65 ms |
+| Dense group 43        |      1122.08 ms |       1186.63 ms |
+
+Every sparse pair improved. Dense controls varied and do not establish a gain: group 43's first pair regressed 1242.30 → 1557.18 ms and remains included. There are only three initial observations per cell. In the first sparse cohort, R2 directory hits increased 4 → 12 and 5 → 20. Corresponding WASM linear-memory high-water changed 21,692,416 → 20,185,088 bytes and 30,408,704 → 26,214,400 bytes. These observations do not establish total Worker peak memory or billing.
+
+An early wait-only variant regressed artifact-loss recovery. The failure-generation policy reduced that regression but did not eliminate it. The final loss control redirected all three disposable directory, individual-summary and overview-batch prefixes to fresh keys. Native R2 listing proved each prefix empty before the query timer. Rebuilding and reusing derived artifacts during the query remained allowed. All **16 complete initial/repeated responses** matched across two paired cohorts and two selectors. Initial baseline/candidate times were 4397.81/4594.16 and 4397.42/4785.32 ms for sixty-four rare terms, and 11084.44/12062.49 and 11542.45/11847.57 ms for dense group 43. Recovery was approximately 3–9% slower in these comparisons; this remains a performance gap. Local filesystem and R2-emulator caches could stay warm in both prepared and loss controls.
+
+The WASM binary and canonical/derived storage formats are unchanged. Regression tests cover concurrent valid directories, missing-source bypass, small/large body admission, expiry without late reads, permit recovery and the existing corruption/canonical recovery cases.

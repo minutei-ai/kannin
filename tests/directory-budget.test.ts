@@ -20,6 +20,11 @@ using segment = new Segment(JSON.stringify(documents));
 const canonical = segment.bytes();
 const length = 16 + new DataView(canonical.buffer, canonical.byteOffset).getUint32(8, true);
 const frame = new Uint8Array(directory_compress(canonical.subarray(0, length)));
+using smallSegment = new Segment(JSON.stringify([document("a", "alpha")]));
+const smallCanonical = smallSegment.bytes();
+const smallLength =
+  16 + new DataView(smallCanonical.buffer, smallCanonical.byteOffset).getUint32(8, true);
+const smallFrame = new Uint8Array(directory_compress(smallCanonical.subarray(0, smallLength)));
 const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
 
 const final = header.documents[4999];
@@ -322,6 +327,137 @@ test("segment origins validate R2 frames before publishing the native Cache API 
   }
 });
 
+test("distinct directory frames briefly share body admission before canonical fallback", async () => {
+  await using active = await fixture();
+  const worker = active.worker;
+  const bucket = await worker.getR2Bucket("STORAGE");
+  expect((await fetch(new URL("/frame-burst", await worker.ready))).status).toBe(204);
+  const keys = ["first", "second"].map(
+    (name) => `namespaces/directory-frame-burst/segments/${name}.rsix`,
+  );
+  for (const key of keys)
+    await bucket.put(`cache/directory-v2/${key}/${length}`, frame, {
+      customMetadata: {
+        source: Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))({
+          key,
+          headerBytes: length,
+        }),
+      },
+    });
+  const responses = await Promise.all(
+    keys.map(async (key) => {
+      const response = await fetch(new URL("/frame", await worker.ready), {
+        method: "POST",
+        body: Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
+          key,
+          offset: 0,
+          length,
+          count: 1,
+        }),
+      });
+      return { status: response.status, bytes: new Uint8Array(await response.arrayBuffer()) };
+    }),
+  );
+  expect(responses.map((response) => response.status)).toEqual([200, 200]);
+  for (const response of responses) expect(response.bytes).toEqual(frame);
+  const state = await fetch(new URL("/state", await worker.ready));
+  expect(state.headers.get("x-canonical-reads")).toBe("0");
+  expect(state.headers.get("x-r2-started")).toBe("2");
+  expect(state.headers.get("x-r2-active")).toBe("0");
+  expect(state.headers.get("x-r2-peak")).toBe("1");
+});
+
+test("waiting frame admissions bypass a concurrent missing cache source", async () => {
+  await using active = await fixture();
+  const worker = active.worker;
+  const origin = await worker.ready;
+  expect((await fetch(new URL("/frame-absent", origin))).status).toBe(204);
+  const responses = await Promise.all(
+    Array.from({ length: 4 }, (_, index) =>
+      fetch(new URL("/frame", origin), {
+        method: "POST",
+        body: Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
+          key: `namespaces/directory-absent/segments/${index}.rsix`,
+          offset: 0,
+          length,
+          count: 1,
+        }),
+      }),
+    ),
+  );
+  expect(responses.map((response) => response.status)).toEqual([503, 503, 503, 503]);
+  const state = await fetch(new URL("/state", origin));
+  expect(state.headers.get("x-directory-r2-reads")).toBe("1");
+  expect(state.headers.get("x-r2-started")).toBe("0");
+});
+
+for (const sample of [
+  { name: "large", frame, length, active: 1 },
+  { name: "small", frame: smallFrame, length: smallLength, active: 4 },
+])
+  test(`expired ${sample.name} frame waiters retain byte admission until body settlement`, async () => {
+    await using active = await fixture();
+    const worker = active.worker;
+    const bucket = await worker.getR2Bucket("STORAGE");
+    const origin = await worker.ready;
+    expect((await fetch(new URL("/cache-stall", origin))).status).toBe(204);
+    const keys = Array.from(
+      { length: 24 },
+      (_, index) => `namespaces/directory-frame-expiry/segments/${sample.name}-${index}.rsix`,
+    );
+    for (const key of keys)
+      await bucket.put(`cache/directory-v2/${key}/${sample.length}`, sample.frame, {
+        customMetadata: {
+          source: Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))({
+            key,
+            headerBytes: sample.length,
+          }),
+        },
+      });
+    const responses = await Promise.all(
+      keys.map((key) =>
+        fetch(new URL("/frame", origin), {
+          method: "POST",
+          body: Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
+            key,
+            offset: 0,
+            length: sample.length,
+            count: 1,
+          }),
+        }),
+      ),
+    );
+    expect(responses.map((response) => response.status)).toEqual(keys.map(() => 503));
+    const pending = await fetch(new URL("/state", origin));
+    expect(pending.headers.get("x-r2-started")).toBe(String(sample.active));
+    expect(pending.headers.get("x-r2-active")).toBe(String(sample.active));
+    expect(pending.headers.get("x-r2-peak")).toBe(String(sample.active));
+    for (const attempt of Array.from({ length: 60 }, (_, index) => index)) {
+      const state = await fetch(new URL("/state", origin));
+      if (state.headers.get("x-r2-active") === "0") break;
+      if (attempt === 59) throw new Error("Frame body did not settle");
+      await Effect.runPromise(Effect.sleep("50 millis"));
+    }
+    expect((await fetch(new URL("/frame-burst", origin))).status).toBe(204);
+    const key = keys[sample.active];
+    if (key === undefined) throw new Error("Missing recovery frame");
+    const recovered = await fetch(new URL("/frame", origin), {
+      method: "POST",
+      body: Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
+        key,
+        offset: 0,
+        length: sample.length,
+        count: 1,
+      }),
+    });
+    expect(recovered.status).toBe(200);
+    expect(new Uint8Array(await recovered.arrayBuffer())).toEqual(sample.frame);
+    const settled = await fetch(new URL("/state", origin));
+    expect(settled.headers.get("x-r2-started")).toBe(String(sample.active + 1));
+    expect(settled.headers.get("x-r2-active")).toBe("0");
+    expect(settled.headers.get("x-r2-peak")).toBe(String(sample.active));
+  });
+
 test("rejected cache admission shares a validated directory only for active readers", async () => {
   await using active = await fixture();
   const worker = active.worker;
@@ -409,8 +545,10 @@ test("slow R2 directory cache bodies keep admission while canonical recovery ret
     const state = await fetch(new URL("/state", await worker.ready));
     expect(state.headers.get("x-r2-active")).toBe("1");
     expect(state.headers.get("x-r2-peak")).toBe("2");
-    if (name === "first") expect(response.headers.get("x-directory-r2-timeouts")).toBe("1");
-    else expect(response.headers.get("x-directory-r2-timeouts")).toBe("0");
+    if (name === "first") {
+      expect(response.headers.get("x-directory-r2-timeouts")).toBe("1");
+      expect(state.headers.get("x-r2-started")).toBe("2");
+    } else expect(state.headers.get("x-r2-started")).toBe("3");
   }
   for (const attempt of Array.from({ length: 60 }, (_, index) => index)) {
     const state = await fetch(new URL("/state", await worker.ready));

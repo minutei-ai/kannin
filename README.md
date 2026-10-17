@@ -11,9 +11,11 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 **1,000,000 documents · deployed Cloudflare · GRU ingress.**
 
-The latest Rust change keeps immutable directories compact within the existing 20 MiB decoded cache. In a strong-query probe with namespace memory cleared before every query, sixty-four rare terms measured HTTP median **711 → 614 ms** and paired Durable Object CPU **365 → 281 ms**. Sixteen terms stayed at **487 ms HTTP**, while CPU fell **182.5 → 154 ms**. Dense group 72 improved; group 43 regressed in HTTP latency. Each HTTP cell has six observations; CPU has five or six matched pairs. Other Cloudflare caches and R2 could remain warm. [Methods, controls and tradeoffs](docs/performance.md#cloudflare-validation-of-compact-retained-directories).
+With prepared R2 directories, a local first-read comparison over one million documents reduced median latency **941 → 560 ms** for sixteen rare terms and **1751 → 898 ms** for sixty-four. Each cell has three fresh-process observations with empty Worker caches; all **48 complete initial/repeated responses** matched. Dense controls varied and were slower in the median. When all derived artifacts started absent, recovery preserved all sixteen responses but measured **3–9% slower** in four initial comparisons. [Methods and remaining gap](docs/performance.md#bounded-admission-before-directory-reconstruction).
 
-With repeated fixed strong selectors, native Durable Object CPU medians changed **39.5 → 4 ms** for sixteen rare terms and **102 → 80.5 ms** for sixty-four, with twelve measured observations per cell. All **224 complete responses** across warm and cold-memory cohorts matched. Local WASM linear-memory high-water increased **27.3 → 31.6 MB**; these CPU gains do not establish lower whole-Worker memory or total billing.
+Directory admission now briefly waits for valid compressed frames instead of immediately reconstructing canonical headers under contention. Up to four small bodies share the original **2 MiB + 8,192-byte** encoded-body budget; a large frame consumes the permits. Sixteen attempts bound pending work, and concurrent cache failures release waiting attempts to canonical recovery. The WASM binary and storage formats are unchanged.
+
+An earlier deployed Rust change reduced warm Durable Object CPU medians **39.5 → 4 ms** and **102 → 80.5 ms** for sixteen/sixty-four rare terms. [Native measurements](docs/performance.md#cloudflare-validation-of-compact-retained-directories).
 
 An earlier edge load run at source `6c03e72`, using an acknowledged sequence barrier, checked 384 complete responses against a strong baseline:
 
@@ -40,7 +42,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **276 Worker/tooling tests and 53 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **280 Worker/tooling tests and 53 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

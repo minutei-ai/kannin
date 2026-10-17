@@ -98,7 +98,12 @@ const MAX_DIRECTORY_FALLBACK_LENGTH = 2 * 1024 * 1024;
 const MAX_DIRECTORY_CACHE_LENGTH = 4 * 1024 * 1024;
 const MAX_DIRECTORY_CACHE_BYTES = MAX_DIRECTORY_FALLBACK_LENGTH + 8192;
 const directoryFallbackReads = Semaphore.makeUnsafe(1);
-const directoryCacheReads = Semaphore.makeUnsafe(1);
+const DIRECTORY_CACHE_UNITS = 4;
+const DIRECTORY_CACHE_UNIT = MAX_DIRECTORY_CACHE_BYTES / DIRECTORY_CACHE_UNITS - 8192;
+const directoryCacheReads = Semaphore.makeUnsafe(DIRECTORY_CACHE_UNITS);
+const directoryFrameAttempts = Semaphore.makeUnsafe(16);
+const directoryFrameFailures = { epoch: 0n };
+const DIRECTORY_FRAME_BUDGET = 250_000_000n;
 const budget = { bytes: 0, payloadBytes: 0 };
 const MAX_CACHE_BYTES = 12 * 1024 * 1024;
 const encodedDirectories = new Map<string, Uint8Array>();
@@ -355,40 +360,76 @@ export const acquireDirectoryFrame = Effect.fn("kannin.acquireDirectoryFrame")(
     Effect.gen(function* () {
       if (length > MAX_DIRECTORY_CACHE_LENGTH)
         return yield* Effect.forkDetach(Effect.succeed(Option.none<Uint8Array>()));
-      const acquisition = directoryCacheReads.withPermitsIfAvailable(1)(
+      const units = Math.min(DIRECTORY_CACHE_UNITS, Math.ceil(length / DIRECTORY_CACHE_UNIT));
+      const acquisition = directoryFrameAttempts.withPermitsIfAvailable(1)(
         Effect.gen(function* () {
-          reads.directoryR2CacheReads += 1;
-          const object = yield* Effect.tryPromise(() =>
-            env.STORAGE.get(`cache/directory-v2/${key}/${length}`),
+          const started = yield* Clock.currentTimeNanos;
+          const observedFailure = directoryFrameFailures.epoch;
+          const acquired = yield* Effect.gen(function* () {
+            if (
+              (yield* Clock.currentTimeNanos) - started >= DIRECTORY_FRAME_BUDGET ||
+              directoryFrameFailures.epoch !== observedFailure
+            )
+              return Option.some(Option.none<Uint8Array>());
+            return yield* directoryCacheReads.withPermitsIfAvailable(units)(
+              Effect.gen(function* () {
+                reads.directoryR2CacheReads += 1;
+                const object = yield* Effect.tryPromise(() =>
+                  env.STORAGE.get(`cache/directory-v2/${key}/${length}`),
+                );
+                if (object === null) return Option.none<Uint8Array>();
+                const source = yield* Schema.decodeUnknownEffect(
+                  Schema.fromJsonString(TermProjectionRange),
+                )(object.customMetadata?.source).pipe(Effect.option);
+                if (
+                  object.size > Math.min(length + 8192, MAX_DIRECTORY_CACHE_BYTES) ||
+                  Option.isNone(source) ||
+                  source.value.key !== key ||
+                  source.value.headerBytes !== length
+                ) {
+                  yield* Effect.tryPromise(() => object.body.cancel());
+                  reads.directoryR2CacheRejected += 1;
+                  return Option.none<Uint8Array>();
+                }
+                const bytes = new Uint8Array(yield* Effect.tryPromise(() => object.arrayBuffer()));
+                reads.directoryR2CacheBytes += bytes.byteLength;
+                const fingerprint = yield* Effect.tryPromise(() =>
+                  crypto.subtle.digest("SHA-256", bytes),
+                );
+                const checked = yield* Effect.try(() => {
+                  using directory = Directory.compressed(bytes, length);
+                  rememberDirectory(
+                    `${env.STORAGE_CACHE_SCOPE}:${key}`,
+                    length,
+                    directory,
+                    fingerprint,
+                  );
+                  return bytes;
+                }).pipe(Effect.option);
+                if (Option.isSome(checked)) reads.directoryR2CacheHits += 1;
+                else reads.directoryR2CacheRejected += 1;
+                return checked;
+              }).pipe(
+                Effect.orElseSucceed(() => Option.none<Uint8Array>()),
+                Effect.tap((frame) =>
+                  Effect.sync(() => {
+                    if (Option.isNone(frame)) directoryFrameFailures.epoch += 1n;
+                  }),
+                ),
+                Effect.uninterruptible,
+              ),
+            );
+          }).pipe(
+            Effect.repeat({
+              while: Option.isNone,
+              schedule: Schedule.min([
+                Schedule.exponential("1 millis"),
+                Schedule.spaced("16 millis"),
+              ]).pipe(Schedule.upTo({ duration: DIRECTORY_FRAME_BUDGET })),
+            }),
           );
-          if (object === null) return Option.none<Uint8Array>();
-          const source = yield* Schema.decodeUnknownEffect(
-            Schema.fromJsonString(TermProjectionRange),
-          )(object.customMetadata?.source).pipe(Effect.option);
-          if (
-            object.size > Math.min(length + 8192, MAX_DIRECTORY_CACHE_BYTES) ||
-            Option.isNone(source) ||
-            source.value.key !== key ||
-            source.value.headerBytes !== length
-          ) {
-            yield* Effect.tryPromise(() => object.body.cancel());
-            reads.directoryR2CacheRejected += 1;
-            return Option.none<Uint8Array>();
-          }
-          const bytes = new Uint8Array(yield* Effect.tryPromise(() => object.arrayBuffer()));
-          reads.directoryR2CacheBytes += bytes.byteLength;
-          const fingerprint = yield* Effect.tryPromise(() =>
-            crypto.subtle.digest("SHA-256", bytes),
-          );
-          const checked = yield* Effect.try(() => {
-            using directory = Directory.compressed(bytes, length);
-            rememberDirectory(`${env.STORAGE_CACHE_SCOPE}:${key}`, length, directory, fingerprint);
-            return bytes;
-          }).pipe(Effect.option);
-          if (Option.isSome(checked)) reads.directoryR2CacheHits += 1;
-          else reads.directoryR2CacheRejected += 1;
-          return checked;
-        }).pipe(Effect.uninterruptible),
+          return Option.flatten(acquired);
+        }),
       );
       return yield* Effect.uninterruptible(
         Effect.gen(function* () {
@@ -408,7 +449,7 @@ export const acquireDirectoryFrame = Effect.fn("kannin.acquireDirectoryFrame")(
 export const waitDirectoryFrame = Effect.fn("kannin.waitDirectoryFrame")(
   (reader: Fiber.Fiber<Option.Option<Uint8Array>>) =>
     Fiber.join(reader).pipe(
-      Effect.timeoutOption("250 millis"),
+      Effect.timeoutOption(DIRECTORY_FRAME_BUDGET),
       Effect.tap((result) =>
         Effect.sync(() => {
           if (Option.isNone(result)) reads.directoryR2CacheTimeouts += 1;

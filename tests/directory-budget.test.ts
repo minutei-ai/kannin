@@ -51,6 +51,11 @@ function directoryWithLength(expected: number) {
   throw new Error("Missing directory boundary");
 }
 
+const admissionLarge = directoryWithLength(2 * 1024 * 1024);
+const admissionLargeFrame = new Uint8Array(
+  directory_compress(admissionLarge.bytes.subarray(0, admissionLarge.length)),
+);
+
 async function fixture() {
   await using cleanup = new AsyncDisposableStack();
   const artifacts = await mkdtemp(join(tmpdir(), "kannin-directory-budget-"));
@@ -159,7 +164,7 @@ test("R2 directory frames recover cold readers with compressed bytes across isol
   expect(recovered.headers.get("x-directory-r2-hits")).toBe("1");
   expect(recovered.headers.get("x-directory-r2-bytes")).toBe(String(frame.byteLength));
   expect(recovered.headers.get("x-distinct-bodies")).toBe("1");
-  expect(frame.byteLength * 10).toBeLessThan(length);
+  expect(frame.byteLength).toBeLessThan(length);
 }, 15000);
 
 test("invalid R2 directory frames recover canonical data and repair disposable artifacts", async () => {
@@ -545,11 +550,11 @@ test("distinct directory frames briefly share body admission before canonical fa
     (name) => `namespaces/directory-frame-burst/segments/${name}.rsix`,
   );
   for (const key of keys)
-    await bucket.put(`cache/directory-v2/${key}/${length}`, frame, {
+    await bucket.put(`cache/directory-v2/${key}/${admissionLarge.length}`, admissionLargeFrame, {
       customMetadata: {
         source: Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))({
           key,
-          headerBytes: length,
+          headerBytes: admissionLarge.length,
         }),
       },
     });
@@ -560,7 +565,7 @@ test("distinct directory frames briefly share body admission before canonical fa
         body: Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
           key,
           offset: 0,
-          length,
+          length: admissionLarge.length,
           count: 1,
         }),
       });
@@ -568,7 +573,7 @@ test("distinct directory frames briefly share body admission before canonical fa
     }),
   );
   expect(responses.map((response) => response.status)).toEqual([200, 200]);
-  for (const response of responses) expect(response.bytes).toEqual(frame);
+  for (const response of responses) expect(response.bytes).toEqual(admissionLargeFrame);
   const state = await fetch(new URL("/state", await worker.ready));
   expect(state.headers.get("x-canonical-reads")).toBe("0");
   expect(state.headers.get("x-r2-started")).toBe("2");
@@ -588,7 +593,7 @@ test("waiting frame admissions bypass a concurrent missing cache source", async 
         body: Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
           key: `namespaces/directory-absent/segments/${index}.rsix`,
           offset: 0,
-          length,
+          length: admissionLarge.length,
           count: 1,
         }),
       }),
@@ -601,7 +606,7 @@ test("waiting frame admissions bypass a concurrent missing cache source", async 
 });
 
 for (const sample of [
-  { name: "large", frame, length, active: 1 },
+  { name: "large", frame: admissionLargeFrame, length: admissionLarge.length, active: 1 },
   { name: "small", frame: smallFrame, length: smallLength, active: 4 },
 ])
   test(`expired ${sample.name} frame waiters retain byte admission until body settlement`, async () => {
@@ -729,27 +734,27 @@ test("slow R2 directory cache bodies keep admission while canonical recovery ret
   expect((await fetch(new URL("/cache-stall", await worker.ready))).status).toBe(204);
   for (const name of ["first", "second"]) {
     const key = `namespaces/directory-r2-stall/segments/${name}.rsix`;
-    await bucket.put(key, canonical);
-    await bucket.put(`cache/directory-v2/${key}/${length}`, frame, {
+    await bucket.put(key, admissionLarge.bytes);
+    await bucket.put(`cache/directory-v2/${key}/${admissionLarge.length}`, admissionLargeFrame, {
       customMetadata: {
         source: Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))({
           key,
-          headerBytes: length,
+          headerBytes: admissionLarge.length,
         }),
       },
     });
-    await cacheFrame(worker, key, length, frame);
+    await cacheFrame(worker, key, admissionLarge.length, admissionLargeFrame);
     const response = await fetch(await worker.ready, {
       method: "POST",
       body: Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
         key,
         offset: 0,
-        length,
+        length: admissionLarge.length,
         count: 8,
       }),
     });
     expect(response.status).toBe(200);
-    expect(new Uint8Array(await response.arrayBuffer())).toEqual(frame);
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(admissionLargeFrame);
     expect(response.headers.get("x-fallbacks")).toBe("1");
     const state = await fetch(new URL("/state", await worker.ready));
     expect(state.headers.get("x-r2-active")).toBe("1");

@@ -315,8 +315,19 @@ impl Header {
         documents + terms + size_of::<Self>() + 32 + FILTER_CACHE_BYTES
     }
 
+    fn compact_json(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(&(
+            self.version,
+            DirectoryDocuments(&self.documents),
+            DirectoryTerms(&self.terms),
+            self.total_title_length,
+            self.total_body_length,
+        ))
+        .map_err(|cause| cause.to_string())
+    }
+
     fn encode(&self, payload: &[u8]) -> Result<Vec<u8>, String> {
-        let json = serde_json::to_vec(self).map_err(|e| e.to_string())?;
+        let json = self.compact_json()?;
         if json.len() + payload.len() + 16 > MAX_BYTES {
             return Err("Segment exceeds 16 MiB".into());
         }
@@ -910,14 +921,7 @@ impl Serialize for DirectoryTerms<'_> {
 pub fn compress_directory(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let header = parse_directory(bytes, bytes.len())?;
     let length = bytes.len();
-    let compact = serde_json::to_vec(&(
-        header.version,
-        DirectoryDocuments(&header.documents),
-        DirectoryTerms(&header.terms),
-        header.total_title_length,
-        header.total_body_length,
-    ))
-    .map_err(|cause| cause.to_string())?;
+    let compact = header.compact_json()?;
     if compact.len() > MAX_BYTES {
         return Err("Compact directory exceeds size budget".into());
     }
@@ -3932,7 +3936,7 @@ mod frequency_tests {
                 })
                 .collect();
             let built = build(docs)?;
-            let base = 16 + serde_json::to_vec(&built.header)?.len();
+            let base = super::parse_header(&built.bytes)?.1;
             let header = Rc::new(built.header);
             for mode in ["any", "all"] {
                 let mut searches = Vec::new();
@@ -4097,7 +4101,7 @@ mod frequency_tests {
             })
             .collect();
         let built = build(docs)?;
-        let base = 16 + serde_json::to_vec(&built.header)?.len();
+        let base = super::parse_header(&built.bytes)?.1;
         let header = Rc::new(built.header);
         for mode in ["any", "all", "phrase"] {
             let mut searches = Vec::new();
@@ -4168,7 +4172,7 @@ mod candidate_tests {
             {"id":"d","text":"beta beta alpha","attributes":{}}
         ]))?;
         let built = build(documents)?;
-        let base = 16 + serde_json::to_vec(&built.header)?.len();
+        let base = super::parse_header(&built.bytes)?.1;
         let header = Rc::new(built.header);
         for (text, dead, expected) in [
             ("alpha beta alpha", vec![], vec![1]),
@@ -4627,7 +4631,7 @@ mod cutoff_certificate_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let built = fixture()?;
         let header = &built.header;
-        let base = 16 + serde_json::to_vec(header)?.len();
+        let base = super::parse_header(&built.bytes)?.1;
         let statistics = Statistics {
             documents: u64::try_from(header.documents.len())?,
             title_length: header.total_title_length,

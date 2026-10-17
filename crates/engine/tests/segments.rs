@@ -912,3 +912,35 @@ fn compact_term_dictionary_preserves_map_order_duplicates_and_lookup()
     assert_eq!(serde_json::to_string(&empty)?, "{}");
     Ok(())
 }
+
+#[test]
+fn canonical_headers_reuse_compact_tuples_and_preserve_object_readers()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut first = document("ação", "rust busca frase");
+    first.revision = u64::MAX;
+    first.title = "日本語 😀".into();
+    first
+        .attributes
+        .insert("escape\nkey".into(), serde_json::json!("á\n😀"));
+    let built = segment::build(vec![first, document("𐀀", "rust storage")])?;
+    assert_eq!(built.bytes[16], b'[');
+    let (compact, base) = segment::parse_header(&built.bytes)?;
+    assert_eq!(
+        serde_json::to_string(&compact)?,
+        serde_json::to_string(&built.header)?
+    );
+    let json = serde_json::to_vec(&built.header)?;
+    assert!(base < json.len() + 16);
+    let mut object = b"RAIOSEG1".to_vec();
+    object.extend_from_slice(&u32::try_from(json.len())?.to_le_bytes());
+    object.extend_from_slice(&crc32fast::hash(&json).to_le_bytes());
+    object.extend_from_slice(&json);
+    object.extend_from_slice(&built.bytes[base..]);
+    let (original, original_base) = segment::parse_header(&object)?;
+    assert_eq!(
+        serde_json::to_string(&original)?,
+        serde_json::to_string(&compact)?
+    );
+    assert_eq!(&object[original_base..], &built.bytes[base..]);
+    Ok(())
+}

@@ -3,8 +3,15 @@ import { Match, Schema } from "effect";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Directory, initSync } from "../dist/wasm/raio_engine";
 import { Root, SegmentHeader, SegmentRange, QueryResult } from "../src/protocol";
 import { request, startWorker, write } from "./harness";
+
+initSync({
+  module: new WebAssembly.Module(
+    await Bun.file(join(import.meta.dir, "../dist/wasm/raio_engine_bg.wasm")).arrayBuffer(),
+  ),
+});
 
 for (const kind of ["text", "vector"])
   for (const size of ["small", "large"])
@@ -76,10 +83,11 @@ for (const kind of ["text", "vector"])
         });
         if (object === null) throw new Error("Missing segment");
         const bytes = new Uint8Array(await object.arrayBuffer());
-        const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(
-          new TextDecoder().decode(bytes.subarray(16)),
+        using directory = Directory.canonical(bytes, segment.headerBytes);
+        const documents = Schema.decodeSync(Schema.fromJsonString(SegmentHeader.fields.documents))(
+          directory.rows(JSON.stringify(Array.from({ length: segment.count }, (_, row) => row))),
         );
-        for (const document of header.documents)
+        for (const document of documents)
           ranges.push({
             key: segment.key,
             offset: segment.headerBytes + document.data.offset,

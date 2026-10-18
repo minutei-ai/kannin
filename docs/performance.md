@@ -4288,3 +4288,18 @@ Before and after deployment, eight mixed rounds each ran four strong selectors, 
 | Dense group 43          |       624.00 / 619.73 ms |                    111.5 / 103.5 ms |         4 |
 
 HTTP and observed paired CPU medians decreased for all four selectors. Request placement changed from local-GRU before deployment to remote-ATL afterward, while ingress remained GRU. These small sequential, cache-sensitive samples do not isolate the optimization's contribution from placement and run-to-run variation, nor establish fully cold backend latency, whole-Worker CPU cost or sustained capacity. The controlled local preparation probe and complete-query comparison provide separate evidence for the allocation reduction.
+
+## Rejected boxed term-name experiment
+
+A local Rust prototype replaced immutable dictionary `String` keys with `Box<str>`, updating allocation charging to match the representation. Canonical and derived-directory encodings stayed unchanged. Native Rust tests and native/WASM Clippy passed. An eight-header, 40-round alternating WASM probe reduced decoded heap charges by about 2%, while median canonical parsing stayed effectively unchanged (**104.23 / 104.71 ms**) and compressed decoding changed **39.42 / 39.07 ms**.
+
+A separate complete-query comparison used the same million-document local R2 fixture and sequence 2000, with fresh processes and alternating variant order across three cohorts. Both query rounds were checked; all **48 complete responses** matched. Partial loss preserved directory frames while replacing correlated pool and batch prefixes with verified empty prefixes. The table reports median first-query latency; storage and operating-system caches could remain warm.
+
+| Cache state  | Query                 | Baseline ms | Prototype ms |
+| ------------ | --------------------- | ----------: | -----------: |
+| Prepared     | Sixty-four rare terms |      775.29 |       785.33 |
+| Prepared     | Dense group 43        |      758.68 |       785.51 |
+| Partial loss | Sixty-four rare terms |     1667.84 |      1777.35 |
+| Partial loss | Dense group 43        |     3724.73 |      3716.01 |
+
+Prepared rare-query WASM capacity decreased from 24,510,464 to 24,051,712 bytes, and dense-query capacity from 8,257,536 to 8,192,000 bytes. These do not measure whole-Worker peak heap. Three of four latency medians increased; the small sample does not establish causality, but supplies no reason to ship this representation for faster search. The prototype was reverted and never deployed. The retained implementation continues using `String` term keys. Further dictionary work should reduce allocations or bytes on the actual critical path rather than assume that smaller record size alone improves latency.

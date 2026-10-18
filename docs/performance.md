@@ -4303,3 +4303,24 @@ A separate complete-query comparison used the same million-document local R2 fix
 | Partial loss | Dense group 43        |     3724.73 |      3716.01 |
 
 Prepared rare-query WASM capacity decreased from 24,510,464 to 24,051,712 bytes, and dense-query capacity from 8,257,536 to 8,192,000 bytes. These do not measure whole-Worker peak heap. Three of four latency medians increased; the small sample does not establish causality, but supplies no reason to ship this representation for faster search. The prototype was reverted and never deployed. The retained implementation continues using `String` term keys. Further dictionary work should reduce allocations or bytes on the actual critical path rather than assume that smaller record size alone improves latency.
+
+## Rejected denser automatic compaction experiment
+
+The local million-document fixture has 200 heterogeneous sources, ranging from 4,000 to 10,000 documents. Its average is 5,000 documents per source. The current automatic queue target is twice the ideal 10,000-document packing count, with a minimum of 32 sources. A proposed denser target was evaluated through the existing compaction API on an isolated copy of local R2, without changing production, the engine or the canonical fixture used by earlier controls.
+
+Seventy-four ordinary merges reduced the copied index to **126 sources**. The remaining live source sizes cannot be paired within the existing 10,000-document limit. Documents stayed at **1,000,000**, sequence stayed **2000**, and only the root's segment inventory changed. Canonical header bytes increased **123,149,840 to 123,711,541**; complete segment bytes increased **302,148,145 to 302,449,694**. Fewer sources did not imply fewer canonical bytes. These totals count root-referenced segments, not whole-bucket storage; retired objects still require ordinary collection and its grace period.
+
+The same compiled Worker queried both layouts in fresh local workerd processes, with alternating order across three cohorts. Both query rounds were checked; all **96 complete responses**, including scores, attributes, revisions and sequence, matched. Prepared derived artifacts survived from the respective layouts. Partial loss replaced correlated pool and batch prefixes with verified empty prefixes; total loss also replaced the directory prefix. The table reports median first-query latency. Storage and operating-system caches could remain warm, and compaction changed source identities and cache reuse as well as source count.
+
+| Cache state  | Query                 | 200 sources ms | 126 sources ms |
+| ------------ | --------------------- | -------------: | -------------: |
+| Prepared     | Sixteen rare terms    |         474.53 |         559.69 |
+| Prepared     | Sixty-four rare terms |         822.16 |        1031.62 |
+| Prepared     | Dense group 72        |         804.97 |         897.97 |
+| Prepared     | Dense group 43        |         785.09 |         838.80 |
+| Partial loss | Sixty-four rare terms |        1739.84 |        2046.72 |
+| Partial loss | Dense group 43        |        3672.54 |        3383.76 |
+| Total loss   | Sixty-four rare terms |        2485.83 |        2890.74 |
+| Total loss   | Dense group 43        |        4044.84 |        3593.16 |
+
+Dense recovery improved by about 8–11%, but rare-query medians increased 16–25%, and every prepared-cache selector was slower. Prepared sixteen-term WASM capacity increased from 19,333,120 to 21,823,488 bytes; the other three observed prepared capacities stayed unchanged. These values do not measure whole-Worker peak heap. This tradeoff does not justify lowering the general automatic compaction target. The existing policy and production index were preserved. Further cold-read work should reduce metadata materialization or acquisition cost within candidate sources rather than presume that reducing source count is universally faster.

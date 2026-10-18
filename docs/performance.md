@@ -4237,3 +4237,18 @@ A controlled local workerd comparison used the same compact canonical million-do
 | Total loss   | Dense group 43        |    4070.7 |   4086.7 |
 
 Across all 200 derived directory frames, compressed size fell from **22,637,777 to 18,150,704 bytes**, a **19.8% reduction**. Every reconstructed document and term entry and the decoded heap charge matched the previous cache reader; the canonical root remained byte-identical. A separate eight-header decoding probe measured 77.52 to 39.58 ms, but that isolated probe does not establish end-to-end latency. Prepared-query gains were concentrated in rare terms; the dense total-loss control was effectively unchanged. The local gate passed 289 Worker/tooling and 57 Rust tests, including exact allocation-budget boundaries, invalid strings, truncation, overflow, ordering, corrupt frames and canonical fallback. The complete 300-query SciFact report remained byte-identical to the previous baseline.
+
+### Native validation of binary directory caches
+
+Alchemy profile `minutei` deployed source `387948e` as Cloudflare version `faec0311-6e12-4d06-b5f8-bbafd219bd76`, verified at 100% traffic with Smart Placement, the same physical R2 bucket and unchanged cache lifecycle rules. The deployment and its unconditional vector metadata migration completed. The existing million-document canonical manifest remained byte-identical to the original captured manifest, at sequence 2000 with 200 sources.
+
+Before and after deployment, eight mixed rounds each ran four strong selectors with a coordinator rebuild before every query and fresh equivalent predicates. All **64 complete responses** matched. Two warmup rounds are excluded from HTTP medians. Coordinator CPU joins the exact response CF-Ray to successful SearchNamespace events, paired by selector and round; unavailable events are excluded rather than counted as zero. Twenty-five of 32 candidate events were available, all on the deployed version.
+
+| Existing index selector | HTTP median before/after | Paired coordinator CPU before/after | CPU pairs |
+| ----------------------- | -----------------------: | ----------------------------------: | --------: |
+| Sixteen rare terms      |       642.49 / 422.94 ms |                        168 / 115 ms |         3 |
+| Sixty-four rare terms   |       758.75 / 627.37 ms |                      307.5 / 208 ms |         4 |
+| Dense group 72          |       616.25 / 650.39 ms |                          99 / 96 ms |         1 |
+| Dense group 43          |       621.77 / 568.17 ms |                        143 / 109 ms |         2 |
+
+GRU served ingress, but measured placement changed from remote-EWR before deployment to local-GRU afterward. These sequential, cache-sensitive observations therefore do not isolate the codec's native latency contribution. HTTP improved in three selectors and regressed in one; CPU coverage is small, especially for dense selectors. Existing correlated artifacts could survive, while the versioned directory namespace started empty. This is native correctness and rollout evidence, not a fully cold backend comparison, sustained-throughput guarantee or Turbopuffer parity result.

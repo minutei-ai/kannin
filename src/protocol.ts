@@ -418,8 +418,23 @@ export const CatalogTelemetry = Schema.Struct({
   entryMs: Schema.Finite,
   totalMs: Schema.Finite,
 });
-export const TermCatalogBatch = Schema.Array(ProjectedTermCatalog).check(
-  Schema.isBetweenLength(1, 16),
+export const TermCatalogBatch = Schema.Struct({
+  filterDigest: Schema.NullOr(Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/))),
+  catalogs: Schema.Array(
+    TermProjection.mapFields((fields) => ({
+      ...fields,
+      selection: Schema.Union([
+        Schema.Struct({ kind: Schema.Literal("model"), eligibility: EligibilityProjection }),
+        Schema.Struct({ kind: Schema.Literal("minimum"), minimum: EligibleMinimum }),
+      ]),
+    })),
+  ).check(Schema.isBetweenLength(1, 16)),
+}).check(
+  Schema.makeFilter(
+    (batch) =>
+      batch.catalogs.some((catalog) => catalog.selection.kind === "minimum") ===
+        (batch.filterDigest !== null) || "Exact term catalogs require a filter digest",
+  ),
 );
 export const OverviewBatch = Schema.Array(Schema.Uint8ArrayFromBase64)
   .check(Schema.isBetweenLength(1, 16))
@@ -532,10 +547,15 @@ export const CorrelatedOverview = Schema.Struct({
     ),
   ),
 });
+export const TermFilters = Schema.fromJsonString(QueryFields.filters);
+export const TermFilterHeader = Schema.StringFromBase64.pipe(Schema.decodeTo(TermFilters));
 export const TermProjectionProps = Schema.Struct({
   bucket: Schema.String.check(Schema.isBetweenLength(1, 63)),
   terms: Schema.fromJsonString(Schema.Array(Schema.String).check(Schema.isMaxLength(64))),
-  filters: Schema.fromJsonString(Schema.Array(Filter).check(Schema.isMaxLength(16))),
+  selection: Schema.Union([
+    Schema.Struct({ kind: Schema.Literal("fields"), fields: EligibilityProjection.fields.fields }),
+    Schema.Struct({ kind: Schema.Literal("filters"), filters: TermFilters }),
+  ]),
   ranges: Schema.Array(TermProjectionRange).check(Schema.isBetweenLength(1, 16)),
 });
 export const StoredOverviewBatch = Schema.Struct({

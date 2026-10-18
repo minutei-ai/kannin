@@ -144,7 +144,7 @@ test("cached old segments cannot resurrect updated or deleted documents", async 
 });
 
 test("the authenticated gateway never exposes immutable cache entrypoints", async () => {
-  for (const path of ["/range", "/directory-v3", "/catalog-v8"]) {
+  for (const path of ["/range", "/directory-v3", "/catalog-v9"]) {
     const url = new URL(path, await worker.ready);
     const anonymous = await fetch(url);
     expect(anonymous.status).toBe(401);

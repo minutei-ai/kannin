@@ -41,6 +41,7 @@ import {
   EligibleMinimum,
   EligibilityProjection,
   TermCatalogBatch,
+  TermFilters,
   type OverviewBatch,
   StoredOverviewBatch,
   OverviewFrameMetadata,
@@ -1484,15 +1485,13 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
   (
     ranges: ReadonlyArray<typeof TermProjectionRange.Type>,
     terms: ReadonlyArray<typeof TermProjectionProps.Type.terms>,
-    filters: typeof TermProjectionProps.Type.filters,
+    filters: typeof TermFilters.Type,
     timings: Headers,
   ) =>
     Effect.gen(function* () {
       if (ranges.length !== terms.length)
         return yield* new Rejected({ status: 503, message: "Bloom projection omitted a segment" });
-      const encodedFilters = yield* Schema.encodeEffect(TermProjectionProps.fields.filters)(
-        filters,
-      );
+      const encodedFilters = yield* Schema.encodeEffect(TermFilters)(filters);
       const fieldSelector = encodeEligibilityFields(
         [...new Set(filters.map((filter) => filter.field))].toSorted(),
       );
@@ -1626,15 +1625,38 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
               const props = {
                 bucket: env.STORAGE_CACHE_SCOPE,
                 terms: encodeProjectionTerms([...requested].toSorted()),
-                filters: group.filters,
+                selection: { kind: "filters" as const, filters: group.filters },
                 ranges: group.entries.map(({ input }) => ({
                   key: input.key,
                   headerBytes: input.headerBytes,
                 })),
               };
+              const filterHeader = yield* Schema.encodeEffect(Schema.StringFromBase64)(
+                group.filters,
+              );
+              const headers = new Headers();
+              const selection = {
+                value: yield* Schema.decodeEffect(TermProjectionProps.fields.selection)(
+                  props.selection,
+                ),
+              };
+              if (filterHeader.length <= 8192 && selection.value.kind === "filters") {
+                const actual = selection.value.filters;
+                selection.value = {
+                  kind: "fields",
+                  fields: [...new Set(actual.map((filter) => filter.field))].toSorted(),
+                };
+                headers.set("x-kannin-filters", filterHeader);
+              }
+              const encodedSelection = yield* Schema.encodeEffect(
+                TermProjectionProps.fields.selection,
+              )(selection.value);
               const fetchedAt = yield* Clock.currentTimeNanos;
               const response = yield* Effect.tryPromise({
-                try: () => exports.Terms({ props }).fetch("https://terms.internal/catalog-v8"),
+                try: () =>
+                  exports
+                    .Terms({ props: { ...props, selection: encodedSelection } })
+                    .fetch("https://terms.internal/catalog-v9", { headers }),
                 catch: (cause) => {
                   if (Schema.is(Rejected)(cause)) return cause;
                   return new Cause.UnknownError(cause);
@@ -1660,7 +1682,16 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
                   message: "Immutable term catalog unavailable",
                 });
               const decodedAt = yield* Clock.currentTimeNanos;
-              const catalogs = yield* decodeTermCatalogBatch(text);
+              const batch = yield* decodeTermCatalogBatch(text);
+              const catalogs = batch.catalogs;
+              if (catalogs.some((catalog) => catalog.selection.kind === "minimum")) {
+                const expectedFilterDigest = yield* Effect.tryPromise(() => sha256(group.filters));
+                if (batch.filterDigest !== expectedFilterDigest)
+                  return yield* new Rejected({
+                    status: 503,
+                    message: "Term catalog filter digest mismatch",
+                  });
+              }
               metrics.decodeMs += Number((yield* Clock.currentTimeNanos) - decodedAt) / 1e6;
               const encodedTelemetry = response.headers.get("x-kannin-catalog-telemetry");
               if (
@@ -1718,26 +1749,33 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
                   });
                 }
                 if (entry.minimum === undefined) {
-                  entry.minimum = catalog.minimum;
-                  const eligibility = Option.fromNullishOr(catalog.eligibility).pipe(
-                    Option.filter(
-                      (model) => encodeEligibilityFields(model.fields) === fieldSelector,
-                    ),
-                    Option.map(encodeEligibility),
-                    Option.filter(
-                      (encoded) => new TextEncoder().encode(encoded).byteLength <= 4096,
-                    ),
-                  );
-                  if (Option.isSome(eligibility))
-                    rememberTermCatalog(entry.eligibilityIdentity, {
-                      kind: "eligibility",
-                      eligibility: eligibility.value,
-                    });
-                  else
+                  if (catalog.selection.kind === "minimum") {
+                    entry.minimum = catalog.selection.minimum;
                     rememberTermCatalog(entry.minimumIdentity, {
                       kind: "minimum",
                       minimum: entry.minimum,
                     });
+                  } else {
+                    const model = catalog.selection.eligibility;
+                    if (encodeEligibilityFields(model.fields) !== fieldSelector)
+                      return yield* new Rejected({
+                        status: 503,
+                        message: "Term eligibility scope mismatch",
+                      });
+                    const encoded = encodeEligibility(model);
+                    if (new TextEncoder().encode(encoded).byteLength > 4096)
+                      return yield* new Rejected({
+                        status: 503,
+                        message: "Term eligibility exceeds four KiB",
+                      });
+                    entry.minimum = yield* Effect.try(() =>
+                      decodeEligibilityMinimum(eligibilityQuery.minimum(encoded)),
+                    );
+                    rememberTermCatalog(entry.eligibilityIdentity, {
+                      kind: "eligibility",
+                      eligibility: encoded,
+                    });
+                  }
                 }
               }
             }

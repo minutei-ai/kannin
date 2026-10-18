@@ -5,6 +5,7 @@ import {
   Cause,
   Clock,
   Effect,
+  Exit,
   Fiber,
   Match,
   Option,
@@ -12,7 +13,6 @@ import {
   Schedule,
   Semaphore,
 } from "effect";
-import type { Exit } from "effect";
 import type { Env } from "../alchemy.run";
 import {
   initSync,
@@ -53,6 +53,8 @@ import {
   PostingSpans,
   TermCatalog,
   TermCatalogBatch,
+  TermFilters,
+  TermFilterHeader,
   CatalogTelemetry,
   LocatedDocument,
   RankingInput,
@@ -288,38 +290,75 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
     if (
       request.method !== "GET" ||
       props._tag === "Failure" ||
-      url.pathname !== "/catalog-v8" ||
+      url.pathname !== "/catalog-v9" ||
       props.value.bucket !== this.env.STORAGE_CACHE_SCOPE
     )
       return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });
+    const filters = {
+      value: Schema.decodeUnknownExit(TermFilterHeader)(request.headers.get("x-kannin-filters")),
+    };
+    if (props.value.selection.kind === "filters")
+      filters.value = Exit.succeed(props.value.selection.filters);
+    if (filters.value._tag === "Failure")
+      return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });
+    const actual = filters.value.value;
+    const fields = [...new Set(actual.map((filter) => filter.field))].toSorted();
+    const selection = props.value.selection;
+    if (
+      selection.kind === "fields" &&
+      (fields.length !== selection.fields.length ||
+        fields.some((field, index) => field !== selection.fields[index]))
+    )
+      return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });
+    const encodedFilters = Schema.encodeSync(TermFilters)(actual);
     return Effect.runPromise(
-      readTermProjections(
-        props.value.ranges,
-        this.ctx.props.terms,
-        this.ctx.props.filters,
-        this.ctx,
-      ).pipe(
+      readTermProjections(props.value.ranges, this.ctx.props.terms, encodedFilters, this.ctx).pipe(
         Effect.flatMap(({ catalogs, telemetry }) =>
           Effect.gen(function* () {
             const entryEnded = yield* Clock.currentTimeNanos;
+            const hasMinimum = catalogs.some((catalog) => catalog.eligibility === null);
+            const filterDigest = { value: Option.none<string>() };
+            if (hasMinimum)
+              filterDigest.value = yield* Effect.tryPromise(() => sha256(encodedFilters)).pipe(
+                Effect.asSome,
+              );
+            const wire = catalogs.map((catalog) => {
+              const projection = { dictionary: catalog.dictionary, partitions: catalog.partitions };
+              if (catalog.eligibility === null)
+                return {
+                  ...projection,
+                  selection: { kind: "minimum" as const, minimum: catalog.minimum },
+                };
+              return {
+                ...projection,
+                selection: { kind: "model" as const, eligibility: catalog.eligibility },
+              };
+            });
+            const cacheControl = { value: "public, max-age=31536000, immutable" };
+            if (props.value.selection.kind === "fields" && actual.length > 0 && hasMinimum)
+              cacheControl.value = "no-store";
             return yield* Effect.all([
-              Schema.encodeEffect(TermCatalogBatch)(catalogs),
+              Schema.encodeEffect(TermCatalogBatch)({
+                catalogs: wire,
+                filterDigest: Option.getOrNull(filterDigest.value),
+              }),
               encodeCatalogTelemetry({
                 ...telemetry,
                 entryMs: Number(entryEnded - entryStarted) / 1e6,
               }),
+              Effect.succeed(cacheControl.value),
             ]);
           }),
         ),
-        Effect.map(([dictionary, telemetry]) =>
-          Response.json(dictionary, {
-            headers: {
-              "cache-control": "public, max-age=31536000, immutable",
-              "x-raio-cache": "terms-origin",
-              "x-kannin-catalog-telemetry": telemetry,
-            },
-          }),
-        ),
+        Effect.map(([dictionary, telemetry, cacheControl]) => {
+          const headers = new Headers({
+            "cache-control": cacheControl,
+            "x-raio-cache": "terms-origin",
+            "x-kannin-catalog-telemetry": telemetry,
+          });
+          if (cacheControl === "no-store") headers.set("vary", "x-kannin-filters");
+          return Response.json(dictionary, { headers });
+        }),
         Effect.tapError((error) =>
           Effect.logError("kannin.termProjection", { ranges: props.value.ranges, error }),
         ),

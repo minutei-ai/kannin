@@ -4273,3 +4273,18 @@ The full local workerd comparison used the same million-document corpus, sequenc
 Observed prepared-query WASM capacities were identical between variants for all four selectors: 19,333,120, 24,510,464, 8,257,536 and 8,257,536 bytes respectively. This does not measure whole-Worker peak heap. The local end-to-end gains are modest compared with the isolated preparation improvement, and these samples do not establish native Cloudflare latency or Turbopuffer parity.
 
 The complete local gate passed **289 Worker/tooling and 59 Rust tests**, including full native/WASM Clippy, Effect lint and types, filter-mask bounds, tombstones and differential comparison with complete-object evaluation across every supported filter operator.
+
+### Native validation of reused filter values
+
+Alchemy profile `minutei` deployed source `97fdf5c` as version `8968bc7e-1218-4912-b7d6-fb5f1a6aedfa`, verified at 100% traffic with Smart Placement, the same physical R2 bucket and unchanged lifecycle rules. The deployment and unconditional vector metadata migration completed. A direct native R2 read confirmed that the original million-document manifest remained byte-identical, with sequence 2000 and 200 sources.
+
+Before and after deployment, eight mixed rounds each ran four strong selectors, rebuilding coordinator memory before each query and using fresh equivalent predicates. All **64 complete responses** matched, including scores, revisions, attributes and sequence. HTTP medians exclude two warmup rounds. Coordinator CPU joins exact response CF-Ray values to successful SearchNamespace events, paired by selector and round. Twenty-seven of 32 candidate events were available, all on the deployed version; missing events are excluded rather than treated as zero.
+
+| Existing index selector | HTTP median before/after | Paired coordinator CPU before/after | CPU pairs |
+| ----------------------- | -----------------------: | ----------------------------------: | --------: |
+| Sixteen rare terms      |       421.41 / 412.86 ms |                        112 / 107 ms |         5 |
+| Sixty-four rare terms   |       596.43 / 566.77 ms |                        212 / 207 ms |         5 |
+| Dense group 72          |       662.86 / 620.08 ms |                         100 / 89 ms |         5 |
+| Dense group 43          |       624.00 / 619.73 ms |                    111.5 / 103.5 ms |         4 |
+
+HTTP and observed paired CPU medians decreased for all four selectors. Request placement changed from local-GRU before deployment to remote-ATL afterward, while ingress remained GRU. These small sequential, cache-sensitive samples do not isolate the optimization's contribution from placement and run-to-run variation, nor establish fully cold backend latency, whole-Worker CPU cost or sustained capacity. The controlled local preparation probe and complete-query comparison provide separate evidence for the allocation reduction.

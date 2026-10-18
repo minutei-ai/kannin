@@ -2237,12 +2237,25 @@ pub mod wasm {
     #[serde(deny_unknown_fields)]
     struct EligibilityProjection {
         fields: Vec<String>,
-        groups: Vec<(Vec<Vec<String>>, u32, u32)>,
+        data: EligibilityData,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+    enum EligibilityData {
+        Joint {
+            groups: Vec<(Vec<Vec<String>>, u32, u32)>,
+        },
+        Marginal {
+            columns: Vec<Vec<(Option<String>, u32, u32)>>,
+        },
     }
 
     struct EligibilityProjectionBuilder {
         fields: Vec<String>,
         groups: Option<BTreeMap<String, (u32, u32)>>,
+        columns: Option<Vec<BTreeMap<String, (u32, u32)>>>,
+        scalar: Vec<u8>,
         bytes: usize,
     }
 
@@ -2260,8 +2273,33 @@ pub mod wasm {
             Ok(Self {
                 fields,
                 groups,
+                columns: None,
+                scalar: Vec::new(),
                 bytes,
             })
+        }
+
+        fn push_columns(&mut self, values: &[Vec<String>], title: u32, body: u32) {
+            let Some(columns) = &mut self.columns else {
+                return;
+            };
+            for (column, values) in columns.iter_mut().zip(values) {
+                let key = values.first().map_or("", String::as_str);
+                if let Some((a, b)) = column.get_mut(key) {
+                    *a = (*a).min(title);
+                    *b = (*b).min(body);
+                } else {
+                    self.bytes += key.len() + 32;
+                    if self.bytes > 4096 {
+                        self.columns = None;
+                        return;
+                    }
+                    column.insert(key.to_owned(), (title, body));
+                }
+            }
+            if columns.iter().map(BTreeMap::len).sum::<usize>() > 256 {
+                self.columns = None;
+            }
         }
 
         fn push(
@@ -2270,9 +2308,9 @@ pub mod wasm {
             title: u32,
             body: u32,
         ) -> Result<(), String> {
-            let Some(groups) = &mut self.groups else {
+            if self.groups.is_none() && self.columns.is_none() {
                 return Ok(());
-            };
+            }
             if self
                 .fields
                 .iter()
@@ -2288,6 +2326,36 @@ pub mod wasm {
                     > 4096
             {
                 self.groups = None;
+                self.columns = None;
+                return Ok(());
+            }
+            if self.groups.is_none() {
+                let Some(columns) = &mut self.columns else {
+                    return Ok(());
+                };
+                for (field, column) in self.fields.iter().zip(columns.iter_mut()) {
+                    self.scalar.clear();
+                    if let Some(value) = attributes.get(field) {
+                        serde_json::to_writer(&mut self.scalar, value)
+                            .map_err(|cause| cause.to_string())?;
+                    }
+                    let key =
+                        std::str::from_utf8(&self.scalar).map_err(|cause| cause.to_string())?;
+                    if let Some((a, b)) = column.get_mut(key) {
+                        *a = (*a).min(title);
+                        *b = (*b).min(body);
+                    } else {
+                        self.bytes += key.len() + 32;
+                        if self.bytes > 4096 {
+                            self.columns = None;
+                            return Ok(());
+                        }
+                        column.insert(key.to_owned(), (title, body));
+                    }
+                }
+                if columns.iter().map(BTreeMap::len).sum::<usize>() > 256 {
+                    self.columns = None;
+                }
                 return Ok(());
             }
             let values: Vec<Vec<_>> = self
@@ -2302,6 +2370,10 @@ pub mod wasm {
                 })
                 .collect::<Result<_, _>>()
                 .map_err(|cause| cause.to_string())?;
+            let Some(groups) = &mut self.groups else {
+                self.push_columns(&values, title, body);
+                return Ok(());
+            };
             let key = serde_json::to_string(&values).map_err(|cause| cause.to_string())?;
             if let Some((minimum_title, minimum_body)) = groups.get_mut(&key) {
                 *minimum_title = (*minimum_title).min(title);
@@ -2309,7 +2381,18 @@ pub mod wasm {
             } else {
                 self.bytes += key.len() + 32;
                 if groups.len() >= 256 || self.bytes > 4096 {
-                    self.groups = None;
+                    let previous = self.groups.take().unwrap_or_default();
+                    self.columns = Some(self.fields.iter().map(|_| BTreeMap::new()).collect());
+                    self.bytes = serde_json::to_vec(&self.fields)
+                        .map_err(|cause| cause.to_string())?
+                        .len()
+                        + 64;
+                    for (key, (a, b)) in previous {
+                        let values: Vec<Vec<String>> =
+                            serde_json::from_str(&key).map_err(|cause| cause.to_string())?;
+                        self.push_columns(&values, a, b);
+                    }
+                    self.push_columns(&values, title, body);
                     return Ok(());
                 }
                 groups.insert(key, (title, body));
@@ -2319,7 +2402,23 @@ pub mod wasm {
 
         fn finish(self) -> Result<Option<EligibilityProjection>, String> {
             let Some(groups) = self.groups else {
-                return Ok(None);
+                return Ok(self.columns.map(|columns| EligibilityProjection {
+                    fields: self.fields,
+                    data: EligibilityData::Marginal {
+                        columns: columns
+                            .into_iter()
+                            .map(|column| {
+                                column
+                                    .into_iter()
+                                    .map(|(key, (title, body))| {
+                                        let value = if key.is_empty() { None } else { Some(key) };
+                                        (value, title, body)
+                                    })
+                                    .collect()
+                            })
+                            .collect(),
+                    },
+                }));
             };
             let groups = groups
                 .into_iter()
@@ -2331,7 +2430,7 @@ pub mod wasm {
                 .collect::<Result<_, _>>()?;
             Ok(Some(EligibilityProjection {
                 fields: self.fields,
-                groups,
+                data: EligibilityData::Joint { groups },
             }))
         }
     }
@@ -2341,6 +2440,54 @@ pub mod wasm {
         filters: Vec<Filter>,
         fields: Vec<String>,
         field_indices: Vec<usize>,
+    }
+
+    impl EligibilityQuery {
+        fn marginal_minimum(
+            &self,
+            columns: Vec<Vec<(Option<String>, u32, u32)>>,
+        ) -> Result<Option<(u32, u32)>, String> {
+            if columns.is_empty()
+                || columns.len() != self.fields.len()
+                || columns.iter().any(Vec::is_empty)
+                || columns.iter().map(Vec::len).sum::<usize>() > 256
+            {
+                return Err("Eligibility projection omitted a field".to_owned());
+            }
+            let mut lower = Some((0_u32, 0_u32));
+            for (index, column) in columns.into_iter().enumerate() {
+                let mut minimum = None;
+                for (value, title, body) in column {
+                    let value = value
+                        .map(|encoded| serde_json::from_str::<serde_json::Value>(&encoded))
+                        .transpose()
+                        .map_err(|cause| cause.to_string())?;
+                    if value
+                        .as_ref()
+                        .is_some_and(|value| value.is_array() || value.is_object())
+                    {
+                        return Err("Eligibility value must be scalar".to_owned());
+                    }
+                    let mut matched = true;
+                    for (filter, field) in self.filters.iter().zip(&self.field_indices) {
+                        if *field == index && !filter.matches(value.as_ref())? {
+                            matched = false;
+                            break;
+                        }
+                    }
+                    if matched {
+                        minimum = Some(match minimum {
+                            Some((a, b)) => (title.min(a), body.min(b)),
+                            None => (title, body),
+                        });
+                    }
+                }
+                lower = lower
+                    .zip(minimum)
+                    .map(|((a, b), (c, d))| (a.max(c), b.max(d)));
+            }
+            Ok(lower)
+        }
     }
 
     #[wasm_bindgen]
@@ -2381,14 +2528,24 @@ pub mod wasm {
             }
             let projection: EligibilityProjection = serde_json::from_str(projection)
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
-            if projection.fields != self.fields
-                || projection.groups.is_empty()
-                || projection.groups.len() > 256
-            {
+            if projection.fields != self.fields {
+                return Err(JsValue::from_str("Eligibility projection scope mismatch"));
+            }
+            let groups = match projection.data {
+                EligibilityData::Joint { groups } => groups,
+                EligibilityData::Marginal { columns } => {
+                    let minimum = self
+                        .marginal_minimum(columns)
+                        .map_err(|cause| JsValue::from_str(&cause))?;
+                    return serde_json::to_string(&minimum)
+                        .map_err(|cause| JsValue::from_str(&cause.to_string()));
+                }
+            };
+            if groups.is_empty() || groups.len() > 256 {
                 return Err(JsValue::from_str("Eligibility projection scope mismatch"));
             }
             let mut minimum = None;
-            for (values, title, body) in projection.groups {
+            for (values, title, body) in groups {
                 if values.len() != self.fields.len() || values.iter().any(|value| value.len() > 1) {
                     return Err(JsValue::from_str("Eligibility projection omitted a field"));
                 }

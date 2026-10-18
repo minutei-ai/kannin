@@ -1634,7 +1634,7 @@ export const readTermCatalogs = Effect.fn("kannin.readTermCatalogs")(
               };
               const fetchedAt = yield* Clock.currentTimeNanos;
               const response = yield* Effect.tryPromise({
-                try: () => exports.Terms({ props }).fetch("https://terms.internal/catalog-v7"),
+                try: () => exports.Terms({ props }).fetch("https://terms.internal/catalog-v8"),
                 catch: (cause) => {
                   if (Schema.is(Rejected)(cause)) return cause;
                   return new Cause.UnknownError(cause);

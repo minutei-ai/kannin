@@ -288,7 +288,7 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
     if (
       request.method !== "GET" ||
       props._tag === "Failure" ||
-      url.pathname !== "/catalog-v7" ||
+      url.pathname !== "/catalog-v8" ||
       props.value.bucket !== this.env.STORAGE_CACHE_SCOPE
     )
       return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });

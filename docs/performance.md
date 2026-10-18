@@ -4354,3 +4354,28 @@ Alchemy profile `minutei` deployed the candidate as version `af087218-d5e7-4e33-
 The candidate executed 111 query-bound projections, but native mixed-query WASM capacity decreased only **28,901,376 to 28,770,304 bytes**, while decoded cache charge remained **20,140,254 bytes**. Placement changed from remote-ATL to remote-IAD with ingress GRU. These observations cannot isolate a causal latency change; the small native memory benefit and mixed CPU results did not justify retaining the complexity.
 
 The candidate was reverted in `db7ff7d`. Alchemy redeployed the restored runtime as version `2a6ef10d-0d48-49e6-8df9-cc16142459ea`, verified at 100% traffic with Smart Placement, the same physical R2 bucket and unchanged lifecycle rules. Restored Worker and WASM artifacts matched the pre-experiment build byte for byte. The original canonical million-document manifest remained byte-identical, and four native rollback controls matched baseline rows, scores, attributes, revisions and sequence. Query-bound directory decoding is **not shipped**.
+
+## Bounded marginal field eligibility
+
+Dense queries with fresh predicate values could issue 25 catalog RPCs on every query even when term projections were retained. The million-document fixture has 100 group values and seven years, producing 700 joint combinations. Exact joint eligibility exceeded the existing 256-group/four-KiB admission limits and was discarded.
+
+Rust now preserves small exact joint models and folds oversized joint models into per-field minima, under the same total 256-value/four-KiB limits. Every predicate on a field applies before taking that field's minimum title/body lengths. Their componentwise maximum is a conservative lower bound on lengths in the full conjunction. A field with no match proves the conjunction empty; separate matching fields do not prove an intersection. Full filters and tombstones still apply before top-k. Missing attributes and explicit null remain distinct. The private catalog cache path changes to `catalog-v8`; canonical R2 objects and derived overview encodings do not change.
+
+The first prototype improved repeated dense queries but increased initial model acquisition. An isolated eight-source WASM projection probe measured 12.51 / 14.72 ms baseline/candidate medians, excluding three warmup rounds. Separately, 200 model decode/encode pairs cost 215.66 ms with full scalar validation, versus 39.23 ms for a primitive-only diagnostic control. The diagnostic control was never used in the application. The retained Schema reuses only successful validation of short encoded scalars, bounded to 256 entries of at most 64 UTF-16 code units. Unknown values still run the complete concrete Schema, invalid values are never retained, and longer strings always revalidate. A subsequent probe measured 48.20 ms for strict validation with reuse. These isolated observations motivated the change; they are separate from full-query timings.
+
+The final local gate passed **293 Worker/tooling and 59 Rust tests**, including native/WASM Clippy, Effect lint and types. New coverage compares marginal bounds with complete-directory minima across scalar operators, missing/null values and impossible cross-field correlations. Complete workerd queries compare original and compacted layouts after updates and deletions, and verify zero additional catalog RPCs after the first model acquisition. Invalid scalar encodings remain rejected after validation-cache saturation.
+
+The full comparison used the same million-document local R2 fixture and sequence 2000. Each variant started in a fresh workerd process, with alternating order across three cohorts and eight query rounds using equivalent fresh predicates. All **384 complete responses**, including scores, attributes, revisions and sequence, matched. Prepared caches retained derived R2 artifacts; partial loss replaced correlated pool and batch prefixes with verified empty prefixes; total loss also replaced the directory prefix. Prefix presence and empty controls were checked. Operating-system and storage caches could remain warm. First-query medians have three samples per cell; repeated medians have 21.
+
+| Cache state  | Selector              | First baseline/candidate ms | Repeated baseline/candidate ms |
+| ------------ | --------------------- | --------------------------: | -----------------------------: |
+| Prepared     | Sixteen rare terms    |             664.09 / 598.49 |                  58.96 / 55.40 |
+| Prepared     | Sixty-four rare terms |           1040.50 / 1115.64 |                193.54 / 198.30 |
+| Prepared     | Dense group 72        |           1030.19 / 1162.40 |                 481.24 / 67.10 |
+| Prepared     | Dense group 43        |           1045.55 / 1210.67 |                 434.44 / 63.73 |
+| Partial loss | Sixty-four rare terms |           2389.00 / 2370.29 |                195.62 / 195.20 |
+| Partial loss | Dense group 43        |           4803.25 / 4767.45 |                 406.22 / 54.07 |
+| Total loss   | Sixty-four rare terms |           3337.54 / 3396.55 |                189.71 / 192.75 |
+| Total loss   | Dense group 43        |           5503.01 / 5200.06 |                 401.73 / 55.40 |
+
+Dense repeated queries issued **25 instead of 200 catalog calls** over eight prepared-cache rounds, and 50 instead of 200 under partial/total loss. Rare-query call counts stayed unchanged. Prepared first dense reads increased 13–16%; total-loss dense recovery decreased about 5.5%. This is a cache construction tradeoff, not a universal cold-read improvement or a production latency guarantee.

@@ -1276,7 +1276,8 @@ test("field eligibility retains numeric wire values, missing cells and query sco
     segment_overview_project(directory.overview(), '["alpha"]', warm),
   );
   if (projected.eligibility === null) throw new Error("Missing eligibility projection");
-  const raw = projected.eligibility.groups.flatMap(([values]) => values.flat());
+  if (projected.eligibility.data.kind !== "joint") throw new Error("Expected joint projection");
+  const raw = projected.eligibility.data.groups.flatMap(([values]) => values.flat());
   expect(raw).toContain("2.0");
   expect(raw).toContain("9007199254740993");
   const encoded = Schema.encodeSync(Schema.fromJsonString(EligibilityProjection))(
@@ -1298,7 +1299,9 @@ test("field eligibility retains numeric wire values, missing cells and query sco
   expect(() =>
     query.minimum(JSON.stringify({ ...projected.eligibility, fields: ["other"] })),
   ).toThrow();
-  expect(() => query.minimum('{"fields":["year"],"groups":[[[["[]"]],0,0]]}')).toThrow();
+  expect(() =>
+    query.minimum('{"fields":["year"],"data":{"kind":"joint","groups":[[[["[]"]],0,0]]}}'),
+  ).toThrow();
 });
 
 test("oversized field projections retain the original minimum fallback", () => {
@@ -1391,5 +1394,197 @@ test("indexed eligibility predicates preserve field order, duplicates and every 
     using reversed = new EligibilityQuery(encodeFilters(filters.toReversed()));
     expect(query.minimum(encoded)).toBe(directory.minimum(encodedFilters));
     expect(reversed.minimum(encoded)).toBe(query.minimum(encoded));
+  }
+});
+
+test("marginal eligibility bounds remain conservative across scalar predicates", () => {
+  using segment = new Segment(
+    JSON.stringify(
+      Array.from({ length: 1400 }, (_, index) => ({
+        id: String(index),
+        revision: 1,
+        title: "alpha ".repeat(index % 5),
+        text: "alpha ".repeat(1 + (index % 13)),
+        attributes: { group: index % 100, year: 2020 + (index % 7) },
+      })),
+    ),
+  );
+  using directory = new Directory(segment.bytes());
+  const encodeFilters = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Filter)));
+  const warm = encodeFilters([
+    { field: "group", op: "exists", value: true },
+    { field: "year", op: "exists", value: true },
+  ]);
+  const projected = Schema.decodeSync(Schema.fromJsonString(ProjectedTermCatalog))(
+    segment_overview_project(directory.overview(), '["alpha"]', warm),
+  );
+  if (projected.eligibility?.data.kind !== "marginal")
+    throw new Error("Expected bounded marginal projection");
+  expect(projected.eligibility.data.columns.map((column) => column.length)).toEqual([100, 7]);
+  const encoded = Schema.encodeSync(Schema.fromJsonString(EligibilityProjection))(
+    projected.eligibility,
+  );
+  expect(encoded.length).toBeLessThanOrEqual(4096);
+  const cases = Schema.decodeSync(Schema.Array(Schema.Array(Filter)))([
+    [
+      { field: "group", op: "eq", value: 72 },
+      { field: "year", op: "gte", value: 2021 },
+    ],
+    [
+      { field: "group", op: "ne", value: 72 },
+      { field: "year", op: "lt", value: 2024 },
+    ],
+    [
+      { field: "group", op: "in", value: [0, 42, 99] },
+      { field: "year", op: "gt", value: 2020 },
+    ],
+    [
+      { field: "group", op: "lte", value: 2 },
+      { field: "year", op: "eq", value: 2026 },
+    ],
+    [
+      { field: "group", op: "gte", value: 0 },
+      { field: "year", op: "exists", value: false },
+    ],
+    [
+      { field: "group", op: "eq", value: 100 },
+      { field: "year", op: "exists", value: true },
+    ],
+    [
+      { field: "group", op: "gt", value: 50 },
+      { field: "group", op: "lt", value: 20 },
+      { field: "year", op: "ne", value: null },
+    ],
+  ]);
+  for (const filters of cases) {
+    const input = encodeFilters(filters);
+    using query = new EligibilityQuery(input);
+    const lower = Schema.decodeSync(Schema.fromJsonString(EligibleMinimum))(query.minimum(encoded));
+    const exact = Schema.decodeSync(Schema.fromJsonString(EligibleMinimum))(
+      directory.minimum(input),
+    );
+    if (exact !== null) {
+      expect(lower).not.toBeNull();
+      if (lower === null) throw new Error("Lost eligible documents");
+      expect(lower[0]).toBeLessThanOrEqual(exact[0]);
+      expect(lower[1]).toBeLessThanOrEqual(exact[1]);
+    }
+    if (lower === null) expect(exact).toBeNull();
+  }
+  using query = new EligibilityQuery(warm);
+  expect(() =>
+    query.minimum(
+      JSON.stringify({ ...projected.eligibility, data: { kind: "marginal", columns: [] } }),
+    ),
+  ).toThrow();
+  expect(() =>
+    query.minimum(
+      JSON.stringify({
+        ...projected.eligibility,
+        data: { kind: "marginal", columns: [[["[]", 0, 0]], [["0", 0, 0]]] },
+      }),
+    ),
+  ).toThrow();
+});
+
+test("marginal bounds preserve missing and null values without assuming field correlation", () => {
+  const attributes = [{}, { flag: null }, { flag: true }, { flag: false }];
+  using segment = new Segment(
+    JSON.stringify(
+      Array.from({ length: 2800 }, (_, index) => ({
+        id: String(index),
+        revision: 1,
+        title: "alpha ".repeat(index % 5),
+        text: "alpha ".repeat(1 + (index % 13)),
+        attributes: { group: index % 100, year: 2020 + (index % 7), ...attributes[index % 4] },
+      })),
+    ),
+  );
+  using directory = new Directory(segment.bytes());
+  const encodeFilters = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Filter)));
+  const common = [
+    { field: "group", op: "gte", value: 0 },
+    { field: "year", op: "gte", value: 2020 },
+  ] as const;
+  const warm = encodeFilters([...common, { field: "flag", op: "exists", value: true }]);
+  const projected = Schema.decodeSync(Schema.fromJsonString(ProjectedTermCatalog))(
+    segment_overview_project(directory.overview(), '["alpha"]', warm),
+  );
+  if (projected.eligibility?.data.kind !== "marginal")
+    throw new Error("Expected marginal projection");
+  const encoded = Schema.encodeSync(Schema.fromJsonString(EligibilityProjection))(
+    projected.eligibility,
+  );
+  const cases = Schema.decodeSync(Schema.Array(Filter))([
+    { field: "flag", op: "eq", value: null },
+    { field: "flag", op: "ne", value: null },
+    { field: "flag", op: "exists", value: false },
+    { field: "flag", op: "exists", value: true },
+    { field: "flag", op: "in", value: [true, null] },
+  ]);
+  for (const predicate of cases) {
+    const filters = encodeFilters([...common, predicate]);
+    using query = new EligibilityQuery(filters);
+    const lower = Schema.decodeSync(Schema.fromJsonString(EligibleMinimum))(query.minimum(encoded));
+    const exact = Schema.decodeSync(Schema.fromJsonString(EligibleMinimum))(
+      directory.minimum(filters),
+    );
+    expect(lower).not.toBeNull();
+    expect(exact).not.toBeNull();
+    if (lower === null || exact === null) throw new Error("Lost scalar eligibility");
+    expect(lower[0]).toBeLessThanOrEqual(exact[0]);
+    expect(lower[1]).toBeLessThanOrEqual(exact[1]);
+  }
+  const impossible = encodeFilters([
+    { field: "group", op: "eq", value: 0 },
+    { field: "year", op: "gte", value: 2020 },
+    { field: "flag", op: "eq", value: true },
+  ]);
+  using query = new EligibilityQuery(impossible);
+  expect(directory.minimum(impossible)).toBe("null");
+  expect(query.minimum(encoded)).not.toBe("null");
+});
+
+test("encoded eligibility scalar validation survives bounded reuse and rejects invalid values", () => {
+  const decode = Schema.decodeExit(EligibilityProjection);
+  for (const index of Array.from({ length: 600 }, (_, value) => value)) {
+    expect(
+      decode({ fields: ["year"], data: { kind: "marginal", columns: [[[String(index), 0, 0]]] } })
+        ._tag,
+    ).toBe("Success");
+  }
+  for (const value of [
+    "[]",
+    "{}",
+    "undefined",
+    "NaN",
+    "Infinity",
+    "1e309",
+    '"\\ud800"',
+    '"\\udfff"',
+    '"unterminated',
+  ]) {
+    for (const repeat of [0, 1]) {
+      expect(
+        decode({
+          fields: ["year"],
+          data: { kind: "marginal", columns: [[[value, repeat, repeat]]] },
+        })._tag,
+      ).toBe("Failure");
+    }
+  }
+  for (const value of [
+    "null",
+    "true",
+    "false",
+    "2.0",
+    "9007199254740993",
+    "1e308",
+    '"\\ud83d\\ude00"',
+    JSON.stringify("a".repeat(128)),
+  ]) {
+    expect(
+      decode({ fields: ["year"], data: { kind: "marginal", columns: [[[value, 0, 0]]] } })._tag,
+    ).toBe("Success");
   }
 });

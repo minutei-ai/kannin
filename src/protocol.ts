@@ -343,23 +343,50 @@ export const TermProjection = Schema.Struct({
   partitions: Schema.NullOr(Schema.Array(TermSummaries).check(Schema.isBetweenLength(1, 32))),
 });
 const decodeEligibilityScalar = Schema.decodeExit(Schema.fromJsonString(Scalar));
+const validatedEligibilityScalars = new Set<string>();
 const EncodedEligibilityScalar = Schema.String.check(
-  Schema.makeFilter(
-    (value) =>
-      decodeEligibilityScalar(value)._tag === "Success" || "Expected encoded attribute scalar",
-  ),
+  Schema.makeFilter((value) => {
+    if (validatedEligibilityScalars.has(value)) return true;
+    if (decodeEligibilityScalar(value)._tag !== "Success")
+      return "Expected encoded attribute scalar";
+    if (value.length <= 64) {
+      if (validatedEligibilityScalars.size >= 256) {
+        const oldest = validatedEligibilityScalars.values().next().value;
+        if (oldest !== undefined) validatedEligibilityScalars.delete(oldest);
+      }
+      validatedEligibilityScalars.add(value);
+    }
+    return true;
+  }),
 );
 export const EligibilityProjection = Schema.Struct({
   fields: Schema.Array(FieldName).check(Schema.isMaxLength(16)),
-  groups: Schema.Array(
-    Schema.Tuple([
-      Schema.Array(Schema.Array(EncodedEligibilityScalar).check(Schema.isMaxLength(1))).check(
-        Schema.isMaxLength(16),
-      ),
-      SegmentBlock.fields.min_title_length,
-      SegmentBlock.fields.min_body_length,
-    ]),
-  ).check(Schema.isBetweenLength(1, 256)),
+  data: Schema.Union([
+    Schema.Struct({
+      kind: Schema.Literal("joint"),
+      groups: Schema.Array(
+        Schema.Tuple([
+          Schema.Array(Schema.Array(EncodedEligibilityScalar).check(Schema.isMaxLength(1))).check(
+            Schema.isMaxLength(16),
+          ),
+          SegmentBlock.fields.min_title_length,
+          SegmentBlock.fields.min_body_length,
+        ]),
+      ).check(Schema.isBetweenLength(1, 256)),
+    }),
+    Schema.Struct({
+      kind: Schema.Literal("marginal"),
+      columns: Schema.Array(
+        Schema.Array(
+          Schema.Tuple([
+            Schema.NullOr(EncodedEligibilityScalar),
+            SegmentBlock.fields.min_title_length,
+            SegmentBlock.fields.min_body_length,
+          ]),
+        ).check(Schema.isBetweenLength(1, 256)),
+      ).check(Schema.isBetweenLength(1, 16)),
+    }),
+  ]),
 });
 export const TermCatalog = TermProjection.mapFields((fields) => ({
   ...fields,

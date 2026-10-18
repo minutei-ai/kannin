@@ -4379,3 +4379,29 @@ The full comparison used the same million-document local R2 fixture and sequence
 | Total loss   | Dense group 43        |           5503.01 / 5200.06 |                 401.73 / 55.40 |
 
 Dense repeated queries issued **25 instead of 200 catalog calls** over eight prepared-cache rounds, and 50 instead of 200 under partial/total loss. Rare-query call counts stayed unchanged. Prepared first dense reads increased 13–16%; total-loss dense recovery decreased about 5.5%. This is a cache construction tradeoff, not a universal cold-read improvement or a production latency guarantee.
+
+### Native validation of marginal eligibility
+
+Alchemy profile `minutei` deployed source `b1bf64d` as version `6e9613d9-f34d-4957-a0d2-6c13a1fb5ffb`, verified at 100% traffic with Smart Placement, the same physical R2 bucket and unchanged lifecycle rules. Deployment and the unconditional vector metadata migration completed. A direct native R2 read confirmed the original million-document manifest remained byte-identical, with sequence 2000 and 200 sources.
+
+Eight mixed rounds each ran four strong selectors after an initial coordinator rebuild, using fresh equivalent predicates and an absent nonce term for dense selectors. All **64 complete responses** matched. HTTP and paired coordinator CPU medians exclude two warmup rounds, leaving six samples per selector. Every before/after coordinator event was available and joined by exact response CF-Ray; all candidate events were on the deployed version.
+
+| Selector              | HTTP median before/after | Coordinator CPU before/after | CPU pairs |
+| --------------------- | -----------------------: | ---------------------------: | --------: |
+| Sixteen rare terms    |       271.50 / 290.27 ms |               45.5 / 32.5 ms |         6 |
+| Sixty-four rare terms |       376.25 / 352.80 ms |               116 / 107.5 ms |         6 |
+| Dense group 72        |       490.01 / 268.05 ms |                 43 / 35.5 ms |         6 |
+| Dense group 43        |       623.97 / 223.39 ms |               50.5 / 34.5 ms |         6 |
+
+Measured warm dense selectors made **zero catalog RPCs**, versus 25 before. The repeated parent CPU and wall-time observations decreased, but parent CPU excludes the separate Terms invocations; this does not establish whole-system compute cost or sustained capacity. Placement changed from remote-IAD to remote-EWR with GRU ingress, so HTTP changes cannot be attributed solely to the code.
+
+A separate four-round series rebuilt coordinator memory before every query, then ran each selector with a fresh predicate. All **32 complete before/after responses** matched. The following medians include all four reset samples per selector; no reset observation is silently treated as warm. All sixteen before/after coordinator events were available and paired by CF-Ray, and all candidate events used the deployed version. Rebuild itself reloads the canonical manifest, and derived/native caches may survive: these are coordinator-reset observations, not fully cold Cloudflare storage or fresh-isolate guarantees.
+
+| Selector after coordinator reset | HTTP median before/after | Coordinator CPU before/after | CPU pairs |
+| -------------------------------- | -----------------------: | ---------------------------: | --------: |
+| Sixteen rare terms               |       492.86 / 618.85 ms |               109.5 / 108 ms |         4 |
+| Sixty-four rare terms            |       869.48 / 605.02 ms |             225.5 / 206.5 ms |         4 |
+| Dense group 72                   |       630.97 / 885.00 ms |                 110 / 129 ms |         4 |
+| Dense group 43                   |       670.40 / 951.39 ms |               102 / 111.5 ms |         4 |
+
+Reset dense queries still acquired 25 catalogs and became slower in this sample, consistent with the prepared first-read setup cost seen locally, though placement and source-cache memory/API hit distribution also changed. Faster repeated reads do **not** establish the requested cold-and-warm production target. The remaining acquisition path needs immutable field-model reuse across predicate values and coordinator restarts; the deployed result retains this known cold-read limitation.

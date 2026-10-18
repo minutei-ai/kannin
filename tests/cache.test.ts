@@ -189,7 +189,7 @@ test("concurrent cold edge queries share immutable range acquisition", async () 
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(5);
+  expect(after.rangeReads - before.rangeReads).toBe(3);
 });
 
 test("term projection batches preserve global frequencies and filter eligibility at their boundary", async () => {

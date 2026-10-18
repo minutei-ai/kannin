@@ -77,6 +77,7 @@ for (const kind of ["text", "vector"])
       if (rootObject === null) throw new Error("Missing root");
       const root = Schema.decodeUnknownSync(Root)(await rootObject.json());
       const ranges = [];
+      const payloadBytes = { total: 0 };
       for (const segment of root.segments) {
         const object = await bucket.get(segment.key, {
           range: { offset: 0, length: segment.headerBytes },
@@ -87,14 +88,25 @@ for (const kind of ["text", "vector"])
         const documents = Schema.decodeSync(Schema.fromJsonString(SegmentHeader.fields.documents))(
           directory.rows(JSON.stringify(Array.from({ length: segment.count }, (_, row) => row))),
         );
-        for (const document of documents)
-          ranges.push({
+        for (const document of documents) {
+          payloadBytes.total += document.data.length;
+          const range = {
             key: segment.key,
             offset: segment.headerBytes + document.data.offset,
             length: document.data.length,
-          });
+          };
+          if (range.length <= 32768) {
+            const end = Math.min(
+              segment.bytes,
+              Math.ceil((range.offset + range.length) / 32768) * 32768,
+            );
+            range.offset = Math.floor(range.offset / 32768) * 32768;
+            range.length = end - range.offset;
+          }
+          ranges.push(range);
+        }
       }
-      const total = ranges.reduce((sum, range) => sum + range.length, 0);
+      const total = payloadBytes.total;
       if (size === "small") expect(total).toBeLessThanOrEqual(65536);
       else expect(total).toBeGreaterThan(65536);
       expect(

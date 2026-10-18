@@ -1,5 +1,17 @@
 import { Schema } from "effect";
-import { SegmentRange, SegmentHeader, CacheMetrics } from "../src/protocol";
+import {
+  SegmentRange,
+  SegmentHeader,
+  CacheMetrics,
+  TermProjectionRange,
+  DataRange,
+} from "../src/protocol";
+
+export const DocumentPageProbeInput = Schema.Struct({
+  source: TermProjectionRange,
+  bytes: SegmentRange.fields.length,
+  pages: Schema.Array(DataRange).check(Schema.isBetweenLength(1, 4)),
+});
 
 export const RangeProbeInput = Schema.Struct({
   ...SegmentRange.fields,

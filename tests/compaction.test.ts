@@ -237,7 +237,7 @@ test("large gaps between pruned term spans retain separate reads", async () => {
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(6);
+  expect(after.rangeReads - before.rangeReads).toBe(4);
 });
 
 test("nearby pruned term spans share a bounded range without decoding gap blocks", async () => {
@@ -270,7 +270,7 @@ test("nearby pruned term spans share a bounded range without decoding gap blocks
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(5);
+  expect(after.rangeReads - before.rangeReads).toBe(3);
 });
 
 test("adjacent term spans share one range across acquisition windows", async () => {
@@ -294,7 +294,7 @@ test("adjacent term spans share one range across acquisition windows", async () 
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(5);
+  expect(after.rangeReads - before.rangeReads).toBe(3);
   for (const match of ["all", "phrase"] as const) {
     const result = Schema.decodeUnknownSync(QueryResult)(
       await (await request(worker, namespace, "query", { ...textQuery(text, 10), match })).json(),

@@ -482,7 +482,7 @@ test("vector top-k materializes only the requested live document pages", async (
   expect(after.rangeReads - before.rangeReads).toBe(1);
 });
 
-test("vector materialization batches adjacent pages in provider score order", async () => {
+test("vector materialization shares byte windows while preserving provider score order", async () => {
   const namespace = "vector-reverse-pages";
   await request(worker, namespace, "write", {
     requestId: "pages",
@@ -513,7 +513,7 @@ test("vector materialization batches adjacent pages in provider score order", as
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(3);
+  expect(after.rangeReads - before.rangeReads).toBe(1);
 });
 
 test("small vector top-k avoids locating every candidate segment", async () => {

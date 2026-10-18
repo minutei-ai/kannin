@@ -1944,6 +1944,18 @@ export function bloomCandidates(
   return selected;
 }
 
+async function readDocumentBytes(key: string, offset: number, length: number, totalBytes: number) {
+  const identity = `${env.STORAGE_CACHE_SCOPE}:${key}/${offset}/${length}`;
+  const windowBytes = SMALL_RANGE_LIMIT / 2;
+  if (length > windowBytes || buffers.has(identity)) return range(key, offset, length);
+  const start = Math.floor(offset / windowBytes) * windowBytes;
+  const end = Math.min(totalBytes, Math.ceil((offset + length) / windowBytes) * windowBytes);
+  const bytes = await range(key, start, end - start);
+  const frame = bytes.slice(offset - start, offset - start + length);
+  remember(identity, frame);
+  return frame;
+}
+
 export async function readDocument(
   key: string,
   headerBytes: number,
@@ -1956,7 +1968,7 @@ export async function readDocument(
     throw new Rejected({ status: 503, message: "Invalid segment document range" });
   const page: { bytes: Uint8Array } = { bytes: new Uint8Array(0) };
   if (payload !== undefined) page.bytes = payload.subarray(data.offset, data.offset + data.length);
-  else page.bytes = await range(key, offset, data.length);
+  else page.bytes = await readDocumentBytes(key, offset, data.length, totalBytes);
   const bytes = page.bytes;
   return decodeStoredDocument(segment_document(bytes));
 }
@@ -2011,7 +2023,8 @@ export const readDocuments = Effect.fn("raio.readDocuments")(function* (
     );
   const bytes = yield* permits.withPermit(
     Effect.tryPromise({
-      try: () => range(key, headerBytes + first.offset, span.end - first.offset),
+      try: () =>
+        readDocumentBytes(key, headerBytes + first.offset, span.end - first.offset, totalBytes),
       catch: (cause) => {
         if (Schema.is(Rejected)(cause)) return cause;
         return new Cause.UnknownError(cause);

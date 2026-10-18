@@ -83,7 +83,7 @@ test("sparse ranking overlaps reads before top-k fills within the existing four-
     Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Array(Schema.Int)))(
       nearlyFull.headers.get("x-fixture-starts"),
     ),
-  ).toHaveLength(6);
+  ).toHaveLength(4);
   for (const segment of Array.from({ length: 8 }, (_, index) => index))
     expect(
       (

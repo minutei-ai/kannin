@@ -1,14 +1,16 @@
 import { env } from "cloudflare:workers";
-import { Effect, Match, Option, Schema } from "effect";
+import { Effect, Match, Option, Schema, Semaphore } from "effect";
 import {
   cacheUsage,
   clearImmutableCache,
   range,
   addFrequencyPosting,
   withDirectory,
+  readDocuments,
+  documentReadConcurrency,
 } from "../src/storage";
 import { Segment, Directory } from "../dist/wasm/raio_engine";
-import { SegmentHeader, RankingInput } from "../src/protocol";
+import { SegmentHeader, RankingInput, StoredDocument } from "../src/protocol";
 import {
   RangeProbeInput,
   RangeProbeResult,
@@ -17,6 +19,7 @@ import {
   DirectoryAgingInput,
   DirectoryAgingResult,
   DecodedDirectoryScanResult,
+  DocumentPageProbeInput,
 } from "./range-contract";
 
 export { Segments, SearchNamespace } from "../src/worker";
@@ -26,6 +29,33 @@ export default {
     if (request.headers.get("authorization") !== `Bearer ${env.API_TOKEN}`)
       return new Response(null, { status: 401 });
     if (request.method !== "POST") return new Response(null, { status: 405 });
+    if (new URL(request.url).pathname === "/document-pages") {
+      const input = Schema.decodeUnknownSync(DocumentPageProbeInput)(await request.json());
+      const before = cacheUsage();
+      const response = await Effect.runPromise(
+        Effect.gen(function* () {
+          const permits = yield* Semaphore.make(documentReadConcurrency(input.pages));
+          return yield* readDocuments(
+            input.source.key,
+            input.source.headerBytes,
+            input.pages,
+            input.bytes,
+            permits,
+          );
+        }).pipe(
+          Effect.match({
+            onFailure: () => new Response(null, { status: 503 }),
+            onSuccess: (documents) =>
+              Response.json(Schema.encodeSync(Schema.Array(StoredDocument))(documents)),
+          }),
+        ),
+      );
+      const after = cacheUsage();
+      response.headers.set("x-reads", String(after.rangeReads - before.rangeReads));
+      response.headers.set("x-bytes", String(after.rangeBytes - before.rangeBytes));
+      response.headers.set("x-charged", String(after.rangeCacheChargedBytes));
+      return response;
+    }
     if (new URL(request.url).pathname === "/decoded-directory-scan") {
       const inputs = Schema.decodeUnknownSync(DirectoryScanInput)(await request.json());
       clearImmutableCache("namespaces");

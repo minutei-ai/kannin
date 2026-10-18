@@ -17,6 +17,8 @@ Immutable field models now survive coordinator restarts through native Workers C
 
 Cold recovery uses compact canonical headers (**352 → 123 MB** over the controlled local million-document corpus) and binary derived directories (**19.8% fewer compressed directory bytes**). Earlier local first-read comparisons improved 16–25% for rare terms under surviving directory caches and about 22% with derived artifacts absent after compact canonical writes. These are separate local experiments, not fully cold Cloudflare guarantees. Existing immutable objects retain their layout; ordinary writes and compaction use compact headers. [Methods and limits](docs/performance.md).
 
+Canonical recovery also constructs immutable field models directly in Rust. The controlled local comparison preserved all 288 complete responses, but total-loss dense first reads increased **5.46 → 5.72 seconds** while preparing a reusable model. Fully cold recovery remains a performance gap. [Recovery measurements and rejected experiments](docs/performance.md#canonical-catalog-recovery-and-field-cache-admission).
+
 An earlier edge load run at source `6c03e72`, using an acknowledged sequence barrier, checked 384 complete responses against a strong baseline:
 
 | Concurrency | p50 ms | p95 ms | Requests/s |

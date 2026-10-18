@@ -3249,10 +3249,7 @@ pub mod wasm {
         super::compress_directory(bytes).map_err(|cause| JsValue::from_str(&cause))
     }
 
-    fn encode_overview(
-        header: &Header,
-        partitions: Option<&[BTreeMap<String, TermSummary>]>,
-    ) -> Result<Vec<u8>, String> {
+    fn overview_eligibility(header: &Header) -> OverviewEligibility<'_> {
         let mut eligibility = BTreeMap::new();
         for document in &header.documents {
             let lengths = eligibility
@@ -3267,9 +3264,16 @@ pub mod wasm {
             lengths.1 = lengths.1.min(document.title_length);
             lengths.2 = lengths.2.min(document.body_length);
         }
+        OverviewEligibility(eligibility)
+    }
+
+    fn encode_overview(
+        header: &Header,
+        partitions: Option<&[BTreeMap<String, TermSummary>]>,
+    ) -> Result<Vec<u8>, String> {
         let json = serde_json::to_vec(&DirectoryOverview {
             header,
-            eligibility: OverviewEligibility(eligibility),
+            eligibility: overview_eligibility(header),
             partitions,
         })
         .map_err(|cause| cause.to_string())?;
@@ -3477,6 +3481,67 @@ pub mod wasm {
                 })
                 .collect();
             serde_json::to_string(&selected).map_err(|cause| JsValue::from_str(&cause.to_string()))
+        }
+
+        #[doc = "# Errors\nRejects invalid terms, filters, attributes, or catalog serialization."]
+        pub fn catalog(&self, terms: &str, filters: &str) -> Result<String, JsValue> {
+            use serde::de::DeserializeSeed;
+
+            let terms: Vec<String> = serde_json::from_str(terms)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            let filters: Vec<Filter> = serde_json::from_str(filters)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            if terms.len() > 64 || filters.len() > 16 {
+                return Err(JsValue::from_str("Catalog projection exceeds query limits"));
+            }
+            let fields: BTreeSet<_> = filters.iter().map(|filter| filter.field.as_str()).collect();
+            let mut groups = EligibilityProjectionBuilder::new(
+                fields.iter().map(|field| (*field).to_owned()).collect(),
+            )
+            .map_err(|cause| JsValue::from_str(&cause))?;
+            let mut minimum = None;
+            if !filters.is_empty() {
+                for (attributes, title, body) in overview_eligibility(&self.header).0.into_values()
+                {
+                    let mut deserializer = serde_json::Deserializer::from_str(attributes.get());
+                    let attributes = SelectedAttributes(&fields)
+                        .deserialize(&mut deserializer)
+                        .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+                    deserializer
+                        .end()
+                        .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+                    groups
+                        .push(&attributes, title, body)
+                        .map_err(|cause| JsValue::from_str(&cause))?;
+                    if matches(&attributes, &filters).map_err(|cause| JsValue::from_str(&cause))? {
+                        minimum = Some(match minimum {
+                            Some((minimum_title, minimum_body)) => {
+                                (title.min(minimum_title), body.min(minimum_body))
+                            }
+                            None => (title, body),
+                        });
+                    }
+                }
+            }
+            if filters.is_empty() {
+                minimum = Some((0, 0));
+            }
+            let projection = Overview {
+                dictionary: terms
+                    .iter()
+                    .filter_map(|term| {
+                        self.header
+                            .terms
+                            .get(term)
+                            .map(|meta| (term.clone(), TermSummary::from(meta)))
+                    })
+                    .collect(),
+                minimum,
+                eligibility: groups.finish().map_err(|cause| JsValue::from_str(&cause))?,
+                partitions: None,
+            };
+            serde_json::to_string(&projection)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))
         }
 
         #[doc = "# Errors\nRejects invalid filters, attributes, or minimum serialization."]

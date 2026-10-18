@@ -4452,3 +4452,24 @@ Only 10/16 coordinator events were available on each side of the reset compariso
 An independent native canary used new namespaces. Four model queries changed predicate values and rebuilt coordinator memory each time; native hit counts were **0, 1, 1, 1**, with every returned identifier matching the oracle. Two concurrent unsupported-model queries returned their different expected documents through the exact fallback. Both canary namespaces were cleaned to **zero documents and zero vector-outbox entries**, with cleanup metadata verified. No existing namespace was mutated by the canary.
 
 The earlier marginal-model deployment's coordinator-reset penalty is reduced in this sample by immutable model reuse. Fully cold Cloudflare storage, cache-loss tail latency, whole-Worker peak memory, sustained load and Turbopuffer parity remain unproven; local dense recovery with total derived-cache loss still takes about 5.4 seconds.
+
+## Canonical catalog recovery and field-cache admission
+
+A fully missing derived-cache control on the compact million-document corpus spends about 95% of its first dense query in catalog acquisition. Three earlier observations recorded 5.19–5.31 seconds in `text_directory`, versus 130–152 ms in ranking. Summed source fallback durations overlap; they are neither query wall time nor CPU measurements. A phase probe on eight compact canonical headers measured about 67 ms parsing, 14 ms exact filter-minimum evaluation and 38 ms preparing overviews. This points to metadata reconstruction rather than the scoring kernel.
+
+Canonical recovery previously returned an exact minimum without a field model, even though its prepared overview could supply one. Rust now constructs the bounded model directly from the already validated directory. It uses the existing grouping of original attribute objects and the same joint/marginal projection builder. A supported model can enter native Workers Cache on this first recovery. Unsupported models retain the exact filter-bound fallback; projection failures retain the previous summary/minimum path. Overview preparation still runs for future term selectors. Canonical objects, derived frame encodings, consistency and the SDK contract do not change.
+
+A controlled local workerd comparison used the same compact million-document corpus, 200 segments and sequence 2000, with fresh processes and alternating variant order across three cohorts. Each selector ran eight rounds with changing equivalent predicates. All **288 complete responses** matched, including scores, attributes, revisions and sequence. First-query medians include every cohort; repeated medians include the other seven rounds per process.
+
+| Cache state  | Selector       | First before / after ms | Repeated before / after ms |
+| ------------ | -------------- | ----------------------: | -------------------------: |
+| Prepared     | 64 rare terms  |     1,133.17 / 1,073.60 |            186.85 / 199.71 |
+| Prepared     | Dense group 43 |     1,257.46 / 1,279.11 |              64.18 / 65.15 |
+| Partial loss | 64 rare terms  |     2,318.50 / 2,463.59 |            195.81 / 194.61 |
+| Partial loss | Dense group 43 |     5,980.72 / 4,990.68 |              55.07 / 54.75 |
+| Total loss   | 64 rare terms  |     3,472.42 / 3,556.05 |            195.03 / 198.59 |
+| Total loss   | Dense group 43 |     5,457.74 / 5,723.59 |              54.92 / 59.12 |
+
+Prepared controls retain derived artifacts. Partial loss replaces correlated pool and batch prefixes with verified empty prefixes; total loss additionally replaces the directory-frame prefix. Storage and OS caches may survive. A 25.27-second partial-loss baseline outlier remains included; the median alone does not describe its tail. These controls do not emulate native Workers Cache. Total-loss dense first reads increased about 4.9% in this sample: constructing an immediately reusable model adds initial work. This is a cache-admission improvement, not a general cold-latency reduction. Fully cold storage and sustained-load targets remain open.
+
+Two alternatives were rejected before deployment. Inline single posting blocks with SmallVec reduced isolated compact-header parsing about 2.3% and compressed-directory decoding about 4%, but five of six complete first-query cells became slower across 192 exact responses. The existing boxed block representation remains. Another prototype recovered the field model by projecting the complete newly compressed overview; all 192 responses matched, but initial recovery became slower. The retained direct Rust path avoids that complete overview decode. Neither rejected prototype was published as a production optimization.

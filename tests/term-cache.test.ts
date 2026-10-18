@@ -10,6 +10,7 @@ import {
   TermCatalogBatch,
   TermFilterHeader,
   TermFilters,
+  CatalogTelemetry,
   QueryResult,
 } from "../src/protocol";
 import { document, request, startWorker, textQuery, write } from "./harness";
@@ -149,6 +150,50 @@ test("immutable field models ignore predicate values while exact fallbacks retai
       )
     ).status,
   ).toBe(503);
+  expect(
+    (
+      await request(
+        worker,
+        "catalog-canonical",
+        "write",
+        write(
+          Array.from({ length: 700 }, (_, index) =>
+            document(String(index), "alpha ".repeat(1 + (index % 9)), {
+              group: index % 100,
+              year: 2020 + (index % 7),
+            }),
+          ),
+        ),
+      )
+    ).status,
+  ).toBe(200);
+  const canonicalRoot = await bucket.get("namespaces/catalog-canonical/root.json");
+  if (canonicalRoot === null) throw new Error("Missing canonical root");
+  const canonical = Schema.decodeSync(Schema.fromJsonString(Root))(await canonicalRoot.text());
+  for (const source of canonical.segments) {
+    await bucket.delete([
+      `cache/correlated-pool-v1/${source.key}`,
+      `cache/directory-v3/${source.key}/${source.headerBytes}`,
+    ]);
+  }
+  expect((await request(worker, "catalog-canonical", "rebuild", {})).status).toBe(200);
+  const recovered = await call("catalog-canonical", { kind: "fields", fields: ["group", "year"] }, [
+    { field: "group", op: "eq", value: 72 },
+    { field: "year", op: "gte", value: 2021 },
+  ]);
+  expect(recovered.status).toBe(200);
+  const encodedTelemetry = recovered.headers.get("x-kannin-catalog-telemetry");
+  if (encodedTelemetry === null) throw new Error("Missing recovery telemetry");
+  const telemetry = Schema.decodeSync(Schema.fromJsonString(CatalogTelemetry))(encodedTelemetry);
+  expect(telemetry.fallbackDirectories).toBe(1);
+  expect(telemetry.r2Hits).toBe(0);
+  expect(recovered.headers.get("cache-control")).toContain("immutable");
+  const recoveredBatch = Schema.decodeUnknownSync(TermCatalogBatch)(await recovered.json());
+  expect(recoveredBatch.filterDigest).toBeNull();
+  expect(recoveredBatch.catalogs[0]?.selection.kind).toBe("model");
+  expect(recoveredBatch.catalogs[0]?.dictionary).toEqual(bodies[0]?.catalogs[0]?.dictionary);
+  expect(recoveredBatch.catalogs[0]?.selection).toEqual(bodies[0]?.catalogs[0]?.selection);
+  expect(recoveredBatch.catalogs[0]?.partitions).toBeNull();
   const note = "😀ação".repeat(1800);
   expect(
     (

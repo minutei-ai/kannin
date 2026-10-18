@@ -1376,14 +1376,21 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
                     (directory) =>
                       Effect.gen(function* () {
                         telemetry.fallbackDirectories += 1;
+                        const bytes = yield* Effect.try(() => directory.overview()).pipe(
+                          Effect.orElseSucceed(() => undefined),
+                        );
+                        const projected = yield* Effect.try(() =>
+                          directory.catalog(terms, filters),
+                        ).pipe(
+                          Effect.flatMap(decodeTermCatalog),
+                          Effect.orElseSucceed(() => undefined),
+                        );
+                        if (projected !== undefined) return { bytes, catalog: projected };
                         const dictionary = yield* Effect.try(() => directory.summary(terms)).pipe(
                           Effect.flatMap(decodeTermSummaries),
                         );
                         const minimum = yield* Effect.try(() => directory.minimum(filters)).pipe(
                           Effect.flatMap(decodeEligibleMinimum),
-                        );
-                        const bytes = yield* Effect.try(() => directory.overview()).pipe(
-                          Effect.orElseSucceed(() => undefined),
                         );
                         return {
                           bytes,

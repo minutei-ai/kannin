@@ -131,6 +131,15 @@ test("compressed overviews preserve term bounds and exact filter minima across s
     for (const terms of [["rust"], ["cafe", "absent"], ["cloudflare", "rust"]]) {
       const encodedTerms = JSON.stringify(terms);
       expect(
+        Schema.decodeSync(Schema.fromJsonString(ProjectedTermCatalog))(
+          directory.catalog(encodedTerms, encodedFilters),
+        ),
+      ).toEqual(
+        Schema.decodeSync(Schema.fromJsonString(ProjectedTermCatalog))(
+          segment_overview_project(overview, encodedTerms, encodedFilters),
+        ),
+      );
+      expect(
         Schema.decodeSync(Schema.fromJsonString(TermCatalog))(
           segment_overview_project(overview, encodedTerms, encodedFilters),
         ),
@@ -194,6 +203,15 @@ test("shared attribute groups preserve minima across operators and different doc
     ]),
   );
   const directory = new Directory(segment.bytes());
+  expect(() =>
+    directory.catalog(JSON.stringify(Array.from({ length: 65 }, () => "rust")), "[]"),
+  ).toThrow();
+  expect(() =>
+    directory.catalog(
+      '["rust"]',
+      JSON.stringify(Array.from({ length: 17 }, () => ({ field: "group", op: "eq", value: 1 }))),
+    ),
+  ).toThrow();
   const overview = directory.overview();
   for (const predicate of [
     [],
@@ -1260,6 +1278,11 @@ test("compact term envelopes preserve full-block maxima and filter minima exactl
       segment_overview_project(directory.overview(), encodedTerms, encodedFilters),
     );
     expect(projected.dictionary).toEqual(compact);
+    expect(
+      Schema.decodeSync(Schema.fromJsonString(TermCatalog))(
+        directory.catalog(encodedTerms, encodedFilters),
+      ),
+    ).toEqual(projected);
     expect(projected.minimum).toEqual(
       Schema.decodeSync(Schema.fromJsonString(EligibleMinimum))(directory.minimum(encodedFilters)),
     );
@@ -1275,6 +1298,11 @@ test("field eligibility retains numeric wire values, missing cells and query sco
   const projected = Schema.decodeSync(Schema.fromJsonString(ProjectedTermCatalog))(
     segment_overview_project(directory.overview(), '["alpha"]', warm),
   );
+  expect(
+    Schema.decodeSync(Schema.fromJsonString(ProjectedTermCatalog))(
+      directory.catalog('["alpha"]', warm),
+    ),
+  ).toEqual(projected);
   if (projected.eligibility === null) throw new Error("Missing eligibility projection");
   if (projected.eligibility.data.kind !== "joint") throw new Error("Expected joint projection");
   const raw = projected.eligibility.data.groups.flatMap(([values]) => values.flat());
@@ -1322,6 +1350,11 @@ test("oversized field projections retain the original minimum fallback", () => {
     segment_overview_project(directory.overview(), '["alpha"]', filters),
   );
   expect(projected.eligibility).toBeNull();
+  expect(
+    Schema.decodeSync(Schema.fromJsonString(ProjectedTermCatalog))(
+      directory.catalog('["alpha"]', filters),
+    ),
+  ).toEqual(projected);
   expect(projected.minimum).toEqual(
     Schema.decodeSync(Schema.fromJsonString(EligibleMinimum))(directory.minimum(filters)),
   );
@@ -1342,6 +1375,11 @@ test("oversized field projections retain the original minimum fallback", () => {
     segment_overview_project(largeDirectory.overview(), '["alpha"]', largeFilters),
   );
   expect(largeProjection.eligibility).toBeNull();
+  expect(
+    Schema.decodeSync(Schema.fromJsonString(ProjectedTermCatalog))(
+      largeDirectory.catalog('["alpha"]', largeFilters),
+    ),
+  ).toEqual(largeProjection);
   expect(largeProjection.minimum).toEqual(
     Schema.decodeSync(Schema.fromJsonString(EligibleMinimum))(largeDirectory.minimum(largeFilters)),
   );
@@ -1386,6 +1424,11 @@ test("indexed eligibility predicates preserve field order, duplicates and every 
     const projected = Schema.decodeSync(Schema.fromJsonString(ProjectedTermCatalog))(
       segment_overview_project(directory.overview(), '["alpha"]', encodedFilters),
     );
+    expect(
+      Schema.decodeSync(Schema.fromJsonString(ProjectedTermCatalog))(
+        directory.catalog('["alpha"]', encodedFilters),
+      ),
+    ).toEqual(projected);
     if (projected.eligibility === null) throw new Error("Missing eligibility projection");
     const encoded = Schema.encodeSync(Schema.fromJsonString(EligibilityProjection))(
       projected.eligibility,
@@ -1420,6 +1463,11 @@ test("marginal eligibility bounds remain conservative across scalar predicates",
   );
   if (projected.eligibility?.data.kind !== "marginal")
     throw new Error("Expected bounded marginal projection");
+  expect(
+    Schema.decodeSync(Schema.fromJsonString(ProjectedTermCatalog))(
+      directory.catalog('["alpha"]', warm),
+    ),
+  ).toEqual(projected);
   expect(projected.eligibility.data.columns.map((column) => column.length)).toEqual([100, 7]);
   const encoded = Schema.encodeSync(Schema.fromJsonString(EligibilityProjection))(
     projected.eligibility,

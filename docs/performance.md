@@ -4405,3 +4405,50 @@ A separate four-round series rebuilt coordinator memory before every query, then
 | Dense group 43                   |       670.40 / 951.39 ms |               102 / 111.5 ms |         4 |
 
 Reset dense queries still acquired 25 catalogs and became slower in this sample, consistent with the prepared first-read setup cost seen locally, though placement and source-cache memory/API hit distribution also changed. Faster repeated reads do **not** establish the requested cold-and-warm production target. The remaining acquisition path needs immutable field-model reuse across predicate values and coordinator restarts; the deployed result retains this known cold-read limitation.
+
+## Native Workers Cache for immutable field models
+
+Source `98ce616` separates immutable catalog identity from predicate values. Native `ctx.props` retains bucket, ordered immutable sources, requested terms and sorted filter fields. Predicates use the Effect base64/JSON header codec up to 8,192 ASCII bytes; larger predicates retain the complete typed filter set in props. A model response contains no predicate-dependent minimum. Unsupported field models use an exact minimum protected by the canonical filter digest; field-scoped exact responses use `no-store` and `Vary`. Strong consistency, tombstones, live statistics and filter-before-top-k remain unchanged. Native Workers Cache can reuse the field model across predicate values and coordinator resets without a new R2 cache or another canonical format.
+
+The full local gate passed **294 Worker/tooling and 59 Rust tests**, including formatting, types, Effect lint and native/WASM Clippy. The integration fixture verifies identical model bodies for different predicates, uncacheable exact fallbacks, rejection of an adulterated filter digest, Unicode and long filters. WASM artifacts were byte-identical to the previous version: this change affects catalog transport and caching.
+
+The local million-document comparison used the same canonical R2 fixture and sequence 2000, fresh processes, three alternating-order cohorts and eight rounds with fresh equivalent predicates. All **384 complete responses** matched. First-query medians have three samples per cell; repeats have 21. Prepared caches retained derived R2 artifacts; partial loss replaced correlated pool/batch prefixes; total loss also replaced the actual directory prefix. Empty replacement prefixes were verified. Storage and operating-system caches could remain warm. This local setup does not demonstrate the native Workers Cache benefit.
+
+| Cache state  | Selector              | First baseline/candidate ms | Repeated baseline/candidate ms |
+| ------------ | --------------------- | --------------------------: | -----------------------------: |
+| Prepared     | Sixteen rare terms    |             609.92 / 582.84 |                  59.71 / 58.70 |
+| Prepared     | Sixty-four rare terms |           1097.36 / 1043.51 |                192.80 / 192.16 |
+| Prepared     | Dense group 72        |           1179.10 / 1248.37 |                  64.83 / 67.14 |
+| Prepared     | Dense group 43        |           1243.47 / 1215.89 |                  67.78 / 65.32 |
+| Partial loss | Sixty-four rare terms |           2254.87 / 2260.73 |                196.04 / 202.11 |
+| Partial loss | Dense group 43        |           4570.62 / 4857.07 |                  57.41 / 59.05 |
+| Total loss   | Sixty-four rare terms |           3330.59 / 3275.77 |                189.48 / 197.30 |
+| Total loss   | Dense group 43        |           5516.79 / 5439.68 |                  58.04 / 58.02 |
+
+Alchemy profile `minutei` deployed the candidate as version `36e6bf95-2d4e-4273-8b6a-3ce2106eca64`, verified at 100% traffic with Smart Placement, the same bucket and unchanged lifecycle rules. Deployment and the unconditional vector metadata migration completed. A direct R2 read confirmed the original million-document manifest remained byte-identical, with sequence 2000 and 200 sources.
+
+The before/after native comparison ran eight mixed rounds of four strong selectors after an initial coordinator rebuild. Warm HTTP medians exclude two warmup rounds, leaving six samples per selector. All **64 complete responses** matched. Placement remained remote-EWR. Exact CF-Ray joins found 27/32 baseline and 28/32 candidate coordinator events; only available matched pairs contribute CPU medians, and every observed candidate event used the deployed version.
+
+| Warm selector         | HTTP median before/after | Paired coordinator CPU before/after | CPU pairs |
+| --------------------- | -----------------------: | ----------------------------------: | --------: |
+| Sixteen rare terms    |       221.29 / 215.64 ms |                        32.5 / 30 ms |         4 |
+| Sixty-four rare terms |       303.47 / 295.74 ms |                      114.5 / 105 ms |         6 |
+| Dense group 72        |       215.94 / 232.34 ms |                          31 / 40 ms |         5 |
+| Dense group 43        |       226.95 / 226.22 ms |                          32 / 31 ms |         5 |
+
+Warm results are mixed, including a slower dense-72 median. Occasional new Bloom false-positive terms required a dictionary acquisition despite otherwise retained models. These observations do not prove a warm speedup.
+
+A separate four-round series cleared coordinator memory before every query, using fresh predicates. All **32 complete before/after responses** matched. Every reset dense candidate query recorded **25 native cache hits**, bypassing source execution. Rebuild itself reloads the manifest, and native/derived caches survive: this measures coordinator recovery, not fully cold storage or a new isolate. All four observations per selector contribute HTTP medians.
+
+| Selector after coordinator reset | HTTP median before/after | Paired coordinator CPU before/after | CPU pairs |
+| -------------------------------- | -----------------------: | ----------------------------------: | --------: |
+| Sixteen rare terms               |       584.12 / 310.64 ms |                          93 / 95 ms |         1 |
+| Sixty-four rare terms            |       665.07 / 425.39 ms |                         Unavailable |         0 |
+| Dense group 72                   |       833.60 / 359.65 ms |                        138 / 123 ms |         1 |
+| Dense group 43                   |       733.96 / 391.90 ms |                        109 / 133 ms |         2 |
+
+Only 10/16 coordinator events were available on each side of the reset comparison; sparse paired CPU observations do not establish a CPU reduction. Parent CPU also excludes separate Terms execution, so no total compute-cost claim follows. Baseline reset requests used remote-EWR; two candidate requests used local-GRU (rare-16 round 1 and dense-43 round 0), with GRU ingress throughout. Restricting to pairs with matching placement still changed dense-72 HTTP 833.60 / 359.65 ms across four pairs and dense-43 622.35 / 389.53 ms across three pairs. These small sequential, cache-sensitive samples do not isolate all placement, cache distribution and runtime variation.
+
+An independent native canary used new namespaces. Four model queries changed predicate values and rebuilt coordinator memory each time; native hit counts were **0, 1, 1, 1**, with every returned identifier matching the oracle. Two concurrent unsupported-model queries returned their different expected documents through the exact fallback. Both canary namespaces were cleaned to **zero documents and zero vector-outbox entries**, with cleanup metadata verified. No existing namespace was mutated by the canary.
+
+The earlier marginal-model deployment's coordinator-reset penalty is reduced in this sample by immutable model reuse. Fully cold Cloudflare storage, cache-loss tail latency, whole-Worker peak memory, sustained load and Turbopuffer parity remain unproven; local dense recovery with total derived-cache loss still takes about 5.4 seconds.

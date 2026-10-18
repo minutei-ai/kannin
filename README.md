@@ -13,7 +13,7 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 **1,000,000 documents · deployed Cloudflare · GRU ingress.**
 
-Bounded field projections removed **25 catalog RPCs per repeated dense query** in the native sample. Strong HTTP medians changed **490 / 624 → 268 / 223 ms** for two dense selectors, with identical complete results and lower paired coordinator CPU. Placement also changed, so the latency difference is not solely attributable to code. **Coordinator-reset dense reads became slower: 631 / 670 → 885 / 951 ms.** Cold-and-warm optimization remains unfinished. [Native measurements](docs/performance.md#native-validation-of-marginal-eligibility).
+Immutable field models now survive coordinator restarts through native Workers Cache. On the same million-document index, coordinator-reset strong HTTP medians changed **584 / 665 → 311 / 425 ms** for sixteen/sixty-four rare terms and **834 / 734 → 360 / 392 ms** for two dense selectors. Every reset dense query recorded **25 native cache hits**. All **96 complete native responses** matched. Warm medians were mixed and broadly similar; two reset requests changed placement. These small samples do not establish sustained capacity or fully cold storage latency. [Native measurements](docs/performance.md#native-workers-cache-for-immutable-field-models).
 
 Cold recovery uses compact canonical headers (**352 → 123 MB** over the controlled local million-document corpus) and binary derived directories (**19.8% fewer compressed directory bytes**). Earlier local first-read comparisons improved 16–25% for rare terms under surviving directory caches and about 22% with derived artifacts absent after compact canonical writes. These are separate local experiments, not fully cold Cloudflare guarantees. Existing immutable objects retain their layout; ordinary writes and compaction use compact headers. [Methods and limits](docs/performance.md).
 
@@ -42,7 +42,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **293 Worker/tooling tests and 59 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **294 Worker/tooling tests and 59 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

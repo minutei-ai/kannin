@@ -1,4 +1,6 @@
 mod binary_directory;
+#[cfg(test)]
+mod query_directory_tests;
 
 use crate::normalize_text;
 use serde::{Deserialize, Serialize};
@@ -1007,6 +1009,15 @@ pub fn parse_compressed_directory(
     expected: usize,
     max_heap_bytes: usize,
 ) -> Result<Header, String> {
+    parse_compressed_directory_terms(bytes, expected, max_heap_bytes, None)
+}
+
+fn parse_compressed_directory_terms(
+    bytes: &[u8],
+    expected: usize,
+    max_heap_bytes: usize,
+    selected: Option<&QueryTerms>,
+) -> Result<Header, String> {
     if bytes.len() < 20 || &bytes[..8] != DIRECTORY_MAGIC || bytes.len() > MAX_BYTES + 8192 {
         return Err("Invalid compressed directory frame".into());
     }
@@ -1040,7 +1051,7 @@ pub fn parse_compressed_directory(
     if decoded.len() != compact_length || verified.finalize() != checksum {
         return Err("Compressed directory integrity check failed".into());
     }
-    let header = binary_directory::decode(&decoded, max_heap_bytes)?;
+    let header = binary_directory::decode(&decoded, max_heap_bytes, selected)?;
     validate_header(&header)?;
     Ok(header)
 }
@@ -1452,6 +1463,19 @@ impl PreparedQuery {
             top_k,
             filters,
         })
+    }
+
+    #[cfg(any(test, target_arch = "wasm32"))]
+    fn ranker_compressed(
+        &self,
+        bytes: &[u8],
+        expected: usize,
+        max_heap_bytes: usize,
+        dead: &[u32],
+    ) -> Result<Search, String> {
+        let header =
+            parse_compressed_directory_terms(bytes, expected, max_heap_bytes, Some(&self.terms))?;
+        self.ranker(header, dead)
     }
 
     #[doc = "# Errors\nRejects invalid filter attributes or tombstone rows."]
@@ -3613,6 +3637,23 @@ pub mod wasm {
 
     #[wasm_bindgen]
     impl PreparedQuery {
+        #[doc = "# Errors\nRejects invalid compressed frames, metadata, allocation budgets or segment tombstones. Retains metadata only for this prepared query."]
+        pub fn ranker_compressed(
+            &self,
+            bytes: &[u8],
+            expected: u32,
+            max_heap_bytes: u32,
+            dead: &str,
+        ) -> Result<Ranker, JsValue> {
+            let dead: Vec<u32> = serde_json::from_str(dead)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            let search = self
+                .query
+                .ranker_compressed(bytes, expected as usize, max_heap_bytes as usize, &dead)
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            Ok(Ranker { search })
+        }
+
         #[wasm_bindgen(constructor)]
         #[doc = "# Errors\nRejects invalid query JSON, query budgets, match mode, or nonempty segment tombstones."]
         pub fn new(query: &str) -> Result<Self, JsValue> {

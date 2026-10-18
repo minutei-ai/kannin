@@ -26,7 +26,7 @@ import {
   segment_overview_project,
   segment_correlated_overview,
 } from "../dist/wasm/raio_engine";
-import type { Ranker } from "../dist/wasm/raio_engine";
+import type { PreparedQuery, Ranker } from "../dist/wasm/raio_engine";
 import type { DataRange, Root } from "./protocol";
 import {
   StoredDocument,
@@ -118,7 +118,11 @@ const MAX_TEXT_PLAN_BYTES = 1024 * 1024;
 const scoreBounds = new Map<string, typeof SegmentScoreBound.Type>();
 const scoreBoundBudget = { bytes: 0 };
 const MAX_SCORE_BOUND_BYTES = 1024 * 1024;
-const admissionCounts = new Map<string, number>();
+const DirectoryAccess = Schema.Struct({
+  frequency: Schema.Int,
+  heapBytes: Schema.Union([Schema.Int, Schema.Undefined]),
+});
+const directoryHistory = new Map<string, typeof DirectoryAccess.Type>();
 const admissionBudget = { bytes: 0, requests: 0 };
 const MAX_ADMISSION_BYTES = 1024 * 1024;
 const directories = new Map<string, { directory: Directory; bytes: number; headerBytes: number }>();
@@ -180,6 +184,7 @@ const reads = {
   rangeCacheHits: 0,
   directoryCacheHits: 0,
   encodedDirectoryCacheHits: 0,
+  directoryQueryProjections: 0,
   textPlanCacheHits: 0,
   workerCacheHits: 0,
   workerCacheMisses: 0,
@@ -255,29 +260,32 @@ function noteDirectoryRequest(key: string) {
   admissionBudget.requests += 1;
   if (admissionBudget.requests >= 4096) {
     admissionBudget.requests = 0;
-    for (const [identity, count] of admissionCounts) {
-      const aged = Math.floor(count / 2);
+    for (const [identity, count] of directoryHistory) {
+      const aged = Math.floor(count.frequency / 2);
       if (aged === 0) {
-        admissionCounts.delete(identity);
-        admissionBudget.bytes -= identity.length * 4 + 128;
-      } else admissionCounts.set(identity, aged);
+        directoryHistory.delete(identity);
+        admissionBudget.bytes -= identity.length * 4 + 160;
+      } else directoryHistory.set(identity, { frequency: aged, heapBytes: count.heapBytes });
     }
   }
-  const previous = admissionCounts.get(key);
+  const previous = directoryHistory.get(key);
   if (previous !== undefined) {
-    admissionCounts.delete(key);
-    admissionCounts.set(key, Math.min(255, previous + 1));
+    directoryHistory.delete(key);
+    directoryHistory.set(key, {
+      frequency: Math.min(255, previous.frequency + 1),
+      heapBytes: previous.heapBytes,
+    });
     return;
   }
-  const charge = key.length * 4 + 128;
+  const charge = key.length * 4 + 160;
   if (charge > MAX_ADMISSION_BYTES) return;
   while (admissionBudget.bytes + charge > MAX_ADMISSION_BYTES) {
-    const oldest = admissionCounts.keys().next().value;
+    const oldest = directoryHistory.keys().next().value;
     if (oldest === undefined) break;
-    admissionCounts.delete(oldest);
-    admissionBudget.bytes -= oldest.length * 4 + 128;
+    directoryHistory.delete(oldest);
+    admissionBudget.bytes -= oldest.length * 4 + 160;
   }
-  admissionCounts.set(key, 1);
+  directoryHistory.set(key, { frequency: 1, heapBytes: undefined });
   admissionBudget.bytes += charge;
 }
 
@@ -288,10 +296,10 @@ function rememberEncodedDirectory(key: string, bytes: Uint8Array) {
   if (charge > maximum) return;
   const victims = [];
   const remaining = { bytes: encodedBudget.bytes };
-  const frequency = admissionCounts.get(key) ?? 0;
+  const frequency = directoryHistory.get(key)?.frequency ?? 0;
   for (const [identity, value] of encodedDirectories) {
     if (remaining.bytes + charge <= maximum) break;
-    if (frequency <= (admissionCounts.get(identity) ?? 0)) return;
+    if (frequency <= (directoryHistory.get(identity)?.frequency ?? 0)) return;
     victims.push(identity);
     remaining.bytes -= value.byteLength + identity.length * 4 + 128;
   }
@@ -330,6 +338,23 @@ export function addFrequencyPosting(
   ranker.add_frequency(term, page);
 }
 
+function planDirectoryAdmission(bytes: number, frequency: number) {
+  if (bytes > MAX_DECODED_CACHE_BYTES) return undefined;
+  const victims = [];
+  const remaining = { bytes: decodedBudget.bytes };
+  for (const [key, entry] of directories) {
+    if (remaining.bytes + bytes <= MAX_DECODED_CACHE_BYTES) break;
+    if (
+      frequency <=
+      (directoryHistory.get(`${key}/0/${entry.headerBytes}/directory-v3`)?.frequency ?? 0)
+    )
+      return undefined;
+    victims.push(key);
+    remaining.bytes -= entry.bytes;
+  }
+  return { victims, bytes: remaining.bytes + bytes };
+}
+
 function rememberDirectory(
   identity: string,
   headerBytes: number,
@@ -337,30 +362,25 @@ function rememberDirectory(
   fingerprint?: ArrayBuffer,
 ) {
   const bytes = directory.heap_bytes();
-  const active = activeDirectories.get(`${identity}/0/${headerBytes}/directory-v3`);
+  const key = `${identity}/0/${headerBytes}/directory-v3`;
+  const access = directoryHistory.get(key);
+  if (access !== undefined)
+    directoryHistory.set(key, { frequency: access.frequency, heapBytes: bytes });
+  const active = activeDirectories.get(key);
   if (active !== undefined && active.directory === undefined && bytes <= MAX_DECODED_BYTES) {
     active.directory = directory.retain();
     active.fingerprint = fingerprint;
   }
   if (directories.has(identity)) return;
-  if (bytes > MAX_DECODED_CACHE_BYTES) return;
-  const frequency = admissionCounts.get(`${identity}/0/${headerBytes}/directory-v3`) ?? 1;
-  const victims = [];
-  const remaining = { bytes: decodedBudget.bytes };
-  for (const [key, entry] of directories) {
-    if (remaining.bytes + bytes <= MAX_DECODED_CACHE_BYTES) break;
-    if (frequency <= (admissionCounts.get(`${key}/0/${entry.headerBytes}/directory-v3`) ?? 0))
-      return;
-    victims.push(key);
-    remaining.bytes -= entry.bytes;
-  }
-  for (const key of victims) {
-    const entry = directories.get(key);
-    directories.delete(key);
+  const admission = planDirectoryAdmission(bytes, access?.frequency ?? 1);
+  if (admission === undefined) return;
+  for (const victim of admission.victims) {
+    const entry = directories.get(victim);
+    directories.delete(victim);
     entry?.directory.free();
   }
   directories.set(identity, { directory: directory.retain(), bytes, headerBytes });
-  decodedBudget.bytes = remaining.bytes + bytes;
+  decodedBudget.bytes = admission.bytes;
 }
 
 export const acquireDirectoryFrame = Effect.fn("kannin.acquireDirectoryFrame")(
@@ -501,6 +521,16 @@ export function publishDirectoryFrame(
   return published;
 }
 
+function readEncodedDirectory(key: string) {
+  const bytes = encodedDirectories.get(key);
+  if (bytes === undefined) return undefined;
+  reads.rangeCacheHits += 1;
+  reads.encodedDirectoryCacheHits += 1;
+  encodedDirectories.delete(key);
+  encodedDirectories.set(key, bytes);
+  return bytes;
+}
+
 export async function range(
   key: string,
   offset: number,
@@ -517,21 +547,19 @@ export async function range(
     Match.orElse(() => rawIdentity),
   );
   if (compressedDirectory) noteDirectoryRequest(cacheKey);
-  const cache = Match.value(compressedDirectory).pipe(
-    Match.when(true, () => encodedDirectories),
-    Match.orElse(() => buffers),
-  );
-  const cached = cache.get(cacheKey);
-  if (cached !== undefined) {
-    reads.rangeCacheHits += 1;
-    cache.delete(cacheKey);
-    cache.set(cacheKey, cached);
-    if (compressedDirectory) reads.encodedDirectoryCacheHits += 1;
-    else {
+  if (compressedDirectory) {
+    const cached = readEncodedDirectory(cacheKey);
+    if (cached !== undefined) return cached;
+  } else {
+    const cached = buffers.get(cacheKey);
+    if (cached !== undefined) {
+      reads.rangeCacheHits += 1;
+      buffers.delete(cacheKey);
+      buffers.set(cacheKey, cached);
       cacheOrder.delete(`r:${cacheKey}`);
       cacheOrder.set(`r:${cacheKey}`, "range");
+      return cached;
     }
-    return cached;
   }
   const pending = pendingRanges.get(cacheKey);
   if (pending !== undefined) return pending;
@@ -907,6 +935,63 @@ export const withDirectory = Effect.fn("raio.withDirectory")(
         }),
     ),
 );
+
+function queryDirectoryFrame(key: string, headerBytes: number) {
+  const identity = `${env.STORAGE_CACHE_SCOPE}:${key}`;
+  const admissionIdentity = `${identity}/0/${headerBytes}/directory-v3`;
+  if (
+    directories.has(identity) ||
+    activeDirectories.get(admissionIdentity)?.directory !== undefined ||
+    admissionBudget.requests + 1 >= 4096
+  )
+    return undefined;
+  const access = directoryHistory.get(admissionIdentity);
+  if (access?.heapBytes === undefined) return undefined;
+  const frequency = Math.min(255, access.frequency + 1);
+  if (planDirectoryAdmission(access.heapBytes, frequency) !== undefined) return undefined;
+  return encodedDirectories.get(admissionIdentity);
+}
+
+export const withRanker = Effect.fn("kannin.withRanker")(<A, E, R>(
+  key: string,
+  headerBytes: number,
+  query: PreparedQuery,
+  dead: string,
+  use: (ranker: Ranker) => Effect.Effect<A, E, R>,
+  permits: Semaphore.Semaphore,
+) => {
+  const complete = withDirectory(
+    key,
+    headerBytes,
+    (directory) =>
+      Effect.acquireUseRelease(
+        Effect.sync(() => directory.ranker_prepared(query, dead)),
+        use,
+        (ranker) => Effect.sync(() => ranker.free()),
+      ),
+    permits,
+  );
+  return Effect.suspend(() => {
+    if (queryDirectoryFrame(key, headerBytes) === undefined) return complete;
+    return Effect.acquireUseRelease(
+      Effect.try(() => {
+        const bytes = queryDirectoryFrame(key, headerBytes);
+        if (bytes === undefined) return Option.none<Ranker>();
+        const identity = `${env.STORAGE_CACHE_SCOPE}:${key}/0/${headerBytes}/directory-v3`;
+        noteDirectoryRequest(identity);
+        readEncodedDirectory(identity);
+        const ranker = query.ranker_compressed(bytes, headerBytes, MAX_DECODED_BYTES, dead);
+        reads.directoryQueryProjections += 1;
+        return Option.some(ranker);
+      }),
+      Option.match({ onSome: use, onNone: () => complete }),
+      Option.match({
+        onSome: (ranker) => Effect.sync(() => ranker.free()),
+        onNone: () => Effect.void,
+      }),
+    );
+  });
+});
 
 function rememberOverview(identity: string, bytes: Uint8Array) {
   const previous = overviewBuffers.get(identity);
@@ -2079,10 +2164,10 @@ export function clearImmutableCache(prefix: string) {
       termCatalogs.delete(key);
       termBudget.bytes -= entry.bytes;
     }
-  for (const key of admissionCounts.keys())
+  for (const key of directoryHistory.keys())
     if (key.startsWith(`${identity}/`)) {
-      admissionCounts.delete(key);
-      admissionBudget.bytes -= key.length * 4 + 128;
+      directoryHistory.delete(key);
+      admissionBudget.bytes -= key.length * 4 + 160;
     }
   for (const [key, bytes] of encodedDirectories)
     if (key.startsWith(`${identity}/`)) {

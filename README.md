@@ -13,6 +13,8 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 **1,000,000 documents · deployed Cloudflare · GRU ingress.**
 
+Binary derived directory caches reduce compressed directory bytes **19.8%**. Over the same local million-document index, median first reads improved **16–20%** for rare terms with prepared caches and **20–25%** with only directory caches preserved. All **96 complete responses** matched; dense queries with total cache loss stayed effectively unchanged. [Methods](docs/performance.md#binary-derived-directory-caches).
+
 Newly written and recompacted segments use smaller canonical headers. A controlled local comparison over one million documents kept the same 200 segments and payloads while reducing header bytes **352 → 123 MB** and total segment bytes **531 → 302 MB**. With derived caches initially absent, median first-read latency changed **3356 → 2635 ms** for sixty-four rare terms and **5730 → 4454 ms** for a dense filtered query: about **22% lower**. All **88 complete responses** across cold, prepared-cache and previous-reader controls matched. Prepared-cache latency was mixed. These are local measurements, not fully cold Cloudflare storage guarantees. [Methods](docs/performance.md#compact-canonical-header-writer).
 
 The existing native reader accepts both header layouts. Public metadata and posting/document payloads are unchanged; deployment preserves existing immutable objects. Normal writes and compaction emit the compact layout. Canonical recovery retains its **8 MiB** raw-header admission budget and reuses surviving compressed R2 directories.
@@ -46,7 +48,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **289 Worker/tooling tests and 54 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **289 Worker/tooling tests and 57 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

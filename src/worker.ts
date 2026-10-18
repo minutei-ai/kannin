@@ -129,8 +129,8 @@ export class Segments extends WorkerEntrypoint<Env, typeof SegmentCacheProps.Typ
       request.method !== "GET" ||
       props._tag === "Failure" ||
       props.value.bucket !== this.env.STORAGE_CACHE_SCOPE ||
-      (url.pathname !== "/range" && url.pathname !== "/directory-v2") ||
-      (url.pathname === "/directory-v2" && decoded.value.offset !== 0)
+      (url.pathname !== "/range" && url.pathname !== "/directory-v3") ||
+      (url.pathname === "/directory-v3" && decoded.value.offset !== 0)
     )
       return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });
     const input = decoded.value;
@@ -179,13 +179,13 @@ export class Segments extends WorkerEntrypoint<Env, typeof SegmentCacheProps.Typ
                 });
               const encoded = yield* Effect.try(() =>
                 Match.value(url.pathname).pipe(
-                  Match.when("/directory-v2", () =>
+                  Match.when("/directory-v3", () =>
                     directory_compress(new Uint8Array(bytes)).slice(),
                   ),
                   Match.orElse(() => bytes),
                 ),
               );
-              if (url.pathname === "/directory-v2")
+              if (url.pathname === "/directory-v3")
                 publishDirectoryFrame(input.key, input.length, new Uint8Array(encoded), context);
               return new Response(encoded, {
                 headers: {
@@ -201,7 +201,7 @@ export class Segments extends WorkerEntrypoint<Env, typeof SegmentCacheProps.Typ
             return Effect.tryPromise(() => object.body.cancel()).pipe(Effect.ignore);
           },
         );
-        if (url.pathname !== "/directory-v2") return yield* canonical;
+        if (url.pathname !== "/directory-v3") return yield* canonical;
         const reader = yield* acquireDirectoryFrame(input.key, input.length);
         const observed = yield* waitDirectoryFrame(reader);
         const cached = Fiber.join(reader).pipe(

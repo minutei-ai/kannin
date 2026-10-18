@@ -1137,27 +1137,26 @@ test("compact directories validate framing, checksums and header semantics", () 
   covered.set(compact, 16);
   expect(new DataView(encoded.buffer, encoded.byteOffset).getUint32(16, true)).toBe(crc32(covered));
   expect(new DataView(encoded.buffer, encoded.byteOffset).getUint32(12, true)).toBe(compact.length);
-  expect(compact[0]).toBe("[".charCodeAt(0));
+  expect(compact[0]).toBe(1);
   const invalid = new Uint8Array(compact);
-  expect(invalid[1]).toBe("1".charCodeAt(0));
-  invalid[1] = "2".charCodeAt(0);
+  invalid[0] = 2;
   const compressed = deflateSync(invalid);
   const forged = new Uint8Array(20 + compressed.byteLength);
   forged.set(encoded.subarray(0, 20));
   forged.set(compressed, 20);
-  expect(() => Directory.compressed(forged, length)).toThrow();
+  expect(() => Directory.compressed(forged, length, 40 * 1024 * 1024)).toThrow();
   covered.set(forged.subarray(0, 16));
   covered.set(invalid, 16);
   new DataView(forged.buffer).setUint32(16, crc32(covered), true);
-  expect(() => Directory.compressed(forged, length)).toThrow("version");
+  expect(() => Directory.compressed(forged, length, 40 * 1024 * 1024)).toThrow("version");
   const damaged = encoded.slice();
   const checksum = damaged[16];
   if (checksum === undefined) throw new Error("Missing directory checksum");
   damaged[16] = checksum ^ 1;
-  expect(() => Directory.compressed(damaged, length)).toThrow();
+  expect(() => Directory.compressed(damaged, length, 40 * 1024 * 1024)).toThrow();
   const legacy = encoded.slice();
-  legacy.set(new TextEncoder().encode("RAIODIR1"));
-  expect(() => Directory.compressed(legacy, length)).toThrow();
+  legacy.set(new TextEncoder().encode("RAIODIR2"));
+  expect(() => Directory.compressed(legacy, length, 40 * 1024 * 1024)).toThrow();
 });
 
 test("compressed directories reject both output length mismatches and incomplete zlib streams", () => {
@@ -1169,24 +1168,24 @@ test("compressed directories reject both output length mismatches and incomplete
   const bytes = segment.bytes();
   const length = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
   const encoded = directory_compress(bytes.subarray(0, length));
-  using directory = Directory.compressed(encoded, length);
+  using directory = Directory.compressed(encoded, length, 40 * 1024 * 1024);
   using canonical = new Directory(bytes.subarray(0, length));
   expect(directory.terms('["alpha"]')).toBe(canonical.terms('["alpha"]'));
   for (const delta of [-1, 1]) {
     const invalid = encoded.slice();
     new DataView(invalid.buffer, invalid.byteOffset).setUint32(8, length + delta, true);
-    expect(() => Directory.compressed(invalid, length + delta)).toThrow();
+    expect(() => Directory.compressed(invalid, length + delta, 40 * 1024 * 1024)).toThrow();
   }
   for (const missing of [1, 4, 8])
     expect(() =>
-      Directory.compressed(encoded.subarray(0, encoded.length - missing), length),
+      Directory.compressed(encoded.subarray(0, encoded.length - missing), length, 40 * 1024 * 1024),
     ).toThrow();
   const damaged = encoded.slice();
   const end = damaged.length - 1;
   const checksum = damaged[end];
   if (checksum === undefined) throw new Error("Missing zlib checksum");
   damaged[end] = checksum ^ 1;
-  expect(() => Directory.compressed(damaged, length)).toThrow();
+  expect(() => Directory.compressed(damaged, length, 40 * 1024 * 1024)).toThrow();
 });
 
 test("compact term envelopes preserve full-block maxima and filter minima exactly", () => {

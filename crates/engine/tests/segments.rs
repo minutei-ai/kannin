@@ -641,27 +641,28 @@ fn compressed_directories_preserve_headers_and_reject_frame_corruption()
         assert!(segment::parse_directory(&damaged, length).is_err());
     }
     let encoded = segment::compress_directory(&built.bytes[..length])?;
-    let decoded = segment::parse_compressed_directory(&encoded, length)?;
+    let decoded = segment::parse_compressed_directory(&encoded, length, 40 * 1024 * 1024)?;
     assert_eq!(
         serde_json::to_value(original)?,
         serde_json::to_value(decoded)?
     );
     assert!(encoded.len() < length);
     assert!(segment::compress_directory(&built.bytes).is_err());
-    assert!(segment::parse_compressed_directory(&encoded, length + 1).is_err());
+    assert!(segment::parse_compressed_directory(&encoded, length + 1, 40 * 1024 * 1024).is_err());
     for end in 0..encoded.len() {
-        assert!(segment::parse_compressed_directory(&encoded[..end], length).is_err());
+        assert!(
+            segment::parse_compressed_directory(&encoded[..end], length, 40 * 1024 * 1024).is_err()
+        );
     }
     for index in [0, 8, 12, 16, encoded.len() - 1] {
         let mut damaged = encoded.clone();
         damaged[index] ^= 1;
-        assert!(segment::parse_compressed_directory(&damaged, length).is_err());
+        assert!(segment::parse_compressed_directory(&damaged, length, 40 * 1024 * 1024).is_err());
     }
     let compact = miniz_oxide::inflate::decompress_to_vec_zlib(&encoded[20..])
         .map_err(|cause| cause.to_string())?;
-    let mut invalid: serde_json::Value = serde_json::from_slice(&compact)?;
-    invalid[0] = serde_json::json!(2);
-    let payload = serde_json::to_vec(&invalid)?;
+    let mut payload = compact;
+    payload[0] = 2;
     let mut forged = encoded[..12].to_vec();
     forged.extend_from_slice(&u32::try_from(payload.len())?.to_le_bytes());
     let mut checksum = crc32fast::Hasher::new();
@@ -669,16 +670,19 @@ fn compressed_directories_preserve_headers_and_reject_frame_corruption()
     checksum.update(&payload);
     forged.extend_from_slice(&checksum.finalize().to_le_bytes());
     forged.extend_from_slice(&miniz_oxide::deflate::compress_to_vec_zlib(&payload, 3));
-    assert!(segment::parse_compressed_directory(&forged, length).is_err());
+    assert!(segment::parse_compressed_directory(&forged, length, 40 * 1024 * 1024).is_err());
     let mut legacy = encoded.clone();
-    legacy[..8].copy_from_slice(b"RAIODIR1");
-    assert!(segment::parse_compressed_directory(&legacy, length).is_err());
+    legacy[..8].copy_from_slice(b"RAIODIR2");
+    assert!(segment::parse_compressed_directory(&legacy, length, 40 * 1024 * 1024).is_err());
     let mut oversized = encoded.clone();
     oversized[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
-    assert!(segment::parse_compressed_directory(&oversized, u32::MAX as usize).is_err());
+    assert!(
+        segment::parse_compressed_directory(&oversized, u32::MAX as usize, 40 * 1024 * 1024)
+            .is_err()
+    );
     let mut undersized = encoded;
     undersized[8..12].copy_from_slice(&16_u32.to_le_bytes());
-    assert!(segment::parse_compressed_directory(&undersized, 16).is_err());
+    assert!(segment::parse_compressed_directory(&undersized, 16, 40 * 1024 * 1024).is_err());
     Ok(())
 }
 
@@ -699,7 +703,7 @@ fn compressed_directories_exceed_the_separate_mutation_log_budget()
     let (_, length) = segment::parse_header(&built.bytes)?;
     assert!(length > raio_engine::MAX_LOG_BYTES);
     let compressed = segment::compress_directory(&built.bytes[..length])?;
-    let decoded = segment::parse_compressed_directory(&compressed, length)?;
+    let decoded = segment::parse_compressed_directory(&compressed, length, 40 * 1024 * 1024)?;
     assert_eq!(decoded.documents.len(), 260);
     assert_eq!(decoded.documents[0].id, "large0000");
     assert_eq!(
@@ -870,7 +874,7 @@ fn retained_directories_release_unused_document_capacity() -> Result<(), Box<dyn
         let expected = serde_json::to_string(&built.header)?;
         let (canonical, length) = segment::parse_header(&built.bytes)?;
         let frame = segment::compress_directory(&built.bytes[..length])?;
-        let compressed = segment::parse_compressed_directory(&frame, length)?;
+        let compressed = segment::parse_compressed_directory(&frame, length, 40 * 1024 * 1024)?;
         for directory in [canonical, compressed] {
             assert_eq!(serde_json::to_string(&directory)?, expected);
             assert_eq!(directory.documents.len(), count);

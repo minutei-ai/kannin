@@ -4218,3 +4218,22 @@ A separate control on the existing million-document index retained its original 
 Coordinator CPU joins the exact response CF-Ray to SearchNamespace events. Three candidate events remained unavailable and were excluded from CPU pairs, never counted as zero. All 29 captured candidate events completed successfully on the deployed version. GRU ingress served every query; measured placement was remote-EWR except one candidate dense-group-72 response at local-GRU. HTTP medians increased in three selectors while CPU moved in both directions. This cache-sensitive control does not isolate a uniform native speedup and does not measure CPU in every bound Worker.
 
 After all native queries, the original million-document R2 manifest remained byte-identical at sequence 2000 with 200 segments. The compact layout's production evidence is the directly inspected fresh canary; existing index objects were preserved.
+
+## Binary derived directory caches
+
+Derived directory frames now encode validated native fields as bounded variable-length integers and UTF-8 strings instead of JSON sequences. Attribute JSON remains exact. Canonical R2 segments, payloads, ranking, consistency and existing memory quotas are unchanged. The disposable cache identity advances to `directory-v3`; misses and invalid frames recover from canonical R2. Decoding checks counts before reservation and charges allocations against the caller's existing 40 MiB directory limit.
+
+A controlled local workerd comparison used the same compact canonical million-document corpus, 200 segments and sequence 2000. Each variant ran in a fresh process, with alternating order across three cohorts. Each query ran twice; this table reports median first-query latency. Prepared caches retained the existing derived artifacts. Partial loss replaced correlated pool and batch prefixes with verified empty prefixes while preserving directory frames. Total loss additionally replaced the directory prefix. All **96 complete responses**, including scores, attributes, revisions and sequence, matched. Storage and operating-system caches could remain warm; these are process-cold measurements rather than fully cold Cloudflare storage.
+
+| Cache state  | Query                 | Before ms | After ms |
+| ------------ | --------------------- | --------: | -------: |
+| Prepared     | Sixteen rare terms    |     525.2 |    438.4 |
+| Prepared     | Sixty-four rare terms |     856.0 |    682.7 |
+| Prepared     | Dense group 72        |    1089.9 |   1079.4 |
+| Prepared     | Dense group 43        |    1068.1 |   1057.1 |
+| Partial loss | Sixty-four rare terms |    2039.9 |   1524.0 |
+| Partial loss | Dense group 43        |    4497.1 |   3594.4 |
+| Total loss   | Sixty-four rare terms |    2542.8 |   2384.4 |
+| Total loss   | Dense group 43        |    4070.7 |   4086.7 |
+
+Across all 200 derived directory frames, compressed size fell from **22,637,777 to 18,150,704 bytes**, a **19.8% reduction**. Every reconstructed document and term entry and the decoded heap charge matched the previous cache reader; the canonical root remained byte-identical. A separate eight-header decoding probe measured 77.52 to 39.58 ms, but that isolated probe does not establish end-to-end latency. Prepared-query gains were concentrated in rare terms; the dense total-loss control was effectively unchanged. The local gate passed 289 Worker/tooling and 57 Rust tests, including exact allocation-budget boundaries, invalid strings, truncation, overflow, ordering, corrupt frames and canonical fallback. The complete 300-query SciFact report remained byte-identical to the previous baseline.

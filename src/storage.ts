@@ -337,19 +337,19 @@ function rememberDirectory(
   fingerprint?: ArrayBuffer,
 ) {
   const bytes = directory.heap_bytes();
-  const active = activeDirectories.get(`${identity}/0/${headerBytes}/directory-v2`);
+  const active = activeDirectories.get(`${identity}/0/${headerBytes}/directory-v3`);
   if (active !== undefined && active.directory === undefined && bytes <= MAX_DECODED_BYTES) {
     active.directory = directory.retain();
     active.fingerprint = fingerprint;
   }
   if (directories.has(identity)) return;
   if (bytes > MAX_DECODED_CACHE_BYTES) return;
-  const frequency = admissionCounts.get(`${identity}/0/${headerBytes}/directory-v2`) ?? 1;
+  const frequency = admissionCounts.get(`${identity}/0/${headerBytes}/directory-v3`) ?? 1;
   const victims = [];
   const remaining = { bytes: decodedBudget.bytes };
   for (const [key, entry] of directories) {
     if (remaining.bytes + bytes <= MAX_DECODED_CACHE_BYTES) break;
-    if (frequency <= (admissionCounts.get(`${key}/0/${entry.headerBytes}/directory-v2`) ?? 0))
+    if (frequency <= (admissionCounts.get(`${key}/0/${entry.headerBytes}/directory-v3`) ?? 0))
       return;
     victims.push(key);
     remaining.bytes -= entry.bytes;
@@ -383,7 +383,7 @@ export const acquireDirectoryFrame = Effect.fn("kannin.acquireDirectoryFrame")(
               Effect.gen(function* () {
                 reads.directoryR2CacheReads += 1;
                 const object = yield* Effect.tryPromise(() =>
-                  env.STORAGE.get(`cache/directory-v2/${key}/${length}`),
+                  env.STORAGE.get(`cache/directory-v3/${key}/${length}`),
                 );
                 if (object === null) return Option.none<Uint8Array>();
                 const source = yield* Schema.decodeUnknownEffect(
@@ -405,7 +405,7 @@ export const acquireDirectoryFrame = Effect.fn("kannin.acquireDirectoryFrame")(
                   crypto.subtle.digest("SHA-256", bytes),
                 );
                 const checked = yield* Effect.try(() => {
-                  using directory = Directory.compressed(bytes, length);
+                  using directory = Directory.compressed(bytes, length, MAX_DECODED_BYTES);
                   rememberDirectory(
                     `${env.STORAGE_CACHE_SCOPE}:${key}`,
                     length,
@@ -477,7 +477,7 @@ export function publishDirectoryFrame(
     bytes.byteLength > Math.min(length + 8192, MAX_DIRECTORY_CACHE_BYTES)
   )
     return false;
-  const identity = `cache/directory-v2/${key}/${length}`;
+  const identity = `cache/directory-v3/${key}/${length}`;
   const published = publishQueryCache(
     `${env.STORAGE_CACHE_SCOPE}:${identity}`,
     bytes.byteLength * 4 + identity.length * 4 + 128,
@@ -508,12 +508,12 @@ export async function range(
   compressedDirectory = false,
 ) {
   const resource = Match.value(compressedDirectory).pipe(
-    Match.when(true, () => "directory-v2"),
+    Match.when(true, () => "directory-v3"),
     Match.orElse(() => "range"),
   );
   const rawIdentity = `${env.STORAGE_CACHE_SCOPE}:${key}/${offset}/${length}`;
   const cacheKey = Match.value(compressedDirectory).pipe(
-    Match.when(true, () => `${rawIdentity}/directory-v2`),
+    Match.when(true, () => `${rawIdentity}/directory-v3`),
     Match.orElse(() => rawIdentity),
   );
   if (compressedDirectory) noteDirectoryRequest(cacheKey);
@@ -575,7 +575,7 @@ export async function range(
             known === undefined ||
             !new Uint8Array(known).every((byte, index) => byte === digest[index])
           ) {
-            using directory = Directory.compressed(bytes, length);
+            using directory = Directory.compressed(bytes, length, MAX_DECODED_BYTES);
             if (active !== undefined)
               rememberDirectory(
                 `${env.STORAGE_CACHE_SCOPE}:${key}`,
@@ -718,7 +718,7 @@ const acquireDirectory = Effect.fn("kannin.acquireDirectory")(
   (key: string, headerBytes: number, canonical: boolean) =>
     Effect.gen(function* () {
       const identity = `${env.STORAGE_CACHE_SCOPE}:${key}`;
-      const admissionIdentity = `${identity}/0/${headerBytes}/directory-v2`;
+      const admissionIdentity = `${identity}/0/${headerBytes}/directory-v3`;
       const cached = directories.get(identity);
       if (cached !== undefined) {
         noteDirectoryRequest(admissionIdentity);
@@ -807,7 +807,7 @@ const acquireDirectory = Effect.fn("kannin.acquireDirectory")(
           }
           const decoded = yield* Effect.try(() => {
             if (canonical && Option.isNone(frame)) return Directory.canonical(bytes, headerBytes);
-            return Directory.compressed(bytes, headerBytes);
+            return Directory.compressed(bytes, headerBytes, MAX_DECODED_BYTES);
           });
           if (decoded.heap_bytes() > MAX_DECODED_BYTES) {
             decoded.free();
@@ -868,7 +868,7 @@ export const withDirectory = Effect.fn("raio.withDirectory")(
   ) =>
     Effect.acquireUseRelease(
       Effect.sync(() => {
-        const identity = `${env.STORAGE_CACHE_SCOPE}:${key}/0/${headerBytes}/directory-v2`;
+        const identity = `${env.STORAGE_CACHE_SCOPE}:${key}/0/${headerBytes}/directory-v3`;
         const existing = activeDirectories.get(identity);
         if (existing !== undefined) {
           existing.readers += 1;

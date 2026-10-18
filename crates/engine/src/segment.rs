@@ -1,3 +1,5 @@
+mod binary_directory;
+
 use crate::normalize_text;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -854,7 +856,7 @@ fn validate_header(header: &Header) -> Result<(), String> {
     Ok(())
 }
 
-const DIRECTORY_MAGIC: &[u8; 8] = b"RAIODIR2";
+const DIRECTORY_MAGIC: &[u8; 8] = b"RAIODIR3";
 
 #[doc = "# Errors\nRejects invalid canonical headers, mismatched lengths, trailing bytes and directory size limits."]
 pub fn parse_directory(bytes: &[u8], expected: usize) -> Result<Header, String> {
@@ -921,8 +923,8 @@ impl Serialize for DirectoryTerms<'_> {
 pub fn compress_directory(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let header = parse_directory(bytes, bytes.len())?;
     let length = bytes.len();
-    let compact = header.compact_json()?;
-    if compact.len() > MAX_BYTES {
+    let compact = binary_directory::encode(&header)?;
+    if compact.len() > MAX_BYTES || compact.len() > length {
         return Err("Compact directory exceeds size budget".into());
     }
     let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&compact, 3);
@@ -947,7 +949,11 @@ pub fn compress_directory(bytes: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 #[doc = "# Errors\nRejects framing, size, compression, checksum, expected length and canonical header violations."]
-pub fn parse_compressed_directory(bytes: &[u8], expected: usize) -> Result<Header, String> {
+pub fn parse_compressed_directory(
+    bytes: &[u8],
+    expected: usize,
+    max_heap_bytes: usize,
+) -> Result<Header, String> {
     if bytes.len() < 20 || &bytes[..8] != DIRECTORY_MAGIC || bytes.len() > MAX_BYTES + 8192 {
         return Err("Invalid compressed directory frame".into());
     }
@@ -964,7 +970,7 @@ pub fn parse_compressed_directory(bytes: &[u8], expected: usize) -> Result<Heade
             .try_into()
             .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
     ) as usize;
-    if compact_length > MAX_BYTES {
+    if compact_length > MAX_BYTES || compact_length > expected {
         return Err("Compact directory exceeds size budget".into());
     }
     let checksum = u32::from_le_bytes(
@@ -981,9 +987,8 @@ pub fn parse_compressed_directory(bytes: &[u8], expected: usize) -> Result<Heade
     if decoded.len() != compact_length || verified.finalize() != checksum {
         return Err("Compressed directory integrity check failed".into());
     }
-    let mut header: Header = serde_json::from_slice(&decoded).map_err(|cause| cause.to_string())?;
+    let header = binary_directory::decode(&decoded, max_heap_bytes)?;
     validate_header(&header)?;
-    header.documents.shrink_to_fit();
     Ok(header)
 }
 
@@ -3200,9 +3205,17 @@ pub mod wasm {
         }
 
         #[doc = "# Errors\nRejects invalid compressed frames or canonical headers and mismatched expected lengths."]
-        pub fn compressed(bytes: &[u8], expected: u32) -> Result<Self, JsValue> {
-            let header = super::parse_compressed_directory(bytes, expected as usize)
-                .map_err(|cause| JsValue::from_str(&cause))?;
+        pub fn compressed(
+            bytes: &[u8],
+            expected: u32,
+            max_heap_bytes: u32,
+        ) -> Result<Self, JsValue> {
+            let header = super::parse_compressed_directory(
+                bytes,
+                expected as usize,
+                max_heap_bytes as usize,
+            )
+            .map_err(|cause| JsValue::from_str(&cause))?;
             Ok(Self {
                 header: Rc::new(header),
             })

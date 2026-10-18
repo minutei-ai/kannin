@@ -4252,3 +4252,24 @@ Before and after deployment, eight mixed rounds each ran four strong selectors w
 | Dense group 43          |       621.77 / 568.17 ms |                        143 / 109 ms |         2 |
 
 GRU served ingress, but measured placement changed from remote-EWR before deployment to local-GRU afterward. These sequential, cache-sensitive observations therefore do not isolate the codec's native latency contribution. HTTP improved in three selectors and regressed in one; CPU coverage is small, especially for dense selectors. Existing correlated artifacts could survive, while the versioned directory namespace started empty. This is native correctness and rollout evidence, not a fully cold backend comparison, sustained-throughput guarantee or Turbopuffer parity result.
+
+## Reused filter attribute projection
+
+On an uncached filter-mask evaluation, Rust now reuses one temporary attribute map across a directory's documents. Requested names borrow from the selection instead of allocating a new key string and map node for every document. Values reset before each document; missing fields, present nulls, escaped duplicate keys, operator ordering and validation of unselected JSON retain their existing semantics. Ranking arithmetic, retained cache quotas, directory encoding and canonical R2 bytes are unchanged.
+
+An isolated WASM probe used eight real 5,000-document headers, alternating variants for 40 rounds and excluding four warmups. Each round changed an equivalent numeric predicate to bypass retained filter masks. Median preparation time changed **15.94 to 10.72 ms** with one selected field and **21.18 to 13.57 ms** with two. Posting-span outputs matched. This isolates preparation rather than complete search latency.
+
+The full local workerd comparison used the same million-document corpus, sequence 2000, compiled binary-directory baseline and physical R2 fixture. Each variant started in a fresh process, with alternating order across three cohorts; both query rounds were checked. Prepared caches survived; partial loss replaced correlated pool and batch prefixes with verified empty prefixes while preserving directories. Predicates selected the same documents. All **72 complete responses**, including scores, attributes, revisions and sequence, matched. The table reports median first-query times. Operating-system and storage caches could remain warm.
+
+| Cache state  | Query                 | Before ms | After ms |
+| ------------ | --------------------- | --------: | -------: |
+| Prepared     | Sixteen rare terms    |    489.83 |   462.72 |
+| Prepared     | Sixty-four rare terms |    805.54 |   787.71 |
+| Prepared     | Dense group 72        |    766.28 |   763.57 |
+| Prepared     | Dense group 43        |    769.60 |   754.88 |
+| Partial loss | Sixty-four rare terms |   1749.56 |  1658.08 |
+| Partial loss | Dense group 43        |   3605.17 |  3446.96 |
+
+Observed prepared-query WASM capacities were identical between variants for all four selectors: 19,333,120, 24,510,464, 8,257,536 and 8,257,536 bytes respectively. This does not measure whole-Worker peak heap. The local end-to-end gains are modest compared with the isolated preparation improvement, and these samples do not establish native Cloudflare latency or Turbopuffer parity.
+
+The complete local gate passed **289 Worker/tooling and 59 Rust tests**, including full native/WASM Clippy, Effect lint and types, filter-mask bounds, tombstones and differential comparison with complete-object evaluation across every supported filter operator.

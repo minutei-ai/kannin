@@ -239,12 +239,13 @@ impl<'de> serde::de::Visitor<'de> for ValidatedDiscard {
     }
 }
 
+#[cfg(any(test, target_arch = "wasm32"))]
 struct SelectedAttributes<'a>(&'a BTreeSet<&'a str>);
 
 struct SelectedAttribute<'a>(&'a BTreeSet<&'a str>);
 
-impl<'de> serde::de::DeserializeSeed<'de> for SelectedAttribute<'_> {
-    type Value = Option<String>;
+impl<'a, 'de> serde::de::DeserializeSeed<'de> for SelectedAttribute<'a> {
+    type Value = Option<&'a str>;
 
     fn deserialize<D: serde::Deserializer<'de>>(
         self,
@@ -254,18 +255,19 @@ impl<'de> serde::de::DeserializeSeed<'de> for SelectedAttribute<'_> {
     }
 }
 
-impl serde::de::Visitor<'_> for SelectedAttribute<'_> {
-    type Value = Option<String>;
+impl<'a> serde::de::Visitor<'_> for SelectedAttribute<'a> {
+    type Value = Option<&'a str>;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("an attribute name")
     }
 
     fn visit_str<E: serde::de::Error>(self, field: &str) -> Result<Self::Value, E> {
-        Ok(self.0.get(field).copied().map(str::to_owned))
+        Ok(self.0.get(field).copied())
     }
 }
 
+#[cfg(any(test, target_arch = "wasm32"))]
 impl<'de> serde::de::DeserializeSeed<'de> for SelectedAttributes<'_> {
     type Value = BTreeMap<String, serde_json::Value>;
 
@@ -277,6 +279,7 @@ impl<'de> serde::de::DeserializeSeed<'de> for SelectedAttributes<'_> {
     }
 }
 
+#[cfg(any(test, target_arch = "wasm32"))]
 impl<'de> serde::de::Visitor<'de> for SelectedAttributes<'_> {
     type Value = BTreeMap<String, serde_json::Value>;
 
@@ -288,12 +291,47 @@ impl<'de> serde::de::Visitor<'de> for SelectedAttributes<'_> {
         let mut selected = BTreeMap::new();
         while let Some(field) = map.next_key_seed(SelectedAttribute(self.0))? {
             if let Some(field) = field {
-                selected.insert(field, map.next_value::<serde_json::Value>()?);
+                selected.insert(field.to_owned(), map.next_value::<serde_json::Value>()?);
             } else {
                 map.next_value::<ValidatedDiscard>()?;
             }
         }
         Ok(selected)
+    }
+}
+
+struct FilterAttributes<'a, 'b> {
+    fields: &'a BTreeSet<&'a str>,
+    values: &'b mut BTreeMap<&'a str, Option<serde_json::Value>>,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for FilterAttributes<'_, '_> {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for FilterAttributes<'_, '_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an attribute object")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        while let Some(field) = map.next_key_seed(SelectedAttribute(self.fields))? {
+            if let Some(field) = field {
+                self.values.insert(field, Some(map.next_value()?));
+            } else {
+                map.next_value::<ValidatedDiscard>()?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -377,16 +415,31 @@ impl Header {
         if let Some(mask) = cached {
             allowed = mask;
         } else if !filters.is_empty() {
-            let fields = filters.iter().map(|filter| filter.field.as_str()).collect();
+            let fields: BTreeSet<_> = filters.iter().map(|filter| filter.field.as_str()).collect();
+            let mut values: BTreeMap<_, Option<serde_json::Value>> =
+                fields.iter().map(|field| (*field, None)).collect();
             for (index, doc) in self.documents.iter().enumerate() {
+                for value in values.values_mut() {
+                    *value = None;
+                }
                 let mut decoder = serde_json::Deserializer::from_str(doc.attributes.get());
-                let attributes = serde::de::DeserializeSeed::deserialize(
-                    SelectedAttributes(&fields),
+                serde::de::DeserializeSeed::deserialize(
+                    FilterAttributes {
+                        fields: &fields,
+                        values: &mut values,
+                    },
                     &mut decoder,
                 )
                 .map_err(|cause| cause.to_string())?;
                 decoder.end().map_err(|cause| cause.to_string())?;
-                allowed[index] = matches(&attributes, filters)?;
+                for filter in filters {
+                    if !filter
+                        .matches(values.get(filter.field.as_str()).and_then(Option::as_ref))?
+                    {
+                        allowed[index] = false;
+                        break;
+                    }
+                }
             }
             let bytes = key.capacity() + allowed.capacity() + 128;
             if bytes <= FILTER_CACHE_BYTES {
@@ -3712,6 +3765,96 @@ mod filter_cache_tests {
                 SelectedAttributes(&fields)
                     .deserialize(&mut decoder)
                     .and_then(|_| decoder.end())
+                    .is_err()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reused_filter_values_match_complete_objects_without_cross_document_leaks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let inputs = [
+            r#"{"group":1,"g\u0072oup":2,"flag":true,"ignored":{"nested":[1,null]}}"#,
+            "{}",
+            r#"{"group":null,"flag":false}"#,
+            r#"{"group":[1,2],"flag":null}"#,
+            r#"{"group":{"nested":1},"flag":"yes"}"#,
+            r#"{"group":-0.0,"ignored":1e308}"#,
+            r#"{"group":3,"flag":true}"#,
+        ];
+        let documents = inputs
+            .iter()
+            .enumerate()
+            .map(|(index, _)| Document {
+                id: format!("{index}"),
+                revision: 1,
+                title: String::new(),
+                text: "target".into(),
+                attributes: std::collections::BTreeMap::new(),
+                vector: None,
+            })
+            .collect();
+        let mut header = build(documents)?.header;
+        for (document, input) in header.documents.iter_mut().zip(inputs) {
+            document.attributes = serde_json::value::RawValue::from_string(input.into())?;
+        }
+        for op in ["eq", "ne", "exists", "in", "gt", "gte", "lt", "lte"] {
+            for value in [
+                json!(2),
+                json!(true),
+                json!(false),
+                json!(null),
+                json!([1, 2]),
+                json!({"nested":1}),
+            ] {
+                for fields in [["group", "flag"], ["missing", "group"], ["group", "group"]] {
+                    let filters: Vec<_> = fields
+                        .iter()
+                        .map(|field| Filter {
+                            field: (*field).into(),
+                            op: op.into(),
+                            value: value.clone(),
+                        })
+                        .collect();
+                    let expected = inputs
+                        .iter()
+                        .map(|input| {
+                            let attributes =
+                                serde_json::from_str(input).map_err(|cause| cause.to_string())?;
+                            super::matches(&attributes, &filters)
+                        })
+                        .collect::<Result<Vec<_>, String>>();
+                    assert_eq!(header.allowed(&filters, &[]), expected);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reused_filter_values_still_validate_unselected_attributes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for input in [
+            r#"{"ignored":1e999,"group":1}"#,
+            r#"{"ignored":{"nested":1e999},"group":1}"#,
+        ] {
+            let document: Document = serde_json::from_value(json!({
+                "id":"a", "text":"target", "attributes":{}
+            }))?;
+            let mut header = build(vec![document])?.header;
+            header.documents[0].attributes =
+                serde_json::value::RawValue::from_string(input.into())?;
+            assert!(
+                header
+                    .allowed(
+                        &[Filter {
+                            field: "group".into(),
+                            op: "eq".into(),
+                            value: json!(1),
+                        }],
+                        &[]
+                    )
                     .is_err()
             );
         }

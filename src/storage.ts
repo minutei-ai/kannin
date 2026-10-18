@@ -98,6 +98,7 @@ const SMALL_RANGE_BODY_UNIT = 64 * 1024;
 const smallRangeReads = Semaphore.makeUnsafe(64);
 const MAX_DIRECTORY_FALLBACK_LENGTH = 2 * 1024 * 1024;
 const MAX_DIRECTORY_CACHE_LENGTH = 4 * 1024 * 1024;
+const SMALL_CATALOG_HEADER_BYTES = 64 * 1024;
 const MAX_DIRECTORY_CACHE_BYTES = MAX_DIRECTORY_FALLBACK_LENGTH + 8192;
 const directoryFallbackReads = Semaphore.makeUnsafe(1);
 const CANONICAL_HEADER_UNIT = 64 * 1024;
@@ -1285,7 +1286,8 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
       const sources: Array<(typeof OverviewBatch.Type)[number]> = [];
       const admission = { bytes: 0, enabled: true };
       const r2Activity = { count: 0 };
-      const fallbackReads = Semaphore.makeUnsafe(1);
+      const fallbackCapacity = 2;
+      const fallbackReads = Semaphore.makeUnsafe(fallbackCapacity);
       const catalogs = yield* Effect.forEach(
         ranges,
         (input, index) =>
@@ -1369,7 +1371,12 @@ export const readTermProjections = Effect.fn("kannin.readTermProjections")(
               const fallbackStarted = yield* Clock.currentTimeNanos;
               const projection =
                 derived ??
-                (yield* fallbackReads.withPermits(1)(
+                (yield* fallbackReads.withPermits(
+                  Math.min(
+                    fallbackCapacity,
+                    Math.ceil(input.headerBytes / SMALL_CATALOG_HEADER_BYTES),
+                  ),
+                )(
                   withDirectory(
                     input.key,
                     input.headerBytes,

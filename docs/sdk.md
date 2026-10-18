@@ -24,6 +24,8 @@ const search =
 KANNIN: Cloudflare.WorkerEntrypoint<Entrypoint>(search, "KanninRpc");
 ```
 
+The Alchemy example requires the declared [entrypoint patch](../patches/alchemy@2.0.0-beta.83.patch) for beta.83. Its original guard recognizes only objects, while a lazy `Worker.ref` is a callable proxy. Without the fix, a foreign named binding silently becomes a binding to the consumer's default entrypoint. The patch accepts callable resource references in both the TypeScript and emitted runtime entry points. Carry the same fix at the consumer's package-manager patch owner when using an affected Alchemy version; installing the SDK does not patch the consumer's infrastructure dependencies. Remove this patch section when the resolved upstream implementation passes `entrypoint.test.ts` without it. Minutei's Alchemy version must be checked independently before configuring its production binding.
+
 Use the consumer's existing process runtime and native environment. For example, at the service Layer that owns the binding:
 
 ```ts
@@ -45,4 +47,4 @@ Both Worker-to-Worker and Worker-to-coordinator calls use native RPC, with struc
 
 A service binding is an account-controlled capability granting access to all Kannin namespaces. It does not use the public HTTP bearer token. Minutei must authorize the actor and workspace and select the permitted namespace on the server before invoking the SDK. Do not expose the binding or arbitrary namespace selection to a browser. The public HTTP API retains its existing authentication.
 
-The workerd integration test connects two Workers and disables HTTP on both the search Worker and its coordinator. It checks writes, idempotency/conflicts, filters, reads, deletions, namespace isolation, sequence barriers and maintenance operations. These local tests do not prove the Minutei production binding has been configured or establish a network latency improvement.
+The workerd integration test connects two Workers and disables HTTP on both the search Worker and its coordinator. It checks writes, idempotency/conflicts, filters, reads, deletions, namespace isolation, sequence barriers and maintenance operations. A separate native Cloudflare canary verified the service binding destination, writes, idempotency/conflicts, filtered and edge queries, deletion and typed failures. Its namespace was reset to zero documents and zero vector-outbox entries, and its temporary Worker was removed. Neither check configures Minutei's production binding or establishes a network latency improvement.

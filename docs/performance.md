@@ -4554,3 +4554,57 @@ All **96 queries** correlated by CF-Ray to successful native SearchNamespace eve
 Alchemy deployment completed with 100% of the candidate version, Smart Placement, the same R2 bucket and unchanged lifecycle rules. The million-document root remained byte-identical to its original snapshot. This change does not complete fully cold metadata recovery, cold tails, sustained load, peak whole-Worker heap, large-corpus ANN recall or Turbopuffer parity.
 
 Two other candidates were rejected before this rollout. An inline Rust key for common single-block term summaries passed exactness checks but regressed the complete local dense cold path about four percent. Parallel canonical header recovery preserved correctness and body quotas but made complete local cold reads roughly five percent slower. Neither candidate was deployed; their microbenchmarks did not justify retaining them.
+
+## Small-header recovery overlap
+
+Source `4088d68` retains serial catalog fallback for headers above 64 KiB and permits two smaller acquisitions within each batch. A larger header consumes both permits. Eight active batches can therefore offer sixteen small-header fallbacks or eight larger ones; the unchanged process admission still limits raw canonical bodies to eight MiB. These limits do not bound decoded directory memory or whole-Worker heap. Root consistency, formats, scoring, cache quotas and document acquisition are unchanged; WASM bytes match the preceding build.
+
+The earlier parallel-recovery experiment included headers up to one MiB and regressed complete local cold reads. This narrower policy targets the observed 53–54 KiB headers in the native cold canary while retaining the previous path for the large headers in the million-document corpus. It does not retry the broader policy unchanged.
+
+The full gate passed **302 Worker/tooling and 59 Rust tests**, formatting, strict lint, Effect types and native/WASM Clippy. The new acquisition test failed first on the prior implementation, observing one active small body instead of two. Six passing cases cover the 64-KiB boundary, its next byte, headers above four MiB, out-of-order completion with ordered results, sixteen small bodies across eight batches, and nine concurrent larger batches sharing the existing eight-MiB raw-body quota. Every fixture finishes with zero active bodies.
+
+A full-query local control used eight real 500-document segments and an added 100-ms delay at canonical header body acquisition. Five alternating pairs each executed one initial query and three coordinator-reset queries. All **forty result sets** matched in rows, scores, attributes, revisions and sequence. First-query medians changed **1004.96 → 575.97 ms**; the directory phase changed **942 → 517 ms**, with eight fallback directories in every first response. Later reset medians were **28.47 → 28.13 ms**. This isolates latency overlap with surviving local caches on repetition, not Cloudflare performance.
+
+The existing compact million-document local control ran three alternating pairs per cell and eight requests per variant. All **288 result sets** matched. Its headers exceed the new small-header threshold, so recovery remains serial. Timings were mixed:
+
+| Derived state / selector | First before → after ms | Seven repetitions, pooled median before → after ms |
+| ------------------------ | ----------------------: | -------------------------------------------------: |
+| Prepared / rare 64       |         846.31 → 845.81 |                                    143.73 → 146.03 |
+| Prepared / dense 43      |         952.76 → 937.25 |                                      50.43 → 49.71 |
+| Partial / rare 64        |       1718.63 → 1724.67 |                                    145.11 → 150.35 |
+| Partial / dense 43       |       3664.98 → 3639.47 |                                      41.68 → 40.99 |
+| Total / rare 64          |       2544.69 → 2476.17 |                                    147.03 → 140.13 |
+| Total / dense 43         |       4131.32 → 4191.30 |                                      43.63 → 41.79 |
+
+These local adapter observations do not establish an improvement for fully cold large catalogs. Filesystem caches remain eligible.
+
+### Native small-header control
+
+Each version used three new 4,000-document namespaces with eight 500-document segments. Native Bloom checks selected ingestion IDs that do not open earlier headers. Only each owned namespace's derived R2 models, model batches and binary directories were deleted before its first query; canonical objects remained intact. All headers were below 64 KiB. First responses confirmed eight directory fallbacks, zero individual-model hits and zero batch-model hits. Subsequent queries selected neighboring documents, first with warm coordinator memory and then after a coordinator reset. This preserves the previous cold-canary method.
+
+All **eighteen result sets** matched in rows, scores, attributes, revisions and sequence eight. Medians across three namespaces:
+
+| State                                              | HTTP before → after ms | Metadata phase before → after ms | Document phase before → after ms | Parent CPU before → after ms |
+| -------------------------------------------------- | ---------------------: | -------------------------------: | -------------------------------: | ---------------------------: |
+| First query, derived artifacts absent              |      2786.88 → 1911.42 |                       1887 → 874 |                        229 → 234 |                      61 → 59 |
+| Different neighboring documents, warm coordinator  |        197.27 → 224.35 |                            4 → 5 |                          <1 → <1 |                       8 → 10 |
+| Different neighboring documents, coordinator reset |        206.45 → 223.84 |                            7 → 8 |                            3 → 5 |                      15 → 17 |
+
+All six first requests reported remote-EWR placement. One candidate warm request reported local-GRU and took 512.63 ms; other warm/reset requests reported remote-EWR. Metadata acquisition fell about **54%**, and first-request HTTP fell about **31%**, while warm/reset medians were higher in this small sample. Parent CPU covers SearchNamespace only and excludes source/cache Worker CPU. All eighteen requests correlated by CF-Ray to successful native parent events and the expected versions: baseline `eaea4036-1187-4b8a-8486-00e7f359c813`, candidate `045f2b5b-3982-4ece-842e-49953b2d61db`.
+
+This is evidence for overlapping small-header latency after derived-cache loss. Freshly written R2 canonical objects may remain warm, three observations per state cannot establish tail latency, and these sequential runs are not a sustained-load test. All six canaries were reset and verified at zero live documents and zero vector outbox items.
+
+### Native million-document control
+
+The unchanged 1,000,000-document, 200-segment index retained sequence 2,000. Each version supplied eight rounds of four changed selectors, plus four rounds resetting coordinator memory before every query. All **96 result sets** matched in rows, scores, attributes, revisions and sequence. Warm medians exclude the first two rounds; reset queries retain eligible native immutable caches.
+
+| Selector | Warm HTTP before → after ms | Reset HTTP before → after ms |
+| -------- | --------------------------: | ---------------------------: |
+| Rare 16  |             227.26 → 213.88 |              340.19 → 347.29 |
+| Rare 64  |             314.65 → 294.85 |              447.90 → 434.81 |
+| Dense 72 |             227.40 → 202.73 |              412.37 → 365.90 |
+| Dense 43 |             230.87 → 216.54 |              376.88 → 370.14 |
+
+Both variants reported remote-EWR throughout these million-document runs. Baseline samples came from the preceding document-window rollout, when separate canary probes overlapped; candidate samples ran after the small-header canaries completed. Parent-event telemetry matched 41 of 48 candidate queries at capture, including a second read of the same observation windows. Missing event coverage remains unverified; the table reports HTTP observations rather than an incomplete parent-CPU comparison. These observations do not isolate load, network or cache-state effects. Larger-header recovery did not gain concurrency, and these are not fully cold storage measurements or proof of a warm-latency improvement from this change.
+
+Alchemy completed the rollout with 100% of the candidate version, Smart Placement, the same R2 bucket and unchanged lifecycle rules. The million-document root remained byte-identical to its original snapshot. Large cold-catalog recovery, sustained-load tails, whole-Worker peak heap, large-corpus ANN recall and Turbopuffer parity remain unproven.

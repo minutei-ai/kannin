@@ -11,15 +11,18 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 ## Performance
 
-**1,000,000 documents · deployed Cloudflare · GRU ingress.**
+Separate native Cloudflare experiments, with GRU ingress:
 
-Document reads now reuse bounded immutable byte windows through the existing caches. In three fresh native 4,000-document namespaces per version, changing to neighboring documents reduced median document materialization **302 → <1 ms** with a warm coordinator and **290 → 4 ms** after coordinator reset. First-query materialization remained **316 → 303 ms**. A separate native thousand-document deletion took **100.57 → 2.01 seconds**, one observation per version. Placement changed from IAD to EWR; broader CPU results were mixed. Local bulk mutations used **1,001 → 8 acquisitions** while reading **100 → 305 kB**, so this trades bounded read-ahead for reuse rather than guaranteeing cheaper sparse reads. [Measurements and limits](docs/performance.md#bounded-document-byte-windows).
+| Workload                                                             |                       Corpus |         Before → after |
+| -------------------------------------------------------------------- | ---------------------------: | ---------------------: |
+| First strong query after derived-cache loss                          | 4,000 documents / 8 segments | 2,786.88 → 1,911.42 ms |
+| Document materialization after a neighboring read, warm coordinator  |              4,000 documents |            302 → <1 ms |
+| Document materialization after a neighboring read, coordinator reset |              4,000 documents |             290 → 4 ms |
+| Ordinary bulk deletion                                               |              1,000 documents |  100.57 → 2.01 seconds |
 
-Immutable field models now survive coordinator restarts through native Workers Cache. On the same million-document index, coordinator-reset strong HTTP medians changed **584 / 665 → 311 / 425 ms** for sixteen/sixty-four rare terms and **834 / 734 → 360 / 392 ms** for two dense selectors. Every reset dense query recorded **25 native cache hits**. All **96 complete native responses** matched. Warm medians were mixed and broadly similar; two reset requests changed placement. These small samples do not establish sustained capacity or fully cold storage latency. [Native measurements](docs/performance.md#native-workers-cache-for-immutable-field-models).
+The latest change overlaps two catalog acquisitions only when their headers are at most 64 KiB. Across three fresh namespaces per version, first-query metadata acquisition fell **1,887 → 874 ms**, with all six first requests placed in EWR and all result rows, scores, attributes, revisions and sequences preserved. Warm/reset HTTP medians were slightly higher in that small sample; one warm request changed placement. Larger headers retain serial recovery. This proves a bounded cold-recovery improvement, not whole-app latency or completely cold R2 storage. [Methods and results](docs/performance.md#small-header-recovery-overlap).
 
-Cold recovery uses compact canonical headers (**352 → 123 MB** over the controlled local million-document corpus) and binary derived directories (**19.8% fewer compressed directory bytes**). Earlier local first-read comparisons improved 16–25% for rare terms under surviving directory caches and about 22% with derived artifacts absent after compact canonical writes. These are separate local experiments, not fully cold Cloudflare guarantees. Existing immutable objects retain their layout; ordinary writes and compaction use compact headers. [Methods and limits](docs/performance.md).
-
-Canonical recovery also constructs immutable field models directly in Rust. The controlled local comparison preserved all 288 complete responses. After derived-cache loss, eight changed-filter queries used **50 → 25 catalog calls** for dense terms and **18 → 9** for rare terms. The first dense repetition improved **674 → 64 ms**, while its initial recovery increased **5.46 → 5.72 seconds** to prepare that reusable model. A fresh native canary confirmed cache hits on all three coordinator resets after the first canonical recovery; million-document native HTTP results were mixed. Fully cold recovery remains a performance gap. [Recovery measurements and rejected experiments](docs/performance.md#canonical-catalog-recovery-and-field-cache-admission).
+Document windows trade bounded read-ahead for reuse: local bulk mutations used **1,001 → 8 acquisitions** but **100 → 305 kB**. The deletion row has one native observation per version and different prior cache state/placement. On the unchanged million-document index, all **96 native result sets** matched in the latest comparison; warm HTTP medians were **203–295 ms** across four selectors. Fully cold large-catalog recovery remains a gap: the latest local dense first read was about **4.2 seconds**. [Read-ahead measurements](docs/performance.md#bounded-document-byte-windows) · [full performance history](docs/performance.md).
 
 An earlier edge load run at source `6c03e72`, using an acknowledged sequence barrier, checked 384 complete responses against a strong baseline:
 
@@ -46,7 +49,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **294 Worker/tooling tests and 59 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **302 Worker/tooling tests and 59 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

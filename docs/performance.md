@@ -4497,4 +4497,60 @@ A separate native million-document comparison checked **96 complete before/after
 
 Ingress remained GRU; reported Worker placement changed from remote-EWR before to remote-IAD afterward. Existing field models could survive in native caches. HTTP results were mixed, and these sequential samples do not isolate a latency contribution from the new reconstruction path. The fresh-namespace canary separately verifies immediate native cache admission. This rollout does not establish whole-app speed, fully cold storage/tails, sustained capacity, peak heap, large-corpus ANN recall or Turbopuffer parity.
 
-Both canary namespaces were verified at zero live documents and zero vector outbox items after cleanup. The million-document canonical root remained byte-identical, and final provider state retained 100% of the candidate version, Smart Placement, the same bucket and lifecycle rules. A single thousand-document cleanup deletion took **100.57 seconds**; the current mutation path reads previous document payloads sequentially while subtracting term counts. Bulk-mutation latency is another remaining whole-app optimization target; this catalog change does not address it.
+Both canary namespaces were verified at zero live documents and zero vector outbox items after cleanup. The million-document canonical root remained byte-identical, and final provider state retained 100% of the candidate version, Smart Placement, the same bucket and lifecycle rules. A single thousand-document cleanup deletion took **100.57 seconds**; that implementation read previous document payloads sequentially while subtracting term counts. The catalog change did not address it. The subsequent [bounded document byte windows](#bounded-document-byte-windows) comparison below measures that mutation workload separately.
+
+## Bounded document byte windows
+
+Source `0f731cf` changes document acquisition only. Frames and contiguous selected spans no larger than 32 KiB first use an exact resident frame, otherwise acquire covering 32 KiB physical windows from the existing immutable range cache. A boundary-crossing read is at most 64 KiB, clipped to the immutable object's known length. Larger frames/spans retain exact reads. Selected frames retain CRC, decompression and Schema validation; neighboring bytes remain opaque. Copies of selected frames and covering windows are both charged to the existing twelve-MiB range/frequency LRU. No resource, cache quota, root freshness contract, ranking algorithm or write ordering changed. The WASM artifact is byte-identical.
+
+The full local gate passed **296 Worker/tooling tests and 59 Rust tests**, formatting, type-aware lint, Effect types and native/WASM Clippy. New workerd cases verify reuse across different selected documents, rejection of a selected corrupt frame without decoding an unselected neighbor, and an intact frame crossing a window boundary at object end. Existing vector ordering, compaction, sparse acquisition and materialization concurrency checks pass.
+
+### Controlled local reads and mutations
+
+Three alternating before/after cohorts used the same compact million-document corpus, fresh workerd processes and eight requests per cell. All **288 complete responses** matched, including rows, scores, attributes, revisions and sequence. Prepared cells retain derived catalog data; partial cells remove correlated models while retaining directories; total cells remove both derived representations. Host/filesystem caches remain eligible. These are local adapter measurements, not Cloudflare storage cold-start percentiles.
+
+| Derived state / selector | First before → after ms | Seven repetitions, pooled median before → after ms |
+| ------------------------ | ----------------------: | -------------------------------------------------: |
+| Prepared / rare 64       |         798.78 → 794.60 |                                    146.28 → 138.46 |
+| Prepared / dense 43      |         930.49 → 915.99 |                                      50.22 → 47.92 |
+| Partial / rare 64        |       1711.31 → 1753.95 |                                    148.08 → 139.52 |
+| Partial / dense 43       |       3654.21 → 3604.15 |                                      40.95 → 44.24 |
+| Total / rare 64          |       2665.45 → 2697.58 |                                    146.04 → 149.22 |
+| Total / dense 43         |       4406.71 → 4450.24 |                                      42.33 → 42.99 |
+
+The complete cold path did not improve consistently. Sparse winners can occupy different windows, leaving acquisition counts unchanged while increasing bytes. Across eight prepared dense requests, raw range bytes increased **443,102 → 769,260** with nineteen acquisitions in both variants; after total derived loss, the corresponding counters were **141,743 → 467,901** with seventeen acquisitions. These counters exclude separate directory transfers and do not measure billed R2 requests.
+
+A separate three-cohort local comparison seeded 1,000 documents, rebuilt coordinator memory and then deleted or updated all documents. Deletion median changed **3265.29 → 196.98 ms**; update median changed **3271.88 → 273.44 ms**. Each case used **1,001 → 8 range acquisitions**, with **100,263 → 305,414 raw bytes**. All paired query responses matched: deleted/old terms disappeared, and updates preserved the expected attributes and revision two. The existing sequential previous-document loop now reuses nearby bytes; writes were not parallelized.
+
+### Fresh native namespaces
+
+Three newly owned 4,000-document namespaces per version used eight 500-document segments. Ingestion IDs were selected against prior segment Bloom filters to avoid opening old directories while seeding. Before the first query, only each canary's derived correlated models, model batches and binary directories were removed. The canonical root and segments remained intact. First-query telemetry confirmed eight canonical-directory fallbacks and no derived-model hits. The next query changed the scalar selector to neighboring document IDs; the final query changed it again after coordinator reset. Each query enforced strong consistency and sequence eight.
+
+All **eighteen complete before/after responses** matched. Medians across the three namespaces:
+
+| State                                              | HTTP before → after ms | Document phase before → after ms | Directory phase before → after ms |
+| -------------------------------------------------- | ---------------------: | -------------------------------: | --------------------------------: |
+| First query, derived artifacts absent              |      2765.81 → 2296.04 |                        316 → 303 |                       1550 → 1601 |
+| Different neighboring documents, warm coordinator  |        692.14 → 213.79 |                         302 → <1 |                             4 → 5 |
+| Different neighboring documents, coordinator reset |        562.94 → 229.99 |                          290 → 4 |                             8 → 6 |
+
+Server timing records whole milliseconds; zero does not prove zero work. Placement changed from remote-IAD to remote-EWR. The first request still pays canonical metadata and document acquisition; native cache reuse after a prior neighboring read is the demonstrated improvement. Freshly written canonical objects may remain warm in R2, so this is forced derived-cache loss, not completely cold Cloudflare storage. All six namespaces finished at zero documents and zero vector outbox items.
+
+A separate native 1,000-document canary used the previous deletion dataset and ordinary deletes, rather than namespace reset. Its deletion completed in **2010.39 ms**, compared with the preceding rollout's **100573.46 ms** observation. Both writes were journaled and committed at sequences one and two; metadata and a strong alpha query confirmed zero documents, zero outbox items and no surviving rows. The initial harness omitted the required empty filters array after deletion; a read-only continuation checked persisted state and completed the query oracle without repeating writes. Each version has only one deletion observation, their prior cache state differs, and placement changed. The result is not a deletion latency percentile or proof of sustained write capacity.
+
+### Native million-document reads
+
+The existing 1,000,000-document, 200-segment index retained sequence 2,000. Each version ran eight rounds of four changed selectors; warm medians exclude the first two rounds. A separate four rounds reset coordinator memory before every query, retaining eligible native immutable caches. All **96 complete responses** matched. HTTP medians and the native SearchNamespace parent CPU are shown separately:
+
+| Selector | Warm HTTP before → after ms | Warm parent CPU before → after ms | Reset HTTP before → after ms | Reset parent CPU before → after ms |
+| -------- | --------------------------: | --------------------------------: | ---------------------------: | ---------------------------------: |
+| Rare 16  |             246.77 → 227.26 |                       38.5 → 33.5 |              426.74 → 340.19 |                        107.5 → 108 |
+| Rare 64  |             344.99 → 314.65 |                       114 → 120.5 |              456.85 → 447.90 |                      201.5 → 213.5 |
+| Dense 72 |             255.32 → 227.40 |                           37 → 36 |              396.93 → 412.37 |                          139 → 145 |
+| Dense 43 |             257.28 → 230.87 |                       37.5 → 36.5 |              381.69 → 376.88 |                        130.5 → 141 |
+
+All **96 queries** correlated by CF-Ray to successful native SearchNamespace events and the expected deployed version: baseline `8a61506c-fd84-4235-a595-8fbc8d85bf56`, candidate `eaea4036-1187-4b8a-8486-00e7f359c813`. Parent CPU excludes source/cache Worker work and is not whole-app CPU. Candidate placement was remote-EWR; baseline was remote-IAD with one local-GRU warm observation. These sequential runs overlapped independent synthetic-namespace probes in the same deployment and do not isolate global load or network effects. Warm HTTP improved in this sample while CPU was mixed and reset CPU increased. Do not attribute the entire HTTP difference to byte windows or call these fully cold storage measurements.
+
+Alchemy deployment completed with 100% of the candidate version, Smart Placement, the same R2 bucket and unchanged lifecycle rules. The million-document root remained byte-identical to its original snapshot. This change does not complete fully cold metadata recovery, cold tails, sustained load, peak whole-Worker heap, large-corpus ANN recall or Turbopuffer parity.
+
+Two other candidates were rejected before this rollout. An inline Rust key for common single-block term summaries passed exactness checks but regressed the complete local dense cold path about four percent. Parallel canonical header recovery preserved correctness and body quotas but made complete local cold reads roughly five percent slower. Neither candidate was deployed; their microbenchmarks did not justify retaining them.

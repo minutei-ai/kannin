@@ -4459,6 +4459,8 @@ A fully missing derived-cache control on the compact million-document corpus spe
 
 Canonical recovery previously returned an exact minimum without a field model, even though its prepared overview could supply one. Rust now constructs the bounded model directly from the already validated directory. It uses the existing grouping of original attribute objects and the same joint/marginal projection builder. A supported model can enter native Workers Cache on this first recovery. Unsupported models retain the exact filter-bound fallback; projection failures retain the previous summary/minimum path. Overview preparation still runs for future term selectors. Canonical objects, derived frame encodings, consistency and the SDK contract do not change.
 
+The full local gate passed **294 Worker/tooling and 59 Rust tests**, including Effect lint/types and native/WASM Clippy. Coverage compares the direct catalog with existing projections across scalar operators, numeric wire values, missing/null cells, joint/marginal models, oversized fallbacks and query limits. The workerd fixture forces canonical recovery, checks its fallback telemetry and verifies immutable admission. Sixteen real legacy/compact headers also preserved direct models, existing summaries and compressed-directory bytes against the previous WASM build.
+
 A controlled local workerd comparison used the same compact million-document corpus, 200 segments and sequence 2000, with fresh processes and alternating variant order across three cohorts. Each selector ran eight rounds with changing equivalent predicates. All **288 complete responses** matched, including scores, attributes, revisions and sequence. First-query medians include every cohort; repeated medians include the other seven rounds per process.
 
 | Cache state  | Selector       | First before / after ms | Repeated before / after ms |
@@ -4470,6 +4472,29 @@ A controlled local workerd comparison used the same compact million-document cor
 | Total loss   | 64 rare terms  |     3,472.42 / 3,556.05 |            195.03 / 198.59 |
 | Total loss   | Dense group 43 |     5,457.74 / 5,723.59 |              54.92 / 59.12 |
 
+After partial or total loss, eight changed-filter rounds issued **9 instead of 18 catalog calls** for rare terms and **25 instead of 50** for dense queries, in every cohort. Prepared controls remained at 9 and 25. The first repeated query after total loss changed **360.31 → 216.08 ms** for rare terms and **674.30 → 63.63 ms** for dense group 43; corresponding partial-loss medians were 422.35 → 247.05 ms and 683.17 → 96.12 ms. These are three-sample medians of round one, rather than established warm-state latency. The initial field model removes the second catalog acquisition before steady-state reuse.
+
 Prepared controls retain derived artifacts. Partial loss replaces correlated pool and batch prefixes with verified empty prefixes; total loss additionally replaces the directory-frame prefix. Storage and OS caches may survive. A 25.27-second partial-loss baseline outlier remains included; the median alone does not describe its tail. These controls do not emulate native Workers Cache. Total-loss dense first reads increased about 4.9% in this sample: constructing an immediately reusable model adds initial work. This is a cache-admission improvement, not a general cold-latency reduction. Fully cold storage and sustained-load targets remain open.
 
 Two alternatives were rejected before deployment. Inline single posting blocks with SmallVec reduced isolated compact-header parsing about 2.3% and compressed-directory decoding about 4%, but five of six complete first-query cells became slower across 192 exact responses. The existing boxed block representation remains. Another prototype recovered the field model by projecting the complete newly compressed overview; all 192 responses matched, but initial recovery became slower. The retained direct Rust path avoids that complete overview decode. Neither rejected prototype was published as a production optimization.
+
+Source `61d504d` deployed in 59.7 seconds, including the unconditional Vectorize metadata migration. Cloudflare reports version `8a61506c-fd84-4235-a595-8fbc8d85bf56` at 100% with Smart Placement, the same R2 bucket and lifecycle rules.
+
+A native canary used a new thousand-document namespace per variant, deleted only that namespace's two derived R2 artifacts before its first query, and rebuilt coordinator memory before each changed-filter query. The first response in both variants recorded one canonical-directory fallback. All eight queries passed their expected-ID oracle. Native cache hits over four rounds changed **[0, 0, 0, 1] → [0, 1, 1, 1]**: the candidate reused its model immediately after the first canonical recovery. These are forced derived-cache misses against freshly written objects, not fully cold R2 storage or million-document recovery measurements.
+
+A separate native million-document comparison checked **96 complete before/after responses**, with scores, attributes, revisions and sequence 2000 identical. Warm HTTP/CPU medians exclude two warmups from eight rounds per selector. Coordinator-reset medians include all four rounds per selector; rebuild reloads the manifest and preserves native/derived caches. CPU refers only to the coordinator event, paired by CF-Ray, rather than whole-Worker or source execution. Every event was available: 32/32 warm and 16/16 reset per variant. All 48 candidate coordinator events used the deployed version.
+
+| Workload          | Selector       | HTTP before / after ms | Coordinator CPU before / after ms | Pairs |
+| ----------------- | -------------- | ---------------------: | --------------------------------: | ----: |
+| Warm              | 16 rare terms  |        219.34 / 246.84 |                           30 / 30 |     6 |
+| Warm              | 64 rare terms  |        305.28 / 309.29 |                       108.5 / 107 |     6 |
+| Warm              | Dense group 72 |        222.21 / 238.18 |                           40 / 31 |     6 |
+| Warm              | Dense group 43 |        238.31 / 231.64 |                         33 / 31.5 |     6 |
+| Coordinator reset | 16 rare terms  |        324.50 / 360.36 |                        95.5 / 104 |     4 |
+| Coordinator reset | 64 rare terms  |        447.44 / 469.73 |                       186.5 / 196 |     4 |
+| Coordinator reset | Dense group 72 |        409.55 / 371.92 |                       134.5 / 122 |     4 |
+| Coordinator reset | Dense group 43 |        388.76 / 361.37 |                         116 / 108 |     4 |
+
+Ingress remained GRU; reported Worker placement changed from remote-EWR before to remote-IAD afterward. Existing field models could survive in native caches. HTTP results were mixed, and these sequential samples do not isolate a latency contribution from the new reconstruction path. The fresh-namespace canary separately verifies immediate native cache admission. This rollout does not establish whole-app speed, fully cold storage/tails, sustained capacity, peak heap, large-corpus ANN recall or Turbopuffer parity.
+
+Both canary namespaces were verified at zero live documents and zero vector outbox items after cleanup. The million-document canonical root remained byte-identical, and final provider state retained 100% of the candidate version, Smart Placement, the same bucket and lifecycle rules. A single thousand-document cleanup deletion took **100.57 seconds**; the current mutation path reads previous document payloads sequentially while subtracting term counts. Bulk-mutation latency is another remaining whole-app optimization target; this catalog change does not address it.

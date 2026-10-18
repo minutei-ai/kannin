@@ -4324,3 +4324,33 @@ The same compiled Worker queried both layouts in fresh local workerd processes, 
 | Total loss   | Dense group 43        |        4044.84 |        3593.16 |
 
 Dense recovery improved by about 8–11%, but rare-query medians increased 16–25%, and every prepared-cache selector was slower. Prepared sixteen-term WASM capacity increased from 19,333,120 to 21,823,488 bytes; the other three observed prepared capacities stayed unchanged. These values do not measure whole-Worker peak heap. This tradeoff does not justify lowering the general automatic compaction target. The existing policy and production index were preserved. Further cold-read work should reduce metadata materialization or acquisition cost within candidate sources rather than presume that reducing source count is universally faster.
+
+## Rejected query-bound directory decoding experiment
+
+Candidate `5f40256` decoded only requested term metadata when the complete directory could not be retained by the existing admission policy. It preserved validation of every encoded entry and retained complete document metadata. The full local gate passed **290 Worker/tooling and 61 Rust tests**, including native/WASM Clippy, Effect lint and types, Unicode queries, corrupted omitted metadata and cache admission aging.
+
+The same million-document local R2 fixture and sequence 2000 were compared in fresh workerd processes, alternating variant order across three cohorts. Eight rounds covered four prepared selectors and two partial-loss selectors; all **288 complete responses** matched. Partial loss preserved directories and replaced correlated pool and batch prefixes with verified empty prefixes. The following medians exclude each process's first query, leaving 21 repeated samples per cell. Storage and operating-system caches could remain warm.
+
+| Cache state  | Selector              | Baseline ms | Candidate ms |
+| ------------ | --------------------- | ----------: | -----------: |
+| Prepared     | Sixteen rare terms    |       44.89 |        42.60 |
+| Prepared     | Sixty-four rare terms |      138.17 |       133.03 |
+| Prepared     | Dense group 72        |      337.90 |       330.81 |
+| Prepared     | Dense group 43        |      334.33 |       331.60 |
+| Partial loss | Sixty-four rare terms |      138.06 |       133.42 |
+| Partial loss | Dense group 43        |      319.01 |       324.21 |
+
+First-query medians were mixed: prepared rare-16 changed 469.20 / 481.35 ms, prepared rare-64 804.13 / 793.69 ms, and partial-loss dense-43 3352.21 / 3385.17 ms. A separate single-pair concurrent control checked four warmup responses and twenty measured responses per variant, all identical. Its median changed 319.28 / 303.24 ms and observed WASM capacity 27,066,368 / 24,838,144 bytes. This small local control does not establish sustained throughput or whole-Worker peak heap.
+
+Alchemy profile `minutei` deployed the candidate as version `af087218-d5e7-4e33-93e1-289e5736aa7c`, verified at 100% traffic with Smart Placement. Eight mixed rounds ran four strong selectors after an initial coordinator rebuild, using fresh equivalent predicates. All **64 complete before/after responses** matched. Thirty of 32 candidate coordinator events were available, all on the candidate version; all 24 measured CPU pairs were available after excluding two warmup rounds. CPU joins use exact response CF-Ray values.
+
+| Selector              | HTTP median before/after | Paired coordinator CPU before/after | CPU pairs |
+| --------------------- | -----------------------: | ----------------------------------: | --------: |
+| Sixteen rare terms    |       240.79 / 242.31 ms |                      31.5 / 36.0 ms |         6 |
+| Sixty-four rare terms |       318.55 / 316.56 ms |                        106 / 105 ms |         6 |
+| Dense group 72        |       542.57 / 521.16 ms |                      38.5 / 42.5 ms |         6 |
+| Dense group 43        |       492.92 / 519.12 ms |                      45.5 / 42.0 ms |         6 |
+
+The candidate executed 111 query-bound projections, but native mixed-query WASM capacity decreased only **28,901,376 to 28,770,304 bytes**, while decoded cache charge remained **20,140,254 bytes**. Placement changed from remote-ATL to remote-IAD with ingress GRU. These observations cannot isolate a causal latency change; the small native memory benefit and mixed CPU results did not justify retaining the complexity.
+
+The candidate was reverted in `db7ff7d`. Alchemy redeployed the restored runtime as version `2a6ef10d-0d48-49e6-8df9-cc16142459ea`, verified at 100% traffic with Smart Placement, the same physical R2 bucket and unchanged lifecycle rules. Restored Worker and WASM artifacts matched the pre-experiment build byte for byte. The original canonical million-document manifest remained byte-identical, and four native rollback controls matched baseline rows, scores, attributes, revisions and sequence. Query-bound directory decoding is **not shipped**.

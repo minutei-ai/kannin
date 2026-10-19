@@ -4608,3 +4608,64 @@ The unchanged 1,000,000-document, 200-segment index retained sequence 2,000. Eac
 Both variants reported remote-EWR throughout these million-document runs. Baseline samples came from the preceding document-window rollout, when separate canary probes overlapped; candidate samples ran after the small-header canaries completed. Parent-event telemetry matched 41 of 48 candidate queries at capture, including a second read of the same observation windows. Missing event coverage remains unverified; the table reports HTTP observations rather than an incomplete parent-CPU comparison. These observations do not isolate load, network or cache-state effects. Larger-header recovery did not gain concurrency, and these are not fully cold storage measurements or proof of a warm-latency improvement from this change.
 
 Alchemy completed the rollout with 100% of the candidate version, Smart Placement, the same R2 bucket and unchanged lifecycle rules. The million-document root remained byte-identical to its original snapshot. Large cold-catalog recovery, sustained-load tails, whole-Worker peak heap, large-corpus ANN recall and Turbopuffer parity remain unproven.
+
+## Scoped attribute-group reuse
+
+Source `4c9e563` avoids reconstructing the same physical attribute groups twice during canonical catalog recovery. Overview encoding prepares sorted group row indices with minimum title/body lengths; the immediately following catalog projection consumes them. The grouping algorithm remains a BTreeMap ordered by exact raw attribute JSON. The preparation lives in the scoped Directory wrapper, while retained cache/active-reader wrappers share the immutable Header and start without preparation. Repeated overview encoding reuses it, catalog consumes it even without filters, and disposal releases any state left by an error. Native heap reporting includes a live group box. This changes no stored format, root freshness, scoring rule, cache quota or native binding contract.
+
+An updated inspector capture over the compact million-document corpus measured a 4,624-ms sampled interval for the dense first query. Header parsing accounted for about 1,576 inclusive sampled milliseconds and physical attribute grouping about 567. The latter ran during overview encoding and again during catalog projection. These are optimized diagnostic-WASM samples with symbols retained, not billed CPU or a production latency benchmark.
+
+Two alternatives were rejected before deployment. A temporary HashMap followed by sorted emission accelerated repeated-attribute microcases but regressed a full high-cardinality control: eight balanced pairs over 50,000 documents changed first-query medians **589.13 → 610.09 ms** and repeated medians **88.13 → 97.37 ms**. Sorting document references directly improved that control's first median **596.19 → 580.93 ms**, but repeated medians increased **88.87 → 96.20 ms**, and isolated repeated-attribute overview/catalog construction became slower. Neither alternative was published. Reusing the existing grouping work avoids selecting an algorithm for one favored attribute distribution.
+
+### Isolated engine and local complete queries
+
+Thirty alternating rounds compared eight original headers, eight compact headers and three synthetic 5,000-document shapes. Four warmups were excluded. A separate WASM instance built synthetic segments, so it did not inflate either measured instance's memory history. All **570 paired overviews and catalog projections** retained byte-identical overview frames and exact catalog JSON. Aggregated medians for eight real headers per row:
+
+| Layout                 | Canonical parse before → after ms | Overview before → after ms | Following catalog before → after ms |
+| ---------------------- | --------------------------------: | -------------------------: | ----------------------------------: |
+| Original named JSON    |                 112.029 → 111.269 |            34.493 → 34.245 |                      17.962 → 5.178 |
+| Compact canonical JSON |                   62.317 → 62.042 |            34.408 → 34.268 |                      18.098 → 5.222 |
+
+The unique-attribute synthetic header's catalog changed **5.719 → 3.638 ms**; its overview stayed similar at **6.509 → 6.461 ms**. Header heap reporting after consumption was equal in every pair. Both measured WASM instances reached **7,471,104 bytes** of linear-memory capacity in this sequence. That is not complete Worker peak memory; the opaque wrapper adds an optional scoped preparation and a live preparation occupies memory until consumption/disposal. Seventeen additional full-segment producer pairs, including varied document lengths and partitioned summaries, produced identical correlated-overview bytes. Header-only compact snapshots were paired with their unchanged original posting/document payloads for that producer check.
+
+The high-cardinality full-query control used ten real 5,000-document segments, with a unique scalar reference on every document and filters over group/year. Eight balanced before/after pairs ran an initial query and three changed-predicate repetitions. All **64 result sets** matched rows, scores, attributes, revisions and sequence ten. First-query medians changed **586.18 → 555.34 ms**; repetitions remained similar at **88.02 → 88.35 ms**. This fixture seeds canonical segments/root directly in local R2 and does not measure ingestion.
+
+The compact million-document comparison used three alternating pairs per cell, fresh processes and eight requests per variant. All **288 final matrix result sets** matched. An initial prepared cohort overlapped a lint invocation and was rerun alone; the superseded timing files remain in private artifacts. Cold-loss cells and final prepared measurements ran without another owned build/test/probe alongside them. Prepared cells retain derived artifacts; partial cells remove correlated models/batches; total cells also remove binary directories. Host and filesystem caches remain eligible.
+
+| Derived state / selector | First before → after ms | Seven repetitions, pooled median before → after ms |
+| ------------------------ | ----------------------: | -------------------------------------------------: |
+| Prepared / rare 64       |         875.13 → 895.05 |                                    154.51 → 153.15 |
+| Prepared / dense 43      |        983.80 → 1028.70 |                                      57.89 → 53.70 |
+| Partial / rare 64        |       2015.60 → 1778.41 |                                    163.83 → 156.01 |
+| Partial / dense 43       |       3940.74 → 3666.97 |                                      44.30 → 44.94 |
+| Total / rare 64          |       2934.10 → 2710.36 |                                    160.44 → 163.74 |
+| Total / dense 43         |       4898.95 → 4593.87 |                                      45.99 → 48.22 |
+
+Cold recovery improved in these observations; prepared controls and repetitions were mixed. These are local adapter measurements, not native storage percentiles. No result cache or weaker freshness was introduced.
+
+The full gate passed **304 Worker/tooling and 59 Rust tests**, with 10,745 assertions, formatting, strict type-aware lint/Effect types and native/WASM Clippy. New tests preserve overview/catalog bytes across physical attribute insertion orders and verify that preparation is reused, counted while live, consumed, and absent from retained handles. The entire **300-query SciFact report** over 5,183 documents was byte-identical to the preceding report: nDCG@10 **0.6730619695232347**, recall@10 **0.7956666666666666**, MRR@10 **0.641808201058201**.
+
+### Native verification
+
+A fresh baseline and candidate each used three new 4,000-document namespaces with eight 500-document segments. Bloom-safe ingestion avoided opening previous headers. Only each owned namespace's derived model, batch and directory artifacts were removed before its first query; canonical objects remained intact. First-query telemetry confirmed eight fallback directories and no derived-model hits. Warm and coordinator-reset queries selected different neighboring documents. All **eighteen result sets** matched rows, scores, attributes, revisions and sequence eight.
+
+| State                                              | HTTP before → after ms | Metadata before → after ms | Documents before → after ms |
+| -------------------------------------------------- | ---------------------: | -------------------------: | --------------------------: |
+| First query, derived artifacts absent              |      1881.77 → 1800.90 |                  997 → 877 |                   201 → 206 |
+| Warm coordinator, different neighboring documents  |        189.53 → 206.52 |                      5 → 5 |                     <1 → <1 |
+| Reset coordinator, different neighboring documents |        226.90 → 235.37 |                     7 → 10 |                       3 → 6 |
+
+All baseline requests reported remote-EWR; all candidate requests reported remote-IAD. Each first-request interval contained exactly one successful native Terms origin event of the expected version. Its CPU values were **114 / 116 / 206 → 113 / 74 / 102 ms**, a median **116 → 102 ms**. Source execution locations differed as well. Three observations do not isolate hardware, JIT or network effects, and source CPU excludes the coordinator, cache services and total billing. Parent CF-Ray coverage was incomplete at capture: **6/9 baseline and 8/9 candidate** events; absent records are not treated as zero or proof of success. No parent-CPU improvement is inferred from them. All six canaries finished at zero live documents and zero vector outbox items.
+
+The unchanged native million-document index supplied eight rounds of four selectors per version, plus four rounds resetting coordinator memory before every query. All **96 result sets** matched rows, scores, attributes, revisions and sequence 2,000. Warm medians exclude the first two rounds; reset queries preserve eligible immutable/native caches.
+
+| Selector | Warm HTTP before → after ms | Reset HTTP before → after ms |
+| -------- | --------------------------: | ---------------------------: |
+| Rare 16  |             213.88 → 238.90 |              347.29 → 354.97 |
+| Rare 64  |             294.85 → 343.05 |              434.81 → 447.28 |
+| Dense 72 |             202.73 → 244.66 |              365.90 → 396.06 |
+| Dense 43 |             216.54 → 242.47 |              370.14 → 404.90 |
+
+Baseline samples came from the preceding rollout, with remote-EWR placement; candidate samples reported remote-IAD and were collected later. HTTP medians increased in every cell. Warm engine-domain `raio` medians remained about **4–5 ms** in both runs, while gateway intervals increased. This timing split does not account for all planning, RPC, network or CPU work, and does not establish a cause for the HTTP difference. Candidate parent events matched **32/32 warm and 14/16 reset** requests at capture; source CPU and HTTP must not be presented as complete application CPU. These observations do not prove a native warm-latency improvement from scoped group reuse.
+
+Alchemy completed the rollout with version `7b568173-72d0-45d3-97e2-4900a80484e3` at 100%, Smart Placement, the same R2 bucket and unchanged lifecycle rules. Baseline source events used `045f2b5b-3982-4ece-842e-49953b2d61db`. The million-document root remained byte-identical to its original snapshot. Fully cold large-catalog latency, sustained-load tails, peak whole-Worker heap, large-corpus ANN recall and Turbopuffer parity remain open.

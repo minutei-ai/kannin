@@ -20,9 +20,11 @@ Separate native Cloudflare experiments, with GRU ingress:
 | Document materialization after a neighboring read, coordinator reset |              4,000 documents |             290 → 4 ms |
 | Ordinary bulk deletion                                               |              1,000 documents |  100.57 → 2.01 seconds |
 
-The latest change overlaps two catalog acquisitions only when their headers are at most 64 KiB. Across three fresh namespaces per version, first-query metadata acquisition fell **1,887 → 874 ms**, with all six first requests placed in EWR and all result rows, scores, attributes, revisions and sequences preserved. Warm/reset HTTP medians were slightly higher in that small sample; one warm request changed placement. Larger headers retain serial recovery. This proves a bounded cold-recovery improvement, not whole-app latency or completely cold R2 storage. [Methods and results](docs/performance.md#small-header-recovery-overlap).
+Small-header recovery overlaps two acquisitions only up to 64 KiB. In the earlier table's three fresh namespaces per version, metadata acquisition fell **1,887 → 874 ms**, with all six first requests placed in EWR and all result rows, scores, attributes, revisions and sequences preserved. Larger headers retain serial recovery. [Native small-header measurements](docs/performance.md#small-header-recovery-overlap).
 
-Document windows trade bounded read-ahead for reuse: local bulk mutations used **1,001 → 8 acquisitions** but **100 → 305 kB**. The deletion row has one native observation per version and different prior cache state/placement. On the unchanged million-document index, all **96 native result sets** matched in the latest comparison; warm HTTP medians were **203–295 ms** across four selectors. Fully cold large-catalog recovery remains a gap: the latest local dense first read was about **4.2 seconds**. [Read-ahead measurements](docs/performance.md#bounded-document-byte-windows) · [full performance history](docs/performance.md).
+Rust now reuses physical attribute groups within a scoped recovery handle. In the controlled local million-document comparison with derived caches absent, dense first reads changed **4.90 → 4.59 seconds** and sixty-four rare terms **2.93 → 2.71 seconds**. The full 300-query SciFact report remained byte-identical. Native model-source CPU changed **116 → 102 ms** in three first-read observations per version, while native million-document warm HTTP medians increased **203–295 → 239–343 ms** with EWR → IAD placement. These samples do not prove a Cloudflare warm-latency improvement or lower total billing. [Recovery methods and limitations](docs/performance.md#scoped-attribute-group-reuse).
+
+Document windows trade bounded read-ahead for reuse: local bulk mutations used **1,001 → 8 acquisitions** but **100 → 305 kB**. The deletion row has one native observation per version and different prior cache state/placement. Fully cold large-catalog recovery still takes seconds locally. [Read-ahead measurements](docs/performance.md#bounded-document-byte-windows).
 
 An earlier edge load run at source `6c03e72`, using an acknowledged sequence barrier, checked 384 complete responses against a strong baseline:
 
@@ -49,7 +51,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **302 Worker/tooling tests and 59 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **304 Worker/tooling tests and 59 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

@@ -1065,9 +1065,21 @@ pub fn compress_directory(bytes: &[u8]) -> Result<Vec<u8>, String> {
     checksum.update(&encoded);
     checksum.update(&compact);
     encoded.extend_from_slice(&checksum.finalize().to_le_bytes());
-    let mut compressor = flate2::write::ZlibEncoder::new(encoded, flate2::Compression::new(3));
-    std::io::Write::write_all(&mut compressor, &compact).map_err(|cause| cause.to_string())?;
-    compressor.finish().map_err(|cause| cause.to_string())
+    let flags = miniz_oxide::deflate::core::create_comp_flags_from_zip_params(3, 1, 0);
+    let mut compressor = miniz_oxide::deflate::core::CompressorOxide::new(flags);
+    let (status, consumed) = miniz_oxide::deflate::core::compress_to_output(
+        &mut compressor,
+        &compact,
+        miniz_oxide::deflate::core::TDEFLFlush::Finish,
+        |chunk| {
+            encoded.extend_from_slice(chunk);
+            true
+        },
+    );
+    if status != miniz_oxide::deflate::core::TDEFLStatus::Done || consumed != compact.len() {
+        return Err(format!("Directory compression failed: {status:?}"));
+    }
+    Ok(encoded)
 }
 
 #[doc = "# Errors\nRejects framing, size, compression, checksum, expected length and canonical header violations."]
@@ -1100,20 +1112,13 @@ pub fn parse_compressed_directory(
             .try_into()
             .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
     );
-    let mut decoded = vec![0; compact_length];
-    let (inflated, status) = zlib_rs::decompress_slice(
-        &mut decoded,
-        &bytes[20..],
-        zlib_rs::InflateConfig::default(),
-    );
-    if status != zlib_rs::ReturnCode::Ok {
-        return Err(format!("Directory decompression failed: {status:?}"));
-    }
-    let decoded_length = inflated.len();
+    let decoded =
+        miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&bytes[20..], compact_length)
+            .map_err(|cause| cause.to_string())?;
     let mut verified = crc32fast::Hasher::new();
     verified.update(&bytes[..16]);
     verified.update(&decoded);
-    if decoded_length != compact_length || verified.finalize() != checksum {
+    if decoded.len() != compact_length || verified.finalize() != checksum {
         return Err("Compressed directory integrity check failed".into());
     }
     let header = binary_directory::decode(&decoded, max_heap_bytes)?;

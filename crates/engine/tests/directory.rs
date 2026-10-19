@@ -89,6 +89,8 @@ fn directory_rejects_invalid_strings_flags_order_overflows_and_trailing_data()
     overflowing_revision.splice(4..5, [128, 128, 128, 128, 128, 128, 128, 128, 128, 2]);
     for payload in [
         invalid_utf8,
+        vec![1, 0, 1, 1, 255, 0, 0, 0, 0],
+        vec![1, 0, 1, 127, b'a', 0, 0, 0, 0],
         invalid_flag,
         invalid_attributes,
         trailing,
@@ -99,5 +101,49 @@ fn directory_rejects_invalid_strings_flags_order_overflows_and_trailing_data()
         let encoded = frame(&payload)?;
         assert!(segment::parse_compressed_directory(&encoded, 4096, 40 * 1024 * 1024).is_err());
     }
+    Ok(())
+}
+
+#[test]
+fn pooled_terms_preserve_unicode_order_last_duplicate_and_independent_clones()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut dictionary: segment::TermDictionary = serde_json::from_str(
+        r#"{"日本語":{"df":6,"blocks":[]},"a":{"df":1,"blocks":[]},"":{"df":0,"blocks":[]},"😀":{"df":7,"blocks":[]},"aé":{"df":3,"blocks":[]},"\u0061":{"df":2,"blocks":[]},"é":{"df":4,"blocks":[]}}"#,
+    )?;
+    assert_eq!(
+        dictionary.keys().collect::<Vec<_>>(),
+        ["", "a", "aé", "é", "日本語", "😀"]
+    );
+    assert_eq!(dictionary.get("a").ok_or("Missing duplicate term")?.df, 2);
+    for absent in ["aa", "aê", "日", "日本語a", "😃"] {
+        assert!(dictionary.get(absent).is_none());
+        assert!(dictionary.get_mut(absent).is_none());
+    }
+    let cloned = dictionary.clone();
+    dictionary
+        .get_mut("日本語")
+        .ok_or("Missing Unicode term")?
+        .df = 9;
+    assert_eq!(cloned.get("日本語").ok_or("Missing cloned term")?.df, 6);
+    assert_eq!(dictionary.iter().len(), 6);
+    assert_eq!((&dictionary).into_iter().len(), 6);
+    assert_eq!(
+        dictionary
+            .iter()
+            .map(|(key, metadata)| (key, metadata.df))
+            .collect::<Vec<_>>(),
+        (&dictionary)
+            .into_iter()
+            .map(|(key, metadata)| (key, metadata.df))
+            .collect::<Vec<_>>()
+    );
+    let encoded = serde_json::to_string(&dictionary)?;
+    let decoded: segment::TermDictionary = serde_json::from_str(&encoded)?;
+    assert_eq!(serde_json::to_string(&decoded)?, encoded);
+    assert_eq!(decoded.get("日本語").ok_or("Missing decoded term")?.df, 9);
+    let empty: segment::TermDictionary = serde_json::from_str("{}")?;
+    assert!(empty.is_empty());
+    assert!(empty.get("").is_none());
+    assert_eq!(empty.iter().len(), 0);
     Ok(())
 }

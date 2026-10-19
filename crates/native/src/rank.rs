@@ -307,7 +307,11 @@ mod tests {
             documents: 1,
             title_length: 0,
             body_length: 3,
-            frequencies: header.terms.keys().map(|term| (term.clone(), 1)).collect(),
+            frequencies: header
+                .terms
+                .keys()
+                .map(|term| (term.to_owned(), 1))
+                .collect(),
         };
         let search = Search::new(header, statistics, "alpha beta gamma", "any", 10, &[], &[])?;
         let groups = Ranker::groups(&search, None).map_err(|error| error.to_string())?;

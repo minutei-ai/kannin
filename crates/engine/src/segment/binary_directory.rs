@@ -76,7 +76,7 @@ struct Decoder<'a> {
     available: usize,
 }
 
-impl Decoder<'_> {
+impl<'a> Decoder<'a> {
     fn charge(&mut self, bytes: usize) -> Result<(), String> {
         self.available = self
             .available
@@ -108,13 +108,8 @@ impl Decoder<'_> {
         Err("Overflowing directory integer".into())
     }
 
-    fn text(&mut self) -> Result<String, String> {
+    fn text_slice(&mut self) -> Result<&'a str, String> {
         let length = self.integer()? as usize;
-        self.charge(
-            length
-                .checked_add(16)
-                .ok_or("Directory allocation overflow")?,
-        )?;
         let end = self
             .offset
             .checked_add(length)
@@ -124,9 +119,18 @@ impl Decoder<'_> {
             .get(self.offset..end)
             .ok_or("Truncated directory string")?;
         self.offset = end;
-        Ok(std::str::from_utf8(value)
-            .map_err(|cause| cause.to_string())?
-            .to_owned())
+        std::str::from_utf8(value).map_err(|cause| cause.to_string())
+    }
+
+    fn text(&mut self) -> Result<String, String> {
+        let value = self.text_slice()?;
+        self.charge(
+            value
+                .len()
+                .checked_add(16)
+                .ok_or("Directory allocation overflow")?,
+        )?;
+        Ok(value.to_owned())
     }
 
     fn range(&mut self) -> Result<Range, String> {
@@ -182,13 +186,21 @@ impl Decoder<'_> {
         }
         self.charge(
             count
-                .checked_mul(size_of::<(String, TermMeta)>())
+                .checked_mul(size_of::<(std::ops::Range<usize>, TermMeta)>())
                 .ok_or("Directory allocation overflow")?,
         )?;
-        let mut entries = Vec::<(String, TermMeta)>::with_capacity(count);
+        let mut entries = Vec::<(std::ops::Range<usize>, TermMeta)>::with_capacity(count);
+        let mut text_length = 0usize;
         for _ in 0..count {
-            let term = self.text()?;
-            if entries.last().is_some_and(|previous| previous.0 >= term) {
+            let term = self.text_slice()?;
+            let range = self.offset - term.len()..self.offset;
+            text_length = text_length
+                .checked_add(term.len())
+                .ok_or("Directory allocation overflow")?;
+            if entries
+                .last()
+                .is_some_and(|previous| self.bytes[previous.0.clone()] >= self.bytes[range.clone()])
+            {
                 return Err("Directory terms are not strictly sorted".into());
             }
             let df = self.integer()?;
@@ -218,14 +230,29 @@ impl Decoder<'_> {
                 });
             }
             entries.push((
-                term,
+                range,
                 TermMeta {
                     df,
                     blocks: blocks.into_boxed_slice(),
                 },
             ));
         }
+        self.charge(
+            text_length
+                .checked_add(16)
+                .ok_or("Directory allocation overflow")?,
+        )?;
+        let mut text = String::with_capacity(text_length);
+        for (range, _) in &mut entries {
+            let start = text.len();
+            text.push_str(
+                std::str::from_utf8(&self.bytes[range.clone()])
+                    .map_err(|cause| cause.to_string())?,
+            );
+            *range = start..text.len();
+        }
         Ok(TermDictionary {
+            text: text.into_boxed_str(),
             entries: entries.into_boxed_slice(),
         })
     }

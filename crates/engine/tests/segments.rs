@@ -20,7 +20,7 @@ fn statistics(header: &Header) -> Statistics {
         frequencies: header
             .terms
             .iter()
-            .map(|(term, meta)| (term.clone(), u64::from(meta.df)))
+            .map(|(term, meta)| (term.to_owned(), u64::from(meta.df)))
             .collect(),
     }
 }

@@ -164,12 +164,13 @@ test("directories above cache admission retain the existing forty-MiB validation
   using segment = new Segment('[{"id":"a","text":"alpha","attributes":{}}]');
   const original = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
   const json = new TextEncoder().encode(
-    Schema.encodeSync(Schema.fromJsonString(SegmentHeader))({
-      ...original,
-      terms: Object.fromEntries(
-        Array.from({ length: 440000 }, (_, index) => [`term${index}`, { df: 0, blocks: [] }]),
-      ),
-    }),
+    JSON.stringify([
+      original.version,
+      original.documents,
+      Object.fromEntries(Array.from({ length: 840000 }, (_, index) => [String(index), [0, []]])),
+      original.total_title_length,
+      original.total_body_length,
+    ]),
   );
   const frame = new Uint8Array(16 + json.byteLength);
   frame.set(new TextEncoder().encode("RAIOSEG1"));
@@ -177,6 +178,7 @@ test("directories above cache admission retain the existing forty-MiB validation
   view.setUint32(8, json.byteLength, true);
   view.setUint32(12, crc32(json), true);
   frame.set(json, 16);
+  expect(frame.byteLength).toBeLessThan(16 * 1024 * 1024);
   const bucket = await worker.getR2Bucket("STORAGE");
   await bucket.put(key, frame);
   const response = await fetch(await worker.ready, {

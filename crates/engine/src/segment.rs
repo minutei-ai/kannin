@@ -69,10 +69,27 @@ pub struct TermMeta {
 
 #[derive(Clone, Default)]
 pub struct TermDictionary {
-    entries: Box<[(String, TermMeta)]>,
+    text: Box<str>,
+    entries: Box<[(std::ops::Range<usize>, TermMeta)]>,
 }
 
 impl TermDictionary {
+    fn from_entries(entries: Vec<(String, TermMeta)>) -> Self {
+        let mut text = String::with_capacity(entries.iter().map(|(term, _)| term.len()).sum());
+        let entries = entries
+            .into_iter()
+            .map(|(term, metadata)| {
+                let start = text.len();
+                text.push_str(&term);
+                (start..text.len(), metadata)
+            })
+            .collect();
+        Self {
+            text: text.into_boxed_str(),
+            entries,
+        }
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -86,26 +103,30 @@ impl TermDictionary {
     #[must_use]
     pub fn get(&self, term: &str) -> Option<&TermMeta> {
         self.entries
-            .binary_search_by(|(key, _)| key.as_str().cmp(term))
+            .binary_search_by(|(key, _)| self.text[key.clone()].cmp(term))
             .ok()
             .map(|index| &self.entries[index].1)
     }
 
     pub fn get_mut(&mut self, term: &str) -> Option<&mut TermMeta> {
         self.entries
-            .binary_search_by(|(key, _)| key.as_str().cmp(term))
+            .binary_search_by(|(key, _)| self.text[key.clone()].cmp(term))
             .ok()
             .map(|index| &mut self.entries[index].1)
     }
 
     #[must_use]
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&String, &TermMeta)> {
-        self.entries.iter().map(|(term, metadata)| (term, metadata))
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&str, &TermMeta)> {
+        self.entries
+            .iter()
+            .map(|(term, metadata)| (&self.text[term.clone()], metadata))
     }
 
     #[must_use]
-    pub fn keys(&self) -> impl ExactSizeIterator<Item = &String> {
-        self.entries.iter().map(|(term, _)| term)
+    pub fn keys(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.entries
+            .iter()
+            .map(|(term, _)| &self.text[term.clone()])
     }
 
     #[must_use]
@@ -114,12 +135,36 @@ impl TermDictionary {
     }
 }
 
+pub struct TermIterator<'a> {
+    text: &'a str,
+    entries: std::slice::Iter<'a, (std::ops::Range<usize>, TermMeta)>,
+}
+
+impl<'a> Iterator for TermIterator<'a> {
+    type Item = (&'a str, &'a TermMeta);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.entries
+            .next()
+            .map(|(range, metadata)| (&self.text[range.clone()], metadata))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.entries.size_hint()
+    }
+}
+
+impl ExactSizeIterator for TermIterator<'_> {}
+
 impl<'a> IntoIterator for &'a TermDictionary {
-    type Item = &'a (String, TermMeta);
-    type IntoIter = std::slice::Iter<'a, (String, TermMeta)>;
+    type Item = (&'a str, &'a TermMeta);
+    type IntoIter = TermIterator<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.entries.iter()
+        TermIterator {
+            text: &self.text,
+            entries: self.entries.iter(),
+        }
     }
 }
 
@@ -167,9 +212,7 @@ impl<'de> Deserialize<'de> for TermDictionary {
                     std::mem::swap(&mut later.1, &mut earlier.1);
                     true
                 });
-                Ok(TermDictionary {
-                    entries: entries.into_boxed_slice(),
-                })
+                Ok(TermDictionary::from_entries(entries))
             }
         }
 
@@ -344,13 +387,13 @@ impl Header {
                 .iter()
                 .map(|doc| doc.id.capacity() + doc.attributes.get().len() + 32)
                 .sum::<usize>();
-        let terms = self.terms.entries.len() * size_of::<(String, TermMeta)>()
+        let terms = self.terms.entries.len() * size_of::<(std::ops::Range<usize>, TermMeta)>()
+            + self.terms.text.len()
+            + 16
             + self
                 .terms
-                .iter()
-                .map(|(term, meta)| {
-                    term.capacity() + 16 + meta.blocks.len() * size_of::<BlockMeta>()
-                })
+                .values()
+                .map(|meta| meta.blocks.len() * size_of::<BlockMeta>())
                 .sum::<usize>();
         documents + terms + size_of::<Self>() + 32 + FILTER_CACHE_BYTES
     }
@@ -788,9 +831,7 @@ fn encode_terms(
             },
         ));
     }
-    Ok(TermDictionary {
-        entries: terms.into_boxed_slice(),
-    })
+    Ok(TermDictionary::from_entries(terms))
 }
 
 #[doc = "# Errors\nRejects empty or duplicate documents, wire-size overflow, serialization errors, and segments beyond the size budget."]
@@ -3389,7 +3430,7 @@ pub mod wasm {
                         }
                     }
                     let summary = partition
-                        .entry(term.clone())
+                        .entry(term.to_owned())
                         .or_insert_with(|| TermSummary {
                             df: 0,
                             bounds: vec![(0, 0, document.title_length, document.body_length)],
@@ -4734,7 +4775,7 @@ mod candidate_tests {
             let mut search =
                 Search::new(header.clone(), statistics, text, "phrase", 10, &dead, &[])?;
             for (term, meta) in &header.terms {
-                if !search.words.contains(term) {
+                if !search.words.iter().any(|word| word == term) {
                     continue;
                 }
                 for block in &meta.blocks {
@@ -4896,7 +4937,7 @@ mod dense_cutoff_tests {
                 frequencies: header
                     .terms
                     .iter()
-                    .map(|(term, meta)| (term.clone(), u64::from(meta.df)))
+                    .map(|(term, meta)| (term.to_owned(), u64::from(meta.df)))
                     .collect(),
             };
             for mode in ["any", "all"] {
@@ -4996,7 +5037,7 @@ mod eligible_bound_tests {
             frequencies: header
                 .terms
                 .iter()
-                .map(|(term, meta)| (term.clone(), u64::from(meta.df)))
+                .map(|(term, meta)| (term.to_owned(), u64::from(meta.df)))
                 .collect(),
         };
         for filters in [
@@ -5018,7 +5059,7 @@ mod eligible_bound_tests {
                     &filters,
                 )?;
                 for (term, metadata) in &header.terms {
-                    if search.words.contains(term) {
+                    if search.words.iter().any(|word| word == term) {
                         for block in &metadata.blocks {
                             let start = base + block.data.offset as usize;
                             search.add(
@@ -5184,7 +5225,7 @@ mod cutoff_certificate_tests {
             frequencies: header
                 .terms
                 .iter()
-                .map(|(word, meta)| (word.clone(), u64::from(meta.df)))
+                .map(|(word, meta)| (word.to_owned(), u64::from(meta.df)))
                 .collect(),
         };
         for mode in ["any", "all", "phrase"] {
@@ -5330,7 +5371,7 @@ mod required_term_tests {
             frequencies: header
                 .terms
                 .iter()
-                .map(|(term, meta)| (term.clone(), u64::from(meta.df)))
+                .map(|(term, meta)| (term.to_owned(), u64::from(meta.df)))
                 .collect(),
         };
         let search = Search::new(
@@ -5423,7 +5464,7 @@ mod required_term_tests {
                 frequencies: header
                     .terms
                     .iter()
-                    .map(|(term, meta)| (term.clone(), u64::from(meta.df) * factor))
+                    .map(|(term, meta)| (term.to_owned(), u64::from(meta.df) * factor))
                     .collect(),
             };
             for query in [

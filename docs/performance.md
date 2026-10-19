@@ -4705,3 +4705,24 @@ The complete million-document control alternated versions for sixteen queries pe
 | Models and directory frames absent | Dense, group 72 |              5,194.07 → 6,795.22 |              47.14 → 50.58 |
 
 Larger frames and mixed complete-query results did not justify the isolated compression gain. The experiment was discarded; local runtime artifacts were restored byte-for-byte to the checked `b70426c` version. Production was unchanged. Shared-host contention and small first-read samples limit causal interpretation. No Cloudflare deployment or cost comparison was performed.
+
+## Contiguous term text in Rust/WASM
+
+Against runtime `b70426c` (unchanged in `92f1533`), term keys now share one UTF-8 allocation. Sorted entries retain ranges into that text. Binary decoding borrows validated source keys until allocating the exact combined length; document attributes, canonical formats, scoring and cache quotas remain unchanged.
+
+Seventeen archived headers were opened in alternating WASM instances for 24 rounds each, excluding four warmups. Opening medians were 5.544 → 5.561 ms, with a median paired ratio of 1.0033: no isolated opening-speed gain. Aggregate retained directory charge fell 19,445,549 → 17,529,577 bytes (9.85%). Every decoded document and term metadata value matched, and recompressed frames were byte-identical. A separate builder instance kept preparation outside the measured modules. Holding those seventeen directories together produced observed WASM linear-memory high-water marks of 18,874,368 → 18,153,472 bytes. Retained charges reserve future filter masks and include conservative overhead; neither measurement bounds whole-Worker memory.
+
+The complete-query comparison used the same compacted million-document namespace, 200 segments and strong sequence barrier. Before/after workerd runtimes alternated order per query and cohort. Three cohorts covered prepared artifacts; two covered each artifact-loss scenario. All 640 responses matched their paired complete result and expected IDs. Warm medians exclude six of sixteen queries per runtime/cohort.
+
+| Derived artifacts                        | Query           | First read before → after, ms | Warm before → after, ms |
+| ---------------------------------------- | --------------- | ----------------------------: | ----------------------: |
+| Prepared                                 | 16 rare terms   |               507.41 → 565.32 |           41.09 → 40.02 |
+| Prepared                                 | 64 rare terms   |               876.58 → 927.53 |         132.17 → 116.20 |
+| Prepared                                 | Dense, group 72 |           1,066.61 → 1,078.55 |           54.90 → 56.04 |
+| Prepared                                 | Dense, group 43 |           1,069.31 → 1,086.55 |           56.38 → 56.81 |
+| Models absent, directory frames retained | 64 rare terms   |           1,839.02 → 1,890.75 |         115.07 → 113.02 |
+| Models absent, directory frames retained | Dense, group 72 |           3,991.12 → 3,863.95 |           46.07 → 45.76 |
+| Models and directory frames absent       | 64 rare terms   |           2,742.23 → 2,682.92 |         132.92 → 110.85 |
+| Models and directory frames absent       | Dense, group 72 |           4,563.22 → 4,501.77 |           46.53 → 47.36 |
+
+Prepared 64-term warm queries had a median paired ratio of 0.870 (23/30 faster); with all derived artifacts initially absent it was 0.802 (19/20). Dense queries were broadly similar and some medians regressed. Prepared first reads also regressed; their two or three observations cannot establish cold-tail behavior. The retained-memory reduction and bounded warm gains justify this local change, without claiming universal speedup. Shared-host contention remains a limitation. Full cold recovery still takes seconds, and Cloudflare performance, billed cost and Turbopuffer parity remain unverified for this version.

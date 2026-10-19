@@ -65,7 +65,7 @@ fn request(
                     .header
                     .terms
                     .iter()
-                    .map(|(word, meta)| (word.clone(), u64::from(meta.df)))
+                    .map(|(word, meta)| (word.to_owned(), u64::from(meta.df)))
                     .collect(),
             },
         },

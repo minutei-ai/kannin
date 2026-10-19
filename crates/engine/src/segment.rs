@@ -418,7 +418,32 @@ impl Header {
             let fields: BTreeSet<_> = filters.iter().map(|filter| filter.field.as_str()).collect();
             let mut values: BTreeMap<_, Option<serde_json::Value>> =
                 fields.iter().map(|field| (*field, None)).collect();
+            let repeated = {
+                use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+
+                let row_hasher = BuildHasherDefault::<DefaultHasher>::default();
+                let mut observed = std::collections::HashMap::new();
+                (0..self.documents.len().min(128)).any(|sample| {
+                    let hash = row_hasher.hash_one(sample).to_le_bytes();
+                    let row =
+                        usize::from(u16::from_le_bytes([hash[0], hash[1]])) % self.documents.len();
+                    observed
+                        .insert(self.documents[row].attributes.get(), row)
+                        .is_some_and(|previous| previous != row)
+                })
+            };
+            let mut evaluated = std::collections::HashMap::new();
             for (index, doc) in self.documents.iter().enumerate() {
+                let available = evaluated.len() < 2048;
+                let entry = if repeated {
+                    Some(evaluated.entry(doc.attributes.get()))
+                } else {
+                    None
+                };
+                if let Some(std::collections::hash_map::Entry::Occupied(entry)) = &entry {
+                    allowed[index] = *entry.get();
+                    continue;
+                }
                 for value in values.values_mut() {
                     *value = None;
                 }
@@ -439,6 +464,9 @@ impl Header {
                         allowed[index] = false;
                         break;
                     }
+                }
+                if available && let Some(std::collections::hash_map::Entry::Vacant(entry)) = entry {
+                    entry.insert(allowed[index]);
                 }
             }
             let bytes = key.capacity() + allowed.capacity() + 128;
@@ -4085,6 +4113,110 @@ mod filter_cache_tests {
                     assert_eq!(header.allowed(&filters, &[]), expected);
                 }
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_attribute_values_preserve_filters_and_query_local_tombstones()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let inputs = [
+            r#"{"group":2,"flag":true}"#,
+            r#"{"group":2,"flag":true}"#,
+            r#"{"group":2,"flag":true}"#,
+            "{}",
+            "{}",
+            r#"{"group":null,"flag":false}"#,
+            r#"{"group":null,"flag":false}"#,
+            r#"{"group":2,"flag":true}"#,
+            r#"{"group":2,"flag":true}"#,
+        ];
+        let documents = inputs
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                serde_json::from_value::<Document>(json!({
+                    "id": format!("{index}"), "text": "target", "attributes": {}
+                }))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut header = build(documents)?.header;
+        for (document, input) in header.documents.iter_mut().zip(inputs) {
+            document.attributes = serde_json::value::RawValue::from_string(input.into())?;
+        }
+        for op in ["eq", "ne", "exists", "in", "gt", "gte", "lt", "lte"] {
+            for value in [json!(2), json!(true), json!(null), json!([1, 2])] {
+                let filters = [Filter {
+                    field: "group".into(),
+                    op: op.into(),
+                    value,
+                }];
+                let expected = inputs
+                    .iter()
+                    .map(|input| {
+                        let attributes =
+                            serde_json::from_str(input).map_err(|cause| cause.to_string())?;
+                        super::matches(&attributes, &filters)
+                    })
+                    .collect::<Result<Vec<_>, String>>();
+                assert_eq!(header.allowed(&filters, &[]), expected);
+                if let Ok(mask) = expected {
+                    let mut deleted = mask.clone();
+                    deleted[0] = false;
+                    deleted[3] = false;
+                    deleted[7] = false;
+                    assert_eq!(header.allowed(&filters, &[0, 3, 7])?, deleted);
+                    assert_eq!(header.allowed(&filters, &[])?, mask);
+                }
+                header.filter_masks.borrow_mut().entries.clear();
+                header.filter_masks.borrow_mut().bytes = 0;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn attribute_reuse_limit_keeps_uncached_rows_and_later_queries_correct()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let documents = (0..5000)
+            .map(|index| {
+                serde_json::from_value::<Document>(json!({
+                    "id": format!("{index:05}"), "text": "target",
+                    "attributes": {"group": index % 2100}
+                }))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let header = build(documents)?.header;
+        for filters in [
+            vec![Filter {
+                field: "group".into(),
+                op: "gte".into(),
+                value: json!(2048),
+            }],
+            vec![Filter {
+                field: "group".into(),
+                op: "eq".into(),
+                value: json!(17),
+            }],
+            vec![Filter {
+                field: "missing".into(),
+                op: "exists".into(),
+                value: json!(false),
+            }],
+        ] {
+            let expected = header
+                .documents
+                .iter()
+                .map(|document| {
+                    let attributes = serde_json::from_str(document.attributes.get())
+                        .map_err(|cause| cause.to_string())?;
+                    super::matches(&attributes, &filters)
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            assert_eq!(header.allowed(&filters, &[])?, expected);
+            assert!(!header.allowed(&filters, &[17, 2117])?[17]);
+            assert!(!header.allowed(&filters, &[17, 2117])?[2117]);
+            assert_eq!(header.allowed(&filters, &[])?, expected);
         }
         Ok(())
     }

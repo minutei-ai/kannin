@@ -4690,3 +4690,18 @@ The change samples raw attributes, then reuses exact filter results within the e
 A paired, single-process WASM control alternated ranker preparation on 5,000 documents for 160 rounds per distribution. After 32 warmups, repeated attributes changed 1.509 → 0.853 ms; unique attributes changed 1.905 → 1.898 ms, with a median paired ratio of 1.000. A separate 96-round control with unique attributes and 1,024-byte padding changed 4.242 → 4.373 ms, a 3.3% median paired regression. Reuse is workload-dependent. With a separate builder instance, observed WASM linear-memory high water stayed at 3,080,192 bytes for the repeated fixture and 3,538,944 for unique attributes in both versions; retained directory charges also matched. These small controls do not bound whole-Worker heap. The release WASM grew from 904,372 to 911,304 bytes.
 
 An earlier process-by-process run overlapped unrelated builds and was excluded from performance conclusions. The final complete-query run alternated versions within each query pair, reducing temporal drift; shared-host contention remains a limitation. First-read medians have only two or three observations per version and are mixed across scenarios. Fully cold recovery still takes seconds. These are local measurements, with no new Cloudflare deployment, billed-CPU, tail-latency or Turbopuffer-parity claim.
+
+## Rejected directory compression level reduction
+
+A local experiment against `b70426c` changed only derived-directory zlib compression from level three to one. On seventeen archived canonical headers, alternating versions for twelve rounds per header, compression-call medians after three warmups changed 17.636 → 12.526 ms. Aggregate frame bytes grew 1,705,463 → 2,004,428, or 17.5%. Decoded sampled rows, term metadata and retained header charges matched.
+
+The complete million-document control alternated versions for sixteen queries per runtime in two cohorts per case. All 256 responses matched their paired response and expected IDs. Warm medians exclude six warmups; first-read medians have only two observations per version.
+
+| Derived artifacts                  | Query           | First read level 3 → level 1, ms | Warm level 3 → level 1, ms |
+| ---------------------------------- | --------------- | -------------------------------: | -------------------------: |
+| Prepared                           | 64 rare terms   |                  893.77 → 934.34 |            133.62 → 136.12 |
+| Prepared                           | Dense, group 72 |              1,179.32 → 1,214.66 |              54.59 → 54.44 |
+| Models and directory frames absent | 64 rare terms   |              3,106.79 → 2,796.87 |            138.74 → 146.89 |
+| Models and directory frames absent | Dense, group 72 |              5,194.07 → 6,795.22 |              47.14 → 50.58 |
+
+Larger frames and mixed complete-query results did not justify the isolated compression gain. The experiment was discarded; local runtime artifacts were restored byte-for-byte to the checked `b70426c` version. Production was unchanged. Shared-host contention and small first-read samples limit causal interpretation. No Cloudflare deployment or cost comparison was performed.

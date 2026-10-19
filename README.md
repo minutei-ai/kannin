@@ -65,7 +65,7 @@ For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN
 
 Authenticated namespace endpoints support atomic writes, text/vector/hybrid queries, metadata, compaction, collection and vector rebuilds. Text reads default to strong consistency; edge eventual is explicit and supports a `minimumSequence` barrier. Vector visibility is eventual. Text top-k is capped at 100; vector/hybrid at 50. Unsupported provider filter pushdown and stale candidates can underfill vector results.
 
-[API and durability](docs/api.md) · [architecture](docs/architecture.md) · [lint](docs/lint.md)
+[API and durability](docs/api.md) · [architecture](docs/architecture.md) · [search research](docs/search-research.md) · [lint](docs/lint.md)
 
 ## License
 

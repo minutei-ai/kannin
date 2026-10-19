@@ -225,6 +225,23 @@ test("Rust pedantic casts are forbidden even under a matching lint expectation",
   expect(result.output).toContain("cast_possible_truncation");
 });
 
+test("Rust allocation rules cannot be lowered by matching lint expectations", async () => {
+  const result = await Effect.runPromise(
+    rustProbe(
+      [
+        "#[expect(clippy::redundant_clone)]",
+        "pub fn cloned(value: String) -> String { value.clone() }",
+        "#[expect(clippy::needless_collect)]",
+        "pub fn collected(values: &[u8]) -> usize { values.iter().collect::<Vec<_>>().len() }",
+      ].join("\n"),
+    ),
+  );
+  expect(result.exitCode).not.toBe(0);
+  expect(result.output).toContain("E0453");
+  expect(result.output).toContain("redundant_clone");
+  expect(result.output).toContain("needless_collect");
+});
+
 test("Rust rejects integer precision loss and accepts a checked conversion", async () => {
   const invalid = await Effect.runPromise(
     rustProbe("#[must_use]\npub fn imprecise(value: u64) -> f64 { value as f64 }"),

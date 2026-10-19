@@ -1,2 +1,8 @@
+[build]
+jobs = 1
+
+[env]
+RUST_TEST_THREADS = "1"
+
 [target.wasm32-unknown-unknown]
 rustflags = ["-C", "target-feature=+simd128"]

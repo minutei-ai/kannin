@@ -1100,13 +1100,20 @@ pub fn parse_compressed_directory(
             .try_into()
             .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
     );
-    let decoded =
-        miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&bytes[20..], compact_length)
-            .map_err(|cause| cause.to_string())?;
+    let mut decoded = vec![0; compact_length];
+    let (inflated, status) = zlib_rs::decompress_slice(
+        &mut decoded,
+        &bytes[20..],
+        zlib_rs::InflateConfig::default(),
+    );
+    if status != zlib_rs::ReturnCode::Ok {
+        return Err(format!("Directory decompression failed: {status:?}"));
+    }
+    let decoded_length = inflated.len();
     let mut verified = crc32fast::Hasher::new();
     verified.update(&bytes[..16]);
     verified.update(&decoded);
-    if decoded.len() != compact_length || verified.finalize() != checksum {
+    if decoded_length != compact_length || verified.finalize() != checksum {
         return Err("Compressed directory integrity check failed".into());
     }
     let header = binary_directory::decode(&decoded, max_heap_bytes)?;

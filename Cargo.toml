@@ -22,6 +22,8 @@ pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
 cast_possible_truncation = "forbid"
 cast_precision_loss = "forbid"
+redundant_clone = "forbid"
+needless_collect = "forbid"
 dbg_macro = "deny"
 unwrap_used = "forbid"
 expect_used = "forbid"

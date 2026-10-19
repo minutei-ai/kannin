@@ -847,7 +847,7 @@ pub fn build(mut documents: Vec<Document>) -> Result<BuiltSegment, String> {
         return Err("Duplicate segment ids".into());
     }
     let mut payload = Vec::new();
-    let mut metadata = Vec::new();
+    let mut metadata = Vec::with_capacity(documents.len());
     let mut lists: BTreeMap<String, Vec<Posting>> = BTreeMap::new();
     let mut total_title_length = 0;
     let mut total_body_length = 0;

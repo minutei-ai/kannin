@@ -247,6 +247,76 @@ test("shared attribute groups preserve minima across operators and different doc
   segment.free();
 });
 
+test("overview bytes and projected catalogs are independent of attribute group insertion order", () => {
+  const groups = [
+    { group: "ação", year: 2024, extra: "日本語" },
+    { group: "a", year: 2020, extra: null },
+    { group: "🚀", year: 2026, extra: 1.5 },
+    { group: "A", year: 2021, extra: 'quoted "value"' },
+  ];
+  const samples = [];
+  for (const shift of [0, 1, 2, 3, 0, 3, 2, 1]) {
+    using segment = new Segment(
+      Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(
+        groups.flatMap((attributes, group) =>
+          Array.from({ length: 8 }, (_, index) => ({
+            id: String(((group + shift) % groups.length) * 8 + index).padStart(3, "0"),
+            revision: 1,
+            title: "",
+            text: "alpha beta",
+            attributes,
+          })),
+        ),
+      ),
+    );
+    using directory = new Directory(segment.bytes());
+    const filters = '[{"field":"year","op":"gte","value":2021}]';
+    const overview = directory.overview();
+    const catalog = directory.catalog('["alpha"]', filters);
+    expect(segment_overview_project(overview, '["alpha"]', filters)).toBe(catalog);
+    samples.push({ overview, catalog });
+  }
+  const first = samples[0];
+  if (first === undefined) throw new Error("Missing overview ordering samples");
+  for (const sample of samples) {
+    expect(sample.overview).toEqual(first.overview);
+    expect(sample.catalog).toBe(first.catalog);
+  }
+});
+
+test("overview groups stay scoped to their handle and are consumed by catalog projection", () => {
+  using segment = new Segment(
+    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(
+      Array.from({ length: 64 }, (_, index) => ({
+        id: String(index),
+        revision: 1,
+        title: "title ".repeat(index % 3),
+        text: "alpha ".repeat(1 + (index % 5)),
+        attributes: { group: index % 4, year: 2020 + (index % 7) },
+      })),
+    ),
+  );
+  using directory = new Directory(segment.bytes());
+  const initial = directory.heap_bytes();
+  const filters = '[{"field":"year","op":"gte","value":2021}]';
+  const expected = directory.catalog('["alpha"]', filters);
+  expect(directory.heap_bytes()).toBe(initial);
+  const bytes = directory.overview();
+  const prepared = directory.heap_bytes();
+  expect(prepared).toBeGreaterThan(initial);
+  expect(directory.overview()).toEqual(bytes);
+  expect(directory.heap_bytes()).toBe(prepared);
+  using retained = directory.retain();
+  expect(retained.heap_bytes()).toBe(initial);
+  expect(retained.catalog('["alpha"]', filters)).toBe(expected);
+  expect(retained.heap_bytes()).toBe(initial);
+  expect(directory.catalog('["alpha"]', filters)).toBe(expected);
+  expect(directory.heap_bytes()).toBe(initial);
+  directory.overview();
+  directory.catalog('["alpha"]', "[]");
+  expect(directory.heap_bytes()).toBe(initial);
+});
+
 test("overview projection validates every pool entry and reference before selecting terms", () => {
   for (const json of [
     '[{"unused":0},[[{},0,0]],null,[{"df":"bad","bounds":[]}]]',

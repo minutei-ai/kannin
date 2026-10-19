@@ -2714,11 +2714,26 @@ pub mod wasm {
         }
     }
 
-    struct OverviewEligibility<'a>(BTreeMap<&'a str, (&'a serde_json::value::RawValue, u32, u32)>);
+    struct EligibilityGroup {
+        row: usize,
+        title: u32,
+        body: u32,
+    }
+
+    struct OverviewEligibility<'a> {
+        header: &'a Header,
+        groups: &'a [EligibilityGroup],
+    }
 
     impl Serialize for OverviewEligibility<'_> {
         fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            serializer.collect_seq(self.0.values())
+            serializer.collect_seq(self.groups.iter().map(|group| {
+                (
+                    self.header.documents[group.row].attributes.as_ref(),
+                    group.title,
+                    group.body,
+                )
+            }))
         }
     }
 
@@ -3249,31 +3264,29 @@ pub mod wasm {
         super::compress_directory(bytes).map_err(|cause| JsValue::from_str(&cause))
     }
 
-    fn overview_eligibility(header: &Header) -> OverviewEligibility<'_> {
+    fn overview_eligibility(header: &Header) -> Box<[EligibilityGroup]> {
         let mut eligibility = BTreeMap::new();
-        for document in &header.documents {
+        for (row, document) in header.documents.iter().enumerate() {
             let lengths = eligibility
                 .entry(document.attributes.get())
-                .or_insert_with(|| {
-                    (
-                        document.attributes.as_ref(),
-                        document.title_length,
-                        document.body_length,
-                    )
-                });
+                .or_insert_with(|| (row, document.title_length, document.body_length));
             lengths.1 = lengths.1.min(document.title_length);
             lengths.2 = lengths.2.min(document.body_length);
         }
-        OverviewEligibility(eligibility)
+        eligibility
+            .into_values()
+            .map(|(row, title, body)| EligibilityGroup { row, title, body })
+            .collect()
     }
 
     fn encode_overview(
         header: &Header,
         partitions: Option<&[BTreeMap<String, TermSummary>]>,
+        groups: &[EligibilityGroup],
     ) -> Result<Vec<u8>, String> {
         let json = serde_json::to_vec(&DirectoryOverview {
             header,
-            eligibility: overview_eligibility(header),
+            eligibility: OverviewEligibility { header, groups },
             partitions,
         })
         .map_err(|cause| cause.to_string())?;
@@ -3362,7 +3375,7 @@ pub mod wasm {
                 }
             }
         }
-        let encoded = encode_overview(&header, Some(&partitions))?;
+        let encoded = encode_overview(&header, Some(&partitions), &overview_eligibility(&header))?;
         if encoded.len() > 1024 * 1024 {
             return Ok(None);
         }
@@ -3405,6 +3418,7 @@ pub mod wasm {
     #[wasm_bindgen]
     pub struct Directory {
         header: Rc<Header>,
+        overview_groups: RefCell<Option<Box<[EligibilityGroup]>>>,
     }
 
     #[wasm_bindgen]
@@ -3415,6 +3429,7 @@ pub mod wasm {
             let (header, _) = parse_header(bytes).map_err(|cause| JsValue::from_str(&cause))?;
             Ok(Self {
                 header: Rc::new(header),
+                overview_groups: RefCell::default(),
             })
         }
 
@@ -3432,6 +3447,7 @@ pub mod wasm {
             .map_err(|cause| JsValue::from_str(&cause))?;
             Ok(Self {
                 header: Rc::new(header),
+                overview_groups: RefCell::default(),
             })
         }
 
@@ -3441,6 +3457,7 @@ pub mod wasm {
                 .map_err(|cause| JsValue::from_str(&cause))?;
             Ok(Self {
                 header: Rc::new(header),
+                overview_groups: RefCell::default(),
             })
         }
 
@@ -3448,12 +3465,18 @@ pub mod wasm {
         pub fn retain(&self) -> Self {
             Self {
                 header: self.header.clone(),
+                overview_groups: RefCell::default(),
             }
         }
 
         #[must_use]
         pub fn heap_bytes(&self) -> usize {
             self.header.heap_bytes()
+                + self
+                    .overview_groups
+                    .borrow()
+                    .as_ref()
+                    .map_or(0, |groups| size_of_val(groups.as_ref()))
         }
 
         #[doc = "# Errors\nRejects invalid term JSON or directory serialization errors."]
@@ -3500,9 +3523,13 @@ pub mod wasm {
             )
             .map_err(|cause| JsValue::from_str(&cause))?;
             let mut minimum = None;
+            let retained = self.overview_groups.borrow_mut().take();
             if !filters.is_empty() {
-                for (attributes, title, body) in overview_eligibility(&self.header).0.into_values()
-                {
+                let physical = retained.unwrap_or_else(|| overview_eligibility(&self.header));
+                for group in &physical {
+                    let attributes = &self.header.documents[group.row].attributes;
+                    let title = group.title;
+                    let body = group.body;
                     let mut deserializer = serde_json::Deserializer::from_str(attributes.get());
                     let attributes = SelectedAttributes(&fields)
                         .deserialize(&mut deserializer)
@@ -3557,7 +3584,15 @@ pub mod wasm {
 
         #[doc = "# Errors\nRejects summary serialization or size budgets."]
         pub fn overview(&self) -> Result<Vec<u8>, JsValue> {
-            encode_overview(&self.header, None).map_err(|cause| JsValue::from_str(&cause))
+            let groups = self
+                .overview_groups
+                .borrow_mut()
+                .take()
+                .unwrap_or_else(|| overview_eligibility(&self.header));
+            let bytes = encode_overview(&self.header, None, &groups)
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            *self.overview_groups.borrow_mut() = Some(groups);
+            Ok(bytes)
         }
 
         #[doc = "# Errors\nRejects invalid ids or tombstones, row overflow, or result serialization errors."]

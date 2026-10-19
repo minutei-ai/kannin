@@ -26,6 +26,8 @@ Local filter-evaluation reuse reduced million-document warm medians from **52 �
 
 Contiguous Rust term storage reduced the retained charge of seventeen directories by **9.85%**. In a separate million-document comparison, sixty-four rare-term warm queries changed **132 → 116 ms**, with all 640 paired responses identical. Dense medians were similar, and some first reads regressed. This local change has not been deployed. [Term-storage measurements](docs/performance.md#contiguous-term-text-in-rustwasm).
 
+Directory compression now streams into its frame buffer using the existing codec. A 16 MiB repeated-byte compressor control removed an **8 MiB temporary allocation**, with identical compressed bytes. Complete-query timings remained mixed. [Compression measurements](docs/performance.md#directory-compression-without-a-scratch-buffer).
+
 Rust now reuses physical attribute groups within a scoped recovery handle. In the controlled local million-document comparison with derived caches absent, dense first reads changed **4.90 → 4.59 seconds** and sixty-four rare terms **2.93 → 2.71 seconds**. The full 300-query SciFact report remained byte-identical. Native model-source CPU changed **116 → 102 ms** in three first-read observations per version, while native million-document warm HTTP medians increased **203–295 → 239–343 ms** with EWR → IAD placement. These samples do not prove a Cloudflare warm-latency improvement or lower total billing. [Recovery methods and limitations](docs/performance.md#scoped-attribute-group-reuse).
 
 Document windows trade bounded read-ahead for reuse: local bulk mutations used **1,001 → 8 acquisitions** but **100 → 305 kB**. The deletion row has one native observation per version and different prior cache state/placement. Fully cold large-catalog recovery still takes seconds locally. [Read-ahead measurements](docs/performance.md#bounded-document-byte-windows).
@@ -55,7 +57,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **304 Worker/tooling tests and 62 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **305 Worker/tooling tests and 63 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

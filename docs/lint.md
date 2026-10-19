@@ -14,7 +14,11 @@ Two concurrency/ownership rules remain deliberately curated: `no-await-in-loop` 
 
 ## Rust
 
-Clippy's full `all`, `pedantic` and `nursery` groups are fatal on all native targets/features and separately on the release WASM library. There are no per-file exemptions or source suppressions. Unsafe code, truncating casts, integer-to-float precision-loss casts, unwrap, expect, panic and placeholders have `forbid` levels. Matching lint expectations cannot lower those levels. Additional restrictions reject error erasure, discarded results, leaks, process exit and oversized stack allocations. Compiler lints reject ignored results, unused lifetimes/qualifications, unreachable exports and unmet lint expectations. Release arithmetic retains overflow checks.
+Clippy's full `all`, `pedantic` and `nursery` groups are fatal on all native targets/features and separately on the release WASM library. There are no per-file exemptions or source suppressions. Unsafe code, truncating casts, integer-to-float precision-loss casts, redundant clones, needless intermediate collections, unwrap, expect, panic and placeholders have `forbid` levels. Matching lint expectations cannot lower those levels. Additional restrictions reject error erasure, discarded results, leaks, process exit and oversized stack allocations. Compiler lints reject ignored results, unused lifetimes/qualifications, unreachable exports and unmet lint expectations. Release arithmetic retains overflow checks.
+
+Cargo defaults to one build job and one test thread through its native configuration. Shared-host commands additionally need an operating-system memory/CPU limit; Cargo concurrency alone does not cap process memory. Run heavy checks and benchmarks serially.
+
+The GitHub check workflow runs the same gate and retains the generated Worker/WASM artifact for one day after success. Candidate branches can use that artifact for bounded local verification when compilation exceeds the shared host's memory budget.
 
 Wire lengths, rows, positions, posting frequencies and bloom indices use checked conversions. Full-width statistics convert through explicit 32-bit limbs; numeric regressions cover rounding boundaries and `u64::MAX`. BM25 uses fused multiply-add and `ln_1p`; an independent exhaustive scorer checks exact pruning and ranking. Parser and WASM errors return declared failures. Public fallible Rust exports document their errors through native documentation attributes.
 

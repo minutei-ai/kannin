@@ -40,6 +40,12 @@ fn directory_budget_is_exact_and_unicode_and_u64_values_are_lossless()
     canonical.extend_from_slice(&crc32fast::hash(&json).to_le_bytes());
     canonical.extend_from_slice(&json);
     let encoded = segment::compress_directory(&canonical)?;
+    let compact = miniz_oxide::inflate::decompress_to_vec_zlib(&encoded[20..])
+        .map_err(|cause| cause.to_string())?;
+    assert_eq!(
+        &encoded[20..],
+        miniz_oxide::deflate::compress_to_vec_zlib(&compact, 3).as_slice()
+    );
     let decoded = segment::parse_compressed_directory(&encoded, canonical.len(), 40 * 1024 * 1024)?;
     assert_eq!(
         serde_json::to_string(&header)?,
@@ -145,5 +151,32 @@ fn pooled_terms_preserve_unicode_order_last_duplicate_and_independent_clones()
     assert!(empty.is_empty());
     assert!(empty.get("").is_none());
     assert_eq!(empty.iter().len(), 0);
+    Ok(())
+}
+
+#[test]
+fn directory_rejects_zlib_corruption_and_declared_size_mismatches()
+-> Result<(), Box<dyn std::error::Error>> {
+    let payload = [1, 0, 0, 0, 0];
+    let encoded = frame(&payload)?;
+    assert!(segment::parse_compressed_directory(&encoded, 4096, 40 * 1024 * 1024).is_ok());
+    for declared in [4_u32, 6, u32::MAX] {
+        let mut mismatched = encoded.clone();
+        mismatched[12..16].copy_from_slice(&declared.to_le_bytes());
+        let mut checksum = crc32fast::Hasher::new();
+        checksum.update(&mismatched[..16]);
+        checksum.update(&payload);
+        mismatched[16..20].copy_from_slice(&checksum.finalize().to_le_bytes());
+        assert!(segment::parse_compressed_directory(&mismatched, 4096, 40 * 1024 * 1024).is_err());
+    }
+    for end in 20..encoded.len() {
+        assert!(
+            segment::parse_compressed_directory(&encoded[..end], 4096, 40 * 1024 * 1024).is_err()
+        );
+    }
+    let mut corrupt = encoded;
+    let last = corrupt.last_mut().ok_or("Missing compressed trailer")?;
+    *last ^= 1;
+    assert!(segment::parse_compressed_directory(&corrupt, 4096, 40 * 1024 * 1024).is_err());
     Ok(())
 }

@@ -1049,8 +1049,7 @@ pub fn compress_directory(bytes: &[u8]) -> Result<Vec<u8>, String> {
     if compact.len() > MAX_BYTES || compact.len() > length {
         return Err("Compact directory exceeds size budget".into());
     }
-    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&compact, 3);
-    let mut encoded = Vec::with_capacity(20 + compressed.len());
+    let mut encoded = Vec::with_capacity(20);
     encoded.extend_from_slice(DIRECTORY_MAGIC);
     encoded.extend_from_slice(
         &u32::try_from(length)
@@ -1066,7 +1065,20 @@ pub fn compress_directory(bytes: &[u8]) -> Result<Vec<u8>, String> {
     checksum.update(&encoded);
     checksum.update(&compact);
     encoded.extend_from_slice(&checksum.finalize().to_le_bytes());
-    encoded.extend_from_slice(&compressed);
+    let flags = miniz_oxide::deflate::core::create_comp_flags_from_zip_params(3, 1, 0);
+    let mut compressor = miniz_oxide::deflate::core::CompressorOxide::new(flags);
+    let (status, consumed) = miniz_oxide::deflate::core::compress_to_output(
+        &mut compressor,
+        &compact,
+        miniz_oxide::deflate::core::TDEFLFlush::Finish,
+        |chunk| {
+            encoded.extend_from_slice(chunk);
+            true
+        },
+    );
+    if status != miniz_oxide::deflate::core::TDEFLStatus::Done || consumed != compact.len() {
+        return Err(format!("Directory compression failed: {status:?}"));
+    }
     Ok(encoded)
 }
 

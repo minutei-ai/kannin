@@ -20,3 +20,10 @@ jobs:
       - run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
       - run: bun install --frozen-lockfile
       - run: bun run check
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: worker
+          path: |
+            dist/worker/
+            dist/wasm/
+          retention-days: 1

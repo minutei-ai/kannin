@@ -1049,8 +1049,7 @@ pub fn compress_directory(bytes: &[u8]) -> Result<Vec<u8>, String> {
     if compact.len() > MAX_BYTES || compact.len() > length {
         return Err("Compact directory exceeds size budget".into());
     }
-    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&compact, 3);
-    let mut encoded = Vec::with_capacity(20 + compressed.len());
+    let mut encoded = Vec::with_capacity(20);
     encoded.extend_from_slice(DIRECTORY_MAGIC);
     encoded.extend_from_slice(
         &u32::try_from(length)
@@ -1066,8 +1065,9 @@ pub fn compress_directory(bytes: &[u8]) -> Result<Vec<u8>, String> {
     checksum.update(&encoded);
     checksum.update(&compact);
     encoded.extend_from_slice(&checksum.finalize().to_le_bytes());
-    encoded.extend_from_slice(&compressed);
-    Ok(encoded)
+    let mut compressor = flate2::write::ZlibEncoder::new(encoded, flate2::Compression::new(3));
+    std::io::Write::write_all(&mut compressor, &compact).map_err(|cause| cause.to_string())?;
+    compressor.finish().map_err(|cause| cause.to_string())
 }
 
 #[doc = "# Errors\nRejects framing, size, compression, checksum, expected length and canonical header violations."]

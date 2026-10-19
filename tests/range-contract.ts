@@ -34,6 +34,7 @@ export const RangeProbeResult = Schema.Struct({
   successes: Schema.Int,
   failures: Schema.Int,
   distinctBodies: Schema.Int,
+  matchingContents: Schema.Boolean,
   lengths: Schema.Array(Schema.Int),
 });
 

@@ -30,6 +30,8 @@ Directory compression now streams into its frame buffer using the existing codec
 
 Rust now reuses physical attribute groups within a scoped recovery handle. In the controlled local million-document comparison with derived caches absent, dense first reads changed **4.90 → 4.59 seconds** and sixty-four rare terms **2.93 → 2.71 seconds**. The full 300-query SciFact report remained byte-identical. Native model-source CPU changed **116 → 102 ms** in three first-read observations per version, while native million-document warm HTTP medians increased **203–295 → 239–343 ms** with EWR → IAD placement. These samples do not prove a Cloudflare warm-latency improvement or lower total billing. [Recovery methods and limitations](docs/performance.md#scoped-attribute-group-reuse).
 
+Immutable Rust directory frames reuse a successful CRC proof without skipping structural or memory-budget validation. In a local 30,000-document control with large unique attributes, warm medians changed **137 → 111 ms**; million-document and first-read results were mixed. All 896 complete comparison responses matched, and the SciFact report stayed identical. This change has not been deployed. [Frame-cache measurements](docs/performance.md#reusing-immutable-directory-frame-validation).
+
 Document windows trade bounded read-ahead for reuse: local bulk mutations used **1,001 → 8 acquisitions** but **100 → 305 kB**. The deletion row has one native observation per version and different prior cache state/placement. Fully cold large-catalog recovery still takes seconds locally. [Read-ahead measurements](docs/performance.md#bounded-document-byte-windows).
 
 An earlier edge load run at source `6c03e72`, using an acknowledged sequence barrier, checked 384 complete responses against a strong baseline:
@@ -57,7 +59,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **305 Worker/tooling tests and 63 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **309 Worker/tooling tests and 63 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

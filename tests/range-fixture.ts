@@ -175,6 +175,7 @@ export default {
     );
     const after = cacheUsage();
     const successes = results.filter((result) => result.status === "fulfilled");
+    const first = successes.at(0);
     return new Response(
       Schema.encodeSync(Schema.fromJsonString(RangeProbeResult))({
         postingBefore: before.postingCacheBytes,
@@ -190,6 +191,14 @@ export default {
         successes: successes.length,
         failures: results.length - successes.length,
         distinctBodies: new Set(successes.map((result) => result.value)).size,
+        matchingContents: successes.every((result) => {
+          if (first === undefined) return false;
+          if (result.value === first.value) return true;
+          return (
+            result.value.byteLength === first.value.byteLength &&
+            result.value.every((byte, index) => byte === first.value[index])
+          );
+        }),
         lengths: successes.map((result) => result.value.byteLength),
       }),
       { headers: { "content-type": "application/json" } },

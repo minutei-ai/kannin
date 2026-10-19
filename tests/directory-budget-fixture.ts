@@ -10,7 +10,7 @@ import {
 } from "../src/storage";
 import type { Env } from "../alchemy.run";
 import { DirectoryBudgetInput } from "./range-contract";
-import { Directory } from "../dist/wasm/raio_engine";
+import { Directory, CompressedDirectory } from "../dist/wasm/raio_engine";
 
 const state = {
   cacheCompleted: 0,
@@ -34,6 +34,14 @@ Object.defineProperty(Directory, "compressed", {
   value: (...input: Parameters<typeof Directory.compressed>) => {
     state.directoryParses += 1;
     return parseDirectory(...input);
+  },
+});
+const parseFrame = Object.getOwnPropertyDescriptors(CompressedDirectory.prototype).directory.value;
+if (parseFrame === undefined) throw new Error("Missing native compressed-directory decoder");
+Object.defineProperty(CompressedDirectory.prototype, "directory", {
+  value(this: CompressedDirectory, ...input: Parameters<CompressedDirectory["directory"]>) {
+    state.directoryParses += 1;
+    return parseFrame.call(this, ...input);
   },
 });
 const wrapped = new WeakSet<R2Bucket>();

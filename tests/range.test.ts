@@ -15,7 +15,7 @@ import {
   DirectoryAgingResult,
   DecodedDirectoryScanResult,
 } from "./range-contract";
-import { initSync, Segment } from "../dist/wasm/raio_engine";
+import { initSync, Segment, directory_compress } from "../dist/wasm/raio_engine";
 
 initSync({
   module: new WebAssembly.Module(
@@ -156,7 +156,10 @@ test("posting range pressure does not reacquire a warm compressed directory", as
   expect(result.encodedDirectoryCacheChargedBytes).toBeLessThanOrEqual(20 * 1024 * 1024);
   expect(result.successes).toBe(8);
   expect(result.failures).toBe(0);
-  expect(result.distinctBodies).toBe(1);
+  expect(result.distinctBodies).toBe(8);
+  expect(result.matchingContents).toBe(true);
+  const expected = directory_compress(segment.bytes().subarray(0, headerBytes));
+  expect(result.lengths).toEqual(Array.from({ length: 8 }, () => expected.byteLength));
 });
 
 test("directories above cache admission retain the existing forty-MiB validation limit", async () => {

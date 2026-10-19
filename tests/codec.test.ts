@@ -14,6 +14,7 @@ import {
   segment_document,
   Segment,
   Directory,
+  CompressedDirectory,
   directory_compress,
   BloomBatch,
   PreparedQuery,
@@ -1705,4 +1706,72 @@ test("encoded eligibility scalar validation survives bounded reuse and rejects i
       decode({ fields: ["year"], data: { kind: "marginal", columns: [[[value, 0, 0]]] } })._tag,
     ).toBe("Success");
   }
+});
+
+function compressedDirectoryFixture() {
+  using segment = new Segment(
+    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))([
+      { id: "ação😀", revision: 1, text: "cloudflare rust", attributes: { group: 1 } },
+      { id: "日本語", revision: 2, text: "rust search", attributes: { group: 2 }, vector: [1, 0] },
+    ]),
+  );
+  const bytes = segment.bytes();
+  const length = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
+  return { bytes: directory_compress(bytes.subarray(0, length)), length };
+}
+
+test("cached directory frames own immutable input and expose only copied bytes", () => {
+  const source = compressedDirectoryFixture();
+  const original = source.bytes.slice();
+  using reference = Directory.compressed(original, source.length, 40 * 1024 * 1024);
+  using cached = new CompressedDirectory(source.bytes, source.length);
+  source.bytes.fill(0);
+  using first = cached.directory(40 * 1024 * 1024);
+  expect(first.rows("[0,1]")).toBe(reference.rows("[0,1]"));
+  const exposed = cached.bytes();
+  exposed.fill(0);
+  expect(cached.bytes()).toEqual(original);
+  using second = cached.directory(40 * 1024 * 1024);
+  expect(second.rows("[0,1]")).toBe(reference.rows("[0,1]"));
+  expect(() => Directory.compressed(exposed, source.length, 40 * 1024 * 1024)).toThrow();
+});
+
+test("retained frames and acquired directories survive release of their cache owners", () => {
+  const source = compressedDirectoryFixture();
+  using owner = new DisposableStack();
+  const frame = owner.use(new CompressedDirectory(source.bytes, source.length));
+  using retainedOwner = new DisposableStack();
+  const retained = retainedOwner.use(frame.retain());
+  using first = frame.directory(40 * 1024 * 1024);
+  const expected = first.rows("[0,1]");
+  owner.dispose();
+  using second = retained.directory(40 * 1024 * 1024);
+  retainedOwner.dispose();
+  expect(first.rows("[0,1]")).toBe(expected);
+  expect(second.rows("[0,1]")).toBe(expected);
+});
+
+test("failed checksum validation never becomes trusted cached directory state", () => {
+  const source = compressedDirectoryFixture();
+  const bytes = source.bytes.slice();
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  view.setUint8(16, view.getUint8(16) ^ 1);
+  using cached = new CompressedDirectory(bytes, source.length);
+  expect(() => cached.directory(40 * 1024 * 1024)).toThrow("integrity");
+  expect(() => cached.directory(40 * 1024 * 1024)).toThrow("integrity");
+});
+
+test("cached integrity never bypasses decoded budgets or expected header lengths", () => {
+  const source = compressedDirectoryFixture();
+  using cached = new CompressedDirectory(source.bytes, source.length);
+  using first = cached.directory(40 * 1024 * 1024);
+  const budget = first.heap_bytes();
+  using exact = cached.directory(budget);
+  expect(exact.heap_bytes()).toBe(budget);
+  expect(() => cached.directory(budget - 1)).toThrow("budget");
+  using recovered = cached.directory(budget);
+  expect(recovered.rows("[0,1]")).toBe(first.rows("[0,1]"));
+  using wrong = new CompressedDirectory(source.bytes, source.length + 1);
+  expect(() => wrong.directory(40 * 1024 * 1024)).toThrow("length");
+  expect(() => wrong.directory(40 * 1024 * 1024)).toThrow("length");
 });

@@ -15,6 +15,7 @@ import { env, exports, waitUntil } from "cloudflare:workers";
 import {
   Segment,
   Directory,
+  CompressedDirectory,
   pack,
   unpack,
   directory_compress,
@@ -111,7 +112,7 @@ const directoryFrameFailures = { epoch: 0n };
 const DIRECTORY_FRAME_BUDGET = 250_000_000n;
 const budget = { bytes: 0, payloadBytes: 0 };
 const MAX_CACHE_BYTES = 12 * 1024 * 1024;
-const encodedDirectories = new Map<string, Uint8Array>();
+const encodedDirectories = new Map<string, CompressedDirectory>();
 const encodedBudget = { bytes: 0 };
 const MAX_ENCODED_DIRECTORY_BYTES = 18 * 1024 * 1024;
 const textPlans = new Map<string, { plan: typeof TextPlan.Type; bytes: number }>();
@@ -283,10 +284,12 @@ function noteDirectoryRequest(key: string) {
   admissionBudget.bytes += charge;
 }
 
-function rememberEncodedDirectory(key: string, bytes: Uint8Array) {
+function rememberEncodedDirectory(key: string, bytes: Uint8Array, expected: number) {
   if (encodedDirectories.has(key)) return;
-  const charge = bytes.byteLength + key.length * 4 + 128;
   const maximum = MAX_ENCODED_DIRECTORY_BYTES - MAX_ADMISSION_BYTES;
+  if (bytes.byteLength + key.length * 4 + 128 > maximum) return;
+  using frame = new CompressedDirectory(bytes, expected);
+  const charge = frame.heap_bytes() + key.length * 4 + 128;
   if (charge > maximum) return;
   const victims = [];
   const remaining = { bytes: encodedBudget.bytes };
@@ -295,11 +298,26 @@ function rememberEncodedDirectory(key: string, bytes: Uint8Array) {
     if (remaining.bytes + charge <= maximum) break;
     if (frequency <= (admissionCounts.get(identity) ?? 0)) return;
     victims.push(identity);
-    remaining.bytes -= value.byteLength + identity.length * 4 + 128;
+    remaining.bytes -= value.heap_bytes() + identity.length * 4 + 128;
   }
-  for (const identity of victims) encodedDirectories.delete(identity);
-  encodedDirectories.set(key, bytes);
+  for (const identity of victims) {
+    const victim = encodedDirectories.get(identity);
+    encodedDirectories.delete(identity);
+    victim?.free();
+  }
+  encodedDirectories.set(key, frame.retain());
   encodedBudget.bytes = remaining.bytes + charge;
+}
+
+function cachedEncodedDirectory(key: string) {
+  const frame = encodedDirectories.get(key);
+  if (frame === undefined) return undefined;
+  noteDirectoryRequest(key);
+  reads.rangeCacheHits += 1;
+  reads.encodedDirectoryCacheHits += 1;
+  encodedDirectories.delete(key);
+  encodedDirectories.set(key, frame);
+  return frame;
 }
 
 export function addFrequencyPosting(
@@ -518,23 +536,29 @@ export async function range(
     Match.when(true, () => `${rawIdentity}/directory-v3`),
     Match.orElse(() => rawIdentity),
   );
-  if (compressedDirectory) noteDirectoryRequest(cacheKey);
-  const cache = Match.value(compressedDirectory).pipe(
-    Match.when(true, () => encodedDirectories),
-    Match.orElse(() => buffers),
+  const cached = Match.value(compressedDirectory).pipe(
+    Match.when(true, () => {
+      const frame = cachedEncodedDirectory(cacheKey);
+      if (frame === undefined) return undefined;
+      return frame.bytes();
+    }),
+    Match.orElse(() => {
+      const bytes = buffers.get(cacheKey);
+      if (bytes === undefined) return undefined;
+      buffers.delete(cacheKey);
+      buffers.set(cacheKey, bytes);
+      return bytes;
+    }),
   );
-  const cached = cache.get(cacheKey);
   if (cached !== undefined) {
-    reads.rangeCacheHits += 1;
-    cache.delete(cacheKey);
-    cache.set(cacheKey, cached);
-    if (compressedDirectory) reads.encodedDirectoryCacheHits += 1;
-    else {
+    if (!compressedDirectory) {
+      reads.rangeCacheHits += 1;
       cacheOrder.delete(`r:${cacheKey}`);
       cacheOrder.set(`r:${cacheKey}`, "range");
     }
     return cached;
   }
+  if (compressedDirectory) noteDirectoryRequest(cacheKey);
   const pending = pendingRanges.get(cacheKey);
   if (pending !== undefined) return pending;
   const acquisition = (async () => {
@@ -697,7 +721,7 @@ export async function range(
     reads.rangeBytes += bytes.byteLength;
     if (!compressedDirectory && bytes.byteLength !== length)
       throw new Rejected({ status: 503, message: "R2 range returned a truncated segment" });
-    if (compressedDirectory) rememberEncodedDirectory(cacheKey, bytes);
+    if (compressedDirectory) rememberEncodedDirectory(cacheKey, bytes, length);
     else remember(cacheKey, bytes);
     return bytes;
   })();
@@ -745,6 +769,24 @@ const acquireDirectory = Effect.fn("kannin.acquireDirectory")(
             message: "Canonical directory acquisition did not retain metadata",
           });
         return shared.retain();
+      }
+      if (!canonical) {
+        const decoded = yield* Effect.try(() => {
+          const frame = cachedEncodedDirectory(admissionIdentity);
+          if (frame === undefined) return undefined;
+          return frame.directory(MAX_DECODED_BYTES);
+        });
+        if (decoded !== undefined) {
+          if (decoded.heap_bytes() > MAX_DECODED_BYTES) {
+            decoded.free();
+            return yield* new Rejected({
+              status: 503,
+              message: "Segment directory exceeds the decoded-memory budget",
+            });
+          }
+          rememberDirectory(identity, headerBytes, decoded);
+          return decoded;
+        }
       }
       const acquire = Effect.gen(function* () {
         const frame = yield* Effect.gen(function* () {
@@ -809,6 +851,10 @@ const acquireDirectory = Effect.fn("kannin.acquireDirectory")(
           }
           const decoded = yield* Effect.try(() => {
             if (canonical && Option.isNone(frame)) return Directory.canonical(bytes, headerBytes);
+            if (!canonical) {
+              const cachedFrame = encodedDirectories.get(admissionIdentity);
+              if (cachedFrame !== undefined) return cachedFrame.directory(MAX_DECODED_BYTES);
+            }
             return Directory.compressed(bytes, headerBytes, MAX_DECODED_BYTES);
           });
           if (decoded.heap_bytes() > MAX_DECODED_BYTES) {
@@ -2149,10 +2195,11 @@ export function clearImmutableCache(prefix: string) {
       admissionCounts.delete(key);
       admissionBudget.bytes -= key.length * 4 + 128;
     }
-  for (const [key, bytes] of encodedDirectories)
+  for (const [key, frame] of encodedDirectories)
     if (key.startsWith(`${identity}/`)) {
       encodedDirectories.delete(key);
-      encodedBudget.bytes -= bytes.byteLength + key.length * 4 + 128;
+      encodedBudget.bytes -= frame.heap_bytes() + key.length * 4 + 128;
+      frame.free();
     }
   for (const [key, bytes] of buffers)
     if (key.startsWith(`${identity}/`)) {

@@ -1088,6 +1088,15 @@ pub fn parse_compressed_directory(
     expected: usize,
     max_heap_bytes: usize,
 ) -> Result<Header, String> {
+    decode_directory_frame(bytes, expected, max_heap_bytes, None)
+}
+
+fn decode_directory_frame(
+    bytes: &[u8],
+    expected: usize,
+    max_heap_bytes: usize,
+    checksum_verified: Option<&std::cell::Cell<bool>>,
+) -> Result<Header, String> {
     if bytes.len() < 20 || &bytes[..8] != DIRECTORY_MAGIC || bytes.len() > MAX_BYTES + 8192 {
         return Err("Invalid compressed directory frame".into());
     }
@@ -1115,14 +1124,22 @@ pub fn parse_compressed_directory(
     let decoded =
         miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&bytes[20..], compact_length)
             .map_err(|cause| cause.to_string())?;
-    let mut verified = crc32fast::Hasher::new();
-    verified.update(&bytes[..16]);
-    verified.update(&decoded);
-    if decoded.len() != compact_length || verified.finalize() != checksum {
+    if decoded.len() != compact_length {
         return Err("Compressed directory integrity check failed".into());
+    }
+    if !checksum_verified.is_some_and(std::cell::Cell::get) {
+        let mut verified = crc32fast::Hasher::new();
+        verified.update(&bytes[..16]);
+        verified.update(&decoded);
+        if verified.finalize() != checksum {
+            return Err("Compressed directory integrity check failed".into());
+        }
     }
     let header = binary_directory::decode(&decoded, max_heap_bytes)?;
     validate_header(&header)?;
+    if let Some(verified) = checksum_verified {
+        verified.set(true);
+    }
     Ok(header)
 }
 
@@ -3493,6 +3510,72 @@ pub mod wasm {
         pub fn header_json(&self) -> Result<String, JsValue> {
             serde_json::to_string(&self.built.header)
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))
+        }
+    }
+
+    struct CachedDirectoryFrame {
+        bytes: Box<[u8]>,
+        expected: usize,
+        checksum_verified: std::cell::Cell<bool>,
+    }
+
+    #[wasm_bindgen]
+    pub struct CompressedDirectory {
+        frame: Rc<CachedDirectoryFrame>,
+    }
+
+    #[wasm_bindgen]
+    impl CompressedDirectory {
+        #[wasm_bindgen(constructor)]
+        #[doc = "# Errors\nRejects invalid frame envelopes and expected header sizes."]
+        pub fn new(bytes: Vec<u8>, expected: u32) -> Result<Self, JsValue> {
+            let expected = expected as usize;
+            if bytes.len() < 20
+                || bytes.len() > MAX_BYTES + 8192
+                || &bytes[..8] != super::DIRECTORY_MAGIC
+                || !(16..=MAX_BYTES).contains(&expected)
+            {
+                return Err(JsValue::from_str("Invalid compressed directory frame"));
+            }
+            Ok(Self {
+                frame: Rc::new(CachedDirectoryFrame {
+                    bytes: bytes.into_boxed_slice(),
+                    expected,
+                    checksum_verified: std::cell::Cell::new(false),
+                }),
+            })
+        }
+
+        #[must_use]
+        pub fn retain(&self) -> Self {
+            Self {
+                frame: Rc::clone(&self.frame),
+            }
+        }
+
+        #[must_use]
+        pub fn bytes(&self) -> Vec<u8> {
+            self.frame.bytes.to_vec()
+        }
+
+        #[must_use]
+        pub fn heap_bytes(&self) -> usize {
+            self.frame.bytes.len() + size_of::<CachedDirectoryFrame>() + 64
+        }
+
+        #[doc = "# Errors\nRejects corruption, invalid headers and decoded-memory budget violations."]
+        pub fn directory(&self, max_heap_bytes: u32) -> Result<Directory, JsValue> {
+            let header = super::decode_directory_frame(
+                &self.frame.bytes,
+                self.frame.expected,
+                max_heap_bytes as usize,
+                Some(&self.frame.checksum_verified),
+            )
+            .map_err(|cause| JsValue::from_str(&cause))?;
+            Ok(Directory {
+                header: Rc::new(header),
+                overview_groups: RefCell::default(),
+            })
         }
     }
 

@@ -4738,3 +4738,25 @@ The million-document control checked 320 complete responses across prepared arti
 The local gate passed 63 Rust tests and 305 Bun tests, including 10,754 Bun assertions. It ran with a 4 GiB memory ceiling, no swap and two CPU cores; observed cgroup peak was about 1.5 GiB. Benchmarks ran serially under 2 GiB. Native Cloudflare latency, whole-Worker peak memory and Turbopuffer parity remain unverified for this change.
 
 Two alternative backends were rejected before main publication. zlib-rs/flate2 compressed sample payloads about 37% faster in isolation, but grew frames 3.38% and WASM 12.1%. Their complete-query comparisons were mixed, including a cold dense process-CPU regression from 5,830 to 6,160 ms. The final change keeps miniz and its existing wire bytes.
+
+## Reusing immutable directory-frame validation
+
+Against `9bffaee`, the encoded-directory cache owns an immutable Rust frame rather than a JavaScript byte array. A successful decode records its private CRC proof; subsequent decodes of those same bytes retain zlib/Adler integrity, framing, structural validation and the caller’s memory limit. Synchronous consumers borrow the cache-owned handle, avoiding a copied frame and asynchronous acquisition on hits. Returned directories own their decoded metadata independently. The existing cache quota includes native allocation/handle overhead. No dependency, persisted representation or cache-version change is introduced.
+
+The local million-document comparison used four fresh workerd cohorts per state, alternating baseline/candidate request order, sixteen requests per cohort/version and six warmups. All 640 complete responses matched, including rows, scores, attributes, revisions and sequence. Warm HTTP medians were:
+
+| Derived artifacts at startup        | Query          |     Before → after |
+| ----------------------------------- | -------------- | -----------------: |
+| Prepared                            | 64 rare terms  | 116.34 → 110.23 ms |
+| Prepared                            | 72 dense terms |   57.69 → 55.11 ms |
+| Models absent, directories retained | 72 dense terms |   45.72 → 49.03 ms |
+| All derived artifacts absent        | 64 rare terms  | 101.97 → 106.95 ms |
+| All derived artifacts absent        | 72 dense terms |   47.57 → 48.42 ms |
+
+First-read process CPU changed 1,520 → 1,402.5 ms for prepared rare queries and 2,177.5 → 2,137.5 ms for prepared dense queries. With all derived artifacts absent, it changed 3,255 → 3,315 ms and 5,210 → 5,297.5 ms respectively. These results are mixed; the change does not establish a general cold- or warm-query improvement. Linux process counters have 10 ms resolution and include local emulation work, rather than Cloudflare billed CPU.
+
+A separate 30,000-document control used thirty segments and unique document attributes containing a 1,536-character padding string, varying a range filter on each request. Four cohorts per state checked another 256 complete responses. Prepared warm HTTP medians changed **137.13 → 111.36 ms**, with mean process CPU **147.75 → 120 ms**. Starting without derived artifacts, subsequent warm medians changed **140.30 → 111.92 ms**, with CPU **149 → 123.75 ms**. First-request CPU was **1,205 → 1,215 ms** prepared and **2,327.5 → 2,362.5 ms** absent. This demonstrates a warm benefit for this control, with a small first-read cost; it does not establish general throughput or tail behavior.
+
+Standalone decoding of seventeen headers checked 340 measured pairs with unchanged contents and a median paired timing ratio of 1.0156. Reusing a validated native frame checked another 340 pairs, with a median paired ratio of 0.9257. Three producer controls preserved every canonical segment, metadata JSON and compressed-frame byte, including Unicode identifiers and mixed vector flags. The full 300-query SciFact report remained byte-identical. WASM grew **914,541 → 917,076 bytes**. Experiments interning raw attributes were withheld because unique-metadata workloads exposed regressions despite lower retained memory.
+
+The full local gate passed **63 Rust tests and 309 Bun tests, with 10,771 assertions**, including formatting, native/WASM Clippy, strict Effect lint and compiler checks. It ran under 4 GiB with swap disabled and two CPU cores; observed cgroup peak was **1.56 GiB**. Benchmarks ran one job at a time under 2 GiB with swap disabled. These are local workerd measurements; the unchanged decoded cache admission and retained header charge do not prove lower whole-Worker peak memory, Cloudflare latency, billed CPU or Turbopuffer parity. This change has not been deployed to Cloudflare.

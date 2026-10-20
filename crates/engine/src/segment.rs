@@ -1121,10 +1121,15 @@ fn decode_directory_frame(
             .try_into()
             .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
     );
-    let decoded =
-        miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&bytes[20..], compact_length)
-            .map_err(|cause| cause.to_string())?;
-    if decoded.len() != compact_length {
+    let mut decoded = vec![0; compact_length];
+    let length = miniz_oxide::inflate::decompress_slice_iter_to_slice(
+        &mut decoded,
+        std::iter::once(&bytes[20..]),
+        true,
+        false,
+    )
+    .map_err(|cause| format!("{cause:?}"))?;
+    if length != compact_length {
         return Err("Compressed directory integrity check failed".into());
     }
     if !checksum_verified.is_some_and(std::cell::Cell::get) {

@@ -32,6 +32,8 @@ Rust now reuses physical attribute groups within a scoped recovery handle. In th
 
 Immutable Rust directory frames reuse a successful CRC proof without skipping structural or memory-budget validation. In a local 30,000-document control with large unique attributes, warm medians changed **137 → 111 ms**; million-document and first-read results were mixed. All 896 complete comparison responses matched, and the SciFact report stayed identical. This change has not been deployed. [Frame-cache measurements](docs/performance.md#reusing-immutable-directory-frame-validation).
 
+Fixed-size directory inflation changed a million-document sparse cold-read median **1,623 → 1,449 ms** with derived R2 artifacts present. With those artifacts absent, median process RSS high-water changed **285 → 262 MiB** for the sparse query; dense recovery remained about **5.3 seconds**. Other RSS results varied, and two steady warm controls were about 3 ms slower. These are local workerd measurements. [Cold-read and RSS measurements](docs/performance.md#fixed-size-directory-inflation-cold-reads-and-process-rss).
+
 Document windows trade bounded read-ahead for reuse: local bulk mutations used **1,001 → 8 acquisitions** but **100 → 305 kB**. The deletion row has one native observation per version and different prior cache state/placement. Fully cold large-catalog recovery still takes seconds locally. [Read-ahead measurements](docs/performance.md#bounded-document-byte-windows).
 
 An earlier edge load run at source `6c03e72`, using an acknowledged sequence barrier, checked 384 complete responses against a strong baseline:

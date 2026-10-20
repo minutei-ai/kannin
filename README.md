@@ -27,7 +27,7 @@ Two alternating paired cohorts use thirty segments, a fixed logical CPU, a two-G
 
 Earlier unfiltered synthetic controls observed common-query medians **139–146 ms** and maxima **161–184 ms** across eight fresh candidate processes with two CPUs. Those workloads and capacity differ from the table above; this is not a general bound or a Cloudflare result. [Capacity control](docs/performance.md#exact-minimum-length-document-indexes).
 
-Complete public BEIR test splits cover **2,029 queries**: SciFact **0.6731**, NFCorpus **0.3068**, ArguAna **0.4064 nDCG@10**. SciFact preserves all 300 result lists and per-query metrics. NIST trec_eval independently reproduced the graded NFCorpus and ArguAna aggregates. Local Vectorize fixtures do not prove provider recall.
+Five complete public BEIR test splits cover **3,677 queries**: SciFact **0.6731**, NFCorpus **0.3068**, ArguAna **0.4064**, SCIDOCS **0.1583** and FiQA **0.2378 nDCG@10**. NIST trec_eval independently confirmed NFCorpus, ArguAna, SCIDOCS and FiQA aggregates. [Collection metrics and reproduction](docs/quality.md). Local Vectorize fixtures do not prove provider recall.
 
 This change has not been deployed to Cloudflare. An earlier native experiment with GRU ingress reduced first strong reads after derived-cache loss **2,786.88 → 1,911.42 ms** on 4,000 documents/eight segments, with EWR query placement. These conditions differ from the local table. [Native measurements](docs/performance.md#small-header-recovery-overlap).
 

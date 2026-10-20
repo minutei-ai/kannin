@@ -47,6 +47,7 @@ import {
   Receipt,
   Rejected,
   Root,
+  CommonTerms,
   SnapshotCacheHeaders,
   SegmentDocument,
   SegmentHits,
@@ -692,12 +693,35 @@ async function textQuery(
     }
   }
   if (planning.value === undefined) {
+    const common = selections.flatMap(({ segment, terms: requested }) => {
+      if (input.filters.length !== 0 || segment.commonTerms === undefined) return [];
+      const saved = new Map(Object.entries(segment.commonTerms));
+      const dictionary = Object.fromEntries(
+        requested.flatMap((term) => {
+          const summary = saved.get(term);
+          if (summary === undefined) return [];
+          return [[term, summary] as const];
+        }),
+      );
+      if (Object.keys(dictionary).length !== requested.length) return [];
+      return [{ dictionary, minimum: [0, 0] as const, partitions: null }];
+    });
     const projections = await Effect.runPromise(
-      readTermCatalogs(
-        selected,
-        selections.map((candidate) => candidate.terms),
-        input.filters,
-        timings,
+      Match.value(common.length === selected.length).pipe(
+        Match.when(true, () =>
+          Effect.sync(() => {
+            timings.append("server-timing", 'catalog_root_prefix;desc="hit"');
+            return common;
+          }),
+        ),
+        Match.orElse(() =>
+          readTermCatalogs(
+            selected,
+            selections.map((candidate) => candidate.terms),
+            input.filters,
+            timings,
+          ),
+        ),
       ),
     );
     const catalog = selected.map((segment, index) => {
@@ -1726,6 +1750,7 @@ export class SearchNamespace extends DurableObject<Env> {
         minimumId: built.header.documents[0].id,
         documentBloom: bloom(built.header.documents.map((document) => document.id)),
         termBloom: bloom(Object.keys(built.header.terms)),
+        commonTerms: built.commonTerms,
         dead: [],
         removedFrequencies: {},
       });
@@ -2134,6 +2159,7 @@ export class SearchNamespace extends DurableObject<Env> {
         minimumId: built.header.documents[0].id,
         documentBloom: bloom(built.header.documents.map((document) => document.id)),
         termBloom: bloom(Object.keys(built.header.terms)),
+        commonTerms: built.commonTerms,
         dead: [],
         removedFrequencies: {},
       });
@@ -2345,15 +2371,44 @@ export class SearchNamespace extends DurableObject<Env> {
               this.current = undefined;
               this.acknowledgedReceipt = undefined;
               clearImmutableCache(this.prefix);
-              const { manifest } = yield* Effect.tryPromise({
+              const current = yield* Effect.tryPromise({
                 try: () => this.root(),
                 catch: (cause) => {
                   if (Schema.is(Rejected)(cause)) return cause;
                   return new Cause.UnknownError(cause);
                 },
               });
+              if (current.manifest.segments.some((segment) => segment.commonTerms === undefined)) {
+                const segments = yield* Effect.forEach(
+                  current.manifest.segments,
+                  (segment) =>
+                    Effect.gen(function* () {
+                      if (segment.commonTerms !== undefined) return segment;
+                      const commonTerms = yield* withDirectory(
+                        segment.key,
+                        segment.headerBytes,
+                        (directory) =>
+                          Schema.decodeEffect(Schema.fromJsonString(CommonTerms))(
+                            directory.common_terms(),
+                          ),
+                        undefined,
+                        true,
+                      );
+                      return { ...segment, commonTerms };
+                    }),
+                  { concurrency: 1 },
+                );
+                yield* Effect.tryPromise({
+                  try: () => this.commit({ ...current.manifest, segments }, current.etag),
+                  catch: (cause) => {
+                    if (Schema.is(Rejected)(cause)) return cause;
+                    return new Cause.UnknownError(cause);
+                  },
+                });
+                clearImmutableCache(this.prefix);
+              }
               return yield* Schema.encodeEffect(RebuildResult)({
-                sequence: manifest.sequence,
+                sequence: current.manifest.sequence,
                 rebuilt: true,
               });
             }

@@ -32,6 +32,7 @@ import type { DataRange, Root } from "./protocol";
 import {
   StoredDocument,
   SegmentHeader,
+  CommonTerms,
   SegmentRange,
   ProjectedTermCatalog,
   TermSummaries,
@@ -1903,9 +1904,15 @@ export const buildSegment = Effect.fn("raio.buildSegment")(
         Effect.map((encoded) => new Segment(encoded)),
       ),
       (segment) =>
-        Schema.decodeEffect(Schema.fromJsonString(SegmentHeader))(segment.header_json()).pipe(
-          Effect.map((header) => ({ bytes: segment.bytes(), header })),
-        ),
+        Effect.gen(function* () {
+          const header = yield* Schema.decodeEffect(Schema.fromJsonString(SegmentHeader))(
+            segment.header_json(),
+          );
+          const commonTerms = yield* Schema.decodeEffect(Schema.fromJsonString(CommonTerms))(
+            segment.common_terms(),
+          );
+          return { bytes: segment.bytes(), header, commonTerms };
+        }),
       (segment) => Effect.sync(() => segment.free()),
     ),
 );

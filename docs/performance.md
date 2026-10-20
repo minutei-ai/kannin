@@ -4839,3 +4839,28 @@ Steady-warm guards used sixteen alternating rounds in two cohorts, excluding eig
 A separate, withheld decoder-reuse prototype eliminated a second UTF-8 pass over already validated binary term keys. Its pilot preserved 96 complete responses, but unique-attribute peak RSS increased about 31 MiB and binary computation CPU was effectively unchanged. It was removed. The pilot also recorded baseline I/O waits: a prepared dense request took 61.56 seconds with 2.09 seconds of process CPU. That baseline outlier must not be presented as a candidate speedup. An instrumented same-version control ran twelve fresh processes and 48 complete responses, with a 2.07-second cold median and 2.33-second maximum; none reproduced the wait. All canonical headers were below two MiB. The wait’s cause remains unconfirmed; no speculative timeout/race patch was applied. No Cloudflare deployment or cold-tail bound is claimed.
 
 The full local gate passed 63 Rust and 310 Bun/workerd tests (10,848 assertions), formatting, strict Effect/TypeScript checks and native/WASM Clippy. Peak cgroup charge was 2,243,551,232 bytes (2.09 GiB), below four GiB with swap disabled and two CPUs.
+
+## Bounded common-term prefixes in canonical manifests
+
+Compared with `fcdf858`, new writes and compaction add at most sixteen frequent-term summaries to each canonical R2 segment reference. Rust chooses terms with physical document frequency above one and names of at most sixty-four UTF-8 bytes. Each summary carries its physical frequency and one conservative score-bound tuple, aggregated from validated posting blocks. Unfiltered queries skip catalog acquisition only when every requested term is present in every selected segment's prefix. Native global live statistics, tombstones, posting evaluation, document acquisition and ranking remain unchanged. Missing/partial prefixes, rare terms and filters keep the existing catalog path. Aggregating bounds can lose correlation and admit more ranking work; this is a bounded metadata index, not cached query results.
+
+An explicit rebuild backfills missing prefixes from canonical headers serially, then conditionally commits only the root metadata through the existing ETag owner. It retains sequence, immutable segment keys and their bytes, and releases migration directory handles. Repeating a completed rebuild does not rewrite the root. Legacy roots remain readable without backfill, so ordinary reads perform no migration.
+
+The synthetic million-document fixture has 200 segments and sequence 2,000. Both variants read the same private cloned manifest referencing the original immutable objects; the original root was checked unchanged. Metadata grew from 5,448,685 to 5,589,117 bytes (2.58%). Four alternating paired cohorts per query/cache state used a fresh workerd and empty process/Cache API state. Prepared controls retain R2 derivatives; absent controls redirect all three derivative prefixes to fresh keys. Filesystem and R2-emulator backend caches may remain warm. Cold latency starts at the HTTP request, after runtime readiness. RSS is the owned Linux workerd high-water measured after the first response and 500 ms settlement; it is not the Cloudflare isolate heap.
+
+| Query   | R2 derivatives | Cold latency median (ms) | Cold RSS high-water median (MiB) |
+| ------- | -------------- | ------------------------ | -------------------------------- |
+| common  | prepared       | 1643.6 → 394.6           | 196.9 → 164.5                    |
+| common  | absent         | 4600.8 → 710.7           | 271.9 → 177.1                    |
+| rust    | prepared       | 1299.2 → 382.4           | 194.2 → 165.6                    |
+| rust    | absent         | 4390.1 → 723.9           | 261.1 → 178.6                    |
+| dense72 | prepared       | 2099.0 → 2021.8          | 217.5 → 219.3                    |
+| dense72 | absent         | 5053.2 → 5179.6          | 343.9 → 323.9                    |
+| rare64  | prepared       | 1382.8 → 1391.1          | 223.0 → 220.4                    |
+| rare64  | absent         | 3086.0 → 3145.0          | 281.8 → 272.5                    |
+
+All 256 complete query responses matched across 128 before/after pairs, including rows, scores, attributes, revisions, sequence and followups. Common query text was `cloudflare rust`; `rust` was the single-term control. Dense72 retains an attribute filter, while rare64 selects sixty-four unique terms. Their cold results remain mixed, including about 126 ms more dense missing-cache latency and 59 ms more sparse missing-cache latency. These samples do not establish universal latency improvement. The candidate common prepared maximum was 537.9 ms and missing-cache maximum 753.9 ms: the 200 ms cold target remains unmet. No Cloudflare deployment, backend-cold bound or Turbopuffer parity is claimed.
+
+The full local gate passed 63 Rust and 313 Bun/workerd tests with 11,300 assertions, strict Effect/TypeScript checks, native/WASM Clippy and formatting. Peak cgroup charge was 1,589,755,904 bytes (1.48 GiB), under four GiB with swap disabled and two CPUs. Comparisons ran under two GiB, no swap and one CPU. New regressions validate prefix admission/order, conservative bounds against complete native rankings, any/all/phrase equality, filtered fallback, live deletions, partial coverage, compaction and idempotent rebuild without changing segment bytes.
+
+The entire 300-query SciFact report stayed byte-identical (SHA-256 `9dbe36ba7a85f61312f089c631c4b0dc134e6e876796921ae8206e270415cb28`), retaining nDCG@10 0.6730619695232347, recall@10 0.7956666666666666 and MRR@10 0.641808201058201.

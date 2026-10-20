@@ -2341,6 +2341,53 @@ pub mod wasm {
         }
     }
 
+    fn common_terms(header: &Header) -> Result<String, String> {
+        let mut entries: Vec<_> = header
+            .terms
+            .iter()
+            .filter(|(term, metadata)| metadata.df > 1 && term.len() <= 64)
+            .collect();
+        if entries.len() > 16 {
+            entries.select_nth_unstable_by(16, |left, right| {
+                right.1.df.cmp(&left.1.df).then_with(|| left.0.cmp(right.0))
+            });
+            entries.truncate(16);
+        }
+        let dictionary: BTreeMap<_, _> = entries
+            .into_iter()
+            .map(|(term, metadata)| {
+                let first = metadata
+                    .blocks
+                    .first()
+                    .ok_or("Common term has no posting blocks")?;
+                let bounds = metadata.blocks.iter().skip(1).fold(
+                    (
+                        first.max_title_tf,
+                        first.max_body_tf,
+                        first.min_title_length,
+                        first.min_body_length,
+                    ),
+                    |(title, body, title_length, body_length), block| {
+                        (
+                            title.max(block.max_title_tf),
+                            body.max(block.max_body_tf),
+                            title_length.min(block.min_title_length),
+                            body_length.min(block.min_body_length),
+                        )
+                    },
+                );
+                Ok::<_, String>((
+                    term,
+                    TermSummary {
+                        df: metadata.df,
+                        bounds: vec![bounds],
+                    },
+                ))
+            })
+            .collect::<Result<_, _>>()?;
+        serde_json::to_string(&dictionary).map_err(|cause| cause.to_string())
+    }
+
     #[derive(Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct EligibilityProjection {
@@ -3516,6 +3563,11 @@ pub mod wasm {
         pub fn bytes(&self) -> Vec<u8> {
             self.built.bytes.clone()
         }
+        #[doc = "# Errors\nRejects common-term metadata or serialization failures."]
+        pub fn common_terms(&self) -> Result<String, JsValue> {
+            common_terms(&self.built.header).map_err(|cause| JsValue::from_str(&cause))
+        }
+
         #[doc = "# Errors\nRejects directory serialization errors."]
         pub fn header_json(&self) -> Result<String, JsValue> {
             serde_json::to_string(&self.built.header)
@@ -3743,6 +3795,11 @@ pub mod wasm {
             };
             serde_json::to_string(&projection)
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))
+        }
+
+        #[doc = "# Errors\nRejects common-term metadata or serialization failures."]
+        pub fn common_terms(&self) -> Result<String, JsValue> {
+            common_terms(&self.header).map_err(|cause| JsValue::from_str(&cause))
         }
 
         #[doc = "# Errors\nRejects invalid filters, attributes, or minimum serialization."]

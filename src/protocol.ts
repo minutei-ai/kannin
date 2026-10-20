@@ -121,6 +121,7 @@ export const Root = Schema.Struct({
       termBloom: Schema.String,
       dead: Schema.Array(Schema.Int),
       removedFrequencies: Schema.Record(Schema.String, Schema.Int),
+      commonTerms: Schema.optional(Schema.suspend(() => CommonTerms)),
     }),
   ),
 });
@@ -338,6 +339,16 @@ export const TermSummary = Schema.Struct({
   ),
 });
 export const TermSummaries = Schema.Record(Schema.String, TermSummary);
+export const CommonTerms = Schema.Record(
+  Schema.String.check(Schema.isMaxLength(64)),
+  TermSummary.check(
+    Schema.makeFilter(
+      (summary) =>
+        (summary.df > 1 && summary.df <= 10000 && summary.bounds.length === 1) ||
+        "Invalid common-term summary",
+    ),
+  ),
+).check(Schema.isMaxProperties(16));
 export const TermProjection = Schema.Struct({
   dictionary: TermSummaries,
   partitions: Schema.NullOr(Schema.Array(TermSummaries).check(Schema.isBetweenLength(1, 32))),

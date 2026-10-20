@@ -34,6 +34,8 @@ Immutable Rust directory frames reuse a successful CRC proof without skipping st
 
 Native Base64 conversion for immutable summaries reduced local SciFact cold peak RSS **222 → 188 MiB** and cold latency **1,605 → 1,473 ms**. Results remain mixed: dense recovery peak RSS increased **325 → 338 MiB**, unique-attribute cold reads slowed about 61 ms, and the natural-language warm control slowed about 4 ms. The **200 ms cold-read target remains unmet**. [Subsequent Rust measurements](docs/performance.md#borrowed-canonical-json-term-keys) retain that limit and document further tradeoffs. [Cold-read and RSS measurements](docs/performance.md#native-base64-for-immutable-overview-sources).
 
+Bounded frequent-term summaries in canonical R2 manifests reduced the local million-document unfiltered `cloudflare rust` cold median **1,644 → 395 ms** with prepared derivatives, and **4,601 → 711 ms** with derivatives absent. Cold RSS medians changed **197 → 165 MiB** and **272 → 177 MiB**. All 256 complete comparison responses matched. Filtered and rare-term results remained mixed; the **200 ms cold target is still unmet**. [Prefix measurements and limits](docs/performance.md#bounded-common-term-prefixes-in-canonical-manifests).
+
 Document windows trade bounded read-ahead for reuse: local bulk mutations used **1,001 → 8 acquisitions** but **100 → 305 kB**. The deletion row has one native observation per version and different prior cache state/placement. Fully cold large-catalog recovery still takes seconds locally. [Read-ahead measurements](docs/performance.md#bounded-document-byte-windows).
 
 An earlier edge load run at source `6c03e72`, using an acknowledged sequence barrier, checked 384 complete responses against a strong baseline:
@@ -61,7 +63,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **309 Worker/tooling tests and 63 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **313 Worker/tooling tests and 63 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

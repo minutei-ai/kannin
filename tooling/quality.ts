@@ -1,10 +1,27 @@
-import { Config, Effect, Schema } from "effect";
+import { Config, Console, Effect, Schema } from "effect";
 import { createHash } from "node:crypto";
-import { join } from "node:path";
-import { Document, Id, QueryResult } from "../src/protocol";
-import { request, startWorker, textQuery, write } from "../tests/harness";
+import { basename, join } from "node:path";
+import { createReadStream } from "node:fs";
+import { createInterface } from "node:readline";
+import { retrievalMetrics } from "./retrieval-metrics";
+import {
+  CompactResult,
+  Document,
+  Id,
+  Metadata,
+  QueryResult,
+  Rejected,
+  RpcCommand,
+} from "../src/protocol";
+import { Miniflare } from "miniflare";
+import { workerOptions, write } from "../tests/harness";
 
 const directory = Effect.runSync(Config.String("RAIO_EVAL_DIRECTORY"));
+const split = Effect.runSync(
+  Config.schema(Schema.Literals(["test", "dev", "train"]), "RAIO_EVAL_SPLIT").pipe(
+    Config.withDefault("test"),
+  ),
+);
 const externalDocument = Schema.Struct({
   id: Id,
   title: Schema.String,
@@ -18,13 +35,11 @@ const judgment = Schema.Tuple([
   Id,
   Schema.FiniteFromString.check(Schema.isGreaterThanOrEqualTo(0)),
 ]);
-const corpusBytes = await Bun.file(join(directory, "corpus.jsonl")).text();
+const corpusPath = join(directory, "corpus.jsonl");
+const corpusHash = createHash("sha256");
+for await (const chunk of Bun.file(corpusPath).stream()) corpusHash.update(chunk);
 const queryBytes = await Bun.file(join(directory, "queries.jsonl")).text();
-const qrelBytes = await Bun.file(join(directory, "qrels/test.tsv")).text();
-const documents = corpusBytes
-  .trim()
-  .split("\n")
-  .map((line) => Schema.decodeSync(Schema.fromJsonString(externalDocument))(line));
+const qrelBytes = await Bun.file(join(directory, `qrels/${split}.tsv`)).text();
 const queries = new Map(
   queryBytes
     .trim()
@@ -35,79 +50,172 @@ const queries = new Map(
     }),
 );
 const judgments = new Map<string, Map<string, number>>();
-const known = new Set(documents.map((document) => document.id));
+
 const qrelLines = qrelBytes.trim().split(/\r?\n/);
 if (qrelLines[0] !== "query-id\tcorpus-id\tscore") throw new Error("Invalid judgment header");
 for (const line of qrelLines.slice(1)) {
   const [query, document, relevance] = Schema.decodeUnknownSync(judgment)(line.split("\t"));
-  if (!known.has(document) || !queries.has(query))
-    throw new Error("Judgment references an unknown record");
+  if (!queries.has(query)) throw new Error("Judgment references an unknown query");
   const values = judgments.get(query) ?? new Map<string, number>();
   values.set(document, relevance);
   judgments.set(query, values);
 }
 if (judgments.size === 0) throw new Error("No judged queries");
-const worker = await startWorker();
+const clientBundle = await Bun.build({
+  entrypoints: [join(import.meta.dir, "../tests/rpc-client.ts")],
+  target: "browser",
+  format: "esm",
+  external: ["cloudflare:workers"],
+});
+if (!clientBundle.success) throw new AggregateError(clientBundle.logs);
+const clientArtifact = clientBundle.outputs[0];
+if (clientArtifact === undefined) throw new Error("Missing SDK client artifact");
+const options = await workerOptions();
+const worker = new Miniflare({
+  ...options,
+  workers: [
+    ...options.workers,
+    {
+      config: {
+        name: "quality-client",
+        compatibilityDate: "2026-10-01",
+        manifest: {
+          mainModule: "client.js",
+          modules: {
+            "client.js": { type: "esm", contents: await clientArtifact.text() },
+          },
+        },
+        env: { KANNIN: { type: "worker", worker: "raio", exportName: "KanninRpc" } },
+      },
+    },
+  ],
+});
 await using cleanup = new AsyncDisposableStack();
 cleanup.defer(() => worker.dispose());
-for (const offset of Array.from(
-  { length: Math.ceil(documents.length / 500) },
-  (_, index) => index * 500,
-)) {
-  const response = await request(
-    worker,
-    "quality-scifact",
-    "write",
-    write(
-      documents.slice(offset, offset + 500).map((document) => ({
-        id: document.id,
-        title: document.title,
-        text: document.text,
-        attributes: {},
-      })),
-    ),
-  );
+const client = await worker.getWorker("quality-client");
+const call = (command: typeof RpcCommand.Type) =>
+  client.fetch("https://quality.internal", {
+    method: "POST",
+    body: Schema.encodeSync(Schema.fromJsonString(RpcCommand))(command),
+  });
+const known = new Set<string>();
+const batch: Array<typeof Document.Type> = [];
+const corpus = createReadStream(corpusPath);
+const rows = createInterface({ input: corpus, crlfDelay: Infinity });
+await using corpusCleanup = new AsyncDisposableStack();
+corpusCleanup.defer(() => {
+  rows.close();
+  corpus.destroy();
+});
+for await (const line of rows) {
+  const document = Schema.decodeSync(Schema.fromJsonString(externalDocument))(line);
+  if (known.has(document.id)) throw new Error("Duplicate corpus identifier");
+  known.add(document.id);
+  batch.push({ id: document.id, title: document.title, text: document.text, attributes: {} });
+  if (batch.length === 500) {
+    const response = await call({
+      namespace: "quality",
+      operation: "write",
+      input: write(batch.splice(0)),
+    });
+    if (!response.ok)
+      throw new Error(`Corpus ingestion failed: ${response.status} ${await response.text()}`);
+    await response.arrayBuffer();
+    console.error(`Indexed ${known.size} documents`);
+  }
+}
+if (batch.length > 0) {
+  const response = await call({ namespace: "quality", operation: "write", input: write(batch) });
   if (!response.ok)
     throw new Error(`Corpus ingestion failed: ${response.status} ${await response.text()}`);
   await response.arrayBuffer();
 }
-const measured = { ndcg10: 0, recall10: 0, mrr10: 0 };
-const evaluated = [];
-for (const [id, relevance] of judgments) {
-  const text = queries.get(id);
-  if (text === undefined) throw new Error("Missing judged query");
-  const response = await request(worker, "quality-scifact", "query", textQuery(text, 10));
-  const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
-  const scores = result.rows.map((row) => relevance.get(row.id) ?? 0);
-  const ideal = [...relevance.values()].toSorted((a, b) => b - a).slice(0, 10);
-  const denominator = ideal.reduce(
-    (sum, score, index) => sum + (2 ** score - 1) / Math.log2(index + 2),
-    0,
-  );
-  const gain = scores.reduce(
-    (sum, score, index) => sum + (2 ** score - 1) / Math.log2(index + 2),
-    0,
-  );
-  const relevant = [...relevance.values()].filter((score) => score > 0).length;
-  const rank = scores.findIndex((score) => score > 0);
-  const metrics = { ndcg10: 0, recall10: 0, mrr10: 0 };
-  if (denominator > 0) metrics.ndcg10 = gain / denominator;
-  if (relevant > 0) metrics.recall10 = scores.filter((score) => score > 0).length / relevant;
-  if (rank >= 0) metrics.mrr10 = 1 / (rank + 1);
-  measured.ndcg10 += metrics.ndcg10;
-  measured.recall10 += metrics.recall10;
-  measured.mrr10 += metrics.mrr10;
-  evaluated.push({ queryId: id, ...metrics, ids: result.rows.map((row) => row.id) });
+const missingJudgments = [...judgments.values()].reduce(
+  (sum, relevance) => sum + [...relevance.keys()].filter((id) => !known.has(id)).length,
+  0,
+);
+for (const _attempt of Array.from({ length: Math.ceil(known.size / 500) }, (_, index) => index)) {
+  const response = await call({ namespace: "quality", operation: "compact" });
+  if (!response.ok)
+    throw new Error(`Corpus compaction failed: ${response.status} ${await response.text()}`);
+  const result = Schema.decodeUnknownSync(CompactResult)(await response.json());
+  if (result.compacted < 2) break;
 }
+const metadata = Schema.decodeUnknownSync(Metadata)(
+  await (await call({ namespace: "quality", operation: "metadata" })).json(),
+);
+if (metadata.documents !== known.size) throw new Error("Compaction changed corpus cardinality");
+console.error(`Evaluating ${judgments.size} queries over ${metadata.segments} compacted segments`);
+const progress = { completed: 0, retries: 0 };
+const evaluated = await Effect.runPromise(
+  Effect.forEach(
+    judgments,
+    ([id, relevance]) =>
+      Effect.gen(function* () {
+        const text = queries.get(id);
+        if (text === undefined) return yield* Effect.die("Missing judged query");
+        const response = yield* Effect.tryPromise(() =>
+          call({
+            namespace: "quality",
+            operation: "query",
+            input: {
+              kind: "text",
+              text,
+              topK: 11,
+              filters: [],
+            },
+          }),
+        ).pipe(
+          Effect.tapError(() =>
+            Effect.sync(() => {
+              progress.retries += 1;
+            }),
+          ),
+          Effect.retry({ times: 2 }),
+        );
+        if (!response.ok) {
+          const body = yield* Effect.tryPromise(() => response.text());
+          return yield* new Rejected({
+            status: response.status,
+            message: `Evaluation query ${id} failed: ${body}`,
+          });
+        }
+        const result = yield* Effect.tryPromise(() => response.json()).pipe(
+          Effect.flatMap(Schema.decodeUnknownEffect(QueryResult)),
+        );
+        const ids = result.rows
+          .filter((row) => row.id !== id)
+          .slice(0, 10)
+          .map((row) => row.id);
+        progress.completed += 1;
+        if (progress.completed % 100 === 0)
+          yield* Console.error(`Evaluated ${progress.completed}/${judgments.size} queries`);
+        return { queryId: id, ...retrievalMetrics(ids, relevance), ids };
+      }),
+    { concurrency: 4 },
+  ),
+);
+const measured = evaluated.reduce(
+  (sum, result) => ({
+    ndcg10: sum.ndcg10 + result.ndcg10,
+    recall10: sum.recall10 + result.recall10,
+    mrr10: sum.mrr10 + result.mrr10,
+  }),
+  { ndcg10: 0, recall10: 0, mrr10: 0 },
+);
 console.log(
   JSON.stringify(
     {
-      dataset: "BEIR SciFact",
-      split: "test",
+      dataset: `BEIR ${basename(directory)}`,
+      split,
       runtime: "local-workerd-rust-wasm-r2",
-      documents: documents.length,
+      documents: known.size,
+      segments: metadata.segments,
       queries: judgments.size,
-      corpusSha256: createHash("sha256").update(corpusBytes).digest("hex"),
+      missingJudgments,
+      transportRetries: progress.retries,
+      corpusSha256: corpusHash.digest("hex"),
+      queriesSha256: createHash("sha256").update(queryBytes).digest("hex"),
       judgmentsSha256: createHash("sha256").update(qrelBytes).digest("hex"),
       ndcg10: measured.ndcg10 / judgments.size,
       recall10: measured.recall10 / judgments.size,

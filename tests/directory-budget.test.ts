@@ -313,7 +313,7 @@ test("segment origins validate R2 frames before publishing the native Cache API 
   expect(await decoded.text()).toBe(expected.terms('["unique3711"]'));
   expect(decoded.headers.get("x-directory-hits")).toBe("1");
   expect(Number(decoded.headers.get("x-directory-bytes"))).toBeGreaterThan(0);
-  expect(Number(decoded.headers.get("x-directory-bytes"))).toBeLessThanOrEqual(20 * 1024 * 1024);
+  expect(Number(decoded.headers.get("x-directory-bytes"))).toBeLessThanOrEqual(29 * 1024 * 1024);
   expect((await fetch(new URL("/fast-origin", await worker.ready))).status).toBe(204);
   const relayed = await fetch(await worker.ready, { method: "POST", body });
   expect(relayed.status).toBe(200);
@@ -679,9 +679,9 @@ test("rejected cache admission shares a validated directory only for active read
   expect((await fetch(new URL("/fast-origin", await worker.ready))).status).toBe(204);
   using expected = Directory.compressed(frame, length, 40 * 1024 * 1024);
   const metadata = expected.terms('["unique3711"]');
-  const capacity = Math.floor((20 * 1024 * 1024) / expected.heap_bytes());
+  const capacity = Math.floor((29 * 1024 * 1024) / expected.heap_bytes());
   expect(capacity).toBeGreaterThan(0);
-  expect(capacity).toBeLessThan(32);
+  expect(capacity).toBeLessThan(64);
   const inputs = Array.from({ length: capacity + 1 }, (_, index) => ({
     key: `namespaces/directory-active/segments/blob-${index}.rsix`,
     offset: 0,
@@ -718,7 +718,7 @@ test("rejected cache admission shares a validated directory only for active read
     expect(response.status).toBe(200);
     expect(await response.text()).toBe(metadata);
     expect(response.headers.get("x-directory-hits")).toBe("0");
-    expect(Number(response.headers.get("x-directory-bytes"))).toBeLessThanOrEqual(20 * 1024 * 1024);
+    expect(Number(response.headers.get("x-directory-bytes"))).toBeLessThanOrEqual(29 * 1024 * 1024);
     const after = await fetch(new URL("/state", await worker.ready));
     expect(
       Number(after.headers.get("x-directory-parses")) -

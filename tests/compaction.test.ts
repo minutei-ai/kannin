@@ -1,6 +1,6 @@
 import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
-import { QueryResult, Metadata, Health } from "../src/protocol";
+import { CompactResult, QueryResult, Metadata, Health } from "../src/protocol";
 import { clearLeaderIndex, document, request, startWorker, textQuery, write } from "./harness";
 
 const worker = await startWorker();
@@ -66,6 +66,7 @@ test("compaction drops superseded records and tombstones", async () => {
 test("compaction retains Vectorize identity across document moves", async () => {
   const values = [1, ...Array.from({ length: 767 }, () => 0)];
   await request(worker, "vectors", "write", {
+    ...write([]),
     requestId: "one",
     upserts: [{ id: "a", text: "rust", attributes: {}, vector: values }],
     deletes: [],
@@ -76,6 +77,7 @@ test("compaction retains Vectorize identity across document moves", async () => 
   const before = Schema.decodeUnknownSync(QueryResult)(
     await (await request(worker, "vectors", "query", input)).json(),
   );
+  expect(before.rows.map((row) => row.id)).toEqual(["a"]);
   expect((await request(worker, "vectors", "compact", {})).status).toBe(200);
   const after = Schema.decodeUnknownSync(QueryResult)(
     await (await request(worker, "vectors", "query", input)).json(),
@@ -373,4 +375,33 @@ test("several nearby term gaps share one total overfetch budget", async () => {
   expect(result.rows.map((row) => row.id)).toEqual(
     Array.from({ length: 10 }, (_, index) => String(index).padStart(4, "0")),
   );
+});
+
+test("compaction rolls back a whole candidate at the decoded byte limit without losing its rows", async () => {
+  const text = `rust ${"x".repeat(220000)}`;
+  for (const batch of Array.from({ length: 5 }, (_, index) => index)) {
+    const created = await request(
+      worker,
+      "byte-window",
+      "write",
+      write(Array.from({ length: 8 }, (_, index) => document(`${batch}-${index}`, text))),
+    );
+    expect(created.status).toBe(200);
+  }
+  const before = await query("byte-window");
+  expect(before.rows).toHaveLength(40);
+  const response = await request(worker, "byte-window", "compact", {});
+  expect(response.status).toBe(200);
+  const result = Schema.decodeUnknownSync(CompactResult)(await response.json());
+  expect(result).toEqual({ compacted: 4, segments: 2, documents: 32 });
+  expect(await query("byte-window")).toEqual(before);
+  const bucket = await worker.getR2Bucket("STORAGE");
+  const prior = await bucket.head("namespaces/byte-window/root.json");
+  const repeated = await request(worker, "byte-window", "compact", {});
+  expect(Schema.decodeUnknownSync(CompactResult)(await repeated.json())).toEqual({
+    compacted: 0,
+    segments: 2,
+  });
+  expect((await bucket.head("namespaces/byte-window/root.json"))?.etag).toBe(prior?.etag);
+  expect(await query("byte-window")).toEqual(before);
 });

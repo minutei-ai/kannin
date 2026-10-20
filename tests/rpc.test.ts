@@ -81,6 +81,7 @@ test("Effect SDK performs native binding RPC with Worker and coordinator HTTP di
       body: Schema.encodeSync(Schema.fromJsonString(RpcCommand))(command),
     });
   const input = {
+    schema: { filterable: ["group"], vectorFilterFields: [] },
     requestId: "first",
     upserts: [
       { id: "a", text: "rust busca", attributes: { group: 1 } },
@@ -118,6 +119,13 @@ test("Effect SDK performs native binding RPC with Worker and coordinator HTTP di
     input: { ...query, filters: [{ field: "group", op: "eq", value: 2 }] },
   });
   expect(filtered.status).toBe(200);
+  const undeclared = await call({
+    namespace: "rpc",
+    operation: "query",
+    input: { ...query, filters: [{ field: "other", op: "exists", value: true }] },
+  });
+  expect(undeclared.status).toBe(400);
+
   expect(
     Schema.decodeUnknownSync(QueryResult)(await filtered.json()).rows.map((row) => row.id),
   ).toEqual(["b"]);

@@ -58,10 +58,6 @@ export async function workerOptions(
               type: "json" as const,
               value: { id: versionId, tag: "", timestamp: "2026-10-01T00:00:00Z" },
             },
-            VECTOR_FILTER_FIELDS: {
-              type: "text" as const,
-              value: '["group","year","category","__proto__","flag"]',
-            },
             API_TOKEN: { type: "text" as const, value: "local-test-token" },
             STORAGE: { type: "r2" as const, name: "raio-test" },
             STORAGE_CACHE_SCOPE: { type: "text" as const, value: "raio-test" },
@@ -193,5 +189,25 @@ export function write(
   deletes: string[] = [],
   requestId = crypto.randomUUID(),
 ) {
-  return { requestId, upserts, deletes };
+  return {
+    requestId,
+    upserts,
+    deletes,
+    schema: {
+      filterable: [
+        "group",
+        "year",
+        "count",
+        "active",
+        "empty",
+        "absent",
+        "value",
+        "source",
+        "missing",
+        "cohort",
+        "note",
+      ],
+      vectorFilterFields: [],
+    },
+  };
 }

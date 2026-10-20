@@ -12,6 +12,10 @@ import {
 import { request, startWorker } from "./harness";
 
 const worker = await startWorker();
+const schema = {
+  filterable: ["group", "year", "category", "__proto__", "flag", "eligible"],
+  vectorFilterFields: ["group", "year", "category", "__proto__", "flag"],
+};
 afterAll(() => worker.dispose());
 const vector = (x: number, y = 0) => [x, y, ...Array.from({ length: 766 }, () => 0)];
 const query = (kind: "vector" | "hybrid" = "vector") => ({
@@ -32,6 +36,7 @@ test("vector dimensions and zero magnitude fail before persistence", async () =>
     expect(
       (
         await request(worker, "dimension", "write", {
+          schema,
           requestId: crypto.randomUUID(),
           upserts: [{ id: "a", text: "lexical", attributes: {}, vector: values }],
           deletes: [],
@@ -51,6 +56,7 @@ test("vector outbox survives provider failure and retries", async () => {
   expect(
     (
       await request(worker, "retry", "write", {
+        schema,
         requestId: "one",
         upserts: [{ id: "a", text: "lexical", attributes: {}, vector: vector(1) }],
         deletes: [],
@@ -74,12 +80,14 @@ test("vector outbox survives provider failure and retries", async () => {
 test("delayed obsolete vectors cannot impersonate newer document revisions", async () => {
   await mode("/defer");
   await request(worker, "revision", "write", {
+    schema,
     requestId: "old",
     upserts: [{ id: "a", text: "old", attributes: {}, vector: vector(1) }],
     deletes: [],
   });
   await request(worker, "revision", "vector-sync", {});
   await request(worker, "revision", "write", {
+    schema,
     requestId: "new",
     upserts: [{ id: "a", text: "new", attributes: {}, vector: vector(0.6, 0.8) }],
     deletes: [],
@@ -95,12 +103,18 @@ test("delayed obsolete vectors cannot impersonate newer document revisions", asy
 
 test("deletion hides stale Vectorize results immediately", async () => {
   await request(worker, "delete", "write", {
+    schema,
     requestId: "create",
     upserts: [{ id: "a", text: "lexical", attributes: {}, vector: vector(1) }],
     deletes: [],
   });
   await request(worker, "delete", "vector-sync", {});
-  await request(worker, "delete", "write", { requestId: "delete", upserts: [], deletes: ["a"] });
+  await request(worker, "delete", "write", {
+    schema,
+    requestId: "delete",
+    upserts: [],
+    deletes: ["a"],
+  });
   const found = Schema.decodeUnknownSync(QueryResult)(
     await (await request(worker, "delete", "query", vectorQuery())).json(),
   );
@@ -116,6 +130,7 @@ test("vectors are namespace isolated", async () => {
 
 test("hybrid combines lexical and vector ranking using RRF", async () => {
   await request(worker, "hybrid", "write", {
+    schema,
     requestId: "hybrid",
     upserts: [
       { id: "both", text: "lexical lexical", attributes: { group: "a" }, vector: vector(1) },
@@ -152,7 +167,7 @@ test("native metadata equality finds eligible vectors outside the unfiltered top
     }
     return { id: String(index), text: "lexical", attributes, vector: values };
   });
-  await request(worker, "prefilter", "write", { requestId: "seed", upserts, deletes: [] });
+  await request(worker, "prefilter", "write", { schema, requestId: "seed", upserts, deletes: [] });
   await request(worker, "prefilter", "vector-sync", {});
   for (const filters of [
     [{ field: "group", op: "eq", value: "eligible" }],
@@ -169,6 +184,7 @@ test("native metadata equality finds eligible vectors outside the unfiltered top
 test("typed scalar hashes preserve null, booleans and strings beyond sixty-four UTF8 bytes", async () => {
   const long = "ação".repeat(40);
   await request(worker, "scalar-index", "write", {
+    schema,
     requestId: "seed",
     deletes: [],
     upserts: [
@@ -213,7 +229,12 @@ test("numeric metadata ranges apply before candidate limits and retain exact res
     attributes: { year: index },
     vector: vector(1),
   }));
-  await request(worker, "range-index", "write", { requestId: "seed", upserts, deletes: [] });
+  await request(worker, "range-index", "write", {
+    schema,
+    requestId: "seed",
+    upserts,
+    deletes: [],
+  });
   await request(worker, "range-index", "vector-sync", {});
   const result = Schema.decodeUnknownSync(QueryResult)(
     await (
@@ -241,7 +262,12 @@ test("R2-backed rebuild cursors resume after provider failure and reconcile inte
     attributes: { group: "old" },
     vector: vector(1),
   }));
-  await request(worker, "rebuild-index", "write", { requestId: "seed", upserts, deletes: [] });
+  await request(worker, "rebuild-index", "write", {
+    schema,
+    requestId: "seed",
+    upserts,
+    deletes: [],
+  });
   const first = Schema.decodeUnknownSync(VectorRebuildResult)(
     await (await request(worker, "rebuild-index", "vector-rebuild", {})).json(),
   );
@@ -250,6 +276,7 @@ test("R2-backed rebuild cursors resume after provider failure and reconcile inte
   if (first.snapshot === null) throw new Error("Missing rebuild snapshot");
   const cursor = { snapshot: first.snapshot, segment: first.segment, row: first.row };
   await request(worker, "rebuild-index", "write", {
+    schema,
     requestId: "changed",
     upserts: [{ id: "150", text: "updated", attributes: { group: "new" }, vector: vector(1) }],
     deletes: ["151"],
@@ -295,6 +322,7 @@ test("rebuild cursor validation and namespace reset cannot silently change the s
   ])
     expect((await request(worker, "invalid-rebuild", "vector-rebuild", cursor)).status).toBe(400);
   await request(worker, "reset-rebuild", "write", {
+    schema,
     requestId: "seed",
     deletes: [],
     upserts: Array.from({ length: 101 }, (_, index) => ({
@@ -309,6 +337,7 @@ test("rebuild cursor validation and namespace reset cannot silently change the s
   );
   if (first.snapshot === null) throw new Error("Missing rebuild snapshot");
   await request(worker, "reset-rebuild", "write", {
+    schema,
     requestId: "reset",
     reset: true,
     upserts: [],
@@ -334,6 +363,7 @@ test("obsolete queued revisions do not allocate extra provider vectors", async (
   );
   for (const revision of [1, 2, 3])
     await request(worker, "skip-obsolete", "write", {
+      schema,
       requestId: `revision-${revision}`,
       upserts: [{ id: "a", text: `lexical ${revision}`, attributes: {}, vector: vector(1) }],
       deletes: [],
@@ -361,11 +391,13 @@ test("reset before vector synchronization drops allocations for the retired epoc
     await (await service.fetch("http://fixture/healthy")).json(),
   );
   await request(worker, "skip-old-epoch", "write", {
+    schema,
     requestId: "old",
     upserts: [{ id: "a", text: "old epoch", attributes: {}, vector: vector(1) }],
     deletes: [],
   });
   await request(worker, "skip-old-epoch", "write", {
+    schema,
     requestId: "reset",
     reset: true,
     upserts: [{ id: "b", text: "new epoch", attributes: {}, vector: vector(1) }],
@@ -389,6 +421,7 @@ test("one queue delivery drains sixteen committed jobs with one vector mutation 
     expect(
       (
         await request(worker, namespace, "write", {
+          schema,
           requestId: `queued-${index}`,
           upserts: [
             { id: `doc-${index}`, text: "queued vectors", attributes: {}, vector: vector(1) },
@@ -457,6 +490,7 @@ test("one queue delivery drains sixteen committed jobs with one vector mutation 
 test("vector top-k materializes only the requested live document pages", async () => {
   const namespace = "vector-pages";
   await request(worker, namespace, "write", {
+    schema,
     requestId: "pages",
     upserts: Array.from({ length: 20 }, (_, index) => ({
       id: String(index).padStart(4, "0"),
@@ -485,6 +519,7 @@ test("vector top-k materializes only the requested live document pages", async (
 test("vector materialization shares byte windows while preserving provider score order", async () => {
   const namespace = "vector-reverse-pages";
   await request(worker, namespace, "write", {
+    schema,
     requestId: "pages",
     upserts: Array.from({ length: 20 }, (_, index) => ({
       id: String(index).padStart(4, "0"),
@@ -520,6 +555,7 @@ test("small vector top-k avoids locating every candidate segment", async () => {
   const namespace = "vector-scattered";
   for (const index of Array.from({ length: 20 }, (_, ordinal) => ordinal))
     await request(worker, namespace, "write", {
+      schema,
       requestId: `page-${index}`,
       upserts: [
         { id: String(index).padStart(4, "0"), text: "lexical", attributes: {}, vector: vector(1) },
@@ -545,6 +581,7 @@ test("small vector top-k avoids locating every candidate segment", async () => {
 test("candidate windows continue through stale revisions and residual filters before top-k", async () => {
   const namespace = "vector-window-residual";
   await request(worker, namespace, "write", {
+    schema,
     requestId: "seed",
     upserts: Array.from({ length: 20 }, (_, index) => ({
       id: String(index).padStart(4, "0"),
@@ -556,6 +593,7 @@ test("candidate windows continue through stale revisions and residual filters be
   });
   await request(worker, namespace, "vector-sync", {});
   await request(worker, namespace, "write", {
+    schema,
     requestId: "retire",
     upserts: Array.from({ length: 8 }, (_, index) => ({
       id: String(index).padStart(4, "0"),
@@ -584,6 +622,7 @@ test("candidate windows continue through stale revisions and residual filters be
 test("bounded ANN cache avoids provider calls and expires without caching document authority", async () => {
   const namespace = "ann-cache";
   await request(worker, namespace, "write", {
+    schema,
     requestId: "seed",
     upserts: [{ id: "a", text: "lexical", attributes: {}, vector: vector(1) }],
     deletes: [],
@@ -613,6 +652,7 @@ test("bounded ANN cache avoids provider calls and expires without caching docume
   );
   expect(renewed.queryCalls).toBe(before.queryCalls + 2);
   await request(worker, namespace, "write", {
+    schema,
     requestId: "replace",
     upserts: [{ id: "a", text: "new", attributes: {}, vector: vector(0.6, 0.8) }],
     deletes: [],

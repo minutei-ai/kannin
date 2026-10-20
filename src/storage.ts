@@ -116,7 +116,7 @@ const budget = { bytes: 0, payloadBytes: 0 };
 const MAX_CACHE_BYTES = 12 * 1024 * 1024;
 const encodedDirectories = new Map<string, CompressedDirectory>();
 const encodedBudget = { bytes: 0 };
-const MAX_ENCODED_DIRECTORY_BYTES = 18 * 1024 * 1024;
+const MAX_ENCODED_DIRECTORY_BYTES = 9 * 1024 * 1024;
 const textPlans = new Map<string, { plan: typeof TextPlan.Type; bytes: number }>();
 const textPlanBudget = { bytes: 0 };
 const MAX_TEXT_PLAN_BYTES = 1024 * 1024;
@@ -138,7 +138,7 @@ const activeDirectories = new Map<
 >();
 const decodedBudget = { bytes: 0 };
 const MAX_DECODED_BYTES = 40 * 1024 * 1024;
-const MAX_DECODED_CACHE_BYTES = 20 * 1024 * 1024;
+const MAX_DECODED_CACHE_BYTES = 29 * 1024 * 1024;
 const CachedTermCatalog = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("projection"), projection: TermProjection }),
   Schema.Struct({ kind: Schema.Literal("minimum"), minimum: EligibleMinimum }),

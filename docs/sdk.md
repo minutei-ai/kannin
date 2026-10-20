@@ -41,6 +41,22 @@ const results = Search.query("legal-corpus", {
 }).pipe(Effect.provideService(Search.Kannin, env.KANNIN));
 ```
 
+Declare filterable attributes through the same binding before querying them:
+
+```ts
+const configured = Search.write("legal-corpus", {
+  requestId: "configure-schema-v1",
+  schema: {
+    filterable: ["authority", "year"],
+    vectorFilterFields: ["authority", "year"],
+  },
+  upserts: [],
+  deletes: [],
+}).pipe(Effect.provideService(Search.Kannin, env.KANNIN));
+```
+
+The namespace owns this schema in R2. Other attributes remain stored but cannot be filtered. Later writes can omit `schema`; changing it requires an explicit reset and reimport. See [schema and migration semantics](api.md). BM25 still uses `title` and `text`; arbitrary full-text columns remain a delivery gate.
+
 `query`, `write`, `metadata`, `compact`, `collect`, `rebuild`, `synchronizeVectors` and `rebuildVectors` return Effects. Input and result types come from the same Schemas as the server. `Rejected` failures retain their status and message and can be handled with `Effect.catchTag("Rejected", ...)`; invalid contracts fail with `SchemaError`, and native binding failures retain their cause in `UnknownError`. No operation retries automatically: retain the same write `requestId` when retrying an uncertain write. An Effect interruption cannot roll back a remote mutation that has already committed.
 
 Both Worker-to-Worker and Worker-to-coordinator calls use native RPC, with structured records rather than Request/Response transport. The namespace coordinator owns the same mutation lock, read leases, sequence barriers, ranking and R2 persistence as the HTTP API. Explicit edge-eventual text queries retain the bounded-age snapshot path and recover through coordinator RPC. Vector visibility remains eventual.

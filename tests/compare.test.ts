@@ -47,6 +47,7 @@ for (const sample of [
     const state = { kanninWrites: 0, kanninQueries: 0, turboQueries: 0, metadata: 0 };
     const reuse = "raio-bench-00000000-0000-0000-0000-000000000000";
     const metadata = Schema.decodeUnknownSync(Metadata)({
+      schema: null,
       sequence: Math.ceil(sample.size / 500),
       documents: sample.size,
       segments: 1,

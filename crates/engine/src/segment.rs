@@ -11,11 +11,128 @@ const MAGIC: &[u8; 8] = b"RAIOSEG1";
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 const BLOCK_SIZE: usize = 128;
 const FILTER_CACHE_BYTES: usize = 32 * 1024;
+const MAX_QUERY_TERMS: usize = 512;
 
 #[derive(Clone, Default)]
 struct FilterMasks {
+    representatives: Option<(String, Box<[u16]>)>,
     entries: VecDeque<(String, Vec<bool>, usize)>,
     bytes: usize,
+}
+
+impl FilterMasks {
+    fn reserve(&mut self, bytes: usize) -> bool {
+        let retained = self.representatives.as_ref().map_or(0, |(scope, rows)| {
+            scope.capacity() + size_of_val(rows.as_ref()) + 128
+        });
+        if bytes > FILTER_CACHE_BYTES.saturating_sub(retained) {
+            return false;
+        }
+        while self.bytes + bytes > FILTER_CACHE_BYTES || self.entries.len() >= 16 {
+            let Some((_, _, removed)) = self.entries.pop_front() else {
+                return false;
+            };
+            self.bytes -= removed;
+        }
+        true
+    }
+
+    fn prepare_representatives(
+        &mut self,
+        documents: &[DocumentMeta],
+        fields: &BTreeSet<&str>,
+    ) -> Result<(), String> {
+        use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+
+        let mut required: BTreeSet<String> =
+            fields.iter().map(|field| (*field).to_owned()).collect();
+        if let Some((scope, _)) = &self.representatives {
+            let previous: BTreeSet<String> =
+                serde_json::from_str(scope).map_err(|cause| cause.to_string())?;
+            if required.is_subset(&previous) {
+                return Ok(());
+            }
+            required.extend(previous);
+            if required.len() > 16 {
+                required.retain(|field| fields.contains(field.as_str()));
+            }
+        }
+        let scope = serde_json::to_string(&required).map_err(|cause| cause.to_string())?;
+        let fields: BTreeSet<_> = required.iter().map(String::as_str).collect();
+        if let Some((scope, rows)) = self.representatives.take() {
+            self.bytes -= scope.capacity() + size_of_val(rows.as_ref()) + 128;
+        }
+        if scope.capacity() + documents.len() * size_of::<u16>() + 128 > FILTER_CACHE_BYTES {
+            return Ok(());
+        }
+
+        let row_hasher = BuildHasherDefault::<DefaultHasher>::default();
+        let mut observed = std::collections::HashMap::new();
+        let repeated = (0..documents.len().min(128)).any(|sample| {
+            let hash = row_hasher.hash_one(sample).to_le_bytes();
+            let row = usize::from(u16::from_le_bytes([hash[0], hash[1]])) % documents.len();
+            observed
+                .insert(documents[row].attributes.get(), row)
+                .is_some_and(|previous| previous != row)
+        });
+        if repeated {
+            let mut raw_groups = std::collections::HashMap::new();
+            let mut groups = std::collections::HashMap::new();
+            let mut group_bytes = 0;
+            let mut values: BTreeMap<_, Option<serde_json::Value>> =
+                fields.iter().map(|field| (*field, None)).collect();
+            let representatives = documents
+                .iter()
+                .enumerate()
+                .map(|(index, doc)| {
+                    let row = u16::try_from(index).map_err(|cause| cause.to_string())?;
+                    if let Some(previous) = raw_groups.get(doc.attributes.get()) {
+                        return Ok(*previous);
+                    }
+                    for value in values.values_mut() {
+                        *value = None;
+                    }
+                    let mut decoder = serde_json::Deserializer::from_str(doc.attributes.get());
+                    serde::de::DeserializeSeed::deserialize(
+                        FilterAttributes {
+                            fields: &fields,
+                            values: &mut values,
+                        },
+                        &mut decoder,
+                    )
+                    .map_err(|cause| cause.to_string())?;
+                    decoder.end().map_err(|cause| cause.to_string())?;
+                    let representative = if values.values().flatten().all(|value| {
+                        !value.is_array()
+                            && !value.is_object()
+                            && value.as_str().is_none_or(|text| text.len() <= 256)
+                    }) {
+                        let projected: Vec<_> = values.values().map(Option::as_slice).collect();
+                        let key =
+                            serde_json::to_string(&projected).map_err(|cause| cause.to_string())?;
+                        let representative = groups.get(&key).copied().unwrap_or(row);
+                        if representative == row && group_bytes + key.capacity() + 64 <= 16 * 1024 {
+                            group_bytes += key.capacity() + 64;
+                            groups.insert(key, row);
+                        }
+                        representative
+                    } else {
+                        row
+                    };
+                    if raw_groups.len() < 2048 {
+                        raw_groups.insert(doc.attributes.get(), representative);
+                    }
+                    Ok(representative)
+                })
+                .collect::<Result<Box<[_]>, String>>()?;
+            let bytes = scope.capacity() + size_of_val(representatives.as_ref()) + 128;
+            if self.reserve(bytes) {
+                self.bytes += bytes;
+                self.representatives = Some((scope, representatives));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -466,31 +583,17 @@ impl Header {
             let fields: BTreeSet<_> = filters.iter().map(|filter| filter.field.as_str()).collect();
             let mut values: BTreeMap<_, Option<serde_json::Value>> =
                 fields.iter().map(|field| (*field, None)).collect();
-            let repeated = {
-                use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
-
-                let row_hasher = BuildHasherDefault::<DefaultHasher>::default();
-                let mut observed = std::collections::HashMap::new();
-                (0..self.documents.len().min(128)).any(|sample| {
-                    let hash = row_hasher.hash_one(sample).to_le_bytes();
-                    let row =
-                        usize::from(u16::from_le_bytes([hash[0], hash[1]])) % self.documents.len();
-                    observed
-                        .insert(self.documents[row].attributes.get(), row)
-                        .is_some_and(|previous| previous != row)
-                })
-            };
-            let mut evaluated = std::collections::HashMap::new();
+            self.filter_masks
+                .borrow_mut()
+                .prepare_representatives(&self.documents, &fields)?;
+            let cache = self.filter_masks.borrow();
             for (index, doc) in self.documents.iter().enumerate() {
-                let available = evaluated.len() < 2048;
-                let entry = if repeated {
-                    Some(evaluated.entry(doc.attributes.get()))
-                } else {
-                    None
-                };
-                if let Some(std::collections::hash_map::Entry::Occupied(entry)) = &entry {
-                    allowed[index] = *entry.get();
-                    continue;
+                if let Some((_, representatives)) = &cache.representatives {
+                    let representative = usize::from(representatives[index]);
+                    if representative != index {
+                        allowed[index] = allowed[representative];
+                        continue;
+                    }
                 }
                 for value in values.values_mut() {
                     *value = None;
@@ -513,19 +616,11 @@ impl Header {
                         break;
                     }
                 }
-                if available && let Some(std::collections::hash_map::Entry::Vacant(entry)) = entry {
-                    entry.insert(allowed[index]);
-                }
             }
+            drop(cache);
             let bytes = key.capacity() + allowed.capacity() + 128;
-            if bytes <= FILTER_CACHE_BYTES {
-                let mut cache = self.filter_masks.borrow_mut();
-                while cache.bytes + bytes > FILTER_CACHE_BYTES || cache.entries.len() >= 16 {
-                    let Some((_, _, removed)) = cache.entries.pop_front() else {
-                        break;
-                    };
-                    cache.bytes -= removed;
-                }
+            let mut cache = self.filter_masks.borrow_mut();
+            if cache.reserve(bytes) {
                 cache.bytes += bytes;
                 cache.entries.push_back((key, allowed.clone(), bytes));
             }
@@ -1269,7 +1364,10 @@ impl QueryTerms {
             .split_whitespace()
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        if top_k == 0 || top_k > 100 || words.iter().collect::<BTreeSet<_>>().len() > 64 {
+        if top_k == 0
+            || top_k > 100
+            || words.iter().collect::<BTreeSet<_>>().len() > MAX_QUERY_TERMS
+        {
             return Err("Invalid search budget".into());
         }
         if mode != "any" && mode != "all" && mode != "phrase" {
@@ -2299,9 +2397,10 @@ pub fn bloom_filter_many<'a>(
 #[cfg(target_arch = "wasm32")]
 pub mod wasm {
     use super::{
-        BlockMeta, BuiltSegment, Document, DocumentMeta, Filter, Header, MAX_BYTES, Range, Search,
-        SelectedAttributes, Statistics, TermDictionary, TermMeta, TermScorer, append, bloom_build,
-        bloom_filter_many, build, decode_page, document_terms, matches, parse_header,
+        BlockMeta, BuiltSegment, Document, DocumentMeta, Filter, Header, MAX_BYTES,
+        MAX_QUERY_TERMS, Range, Search, SelectedAttributes, Statistics, TermDictionary, TermMeta,
+        TermScorer, append, bloom_build, bloom_filter_many, build, decode_page, document_terms,
+        matches, parse_header,
     };
     use serde::{Deserialize, Serialize};
     use std::cell::RefCell;
@@ -3892,7 +3991,7 @@ pub mod wasm {
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
             let filters: Vec<Filter> = serde_json::from_str(filters)
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
-            if terms.len() > 64 || filters.len() > 16 {
+            if terms.len() > MAX_QUERY_TERMS || filters.len() > 16 {
                 return Err(JsValue::from_str("Catalog projection exceeds query limits"));
             }
             let fields: BTreeSet<_> = filters.iter().map(|filter| filter.field.as_str()).collect();
@@ -4087,8 +4186,8 @@ pub mod wasm {
 
         let terms: Vec<String> =
             serde_json::from_str(terms).map_err(|cause| JsValue::from_str(&cause.to_string()))?;
-        if terms.len() > 64 {
-            return Err(JsValue::from_str("Overview projection exceeds 64 terms"));
+        if terms.len() > MAX_QUERY_TERMS {
+            return Err(JsValue::from_str("Overview projection exceeds 512 terms"));
         }
         let requested = terms.into_iter().collect();
         let filters: Vec<Filter> =
@@ -4547,6 +4646,7 @@ mod filter_cache_tests {
     #[test]
     fn repeated_attribute_values_preserve_filters_and_query_local_tombstones()
     -> Result<(), Box<dyn std::error::Error>> {
+        let large = serde_json::to_string(&json!({ "group": "x".repeat(300), "flag": true }))?;
         let inputs = [
             r#"{"group":2,"flag":true}"#,
             r#"{"group":2,"flag":true}"#,
@@ -4557,6 +4657,12 @@ mod filter_cache_tests {
             r#"{"group":null,"flag":false}"#,
             r#"{"group":2,"flag":true}"#,
             r#"{"group":2,"flag":true}"#,
+            r#"{"group":[1,2],"flag":true}"#,
+            r#"{"group":[1,2],"flag":true}"#,
+            r#"{"group":{"nested":1},"flag":false}"#,
+            r#"{"group":{"nested":1},"flag":false}"#,
+            large.as_str(),
+            large.as_str(),
         ];
         let documents = inputs
             .iter()
@@ -4572,7 +4678,14 @@ mod filter_cache_tests {
             document.attributes = serde_json::value::RawValue::from_string(input.into())?;
         }
         for op in ["eq", "ne", "exists", "in", "gt", "gte", "lt", "lte"] {
-            for value in [json!(2), json!(true), json!(null), json!([1, 2])] {
+            for value in [
+                json!(2),
+                json!(true),
+                json!(null),
+                json!([1, 2]),
+                json!({"nested":1}),
+                json!("x".repeat(300)),
+            ] {
                 let filters = [Filter {
                     field: "group".into(),
                     op: op.into(),
@@ -4595,8 +4708,7 @@ mod filter_cache_tests {
                     assert_eq!(header.allowed(&filters, &[0, 3, 7])?, deleted);
                     assert_eq!(header.allowed(&filters, &[])?, mask);
                 }
-                header.filter_masks.borrow_mut().entries.clear();
-                header.filter_masks.borrow_mut().bytes = 0;
+                *header.filter_masks.borrow_mut() = super::FilterMasks::default();
             }
         }
         Ok(())
@@ -4630,6 +4742,11 @@ mod filter_cache_tests {
                 op: "exists".into(),
                 value: json!(false),
             }],
+            vec![Filter {
+                field: "group".into(),
+                op: "eq".into(),
+                value: json!("x".repeat(24000)),
+            }],
         ] {
             let expected = header
                 .documents
@@ -4644,7 +4761,45 @@ mod filter_cache_tests {
             assert!(!header.allowed(&filters, &[17, 2117])?[17]);
             assert!(!header.allowed(&filters, &[17, 2117])?[2117]);
             assert_eq!(header.allowed(&filters, &[])?, expected);
+            let cache = header.filter_masks.borrow();
+            assert!(cache.representatives.is_some());
+            assert!(cache.bytes <= FILTER_CACHE_BYTES);
+            assert_eq!(
+                cache.bytes,
+                cache
+                    .entries
+                    .iter()
+                    .map(|(_, _, bytes)| bytes)
+                    .sum::<usize>()
+                    + cache
+                        .representatives
+                        .as_ref()
+                        .map_or(0, |(scope, rows)| scope.capacity()
+                            + size_of_val(rows.as_ref())
+                            + 128)
+            );
         }
+        for index in 0..20 {
+            let filter = Filter {
+                field: format!("missing{index}"),
+                op: "exists".into(),
+                value: json!(false),
+            };
+            assert_eq!(header.allowed(&[filter], &[])?, vec![true; 5000]);
+            let cache = header.filter_masks.borrow();
+            assert!(cache.bytes <= FILTER_CACHE_BYTES);
+            if let Some((scope, _)) = &cache.representatives {
+                let fields: BTreeSet<String> = serde_json::from_str(scope)?;
+                assert!(fields.len() <= 16);
+            }
+        }
+        let filter = Filter {
+            field: "group".into(),
+            op: "eq".into(),
+            value: json!(17),
+        };
+        let expected: Vec<_> = (0..5000).map(|row| row % 2100 == 17).collect();
+        assert_eq!(header.allowed(&[filter], &[])?, expected);
         Ok(())
     }
 

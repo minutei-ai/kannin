@@ -68,7 +68,8 @@ import {
   WriteResult,
   VectorMessage,
   VectorSyncResult,
-  VectorFilterFields,
+  NamespaceSchema,
+  TextTerms,
   VectorSelection,
   VectorCandidates,
   VectorCandidateFrame,
@@ -621,8 +622,10 @@ async function textQuery(
   timings.append("server-timing", 'text_phase;desc="catalog"');
   const words = tokenize(input.text).split(" ").filter(Boolean);
   const terms = [...new Set(words)];
-  if (terms.length > 64 || (input.match === "phrase" && words.length > 64))
-    throw new Rejected({ status: 400, message: "Query exceeds 64 normalized terms" });
+  if (!Schema.is(TextTerms)(terms))
+    throw new Rejected({ status: 400, message: "Query exceeds 512 normalized terms" });
+  if (input.match === "phrase" && words.length > 64)
+    throw new Rejected({ status: 400, message: "Phrase exceeds 64 normalized tokens" });
   if (terms.length === 0 || root.documents === 0) return [];
   const covered = root.segments.every((segment) => {
     const dictionary = segment.commonTerms;
@@ -1329,9 +1332,7 @@ async function vectorQuery(
   const encodedFilters = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Filter)))(
     input.filters,
   );
-  const fields = Schema.decodeSync(Schema.fromJsonString(VectorFilterFields))(
-    env.VECTOR_FILTER_FIELDS,
-  );
+  const fields = root.schema?.vectorFilterFields ?? [];
   const prefilter = await Effect.runPromise(vectorPrefilter(input.filters, fields));
   const options: VectorizeQueryOptions = {
     namespace: root.vectorEpoch,
@@ -1527,6 +1528,10 @@ async function query(
 ) {
   if (manifest.sequence < (input.minimumSequence ?? 0))
     throw new Rejected({ status: 409, message: "Requested sequence is not committed" });
+  const filterable = manifest.schema?.filterable ?? [];
+  for (const filter of input.filters)
+    if (!filterable.includes(filter.field))
+      throw new Rejected({ status: 400, message: `Attribute is not filterable: ${filter.field}` });
   if (input.kind === "text") {
     const rows = await Match.value(executions).pipe(
       Match.when(undefined, () => textQuery(input, manifest, timings, ctx)),
@@ -1671,7 +1676,7 @@ export class SearchNamespace extends DurableObject<Env> {
   }
 
   private async enqueueCompaction(namespace: string, root: typeof Root.Type) {
-    const target = Math.max(32, Math.ceil(root.documents / 10000) * 2);
+    const target = Math.max(4, Math.ceil(root.documents / 10000) * 2);
     if (root.segments.length > target)
       await this.env.INDEX_JOBS.send(Schema.encodeSync(IndexMessage)({ namespace }));
   }
@@ -1680,7 +1685,7 @@ export class SearchNamespace extends DurableObject<Env> {
     const ids = [...input.upserts.map((document) => document.id), ...input.deletes];
     if (new Set(ids).size !== ids.length)
       throw new Rejected({ status: 400, message: "Duplicate ids within a write" });
-    if (input.reset !== true && ids.length === 0)
+    if (input.reset !== true && input.schema === undefined && ids.length === 0)
       throw new Rejected({ status: 400, message: "Empty write" });
     for (const document of input.upserts)
       if (document.vector !== undefined && document.vector.length !== 768)
@@ -1707,6 +1712,15 @@ export class SearchNamespace extends DurableObject<Env> {
         requestId: input.requestId,
         vectorSync: "queued",
       });
+    }
+    if (
+      input.schema !== undefined &&
+      current.manifest.schema !== undefined &&
+      input.reset !== true
+    ) {
+      const encodeSchema = Schema.encodeSync(Schema.fromJsonString(NamespaceSchema));
+      if (encodeSchema(input.schema) !== encodeSchema(current.manifest.schema))
+        throw new Rejected({ status: 409, message: "Changing namespace schema requires reset" });
     }
     const prior = await locate(ids, current.manifest);
     const sequence = current.manifest.sequence + 1;
@@ -1756,7 +1770,10 @@ export class SearchNamespace extends DurableObject<Env> {
         removedFrequencies: Object.fromEntries(removedFrequencies),
       };
     });
+    const schema = input.schema ?? current.manifest.schema;
     const epoch = { value: current.manifest.vectorEpoch };
+    if (input.schema !== undefined && current.manifest.schema === undefined)
+      epoch.value = await sha256(`${current.manifest.vectorEpoch}\0schema\0${sequence}`);
     if (input.reset === true) {
       segments.splice(0);
       totals.documents = 0;
@@ -1816,6 +1833,7 @@ export class SearchNamespace extends DurableObject<Env> {
       jobs.push({ log: logKey, sequence });
     const receipt = { sequence, requestId: input.requestId, digest: fingerprint };
     const manifest = {
+      schema,
       version: 1,
       sequence,
       head: logKey,
@@ -1842,9 +1860,7 @@ export class SearchNamespace extends DurableObject<Env> {
   }
 
   private async rebuildVectors(input: typeof VectorRebuild.Type) {
-    const fields = Schema.decodeSync(Schema.fromJsonString(VectorFilterFields))(
-      this.env.VECTOR_FILTER_FIELDS,
-    );
+    const fields = (await this.root()).manifest.schema?.vectorFilterFields ?? [];
     const snapshot = input.snapshot ?? crypto.randomUUID();
     const key = `${this.prefix}/vector-rebuild/${snapshot}.json`;
     const saved = { root: (await this.root()).manifest, fields };
@@ -1958,9 +1974,7 @@ export class SearchNamespace extends DurableObject<Env> {
     const vectors: VectorizeVector[] = [];
     const deletes: string[] = [];
     const completed = new Set<number>();
-    const fields = Schema.decodeSync(Schema.fromJsonString(VectorFilterFields))(
-      this.env.VECTOR_FILTER_FIELDS,
-    );
+    const fields = current.manifest.schema?.vectorFilterFields ?? [];
     for (const job of jobs) {
       const object = await this.env.STORAGE.get(job.log);
       if (object === null)
@@ -2133,18 +2147,22 @@ export class SearchNamespace extends DurableObject<Env> {
     const ordered = current.manifest.segments.toSorted(
       (a, b) => a.count - a.dead.length - (b.count - b.dead.length),
     );
-    const selected: typeof ordered = [];
+    const candidates: typeof ordered = [];
     const budget = { count: 0, bytes: 0 };
     for (const segment of ordered) {
       const count = segment.count - segment.dead.length;
-      if (selected.length >= 8 || budget.count + count > 10000) break;
-      selected.push(segment);
+      if (candidates.length >= 8 || budget.count + count > 10000) break;
+      candidates.push(segment);
       budget.count += count;
     }
-    if (selected.length < 2 && !selected.some((segment) => segment.dead.length))
+    if (candidates.length < 2 && !candidates.some((segment) => segment.dead.length))
       return { compacted: 0, segments: current.manifest.segments.length };
+    const selected: typeof ordered = [];
     const documents: Array<typeof StoredDocument.Type> = [];
-    for (const segment of selected) {
+    const encodeDocument = Schema.encodeSync(Schema.fromJsonString(StoredDocument));
+    const encoder = new TextEncoder();
+    for (const segment of candidates) {
+      const window = { documents: documents.length, bytes: budget.bytes, exceeded: false };
       const dead = new Set(segment.dead);
       const rows = Array.from({ length: segment.count }, (_, row) => row).filter(
         (row) => !dead.has(row),
@@ -2172,17 +2190,23 @@ export class SearchNamespace extends DurableObject<Env> {
           segment.bytes,
           payload,
         );
-        budget.bytes += new TextEncoder().encode(
-          Schema.encodeSync(Schema.fromJsonString(StoredDocument))(source),
-        ).byteLength;
-        if (budget.bytes > 8 * 1024 * 1024)
-          throw new Rejected({
-            status: 413,
-            message: "Compaction window exceeds its 8 MiB decoded-document budget",
-          });
+        const bytes = encoder.encode(encodeDocument(source)).byteLength;
+        if (budget.bytes + bytes > 8 * 1024 * 1024) {
+          window.exceeded = true;
+          break;
+        }
+        budget.bytes += bytes;
         documents.push(source);
       }
+      if (window.exceeded) {
+        documents.length = window.documents;
+        budget.bytes = window.bytes;
+        continue;
+      }
+      selected.push(segment);
     }
+    if (selected.length < 2 && !selected.some((segment) => segment.dead.length))
+      return { compacted: 0, segments: current.manifest.segments.length };
     const retained = current.manifest.segments.filter(
       (segment) => !selected.some((source) => source.key === segment.key),
     );
@@ -2327,6 +2351,7 @@ export class SearchNamespace extends DurableObject<Env> {
                 },
               });
               return yield* Schema.encodeEffect(Metadata)({
+                schema: manifest.schema ?? null,
                 sequence: manifest.sequence,
                 documents: manifest.documents,
                 segments: manifest.segments.length,

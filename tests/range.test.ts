@@ -153,7 +153,7 @@ test("posting range pressure does not reacquire a warm compressed directory", as
   const result = Schema.decodeUnknownSync(RangeProbeResult)(await response.json());
   expect(result.reads).toBe(0);
   expect(result.encodedDirectoryCacheChargedBytes).toBeGreaterThan(0);
-  expect(result.encodedDirectoryCacheChargedBytes).toBeLessThanOrEqual(20 * 1024 * 1024);
+  expect(result.encodedDirectoryCacheChargedBytes).toBeLessThanOrEqual(9 * 1024 * 1024);
   expect(result.successes).toBe(8);
   expect(result.failures).toBe(0);
   expect(result.distinctBodies).toBe(8);
@@ -162,7 +162,7 @@ test("posting range pressure does not reacquire a warm compressed directory", as
   expect(result.lengths).toEqual(Array.from({ length: 8 }, () => expected.byteLength));
 });
 
-test("directories above cache admission retain the existing forty-MiB validation limit", async () => {
+test("hot metadata can reject large directories without lowering the forty-MiB validation limit", async () => {
   const key = "namespaces/range-directory-large/segments/data.rsix";
   using segment = new Segment('[{"id":"a","text":"alpha","attributes":{}}]');
   const original = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
@@ -183,6 +183,23 @@ test("directories above cache admission retain the existing forty-MiB validation
   frame.set(json, 16);
   expect(frame.byteLength).toBeLessThan(16 * 1024 * 1024);
   const bucket = await worker.getR2Bucket("STORAGE");
+  const hotKey = key.replace(".rsix", "-hot.rsix");
+  await bucket.put(hotKey, frame);
+  const warmed = await fetch(await worker.ready, {
+    method: "POST",
+    headers: { authorization: "Bearer local-test-token", "content-type": "application/json" },
+    body: Schema.encodeSync(Schema.fromJsonString(RangeProbeInput))({
+      key: hotKey,
+      offset: 0,
+      length: frame.byteLength,
+      count: 2,
+      decodeDirectory: true,
+    }),
+  });
+  expect(warmed.status).toBe(200);
+  const resident = Schema.decodeUnknownSync(RangeProbeResult)(await warmed.json());
+  expect(resident.directoryCacheChargedBytes).toBeGreaterThan(20 * 1024 * 1024);
+  expect(resident.directoryCacheChargedBytes).toBeLessThanOrEqual(29 * 1024 * 1024);
   await bucket.put(key, frame);
   const response = await fetch(await worker.ready, {
     method: "POST",
@@ -199,7 +216,7 @@ test("directories above cache admission retain the existing forty-MiB validation
   const result = Schema.decodeUnknownSync(RangeProbeResult)(await response.json());
   expect(result.decodedDirectoryBytes).toBeGreaterThan(20 * 1024 * 1024);
   expect(result.decodedDirectoryBytes).toBeLessThanOrEqual(40 * 1024 * 1024);
-  expect(result.directoryCacheChargedBytes).toBe(0);
+  expect(result.directoryCacheChargedBytes).toBe(resident.directoryCacheChargedBytes);
   expect(result.successes).toBe(1);
 }, 30000);
 
@@ -275,7 +292,7 @@ test("repeated directory scans retain a hot subset when the namespace exceeds ad
   expect(last.encodedDirectoryCacheEntries).toBeGreaterThan(0);
   expect(last.encodedDirectoryCacheEntries).toBeLessThan(10);
   expect(last.reads).toBe(10 - last.encodedDirectoryCacheEntries);
-  expect(last.encodedDirectoryCacheChargedBytes).toBeLessThanOrEqual(20 * 1024 * 1024);
+  expect(last.encodedDirectoryCacheChargedBytes).toBeLessThanOrEqual(9 * 1024 * 1024);
   expect(last.encodedDirectoryAdmissionChargedBytes).toBeGreaterThan(0);
   expect(last.encodedDirectoryAdmissionChargedBytes).toBeLessThanOrEqual(1024 * 1024);
 }, 30000);
@@ -318,7 +335,7 @@ test("decoded directory scans retain validated metadata beyond cache capacity", 
   for (const report of reports) {
     expect(report.metadata).toEqual(inputs.map(() => original.terms));
     expect(report.bytes).toBeGreaterThan(0);
-    expect(report.bytes).toBeLessThanOrEqual(20 * 1024 * 1024);
+    expect(report.bytes).toBeLessThanOrEqual(29 * 1024 * 1024);
     expect(report.history).toBeLessThanOrEqual(1024 * 1024);
   }
   expect(reports[1]?.hits).toBeGreaterThan(0);

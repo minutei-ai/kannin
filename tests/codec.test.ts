@@ -160,10 +160,10 @@ test("compressed overviews preserve term bounds and exact filter minima across s
     expect(() =>
       segment_overview_project(
         overview,
-        JSON.stringify(Array.from({ length: 65 }, () => "rust")),
+        JSON.stringify(Array.from({ length: 513 }, () => "rust")),
         encodedFilters,
       ),
-    ).toThrow("64 terms");
+    ).toThrow("512 terms");
   }
   directory.free();
   segment.free();
@@ -205,7 +205,7 @@ test("shared attribute groups preserve minima across operators and different doc
   );
   const directory = new Directory(segment.bytes());
   expect(() =>
-    directory.catalog(JSON.stringify(Array.from({ length: 65 }, () => "rust")), "[]"),
+    directory.catalog(JSON.stringify(Array.from({ length: 513 }, () => "rust")), "[]"),
   ).toThrow();
   expect(() =>
     directory.catalog(
@@ -758,7 +758,7 @@ test("prepared queries reject shared tombstones and preserve query-budget failur
     { ...input, top_k: 0 },
     { ...input, top_k: 101 },
     { ...input, mode: "invalid" },
-    { ...input, text: Array.from({ length: 65 }, (_, index) => `term${index}`).join(" ") },
+    { ...input, text: Array.from({ length: 513 }, (_, index) => `term${index}`).join(" ") },
     { ...input, mode: "phrase", text: "alpha ".repeat(65) },
   ])
     expect(() => new PreparedQuery(JSON.stringify(invalid))).toThrow();

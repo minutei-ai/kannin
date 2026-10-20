@@ -78,6 +78,7 @@ const report = await (async () => {
           method: "POST",
           headers,
           body: Schema.encodeSync(Schema.fromJsonString(Write))({
+            schema: { filterable: ["group", "year"], vectorFilterFields: [] },
             requestId: `batch-${offset}`,
             upserts: documents,
             deletes: [],

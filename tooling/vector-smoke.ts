@@ -31,6 +31,7 @@ const written = await fetch(new URL(`/v1/namespaces/${namespace}/write`, url), {
   method: "POST",
   headers,
   body: Schema.encodeSync(Schema.fromJsonString(Write))({
+    schema: { filterable: ["group", "year"], vectorFilterFields: ["group", "year"] },
     requestId: "seed",
     upserts: documents,
     deletes: [],

@@ -3,12 +3,10 @@ import * as Output from "alchemy/Output";
 import * as Command from "alchemy/Command";
 import * as Cloudflare from "alchemy/Cloudflare";
 import { state as cloudflareState } from "alchemy/Cloudflare/StateStore";
-import { Config, Effect, Layer, Schema } from "effect";
+import { Config, Effect, Layer } from "effect";
 import { join } from "node:path";
 
 import type { Binding } from "./src/rpc";
-
-import { VectorFilterFields } from "./src/protocol";
 
 export const Bucket = Cloudflare.R2.Bucket("Storage", {
   lifecycleRules: [
@@ -57,20 +55,11 @@ export const Worker = Cloudflare.Worker(
   "Search",
   Effect.gen(function* () {
     const token = yield* Config.Redacted("RAIO_API_TOKEN");
-    const fields = yield* Config.schema(
-      Schema.fromJsonString(VectorFilterFields),
-      "RAIO_VECTOR_FILTER_FIELDS",
-    ).pipe(Config.withDefault([]));
     const indexes = yield* Effect.forEach(
-      [...EqualityIndexes.slice(0, fields.length), ...NumericIndexes.slice(0, fields.length)],
+      [...EqualityIndexes, ...NumericIndexes],
       (resource) => resource,
     );
-    const encodedFields = yield* Schema.encodeEffect(Schema.fromJsonString(VectorFilterFields))(
-      fields,
-    ).pipe(Effect.orDie);
-    const indexedFields = Output.all(...indexes.map((index) => Output.of(index))).pipe(
-      Output.map(() => encodedFields),
-    );
+    const indexesReady = yield* Output.all(...indexes.map((index) => Output.of(index)));
     return {
       main: join(import.meta.dir, "dist/worker/worker.js"),
       bundle: false,
@@ -87,8 +76,7 @@ export const Worker = Cloudflare.Worker(
         API_TOKEN: token,
         STORAGE: yield* Bucket,
         STORAGE_CACHE_SCOPE: (yield* Bucket).bucketName,
-        VECTORS: yield* Vectors,
-        VECTOR_FILTER_FIELDS: indexedFields,
+        VECTORS: Effect.as(indexesReady, yield* Vectors),
         VECTOR_JOBS: yield* VectorJobs,
         INDEX_JOBS: yield* IndexJobs,
         NAMESPACES: Cloudflare.DurableObject<Binding & Rpc.DurableObjectBranded>("SearchNamespace"),

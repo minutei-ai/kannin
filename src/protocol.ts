@@ -24,6 +24,21 @@ export const VectorFilterFields = Schema.Array(FieldName).check(
     (fields) => new Set(fields).size === fields.length || "Duplicate indexed field",
   ),
 );
+export const NamespaceSchema = Schema.Struct({
+  filterable: Schema.Array(FieldName).check(
+    Schema.isMaxLength(64),
+    Schema.makeFilter(
+      (fields) => new Set(fields).size === fields.length || "Duplicate filterable field",
+    ),
+  ),
+  vectorFilterFields: VectorFilterFields,
+}).check(
+  Schema.makeFilter(
+    (schema) =>
+      schema.vectorFilterFields.every((field) => schema.filterable.includes(field)) ||
+      "Vector filter fields must be filterable",
+  ),
+);
 export const Vector = Schema.Array(
   Schema.Finite.check(
     Schema.isBetween({ minimum: -3.4028234663852886e38, maximum: 3.4028234663852886e38 }),
@@ -44,6 +59,7 @@ export const Document = Schema.Struct({
   vector: Schema.optional(Vector),
 });
 export const Write = Schema.Struct({
+  schema: Schema.optional(NamespaceSchema),
   requestId: Id,
   upserts: Schema.Array(Document).check(Schema.isMaxLength(1000)),
   deletes: Schema.Array(Id).check(Schema.isMaxLength(1000)),
@@ -97,6 +113,7 @@ export const Query = Schema.Union([
   }),
 ]);
 export const Root = Schema.Struct({
+  schema: Schema.optional(NamespaceSchema),
   version: Schema.Literal(1),
   sequence: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   head: Schema.Union([Schema.String, Schema.Null]),
@@ -263,6 +280,7 @@ export const CacheMetrics = Schema.Struct({
   cacheApiHits: Schema.Int,
 });
 export const Metadata = Schema.Struct({
+  schema: Schema.NullOr(NamespaceSchema),
   sequence: Schema.Int,
   documents: Schema.Int,
   segments: Schema.Int,
@@ -600,9 +618,10 @@ export const CorrelatedOverview = Schema.Struct({
 });
 export const TermFilters = Schema.fromJsonString(QueryFields.filters);
 export const TermFilterHeader = Schema.StringFromBase64.pipe(Schema.decodeTo(TermFilters));
+export const TextTerms = Schema.Array(Schema.String).check(Schema.isMaxLength(512));
 export const TermProjectionProps = Schema.Struct({
   bucket: Schema.String.check(Schema.isBetweenLength(1, 63)),
-  terms: Schema.fromJsonString(Schema.Array(Schema.String).check(Schema.isMaxLength(64))),
+  terms: Schema.fromJsonString(TextTerms),
   selection: Schema.Union([
     Schema.Struct({ kind: Schema.Literal("fields"), fields: EligibilityProjection.fields.fields }),
     Schema.Struct({ kind: Schema.Literal("filters"), filters: TermFilters }),

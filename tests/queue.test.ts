@@ -50,12 +50,12 @@ test("native index queue compacts immutable R2 segments without changing live ro
   }
   const bucket = await worker.getR2Bucket("STORAGE");
   const progress = { complete: false };
-  for (const _attempt of Array.from({ length: 100 }, (_, value) => value)) {
+  for (const _attempt of Array.from({ length: 500 }, (_, value) => value)) {
     const object = await bucket.get("namespaces/indexqueue/root.json");
     expect(object).not.toBeNull();
     if (object === null) return;
     const manifest = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
-    if (manifest.segments.length <= 32) {
+    if (manifest.segments.length <= 4) {
       expect(manifest.documents).toBe(64);
       progress.complete = true;
       break;

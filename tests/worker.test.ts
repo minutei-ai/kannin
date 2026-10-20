@@ -199,3 +199,43 @@ test("R2 logs reconstruct projection and preserve receipts", async () => {
     ).sequence,
   ).toBe(1);
 });
+
+test("long BM25 queries retain every normalized term through cached catalog projection", async () => {
+  const terms = Array.from({ length: 512 }, (_, index) => `word${index}`);
+  expect(
+    (
+      await request(
+        state.worker,
+        "long-query",
+        "write",
+        write([
+          document("complete", terms.join(" ")),
+          document("partial", terms.slice(0, 256).join(" ")),
+          document("absent", "irrelevant"),
+        ]),
+      )
+    ).status,
+  ).toBe(200);
+  for (const match of ["any", "all"]) {
+    const input = { ...textQuery(terms.join(" ")), match };
+    const response = await request(state.worker, "long-query", "query", input);
+    expect(response.status).toBe(200);
+    const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+    if (match === "all") expect(result.rows.map((row) => row.id)).toEqual(["complete"]);
+    else expect(result.rows.map((row) => row.id)).toEqual(["complete", "partial"]);
+    const repeated = await request(state.worker, "long-query", "query", input);
+    expect(Schema.decodeUnknownSync(QueryResult)(await repeated.json())).toEqual(result);
+  }
+  expect(
+    (await request(state.worker, "long-query", "query", textQuery([...terms, "extra"].join(" "))))
+      .status,
+  ).toBe(400);
+  expect(
+    (
+      await request(state.worker, "long-query", "query", {
+        ...textQuery(terms.slice(0, 65).join(" ")),
+        match: "phrase",
+      })
+    ).status,
+  ).toBe(400);
+});

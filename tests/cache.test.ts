@@ -3,7 +3,15 @@ import { Schema } from "effect";
 import { Response } from "miniflare";
 import { createHash } from "node:crypto";
 import { Root, QueryResult, Metadata, Health, TermProjectionProps } from "../src/protocol";
-import { document, request, startWorker, textQuery, write, evictWrittenOverviews } from "./harness";
+import {
+  clearLeaderIndex,
+  document,
+  request,
+  startWorker,
+  textQuery,
+  write,
+  evictWrittenOverviews,
+} from "./harness";
 import { corpus } from "../tooling/corpus";
 
 const worker = await startWorker();
@@ -169,6 +177,7 @@ test("concurrent cold edge queries share immutable range acquisition", async () 
       ),
     ),
   );
+  await clearLeaderIndex(worker, namespace);
   const before = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
@@ -579,6 +588,7 @@ test("cached term bounds prune uncompetitive segments after directory eviction",
         ),
       ),
     );
+  await clearLeaderIndex(worker, namespace);
   const input = { ...textQuery("equal terms", 1), consistency: "edge-eventual" };
   const original = Schema.decodeUnknownSync(QueryResult)(
     await (await request(worker, namespace, "query", input)).json(),
@@ -1029,6 +1039,7 @@ test("the sequential ranking prefix preserves common-query pruning before parall
     expect((await request(worker, namespace, "write", write(corpus(offset, 10000)))).status).toBe(
       200,
     );
+  await clearLeaderIndex(worker, namespace);
   const response = await request(worker, namespace, "query", textQuery("cloudflare rust"));
   expect(response.status).toBe(200);
   const result = Schema.decodeUnknownSync(QueryResult)(await response.json());

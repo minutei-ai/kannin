@@ -48,6 +48,7 @@ import {
   Rejected,
   Root,
   CommonTerms,
+  CommonLeaders,
   SnapshotCacheHeaders,
   SegmentDocument,
   SegmentHits,
@@ -623,7 +624,31 @@ async function textQuery(
   if (terms.length > 64 || (input.match === "phrase" && words.length > 64))
     throw new Rejected({ status: 400, message: "Query exceeds 64 normalized terms" });
   if (terms.length === 0 || root.documents === 0) return [];
-  const bloomMatches = bloomCandidates(root.segments, terms, "termBloom");
+  const covered = root.segments.every((segment) => {
+    const dictionary = segment.commonTerms;
+    if (dictionary === undefined) return false;
+    return terms.every((term) => Object.hasOwn(dictionary, term));
+  });
+  const bloomMatches = Match.value(covered).pipe(
+    Match.when(true, () => {
+      timings.append("server-timing", 'text_membership;desc="manifest"');
+      return root.segments.map(() => terms);
+    }),
+    Match.orElse(() => bloomCandidates(root.segments, terms, "termBloom")),
+  );
+  const localRanking =
+    covered &&
+    input.filters.length === 0 &&
+    input.match !== "phrase" &&
+    root.segments.every((segment) => {
+      const leaders = segment.commonLeaders;
+      if (segment.dead.length !== 0 || leaders === undefined) return false;
+      return leaders.some(
+        (leader) =>
+          leader.documents.length >= Math.min(input.topK, segment.count) &&
+          terms.every((term) => leader.terms.includes(term)),
+      );
+    });
   const candidates = root.segments.map((segment, index) => {
     const selected = bloomMatches[index];
     if (selected === undefined)
@@ -666,12 +691,14 @@ async function textQuery(
     });
     planning.key = `${workerEnv.STORAGE_CACHE_SCOPE}:${firstSelected.key}/plan:${await sha256(identity)}`;
     planning.value = textPlan(planning.key);
-    shared.key = new URL("https://raio-cache.internal/text-plans-v1");
-    shared.key.searchParams.set("identity", planning.key);
-    shared.key.searchParams.set("version", workerEnv.CF_VERSION_METADATA.id);
+    if (!localRanking) {
+      shared.key = new URL("https://raio-cache.internal/text-plans-v1");
+      shared.key.searchParams.set("identity", planning.key);
+      shared.key.searchParams.set("version", workerEnv.CF_VERSION_METADATA.id);
+    }
     reuse.plan = "memory";
-    if (planning.value === undefined) {
-      reuse.plan = "miss";
+    if (planning.value === undefined) reuse.plan = "miss";
+    if (planning.value === undefined && shared.key !== undefined) {
       const acquired = await acquireSharedTextPlan(shared.key, ctx, timings);
       if (acquired !== undefined) {
         shared.cache = acquired.cache;
@@ -866,6 +893,7 @@ async function textQuery(
     blocks: 0,
     bytes: 0,
     segments: 0,
+    common: 0,
   };
   using plans = new DisposableStack();
   const compilation: { query: PreparedQuery | undefined } = { query: undefined };
@@ -928,6 +956,26 @@ async function textQuery(
         ({ segment, identity }) => {
           const dead = Schema.encodeSync(integers)(segment.dead);
           const prepareStarted = Effect.runSync(Clock.currentTimeNanos);
+          if (
+            input.filters.length === 0 &&
+            input.match !== "phrase" &&
+            segment.commonTerms !== undefined &&
+            segment.commonLeaders !== undefined
+          ) {
+            const common = prepared.common_hits(
+              Schema.encodeSync(Schema.fromJsonString(CommonTerms))(segment.commonTerms),
+              Schema.encodeSync(Schema.fromJsonString(CommonLeaders))(segment.commonLeaders),
+              segment.count,
+              dead,
+            );
+            if (common !== undefined) {
+              rankMetrics.common += 1;
+              rankMetrics.prepare += Effect.runSync(Clock.currentTimeNanos) - prepareStarted;
+              return Effect.map(decodeSegmentHits(common), (hits) =>
+                hits.map((hit) => ({ ...hit, segment })),
+              );
+            }
+          }
           return withDirectory(
             segment.key,
             segment.headerBytes,
@@ -1178,6 +1226,7 @@ async function textQuery(
       }
     }
   }
+  timings.append("server-timing", `text_common_leaders;desc="segments=${rankMetrics.common}"`);
   timings.append("server-timing", `text_rank;dur=${Number(rankingEnded - dictionaryEnded) / 1e6}`);
   timings.append("server-timing", `text_rank_prepare;dur=${Number(rankMetrics.prepare) / 1e6}`);
   timings.append(
@@ -1751,6 +1800,7 @@ export class SearchNamespace extends DurableObject<Env> {
         documentBloom: bloom(built.header.documents.map((document) => document.id)),
         termBloom: bloom(Object.keys(built.header.terms)),
         commonTerms: built.commonTerms,
+        commonLeaders: built.commonLeaders,
         dead: [],
         removedFrequencies: {},
       });
@@ -2160,6 +2210,7 @@ export class SearchNamespace extends DurableObject<Env> {
         documentBloom: bloom(built.header.documents.map((document) => document.id)),
         termBloom: bloom(Object.keys(built.header.terms)),
         commonTerms: built.commonTerms,
+        commonLeaders: built.commonLeaders,
         dead: [],
         removedFrequencies: {},
       });
@@ -2378,23 +2429,35 @@ export class SearchNamespace extends DurableObject<Env> {
                   return new Cause.UnknownError(cause);
                 },
               });
-              if (current.manifest.segments.some((segment) => segment.commonTerms === undefined)) {
+              if (
+                current.manifest.segments.some(
+                  (segment) =>
+                    segment.commonTerms === undefined || segment.commonLeaders === undefined,
+                )
+              ) {
                 const segments = yield* Effect.forEach(
                   current.manifest.segments,
                   (segment) =>
                     Effect.gen(function* () {
-                      if (segment.commonTerms !== undefined) return segment;
-                      const commonTerms = yield* withDirectory(
+                      if (segment.commonTerms !== undefined && segment.commonLeaders !== undefined)
+                        return segment;
+                      const metadata = yield* withDirectory(
                         segment.key,
                         segment.headerBytes,
                         (directory) =>
-                          Schema.decodeEffect(Schema.fromJsonString(CommonTerms))(
-                            directory.common_terms(),
-                          ),
+                          Effect.gen(function* () {
+                            const commonTerms = yield* Schema.decodeEffect(
+                              Schema.fromJsonString(CommonTerms),
+                            )(directory.common_terms());
+                            const commonLeaders = yield* Schema.decodeEffect(
+                              Schema.fromJsonString(CommonLeaders),
+                            )(directory.common_leaders());
+                            return { commonTerms, commonLeaders };
+                          }),
                         undefined,
                         true,
                       );
-                      return { ...segment, commonTerms };
+                      return { ...segment, ...metadata };
                     }),
                   { concurrency: 1 },
                 );

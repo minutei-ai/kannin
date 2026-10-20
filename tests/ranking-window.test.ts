@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { QueryResult } from "../src/protocol";
-import { document, request, startWorker, textQuery, write } from "./harness";
+import { clearLeaderIndex, document, request, startWorker, textQuery, write } from "./harness";
 
 test("sparse ranking overlaps reads before top-k fills within the existing four-reader limit", async () => {
   const artifacts = await mkdtemp(join(tmpdir(), "kannin-ranking-window-"));
@@ -44,6 +44,7 @@ test("sparse ranking overlaps reads before top-k fills within the existing four-
   );
   for (const value of documents)
     expect((await request(worker, "window-sparse", "write", write([value]))).status).toBe(200);
+  await clearLeaderIndex(worker, "window-sparse");
   const response = await request(worker, "window-sparse", "query", textQuery("alpha beta", 10));
   expect(response.status).toBe(200);
   const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
@@ -66,6 +67,7 @@ test("sparse ranking overlaps reads before top-k fills within the existing four-
     );
     expect((await request(worker, "window-nearly-full", "write", write(values))).status).toBe(200);
   }
+  await clearLeaderIndex(worker, "window-nearly-full");
   const nearlyFull = await request(
     worker,
     "window-nearly-full",

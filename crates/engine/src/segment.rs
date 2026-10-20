@@ -2341,6 +2341,153 @@ pub mod wasm {
         }
     }
 
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LeaderDocument {
+        row: u32,
+        id: String,
+        data: Range,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct CommonLeader {
+        field: String,
+        terms: Vec<String>,
+        length: u32,
+        longer: bool,
+        documents: Vec<LeaderDocument>,
+    }
+
+    impl CommonLeader {
+        fn hits<'a>(
+            &'a self,
+            query: &super::PreparedQuery,
+            dictionary: &BTreeMap<String, TermSummary>,
+            count: u32,
+            excluded: &BTreeSet<u32>,
+        ) -> Option<Vec<Ranked<'a>>> {
+            let normalization = query.terms.scorers.first()?;
+            let title = self.field == "title";
+            let counts = if title { (1, 0) } else { (0, 1) };
+            if !query.terms.order.iter().all(|index| {
+                self.terms.contains(&query.terms.words[*index])
+                    && dictionary
+                        .get(&query.terms.words[*index])
+                        .is_some_and(|metadata| {
+                            metadata.df == count
+                                && metadata.bounds.len() == 1
+                                && metadata.bounds.first().is_some_and(|&(a, b, x, y)| {
+                                    (a, b) == counts && if title { x } else { y } == self.length
+                                })
+                        })
+            }) {
+                return None;
+            }
+            let score_at = |length| {
+                let lengths = if title { (length, 0) } else { (0, length) };
+                let denominators = normalization.denominators(lengths.0, lengths.1);
+                query
+                    .terms
+                    .scorers
+                    .iter()
+                    .map(|scorer| scorer.score_normalized(counts.0, counts.1, denominators))
+                    .sum::<f64>()
+            };
+            let score = score_at(self.length);
+            if !score.is_finite() || score <= 0.0 {
+                return None;
+            }
+            if self.longer {
+                let next = self.length.checked_add(1)?;
+                if score_at(next) >= score {
+                    return None;
+                }
+            }
+            let required = query
+                .top_k
+                .min(usize::try_from(count).ok()? - excluded.len());
+            let ranked: Vec<_> = self
+                .documents
+                .iter()
+                .filter(|document| !excluded.contains(&document.row))
+                .take(required)
+                .map(|document| Ranked {
+                    row: document.row,
+                    id: &document.id,
+                    score,
+                    data: &document.data,
+                })
+                .collect();
+            if ranked.len() != required {
+                return None;
+            }
+            Some(ranked)
+        }
+    }
+
+    fn common_leaders(header: &Header) -> Result<String, String> {
+        let count = u32::try_from(header.documents.len()).map_err(|cause| cause.to_string())?;
+        let mut leaders = Vec::new();
+        for field in ["title", "body"] {
+            let title = field == "title";
+            let terms: Vec<_> = header
+                .terms
+                .iter()
+                .filter(|(term, metadata)| count > 1 && metadata.df == count && term.len() <= 64)
+                .take(16)
+                .filter(|(_, metadata)| {
+                    metadata.blocks.iter().all(|block| {
+                        (block.max_title_tf, block.max_body_tf)
+                            == if title { (1, 0) } else { (0, 1) }
+                    })
+                })
+                .map(|(term, _)| term.to_owned())
+                .collect();
+            if terms.is_empty() {
+                continue;
+            }
+            let length = |document: &DocumentMeta| {
+                if title {
+                    document.title_length
+                } else {
+                    document.body_length
+                }
+            };
+            let Some(minimum) = header.documents.iter().map(length).min() else {
+                continue;
+            };
+            let mut documents = Vec::new();
+            let mut bytes = 0;
+            for (row, document) in header.documents.iter().enumerate() {
+                if length(document) != minimum {
+                    continue;
+                }
+                let charge = document.id.len() * 6 + 128;
+                if documents.len() == 16 || bytes + charge > 4096 {
+                    break;
+                }
+                bytes += charge;
+                documents.push(LeaderDocument {
+                    row: u32::try_from(row).map_err(|cause| cause.to_string())?,
+                    id: document.id.clone(),
+                    data: document.data.clone(),
+                });
+            }
+            leaders.push(CommonLeader {
+                field: field.to_owned(),
+                terms,
+                length: minimum,
+                longer: header
+                    .documents
+                    .iter()
+                    .any(|document| length(document) > minimum),
+                documents,
+            });
+        }
+        serde_json::to_string(&leaders).map_err(|cause| cause.to_string())
+    }
+
     fn common_terms(header: &Header) -> Result<String, String> {
         let mut entries: Vec<_> = header
             .terms
@@ -3568,6 +3715,11 @@ pub mod wasm {
             common_terms(&self.built.header).map_err(|cause| JsValue::from_str(&cause))
         }
 
+        #[doc = "# Errors\nRejects common-leader serialization errors."]
+        pub fn common_leaders(&self) -> Result<String, JsValue> {
+            common_leaders(&self.built.header).map_err(|cause| JsValue::from_str(&cause))
+        }
+
         #[doc = "# Errors\nRejects directory serialization errors."]
         pub fn header_json(&self) -> Result<String, JsValue> {
             serde_json::to_string(&self.built.header)
@@ -3800,6 +3952,11 @@ pub mod wasm {
         #[doc = "# Errors\nRejects common-term metadata or serialization failures."]
         pub fn common_terms(&self) -> Result<String, JsValue> {
             common_terms(&self.header).map_err(|cause| JsValue::from_str(&cause))
+        }
+
+        #[doc = "# Errors\nRejects common-leader serialization errors."]
+        pub fn common_leaders(&self) -> Result<String, JsValue> {
+            common_leaders(&self.header).map_err(|cause| JsValue::from_str(&cause))
         }
 
         #[doc = "# Errors\nRejects invalid filters, attributes, or minimum serialization."]
@@ -4101,6 +4258,73 @@ pub mod wasm {
 
     #[wasm_bindgen]
     impl PreparedQuery {
+        #[doc = "# Errors\nRejects invalid common-leader metadata or tombstones."]
+        pub fn common_hits(
+            &self,
+            catalog: &str,
+            leaders: &str,
+            count: u32,
+            dead: &str,
+        ) -> Result<Option<String>, JsValue> {
+            if !self.query.filters.is_empty() || self.query.mode == "phrase" {
+                return Ok(None);
+            }
+            if leaders.len() > 16384 {
+                return Err(JsValue::from_str(
+                    "Common-leader source exceeds byte budget",
+                ));
+            }
+            let dictionary: BTreeMap<String, TermSummary> = serde_json::from_str(catalog)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            let leaders: Vec<CommonLeader> = serde_json::from_str(leaders)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            let dead: Vec<u32> = serde_json::from_str(dead)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            let excluded: BTreeSet<_> = dead.iter().copied().collect();
+            if count == 0
+                || count > 10000
+                || dictionary.len() > 16
+                || leaders.len() > 2
+                || excluded.len() != dead.len()
+                || dead.iter().any(|row| *row >= count)
+            {
+                return Err(JsValue::from_str("Invalid common-leader budget"));
+            }
+            for leader in &leaders {
+                if !matches!(leader.field.as_str(), "title" | "body")
+                    || leader.terms.is_empty()
+                    || leader.terms.len() > 16
+                    || leader
+                        .terms
+                        .iter()
+                        .any(|term| term.is_empty() || term.len() > 64)
+                    || leader.documents.len() > 16
+                    || leader.documents.iter().any(|document| {
+                        document.row >= count
+                            || document.id.is_empty()
+                            || document.id.encode_utf16().count() > 128
+                    })
+                    || leader.documents.windows(2).any(|pair| {
+                        pair[0].row >= pair[1].row
+                            || pair[0]
+                                .id
+                                .encode_utf16()
+                                .cmp(pair[1].id.encode_utf16())
+                                .is_ge()
+                    })
+                {
+                    return Err(JsValue::from_str("Invalid common-leader rows"));
+                }
+            }
+            let ranked = leaders
+                .iter()
+                .find_map(|leader| leader.hits(&self.query, &dictionary, count, &excluded));
+            ranked
+                .map(|ranked| serde_json::to_string(&ranked))
+                .transpose()
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))
+        }
+
         #[wasm_bindgen(constructor)]
         #[doc = "# Errors\nRejects invalid query JSON, query budgets, match mode, or nonempty segment tombstones."]
         pub fn new(query: &str) -> Result<Self, JsValue> {

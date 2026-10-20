@@ -33,6 +33,7 @@ import {
   StoredDocument,
   SegmentHeader,
   CommonTerms,
+  CommonLeaders,
   SegmentRange,
   ProjectedTermCatalog,
   TermSummaries,
@@ -1911,7 +1912,10 @@ export const buildSegment = Effect.fn("raio.buildSegment")(
           const commonTerms = yield* Schema.decodeEffect(Schema.fromJsonString(CommonTerms))(
             segment.common_terms(),
           );
-          return { bytes: segment.bytes(), header, commonTerms };
+          const commonLeaders = yield* Schema.decodeEffect(Schema.fromJsonString(CommonLeaders))(
+            segment.common_leaders(),
+          );
+          return { bytes: segment.bytes(), header, commonTerms, commonLeaders };
         }),
       (segment) => Effect.sync(() => segment.free()),
     ),

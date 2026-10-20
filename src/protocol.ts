@@ -122,6 +122,7 @@ export const Root = Schema.Struct({
       dead: Schema.Array(Schema.Int),
       removedFrequencies: Schema.Record(Schema.String, Schema.Int),
       commonTerms: Schema.optional(Schema.suspend(() => CommonTerms)),
+      commonLeaders: Schema.optional(Schema.suspend(() => CommonLeaders)),
     }),
   ),
 });
@@ -339,6 +340,23 @@ export const TermSummary = Schema.Struct({
   ),
 });
 export const TermSummaries = Schema.Record(Schema.String, TermSummary);
+export const CommonLeaders = Schema.Array(
+  Schema.Struct({
+    field: Schema.Literals(["title", "body"]),
+    terms: Schema.Array(Unicode.check(Schema.isBetweenLength(1, 64))).check(
+      Schema.isBetweenLength(1, 16),
+    ),
+    length: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 4294967295 })),
+    longer: Schema.Boolean,
+    documents: Schema.Array(
+      Schema.Struct({
+        row: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 9999 })),
+        id: Id,
+        data: DataRange,
+      }),
+    ).check(Schema.isMaxLength(16)),
+  }),
+).check(Schema.isMaxLength(2));
 export const CommonTerms = Schema.Record(
   Schema.String.check(Schema.isMaxLength(64)),
   TermSummary.check(

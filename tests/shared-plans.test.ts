@@ -133,9 +133,12 @@ test("shared tightened plans survive fresh workerd instances and reject corrupt 
           "write",
           write(
             Array.from({ length: 24 }, (_, row) =>
-              document(
-                `${String(segment).padStart(2, "0")}-${String(row).padStart(2, "0")}`,
-                `${"alpha beta gamma delta ".repeat(2 + (row % 8))}unique${segment}row${row}`,
+              Object.assign(
+                document(
+                  `${String(segment).padStart(2, "0")}-${String(row).padStart(2, "0")}`,
+                  `${"alpha beta gamma delta ".repeat(2 + (row % 8))}unique${segment}row${row}`,
+                ),
+                { title: "fixture" },
               ),
             ),
           ),

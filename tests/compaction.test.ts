@@ -1,7 +1,7 @@
 import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
 import { QueryResult, Metadata, Health } from "../src/protocol";
-import { document, request, startWorker, textQuery, write } from "./harness";
+import { clearLeaderIndex, document, request, startWorker, textQuery, write } from "./harness";
 
 const worker = await startWorker();
 afterAll(() => worker.dispose());
@@ -252,6 +252,7 @@ test("nearby pruned term spans share a bounded range without decoding gap blocks
       ),
     ),
   );
+  await clearLeaderIndex(worker, namespace);
   const before = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
@@ -282,6 +283,7 @@ test("adjacent term spans share one range across acquisition windows", async () 
     "write",
     write(Array.from({ length: 80 }, (_, index) => document(String(index).padStart(4, "0"), text))),
   );
+  await clearLeaderIndex(worker, namespace);
   const before = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );

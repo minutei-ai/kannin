@@ -1,7 +1,7 @@
 import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
 import { QueryResult, Metadata } from "../src/protocol";
-import { document, request, startWorker, textQuery, write } from "./harness";
+import { clearLeaderIndex, document, request, startWorker, textQuery, write } from "./harness";
 
 const worker = await startWorker();
 afterAll(() => worker.dispose());
@@ -14,6 +14,7 @@ test("posting timing counts remain request-local across concurrent edge queries"
     "write",
     write(Array.from({ length: 8 }, (_, index) => document(String(index), "alpha beta"))),
   );
+  await clearLeaderIndex(worker, namespace);
   const responses = await Promise.all(
     Array.from({ length: 12 }, async (_, index) => {
       const text = "alpha";

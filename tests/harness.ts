@@ -1,6 +1,6 @@
 import { Miniflare } from "miniflare";
 import { join } from "node:path";
-import { Metadata, type Write, type Attributes } from "../src/protocol";
+import { Metadata, Root, type Write, type Attributes } from "../src/protocol";
 import { Effect, Schema } from "effect";
 
 const root = join(import.meta.dir, "..");
@@ -159,6 +159,25 @@ export async function evictWrittenOverviews(
   }
   const rebuilt = await request(worker, namespace, "rebuild", {});
   if (rebuilt.status !== 200) throw new Error("Failed to evict writer overview memory");
+}
+
+export async function clearLeaderIndex(worker: Miniflare, namespace: string) {
+  const bucket = await worker.getR2Bucket("STORAGE");
+  const key = `namespaces/${namespace}/root.json`;
+  const object = await bucket.get(key);
+  if (object === null) throw new Error("Missing fixture manifest");
+  const manifest = Schema.decodeUnknownSync(Root)(await object.json());
+  await bucket.put(
+    key,
+    Schema.encodeSync(Schema.fromJsonString(Root))({
+      ...manifest,
+      segments: manifest.segments.map((segment) =>
+        Object.assign({}, segment, { commonLeaders: [] }),
+      ),
+    }),
+  );
+  const response = await request(worker, namespace, "rebuild", {});
+  if (!response.ok) throw new Error("Failed to reload fixture manifest");
 }
 
 export function textQuery(text: string, topK = 10, filters: unknown[] = []) {

@@ -4814,3 +4814,28 @@ A separate steady-warm guard alternated two versions over sixteen rounds in two 
 The six cold/RSS cases and three warm guards preserved all 384 complete responses (192 paired comparisons), including exact scores, IDs, revisions, attributes and acknowledged sequence. Four producer controls retained identical canonical/header/frame bytes. The entire 300-query SciFact report remained byte-identical, SHA-256 `9dbe36ba7a85f61312f089c631c4b0dc134e6e876796921ae8206e270415cb28`. The serialized benchmark/quality scope peaked at 1,561,567,232 bytes (1.45 GiB), limited to two GiB, one CPU and no swap. No Cloudflare deployment, native cold-tail proof or Turbopuffer parity is claimed.
 
 The full local gate passed 63 Rust and 310 Bun/workerd tests (10,848 assertions), formatting, strict Effect/TypeScript checks and native/WASM Clippy. Its peak cgroup charge was 1,639,723,008 bytes (1.53 GiB), below the four-GiB ceiling with swap disabled and two CPUs.
+
+## Borrowed canonical JSON term keys
+
+Canonical JSON dictionary parsing now uses Serde borrowing for unescaped keys until copying them into the existing owned dictionary text. Escaped keys use the native owned fallback. The producer and parser reuse the existing constructor through `AsRef<str>`; no dependency, canonical/cache format, heap charge, UTF-8 prevalidation, ordering or last-duplicate-wins rule changed. The existing dictionary regression now compares string, byte-slice and reader inputs.
+
+An alternating workerd computation control used seventeen real canonical headers and their compressed directories, sixteen rounds and eight operations per measured request. Excluding four warmup rounds, mean process CPU per canonical parse changed 10.625 → 10.331 ms; the unchanged binary path changed 6.783 → 6.936 ms. That small operation-level change does not establish a whole-query gain.
+
+The following full-query comparison against `3162c70` repeats the previous section’s four-cohort, fresh-process, 500 ms settlement and Linux RSS method. Prepared and absent derivatives remain separate.
+
+| Corpus / selector                     | Derivatives | Cold ms before / after | Cold peak RSS MiB before / after | Idle RSS MiB before / after |
+| :------------------------------------ | :---------- | ---------------------: | -------------------------------: | --------------------------: |
+| 1M / 64 rare terms                    | prepared    |        1483.6 / 1371.5 |                    222.4 / 222.4 |               233.0 / 231.9 |
+| 1M / dense group 72                   | prepared    |        2085.8 / 2019.5 |                    215.6 / 217.2 |               223.9 / 225.6 |
+| 1M / 64 rare terms                    | absent      |        3314.5 / 3215.8 |                    266.8 / 254.4 |               269.2 / 257.2 |
+| 1M / dense group 72                   | absent      |        5141.9 / 5290.6 |                    304.0 / 299.5 |               311.9 / 304.5 |
+| 30k unique attributes / 64 rare terms | absent      |        2349.3 / 2396.4 |                    226.2 / 224.4 |               220.6 / 220.6 |
+| SciFact 5,183 / query 587             | absent      |        1522.8 / 1448.7 |                    188.1 / 188.9 |               193.5 / 191.5 |
+
+Sparse recovery saved about twelve MiB of peak/idle process RSS. Dense recovery was 2.9% slower despite a lower RSS median; unique-attribute cold reads were 2.0% slower, and prepared dense RSS increased about 1.6 MiB. These are measured tradeoffs, not uniform improvements. The observed candidate cold maximum ranged from 1,427.1 ms for prepared sparse reads to 5,443.3 ms for dense recovery; the 200 ms target remains unmet.
+
+Steady-warm guards used sixteen alternating rounds in two cohorts, excluding eight warmup rounds. SciFact query 587 latency/mean process CPU changed 40.19/42.500 → 36.17/40.625 ms, dense group 72 changed 56.37/73.125 → 59.34/74.375, and sparse 64 terms changed 115.60/131.250 → 115.15/128.125. The approximately three-millisecond dense warm regression remains explicit. All 384 complete responses (192 paired comparisons) matched, and the complete 300-query SciFact report retained SHA-256 `9dbe36ba7a85f61312f089c631c4b0dc134e6e876796921ae8206e270415cb28`. Four producer controls retained exact canonical/header/frame bytes. The serialized validation scope peaked at 1,220,239,360 bytes (1.14 GiB), under two GiB with one CPU and no swap.
+
+A separate, withheld decoder-reuse prototype eliminated a second UTF-8 pass over already validated binary term keys. Its pilot preserved 96 complete responses, but unique-attribute peak RSS increased about 31 MiB and binary computation CPU was effectively unchanged. It was removed. The pilot also recorded baseline I/O waits: a prepared dense request took 61.56 seconds with 2.09 seconds of process CPU. That baseline outlier must not be presented as a candidate speedup. An instrumented same-version control ran twelve fresh processes and 48 complete responses, with a 2.07-second cold median and 2.33-second maximum; none reproduced the wait. All canonical headers were below two MiB. The wait’s cause remains unconfirmed; no speculative timeout/race patch was applied. No Cloudflare deployment or cold-tail bound is claimed.
+
+The full local gate passed 63 Rust and 310 Bun/workerd tests (10,848 assertions), formatting, strict Effect/TypeScript checks and native/WASM Clippy. Peak cgroup charge was 2,243,551,232 bytes (2.09 GiB), below four GiB with swap disabled and two CPUs.

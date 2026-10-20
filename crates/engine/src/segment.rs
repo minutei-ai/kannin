@@ -74,13 +74,14 @@ pub struct TermDictionary {
 }
 
 impl TermDictionary {
-    fn from_entries(entries: Vec<(String, TermMeta)>) -> Self {
-        let mut text = String::with_capacity(entries.iter().map(|(term, _)| term.len()).sum());
+    fn from_entries<T: AsRef<str>>(entries: Vec<(T, TermMeta)>) -> Self {
+        let mut text =
+            String::with_capacity(entries.iter().map(|(term, _)| term.as_ref().len()).sum());
         let entries = entries
             .into_iter()
             .map(|(term, metadata)| {
                 let start = text.len();
-                text.push_str(&term);
+                text.push_str(term.as_ref());
                 (start..text.len(), metadata)
             })
             .collect();
@@ -187,6 +188,10 @@ pub struct Header {
 
 impl<'de> Deserialize<'de> for TermDictionary {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(transparent)]
+        struct TermKey<'a>(#[serde(borrow)] std::borrow::Cow<'a, str>);
+
         struct Terms;
 
         impl<'de> serde::de::Visitor<'de> for Terms {
@@ -200,9 +205,9 @@ impl<'de> Deserialize<'de> for TermDictionary {
                 self,
                 mut map: A,
             ) -> Result<Self::Value, A::Error> {
-                let mut entries = Vec::<(String, TermMeta)>::new();
-                while let Some(entry) = map.next_entry()? {
-                    entries.push(entry);
+                let mut entries = Vec::<(std::borrow::Cow<'de, str>, TermMeta)>::new();
+                while let Some((term, metadata)) = map.next_entry::<TermKey<'de>, TermMeta>()? {
+                    entries.push((term.0, metadata));
                 }
                 entries.sort_by(|left, right| left.0.cmp(&right.0));
                 entries.dedup_by(|later, earlier| {

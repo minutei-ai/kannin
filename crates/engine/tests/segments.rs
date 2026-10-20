@@ -752,12 +752,18 @@ fn decoded_term_maps_match_native_serde_order_and_duplicate_semantics()
             String::from("terms"),
             serde_json::value::RawValue::from_string(dictionary)?,
         );
-        let decoded: Header = serde_json::from_str(&serde_json::to_string(&fields)?)?;
-        assert_eq!(
-            serde_json::to_string(&decoded.terms)?,
-            serde_json::to_string(&expected)?
-        );
-        assert_eq!(decoded.documents.len(), built.header.documents.len());
+        let encoded = serde_json::to_string(&fields)?;
+        for decoded in [
+            serde_json::from_str::<Header>(&encoded)?,
+            serde_json::from_slice::<Header>(encoded.as_bytes())?,
+            serde_json::from_reader::<_, Header>(std::io::Cursor::new(encoded.as_bytes()))?,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&decoded.terms)?,
+                serde_json::to_string(&expected)?
+            );
+            assert_eq!(decoded.documents.len(), built.header.documents.len());
+        }
     }
     Ok(())
 }

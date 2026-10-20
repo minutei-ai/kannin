@@ -26,6 +26,8 @@ Current local results use one million documents across 200 segments, four paired
 
 **The 200 ms maximum cold-read target is not met.** Bounded canonical summaries and minimum-length indexes reduced common missing-cache medians **734 → 225 ms** and RSS **178 → 157 MiB**. All 256 complete comparison responses matched. Results elsewhere remain mixed: rare recovery peak RSS increased about 17 MiB. [Methods, before/after data and limits](docs/performance.md#exact-minimum-length-document-indexes).
 
+With the same code/data and absent derivatives, a separate **two-CPU, two-GiB** control observed common-query medians **139–146 ms** and maxima **161–184 ms** across eight fresh candidate processes. All 64 paired-control responses matched. This meets 200 ms only for those sampled unfiltered workloads under that capacity limit; rare/filtered queries and Cloudflare remain outside that result. [Capacity control](docs/performance.md#exact-minimum-length-document-indexes).
+
 The 300-query SciFact report remains byte-identical: **0.6731 nDCG@10**, **0.7957 recall@10**, **0.6418 MRR@10**. Local Vectorize fixtures do not prove provider recall.
 
 This change has not been deployed to Cloudflare. An earlier native experiment with GRU ingress reduced first strong reads after derived-cache loss **2,786.88 → 1,911.42 ms** on 4,000 documents/eight segments, with EWR query placement. These conditions differ from the local table. [Native measurements](docs/performance.md#small-header-recovery-overlap).

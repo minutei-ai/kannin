@@ -1796,7 +1796,10 @@ export class SearchNamespace extends DurableObject<Env> {
     writes.push(() => this.env.STORAGE.put(logKey, encodedLog));
     if (input.upserts.length > 0) {
       const built = await Effect.runPromise(
-        buildSegment(input.upserts.map((document) => ({ ...document, revision: sequence }))),
+        buildSegment(
+          input.upserts.map((document) => ({ ...document, revision: sequence })),
+          schema?.filterable,
+        ),
       );
       const key = `${this.prefix}/segments/${sequence}-${fingerprint}.rsix`;
       const headerBytes =
@@ -2211,7 +2214,9 @@ export class SearchNamespace extends DurableObject<Env> {
       (segment) => !selected.some((source) => source.key === segment.key),
     );
     if (documents.length > 0) {
-      const built = await Effect.runPromise(buildSegment(documents));
+      const built = await Effect.runPromise(
+        buildSegment(documents, current.manifest.schema?.filterable),
+      );
       const key = `${this.prefix}/segments/compact-${current.manifest.sequence}-${crypto.randomUUID()}.rsix`;
       const stored = await this.env.STORAGE.put(key, built.bytes);
       if (stored === null)

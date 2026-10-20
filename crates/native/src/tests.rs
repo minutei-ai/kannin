@@ -40,7 +40,7 @@ fn fixture() -> Result<BuiltSegment, Failure> {
             vector: None,
         })
         .collect();
-    Ok(segment::build(documents)?)
+    Ok(segment::build(documents, None)?)
 }
 
 fn request(

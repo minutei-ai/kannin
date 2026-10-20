@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { cpus } from "node:os";
+import { availableParallelism, cpus } from "node:os";
 import { Schema } from "effect";
 import { QueryResult, Health, Row } from "../src/protocol";
 import { request, startWorker, textQuery, write } from "../tests/harness";
@@ -107,6 +107,7 @@ console.log(
     {
       runtime: "local-workerd",
       cpu: cpus()[0]?.model,
+      availableParallelism: availableParallelism(),
       bun: Bun.version,
       bundleSha256,
       wasmSha256,

@@ -51,6 +51,7 @@ import {
   TermProjectionProps,
   SegmentCacheProps,
   Rejected,
+  NamespaceSchema,
   TextPlan,
   type SegmentScoreBound,
 } from "./protocol";
@@ -1899,11 +1900,17 @@ export const storeSegmentCaches = Effect.fn("kannin.storeSegmentCaches")(
 );
 
 export const buildSegment = Effect.fn("raio.buildSegment")(
-  (documents: ReadonlyArray<typeof StoredDocument.Type>) =>
+  (
+    documents: ReadonlyArray<typeof StoredDocument.Type>,
+    filterable: (typeof NamespaceSchema.Type)["filterable"] | undefined,
+  ) =>
     Effect.acquireUseRelease(
-      Schema.encodeEffect(Schema.fromJsonString(Schema.Array(StoredDocument)))(documents).pipe(
-        Effect.map((encoded) => new Segment(encoded)),
-      ),
+      Effect.all([
+        Schema.encodeEffect(Schema.fromJsonString(Schema.Array(StoredDocument)))(documents),
+        Schema.encodeEffect(
+          Schema.UndefinedOr(Schema.fromJsonString(NamespaceSchema.fields.filterable)),
+        )(filterable),
+      ]).pipe(Effect.map(([encoded, fields]) => new Segment(encoded, fields))),
       (segment) =>
         Effect.gen(function* () {
           const header = yield* Schema.decodeEffect(Schema.fromJsonString(SegmentHeader))(

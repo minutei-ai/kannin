@@ -1,10 +1,131 @@
 import { afterAll, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Schema } from "effect";
-import { Metadata, NamespaceSchema, QueryResult, WriteResult } from "../src/protocol";
+import {
+  CompactResult,
+  Metadata,
+  NamespaceSchema,
+  QueryResult,
+  Root,
+  WriteResult,
+} from "../src/protocol";
 import { request, startWorker, textQuery } from "./harness";
 
 const worker = await startWorker();
 afterAll(() => worker.dispose());
+
+test("declared headers stay compact across reload and compaction while source attributes remain intact", async () => {
+  const persistence = await mkdtemp(join(tmpdir(), "kannin-indexed-attributes-"));
+  await using cleanup = new AsyncDisposableStack();
+  cleanup.defer(() => rm(persistence, { recursive: true, force: true }));
+  const documents = Array.from({ length: 20 }, (_, index) => ({
+    id: String(index).padStart(2, "0"),
+    text: `rust unique${index}`,
+    attributes: {
+      year: 2024 + (index % 2),
+      externalId: index,
+      padding: "x".repeat(4096),
+      flag: index % 2 === 0,
+      empty: null,
+    },
+  }));
+  const headers = { unconfigured: 0, year: 0, empty: 0 };
+  {
+    const writer = await startWorker(persistence);
+    await using lifetime = new AsyncDisposableStack();
+    lifetime.defer(() => writer.dispose());
+    const bucket = await writer.getR2Bucket("STORAGE");
+    for (const [name, schema] of [
+      ["unconfigured", undefined],
+      ["year", { filterable: ["year"], vectorFilterFields: [] }],
+      ["empty", { filterable: [], vectorFilterFields: [] }],
+    ] as const) {
+      for (const batch of [0, 1]) {
+        const response = await request(writer, `projection-${name}`, "write", {
+          requestId: `batch-${batch}`,
+          schema,
+          upserts: documents.slice(batch * 10, batch * 10 + 10),
+          deletes: [],
+        });
+        expect(response.status, await response.clone().text()).toBe(200);
+      }
+      const stored = await bucket.get(`namespaces/projection-${name}/root.json`);
+      expect(stored).not.toBeNull();
+      if (stored === null) return;
+      const root = Schema.decodeUnknownSync(Root)(await stored.json());
+      expect(root.documents).toBe(20);
+      expect(root.segments).toHaveLength(2);
+      headers[name] = root.segments.reduce((sum, segment) => sum + segment.headerBytes, 0);
+    }
+  }
+  expect(headers.year).toBeLessThan(headers.unconfigured / 8);
+  expect(headers.empty).toBeLessThan(headers.year);
+  const reader = await startWorker(persistence);
+  cleanup.defer(() => reader.dispose());
+  for (const name of ["unconfigured", "year", "empty"]) {
+    for (const consistency of ["strong", "edge-eventual"] as const) {
+      const response = await request(reader, `projection-${name}`, "query", {
+        ...textQuery("rust"),
+        consistency,
+        minimumSequence: 2,
+      });
+      expect(response.status, await response.clone().text()).toBe(200);
+      const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+      expect(result.rows.map((row) => row.attributes)).toEqual(
+        documents.slice(0, 10).map((document) => document.attributes),
+      );
+    }
+  }
+  const configure = await request(reader, "projection-unconfigured", "write", {
+    requestId: "configure",
+    schema: { filterable: ["year"], vectorFilterFields: [] },
+    upserts: [],
+    deletes: [],
+  });
+  expect(configure.status).toBe(200);
+  const query = textQuery("rust", 10, [{ field: "year", op: "eq", value: 2025 }]);
+  const original = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(reader, "projection-year", "query", query)).json(),
+  );
+  const migrated = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(reader, "projection-unconfigured", "query", query)).json(),
+  );
+  expect(migrated.rows).toEqual(original.rows);
+  const bucket = await reader.getR2Bucket("STORAGE");
+  for (const namespace of ["projection-year", "projection-unconfigured"]) {
+    const compact = await request(reader, namespace, "compact", {});
+    expect(compact.status).toBe(200);
+    expect(Schema.decodeUnknownSync(CompactResult)(await compact.json())).toEqual({
+      compacted: 2,
+      segments: 1,
+      documents: 20,
+    });
+    expect((await request(reader, namespace, "rebuild", {})).status).toBe(200);
+    const stored = await bucket.get(`namespaces/${namespace}/root.json`);
+    expect(stored).not.toBeNull();
+    if (stored === null) return;
+    const root = Schema.decodeUnknownSync(Root)(await stored.json());
+    expect(root.segments.reduce((sum, segment) => sum + segment.headerBytes, 0)).toBeLessThan(
+      headers.unconfigured / 8,
+    );
+    const result = Schema.decodeUnknownSync(QueryResult)(
+      await (await request(reader, namespace, "query", query)).json(),
+    );
+    expect(result.rows).toEqual(original.rows);
+  }
+  expect(
+    (
+      await request(
+        reader,
+        "projection-year",
+        "query",
+        textQuery("rust", 10, [{ field: "padding", op: "exists", value: true }]),
+      )
+    ).status,
+  ).toBe(400);
+});
 
 test("attributes remain stored but cannot be filtered without an explicit namespace schema", async () => {
   const created = await request(worker, "unconfigured", "write", {

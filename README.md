@@ -11,19 +11,19 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 ## Performance
 
-The latest paired local comparison uses one million documents across 200 segments, one CPU and a two-GiB memory cap with swap disabled. Warm samples change filter values on every request. Cold samples start a fresh workerd with empty process/Cache API state; filesystem and emulated R2 backend caches may remain warm.
+Configured namespaces now keep only declared filter attributes in new segment headers. On a local 30,000-document corpus with large unselected attributes, headers shrink **50.2 → 3.1 MB**, and complete segment storage **54.9 → 7.8 MB**. Complete document/posting payloads remain identical. A control where every attribute is declared preserves complete segment bytes.
 
-| Workload                                 | State                      | Before median (ms) | Current median (ms) | Current observed maximum (ms) |
-| ---------------------------------------- | -------------------------- | -----------------: | ------------------: | ----------------------------: |
-| Filtered dense                           | warm                       |               56.9 |                57.8 |                          80.3 |
-| 64 rare terms + filter                   | warm                       |              129.0 |                38.9 |                          51.5 |
-| 64 rare terms, alternating filter fields | warm                       |              138.9 |                53.8 |                          68.8 |
-| Filtered dense                           | cold, prepared derivatives |             1937.6 |              2050.9 |                        2287.1 |
-| 64 rare terms + filter                   | cold, prepared derivatives |             1721.2 |              1913.4 |                        1966.4 |
-| Filtered dense                           | cold, absent derivatives   |             6758.8 |              6043.6 |                        6114.6 |
-| 64 rare terms + filter                   | cold, absent derivatives   |             3798.0 |              3712.2 |                        3723.1 |
+| Rich-attribute workload | State                  | Before median (ms) | Current median (ms) |
+| ----------------------- | ---------------------- | -----------------: | ------------------: |
+| 64 rare terms + filter  | prepared cold          |             2020.4 |              1189.6 |
+| Dense all + filter      | prepared cold          |              944.2 |               541.7 |
+| Phrase + filter         | prepared cold          |              855.3 |               557.0 |
+| 64 rare terms + filter  | absent-derivative cold |             2932.1 |              1046.3 |
+| 64 rare terms + filter  | warm                   |              131.1 |                37.2 |
 
-**The general 200 ms cold / 100 ms warm targets remain unmet.** Warm rare-term median latency fell about 70%, and alternating-field workerd RSS high-water fell **245.5 → 234.8 MiB**. Dense warm latency is essentially unchanged; prepared cold latency regressed. All **288 complete responses matched across 144 pairs**. Linux process RSS includes emulator overhead and is not Cloudflare isolate heap. [Methods, budgets and tradeoffs](docs/performance.md#bounded-filter-row-reuse-and-benchmark-coverage).
+Two alternating paired cohorts use thirty segments, a fixed logical CPU, a two-GiB cap and no swap. Process/Cache API state is empty for cold reads; backend/filesystem caches may remain warm. All **640 complete responses match across 320 pairs**. Rare recovery workerd RSS high-water falls **226 → 158 MiB**; this includes local emulation and is not Cloudflare isolate heap. [All workloads, methods and tradeoffs](docs/performance.md#namespace-header-projection).
+
+**The general 200 ms cold / 100 ms warm targets remain unmet.** Cold reads still exceed one second in some workloads; phrase warm maximum reaches 177.8 ms. Dense warm results and controls without discarded attributes remain mixed. The earlier million-document fixture already contains only its declared attributes, so this reduction does not establish a gain there. [Million-document results](docs/performance.md#bounded-filter-row-reuse-and-benchmark-coverage).
 
 Earlier unfiltered synthetic controls observed common-query medians **139–146 ms** and maxima **161–184 ms** across eight fresh candidate processes with two CPUs. Those workloads and capacity differ from the table above; this is not a general bound or a Cloudflare result. [Capacity control](docs/performance.md#exact-minimum-length-document-indexes).
 
@@ -46,13 +46,13 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **323 Worker/tooling tests and 63 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **324 Worker/tooling tests and 64 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 
 ## API and limits
 
-Authenticated namespace endpoints support atomic writes, text/vector/hybrid queries, metadata, compaction, collection and vector rebuilds. Declare `schema.filterable` per namespace and its ordered `schema.vectorFilterFields` subset on a write; undeclared filter attributes are rejected. The schema is persisted in R2 and changing it requires reset/reimport. BM25 currently indexes fixed `title` and `text` fields; arbitrary full-text attribute indexing remains unimplemented. Text reads default to strong consistency; edge eventual is explicit and supports a `minimumSequence` barrier. Vector visibility is eventual. Text top-k is capped at 100; vector/hybrid at 50. Unsupported provider filter pushdown and stale candidates can underfill vector results.
+Authenticated namespace endpoints support atomic writes, text/vector/hybrid queries, metadata, compaction, collection and vector rebuilds. Declare `schema.filterable` per namespace and its ordered `schema.vectorFilterFields` subset on a write; undeclared filter attributes are rejected. The schema is persisted in R2 and changing it requires reset/reimport. Configured writes keep only declared filter attributes in segment headers; complete attributes stay in document payloads and returned rows. BM25 currently indexes fixed `title` and `text` fields; arbitrary full-text attribute indexing remains unimplemented. Text reads default to strong consistency; edge eventual is explicit and supports a `minimumSequence` barrier. Vector visibility is eventual. Text top-k is capped at 100; vector/hybrid at 50. Unsupported provider filter pushdown and stale candidates can underfill vector results.
 
 [API and durability](docs/api.md) · [architecture](docs/architecture.md) · [search research](docs/search-research.md) · [lint](docs/lint.md)
 

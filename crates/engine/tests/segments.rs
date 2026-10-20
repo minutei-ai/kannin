@@ -33,7 +33,7 @@ fn search(
     filters: &[Filter],
     k: usize,
 ) -> Result<Vec<(String, f64)>, Box<dyn std::error::Error>> {
-    let built = segment::build(docs)?;
+    let built = segment::build(docs, None)?;
     let (header, base) = segment::parse_header(&built.bytes)?;
     let mut search = Search::new(
         header.clone(),
@@ -63,10 +63,10 @@ fn search(
 
 #[test]
 fn object_ranges_are_self_contained_and_crc_checked() -> Result<(), Box<dyn std::error::Error>> {
-    let built = segment::build(vec![
-        document("b", "ação cloudflare"),
-        document("a", "rust rust"),
-    ])?;
+    let built = segment::build(
+        vec![document("b", "ação cloudflare"), document("a", "rust rust")],
+        None,
+    )?;
     let (header, base) = segment::parse_header(&built.bytes)?;
     assert_eq!(header.documents[0].id, "a");
     for metadata in &header.documents {
@@ -221,7 +221,7 @@ fn block_pruning_matches_exhaustive_bm25_on_varied_documents()
             doc
         })
         .collect();
-    let built = segment::build(docs.clone())?;
+    let built = segment::build(docs.clone(), None)?;
     let stats = statistics(&built.header);
     let mut expected: Vec<_> = docs
         .iter()
@@ -300,7 +300,7 @@ fn posting_directory_rejects_reordered_and_overlapping_rows()
     let docs = (0..512)
         .map(|index| document(format!("{index:05}"), "alpha beta"))
         .collect();
-    let built = segment::build(docs)?;
+    let built = segment::build(docs, None)?;
     for overlap in [false, true] {
         let mut header: serde_json::Value = serde_json::to_value(&built.header)?;
         let blocks = header["terms"]["alpha"]["blocks"]
@@ -337,7 +337,7 @@ fn eligible_posting_spans_preserve_scores_across_gaps_and_tombstones()
             doc
         })
         .collect();
-    let built = segment::build(docs)?;
+    let built = segment::build(docs, None)?;
     let (header, base) = segment::parse_header(&built.bytes)?;
     let filters = [Filter {
         field: "group".into(),
@@ -413,7 +413,7 @@ fn posting_spans_bound_gap_overfetch() -> Result<(), Box<dyn std::error::Error>>
             doc
         })
         .collect();
-    let built = segment::build(docs)?;
+    let built = segment::build(docs, None)?;
     for gap in [4096, 4097] {
         let mut header = built.header.clone();
         let metadata = header.terms.get_mut("alpha").ok_or("Missing term")?;
@@ -594,7 +594,7 @@ fn cutoff_posting_spans_preserve_gap_budgets() -> Result<(), Box<dyn std::error:
             document(format!("{index:05}"), text)
         })
         .collect();
-    let built = segment::build(docs)?;
+    let built = segment::build(docs, None)?;
     let statistics = statistics(&built.header);
     let cutoff = segment::bm25(0, 1, 0, 1, &statistics, 384) * 0.9;
     for gap in [4096, 4097] {
@@ -623,6 +623,7 @@ fn compressed_directories_preserve_headers_and_reject_frame_corruption()
                 )
             })
             .collect(),
+        None,
     )?;
     let (original, length) = segment::parse_header(&built.bytes)?;
     let canonical = segment::parse_directory(&built.bytes[..length], length)?;
@@ -699,7 +700,7 @@ fn compressed_directories_exceed_the_separate_mutation_log_budget()
             doc
         })
         .collect();
-    let built = segment::build(documents)?;
+    let built = segment::build(documents, None)?;
     let (_, length) = segment::parse_header(&built.bytes)?;
     assert!(length > raio_engine::MAX_LOG_BYTES);
     let compressed = segment::compress_directory(&built.bytes[..length])?;
@@ -716,7 +717,10 @@ fn compressed_directories_exceed_the_separate_mutation_log_budget()
 #[test]
 fn decoded_term_maps_match_native_serde_order_and_duplicate_semantics()
 -> Result<(), Box<dyn std::error::Error>> {
-    let built = segment::build(vec![document("a", "alpha beta gamma delta epsilon zeta")])?;
+    let built = segment::build(
+        vec![document("a", "alpha beta gamma delta epsilon zeta")],
+        None,
+    )?;
     let encoded = serde_json::to_string(&built.header)?;
     let original: BTreeMap<String, Box<serde_json::value::RawValue>> =
         serde_json::from_str(&encoded)?;
@@ -771,7 +775,7 @@ fn decoded_term_maps_match_native_serde_order_and_duplicate_semantics()
 #[test]
 fn decoded_term_maps_reject_invalid_entries_and_object_framing()
 -> Result<(), Box<dyn std::error::Error>> {
-    let built = segment::build(vec![document("a", "alpha")])?;
+    let built = segment::build(vec![document("a", "alpha")], None)?;
     let original: BTreeMap<String, Box<serde_json::value::RawValue>> =
         serde_json::from_str(&serde_json::to_string(&built.header)?)?;
     for dictionary in [
@@ -797,16 +801,22 @@ fn decoded_term_maps_reject_invalid_entries_and_object_framing()
 fn prepared_queries_reuse_global_terms_without_retaining_segment_tombstones()
 -> Result<(), Box<dyn std::error::Error>> {
     let sources = [
-        segment::build(vec![
-            document("a", "alpha beta alpha"),
-            document("b", "beta alpha"),
-            document("c", "alpha beta"),
-        ])?,
-        segment::build(vec![
-            document("d", "beta beta"),
-            document("e", "alpha beta alpha"),
-            document("f", "alpha"),
-        ])?,
+        segment::build(
+            vec![
+                document("a", "alpha beta alpha"),
+                document("b", "beta alpha"),
+                document("c", "alpha beta"),
+            ],
+            None,
+        )?,
+        segment::build(
+            vec![
+                document("d", "beta beta"),
+                document("e", "alpha beta alpha"),
+                document("f", "alpha"),
+            ],
+            None,
+        )?,
     ];
     for mode in ["any", "all", "phrase"] {
         for documents in [6, 19] {
@@ -876,6 +886,7 @@ fn retained_directories_release_unused_document_capacity() -> Result<(), Box<dyn
             (0..count)
                 .map(|index| document(format!("{index:05}"), format!("alpha unique{index}")))
                 .collect(),
+            None,
         )?;
         let expected = serde_json::to_string(&built.header)?;
         let (canonical, length) = segment::parse_header(&built.bytes)?;
@@ -932,7 +943,7 @@ fn canonical_headers_reuse_compact_tuples_and_preserve_object_readers()
     first
         .attributes
         .insert("escape\nkey".into(), serde_json::json!("á\n😀"));
-    let built = segment::build(vec![first, document("𐀀", "rust storage")])?;
+    let built = segment::build(vec![first, document("𐀀", "rust storage")], None)?;
     assert_eq!(built.bytes[16], b'[');
     let (compact, base) = segment::parse_header(&built.bytes)?;
     assert_eq!(

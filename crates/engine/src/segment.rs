@@ -934,14 +934,38 @@ fn encode_terms(
     Ok(TermDictionary::from_entries(terms))
 }
 
-#[doc = "# Errors\nRejects empty or duplicate documents, wire-size overflow, serialization errors, and segments beyond the size budget."]
-pub fn build(mut documents: Vec<Document>) -> Result<BuiltSegment, String> {
+fn filterable_fields(names: &[String]) -> Result<BTreeSet<&str>, String> {
+    let selected: BTreeSet<_> = names.iter().map(String::as_str).collect();
+    if names.len() > 64
+        || selected.len() != names.len()
+        || names.iter().any(|name| {
+            name.len() > 64
+                || !name
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|first| first.is_ascii_alphabetic() || *first == b'_')
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+    {
+        return Err("Invalid filterable attributes".to_owned());
+    }
+    Ok(selected)
+}
+
+#[doc = "# Errors\nRejects empty or duplicate documents, invalid field declarations, wire-size overflow, serialization errors, and segments beyond the size budget."]
+pub fn build(
+    mut documents: Vec<Document>,
+    filterable: Option<&[String]>,
+) -> Result<BuiltSegment, String> {
     if documents.is_empty() {
         return Err("Segment must contain at least one document".into());
     }
     if documents.len() > 10000 {
         return Err("Segment exceeds 10000 documents".into());
     }
+    let filterable = filterable.map(filterable_fields).transpose()?;
     documents.sort_by(|a, b| a.id.encode_utf16().cmp(b.id.encode_utf16()));
     if documents.windows(2).any(|pair| pair[0].id == pair[1].id) {
         return Err("Duplicate segment ids".into());
@@ -986,15 +1010,27 @@ pub fn build(mut documents: Vec<Document>) -> Result<BuiltSegment, String> {
         }
         let json = serde_json::to_vec(document).map_err(|e| e.to_string())?;
         let data = append(&mut payload, &json)?;
+        let attributes = filterable
+            .as_ref()
+            .map_or_else(
+                || serde_json::value::to_raw_value(&document.attributes),
+                |fields| {
+                    serde_json::value::to_raw_value(
+                        &document
+                            .attributes
+                            .iter()
+                            .filter(|(name, _)| fields.contains(name.as_str()))
+                            .collect::<BTreeMap<_, _>>(),
+                    )
+                },
+            )
+            .map_err(|cause| cause.to_string())?;
         metadata.push(DocumentMeta {
             id: document.id.clone(),
             revision: document.revision,
             title_length: u32::try_from(title_tokens.len()).map_err(|cause| cause.to_string())?,
             body_length: u32::try_from(body_tokens.len()).map_err(|cause| cause.to_string())?,
-            attributes: serde_json::value::RawValue::from_string(
-                serde_json::to_string(&document.attributes).map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?,
+            attributes,
             data,
             vector: document.vector.is_some(),
         });
@@ -3798,11 +3834,16 @@ pub mod wasm {
     impl Segment {
         #[wasm_bindgen(constructor)]
         #[doc = "# Errors\nRejects invalid input serialization or segment framing, size, and integrity constraints."]
-        pub fn new(json: &str) -> Result<Self, JsValue> {
+        pub fn new(json: &str, filterable: Option<String>) -> Result<Self, JsValue> {
             let documents: Vec<Document> =
                 serde_json::from_str(json).map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let filterable = filterable
+                .map(|json| serde_json::from_str::<Vec<String>>(&json))
+                .transpose()
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
             Ok(Self {
-                built: build(documents).map_err(|cause| JsValue::from_str(&cause))?,
+                built: build(documents, filterable.as_deref())
+                    .map_err(|cause| JsValue::from_str(&cause))?,
             })
         }
         #[must_use]
@@ -4542,6 +4583,77 @@ mod filter_cache_tests {
     use std::collections::BTreeSet;
 
     #[test]
+    fn configured_headers_keep_selected_attributes_and_preserve_document_payloads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let documents = (0..32)
+            .map(|index| {
+                serde_json::from_value::<Document>(json!({
+                    "id": format!("{index:02}"), "text": format!("rust unique{index}"),
+                    "attributes": {
+                        "year": 2024 + index % 2, "__proto__": index % 2 == 0,
+                        "externalId": index, "padding": "x".repeat(2048)
+                    }
+                }))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let original = build(documents.clone(), None)?;
+        let fields = vec!["year".into(), "__proto__".into()];
+        let selected = build(documents.clone(), Some(&fields))?;
+        let (_, original_base) = super::parse_header(&original.bytes)?;
+        let (_, selected_base) = super::parse_header(&selected.bytes)?;
+        assert_eq!(
+            original.bytes[original_base..],
+            selected.bytes[selected_base..]
+        );
+        assert!(selected_base < original_base / 4);
+        for (metadata, document) in selected.header.documents.iter().zip(&documents) {
+            let attributes: serde_json::Value = serde_json::from_str(metadata.attributes.get())?;
+            assert_eq!(
+                attributes,
+                json!({"year": document.attributes["year"], "__proto__": document.attributes["__proto__"]})
+            );
+            let start = selected_base + metadata.data.offset as usize;
+            let payload =
+                super::decode_page(&selected.bytes[start..start + metadata.data.length as usize])?;
+            let stored: Document = serde_json::from_slice(&payload)?;
+            assert_eq!(stored.attributes, document.attributes);
+        }
+        for op in ["eq", "ne", "gt", "gte", "lt", "lte", "in", "exists"] {
+            for value in [json!(2024), json!([2024]), json!(true)] {
+                let filters = [Filter {
+                    field: "year".into(),
+                    op: op.into(),
+                    value,
+                }];
+                assert_eq!(
+                    selected.header.allowed(&filters, &[]),
+                    original.header.allowed(&filters, &[])
+                );
+            }
+        }
+        let empty = build(documents.clone(), Some(&[]))?;
+        assert!(
+            empty
+                .header
+                .documents
+                .iter()
+                .all(|document| document.attributes.get() == "{}")
+        );
+        for fields in [
+            vec!["year".into(), "year".into()],
+            vec![String::new()],
+            vec!["1year".into()],
+            vec!["a-b".into()],
+            vec!["á".into()],
+            vec!["x".repeat(65)],
+            (0..65).map(|index| format!("field{index}")).collect(),
+        ] {
+            assert!(build(documents.clone(), Some(&fields)).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn projected_attribute_keys_preserve_escapes_duplicates_and_ignored_validation()
     -> Result<(), Box<dyn std::error::Error>> {
         let fields = BTreeSet::from(["flag", "group"]);
@@ -4606,7 +4718,7 @@ mod filter_cache_tests {
                 vector: None,
             })
             .collect();
-        let mut header = build(documents)?.header;
+        let mut header = build(documents, None)?.header;
         for (document, input) in header.documents.iter_mut().zip(inputs) {
             document.attributes = serde_json::value::RawValue::from_string(input.into())?;
         }
@@ -4673,7 +4785,7 @@ mod filter_cache_tests {
                 }))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let mut header = build(documents)?.header;
+        let mut header = build(documents, None)?.header;
         for (document, input) in header.documents.iter_mut().zip(inputs) {
             document.attributes = serde_json::value::RawValue::from_string(input.into())?;
         }
@@ -4725,7 +4837,7 @@ mod filter_cache_tests {
                 }))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let header = build(documents)?.header;
+        let header = build(documents, None)?.header;
         for filters in [
             vec![Filter {
                 field: "group".into(),
@@ -4813,7 +4925,7 @@ mod filter_cache_tests {
             let document: Document = serde_json::from_value(json!({
                 "id":"a", "text":"target", "attributes":{}
             }))?;
-            let mut header = build(vec![document])?.header;
+            let mut header = build(vec![document], None)?.header;
             header.documents[0].attributes =
                 serde_json::value::RawValue::from_string(input.into())?;
             assert!(
@@ -4838,7 +4950,7 @@ mod filter_cache_tests {
         let document: Document = serde_json::from_value(json!({
             "id": "a", "text": "target", "attributes": {"group": 0}
         }))?;
-        let header = build(vec![document])?.header;
+        let header = build(vec![document], None)?.header;
         for index in 0..128 {
             let filter = Filter {
                 field: "group".into(),
@@ -5062,7 +5174,7 @@ mod frequency_tests {
                     vector: None,
                 })
                 .collect();
-            let built = build(docs)?;
+            let built = build(docs, None)?;
             let base = super::parse_header(&built.bytes)?.1;
             let header = Rc::new(built.header);
             for mode in ["any", "all"] {
@@ -5138,9 +5250,12 @@ mod frequency_tests {
     #[test]
     fn frequency_decoding_still_checks_positions_against_document_lengths()
     -> Result<(), Box<dyn std::error::Error>> {
-        let built = build(serde_json::from_value(json!([
-            {"id":"a","text":"alpha beta alpha","attributes":{}}
-        ]))?)?;
+        let built = build(
+            serde_json::from_value(json!([
+                {"id":"a","text":"alpha beta alpha","attributes":{}}
+            ]))?,
+            None,
+        )?;
         let mut page = Vec::new();
         append(&mut page, &[1, 0, 0, 1, 3])?;
         for mode in ["any", "all", "phrase"] {
@@ -5169,11 +5284,14 @@ mod frequency_tests {
     #[test]
     fn excluded_rows_do_not_hide_corruption_or_disordered_blocks()
     -> Result<(), Box<dyn std::error::Error>> {
-        let built = build(serde_json::from_value(json!([
-            {"id":"a","text":"alpha","attributes":{}},
-            {"id":"b","text":"alpha","attributes":{}},
-            {"id":"c","text":"alpha","attributes":{}}
-        ]))?)?;
+        let built = build(
+            serde_json::from_value(json!([
+                {"id":"a","text":"alpha","attributes":{}},
+                {"id":"b","text":"alpha","attributes":{}},
+                {"id":"c","text":"alpha","attributes":{}}
+            ]))?,
+            None,
+        )?;
         let mut later = Vec::new();
         append(&mut later, &[1, 2, 0, 1, 0])?;
         let mut earlier = Vec::new();
@@ -5227,7 +5345,7 @@ mod frequency_tests {
                 vector: None,
             })
             .collect();
-        let built = build(docs)?;
+        let built = build(docs, None)?;
         let base = super::parse_header(&built.bytes)?.1;
         let header = Rc::new(built.header);
         for mode in ["any", "all", "phrase"] {
@@ -5298,7 +5416,7 @@ mod candidate_tests {
             {"id":"c","text":"alpha beta","attributes":{}},
             {"id":"d","text":"beta beta alpha","attributes":{}}
         ]))?;
-        let built = build(documents)?;
+        let built = build(documents, None)?;
         let base = super::parse_header(&built.bytes)?.1;
         let header = Rc::new(built.header);
         for (text, dead, expected) in [
@@ -5469,6 +5587,7 @@ mod dense_cutoff_tests {
                         vector: None,
                     })
                     .collect(),
+                None,
             )?;
             let header = std::rc::Rc::new(built.header);
             let statistics = Statistics {
@@ -5569,7 +5688,7 @@ mod eligible_bound_tests {
                 vector: None,
             })
             .collect();
-        let built = build(docs)?;
+        let built = build(docs, None)?;
         let (header, base) = parse_header(&built.bytes)?;
         let statistics = Statistics {
             documents: u64::try_from(header.documents.len())?,
@@ -5685,7 +5804,7 @@ mod cutoff_certificate_tests {
                 }
             })
             .collect();
-        build(documents)
+        build(documents, None)
     }
 
     fn assert_cutoff_certificate(
@@ -5903,7 +6022,7 @@ mod required_term_tests {
                 vector: None,
             })
             .collect();
-        let built = build(docs)?;
+        let built = build(docs, None)?;
         let (header, base) = parse_header(&built.bytes)?;
         let statistics = Statistics {
             documents: u64::try_from(header.documents.len())?,
@@ -5978,7 +6097,7 @@ mod required_term_tests {
                 vector: None,
             })
             .collect();
-        let built = build(docs)?;
+        let built = build(docs, None)?;
         let (header, base) = parse_header(&built.bytes)?;
         let calls = Rc::new(Cell::new(0));
         let mut lists = BTreeMap::new();

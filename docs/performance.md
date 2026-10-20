@@ -4915,3 +4915,47 @@ Mean owned process CPU for warm rare queries falls 141.3 → 48.3 ms; alternatin
 The public quality runner streams corpus batches, invokes the native Effect SDK service binding, performs bounded compaction and evaluates complete SciFact, NFCorpus and ArguAna test judgments. See [retrieval quality](quality.md) for hashes, parameters, metrics, missing judgments and retry counts. Any/all queries accept 512 normalized distinct terms; phrases retain 64 tokens. The synthetic benchmark now covers eleven selectors in both strong and edge modes, including phrase/all/filter combinations and 64/256/512-term queries. The 1,000-document smoke passed all 1,100 measured responses across 22 selector/mode combinations with identical rows and scores and verified acknowledged sequences; its complete emulator group peaked at 331 MiB. This validates the runner and ranking stability, not million-document performance for every selector.
 
 The complete local gate passes 323 Bun/workerd/tooling tests with 11,656 assertions and 63 Rust tests, formatting, strict Effect/TypeScript lint and compiler checks, and native/WASM Clippy. Peak gate charge was 1.47 GiB under four GiB, two CPUs and no swap. No dependencies or runtime framework were added. This cut is local only: Cloudflare deployment, native Vectorize recall, whole-isolate memory, matched competitor benchmarks and universal latency targets remain unverified.
+
+## Namespace header projection
+
+Compared with `346f4f2`, configured writes and compaction store only declared filterable attributes in header metadata. Complete document attributes remain in R2 payloads and query rows. Unconfigured writes retain full metadata to support a later first schema-only configuration. Existing headers remain readable; eligible compaction or reset/reimport applies the projection. A clean single segment remains a compact no-op. BM25 parameters, positional postings, compression levels and cache quotas are unchanged.
+
+Two deterministic corpora each contain 30,000 documents in thirty 1,000-document segments. Rich documents store year, a unique external ID and 1,536 bytes of padding, with only year declared filterable. Lean documents contain year and external ID, both declared filterable. Rich canonical headers shrink 50,186,966 → 3,056,966 bytes (93.9%); complete segments shrink 54,948,691 → 7,818,691 bytes (85.8%). Corpus hashes and every document/posting payload match. Lean canonical segment bytes match in full.
+
+Each cache state and selector uses two alternating paired cohorts with fresh workerd processes and empty process/Cache API state. Prepared controls retain derived R2 artifacts; absent controls redirect all three derivative prefixes to unique empty keys. Filesystem and emulated R2 backend caches may remain warm. Requests use strong consistency and change the year threshold each round. Any/all/phrase queries use the same text and filters; rare queries contain sixty-four unique terms. All 640 complete responses match across 320 pairs, including attributes, scores, revisions, sequence and followups.
+
+The native process group is pinned to allowed logical CPU 27, capped at one CPU/two GiB with swap disabled; temporary files use disk-backed storage. Every sampled query records native cgroup CPU usage and throttling, gateway duration and workerd RSS high-water after settlement. Sampled queries recorded no quota throttling. RSS includes local runtime/storage emulation, not Cloudflare isolate heap. The comparison group peaks at 658 MiB. Cold starts at the HTTP request after runtime readiness; warm tails discard eight of sixteen rounds. Cold samples number two per variant, warm tails sixteen. These are small samples, not statistical tail bounds.
+
+| Rich workload | R2 derivatives | Cold median before → after (ms) | Candidate maximum (ms) | Cold workerd HWM before → after (MiB) |
+| ------------- | -------------- | ------------------------------: | ---------------------: | ------------------------------------: |
+| 64 rare terms | prepared       |                 2020.4 → 1189.6 |                 1281.3 |                         196.0 → 156.8 |
+| Dense any     | prepared       |                19917.9* → 564.5 |                  572.2 |                         152.0 → 135.7 |
+| Dense all     | prepared       |                   944.2 → 541.7 |                  552.4 |                         152.2 → 137.7 |
+| Phrase        | prepared       |                   855.3 → 557.0 |                  619.7 |                         153.2 → 135.6 |
+| 64 rare terms | absent         |                 2932.1 → 1046.3 |                 1070.0 |                         225.8 → 158.5 |
+| Dense any     | absent         |                  1459.8 → 814.2 |                  870.9 |                         221.2 → 150.1 |
+| Dense all     | absent         |                  1398.8 → 772.8 |                  774.7 |                         215.5 → 151.2 |
+| Phrase        | absent         |                  1405.0 → 776.4 |                  782.3 |                         221.2 → 148.8 |
+
+The marked baseline includes a 38,926 ms request with 4,451 ms of total group CPU; its other paired baseline took 909 ms. The long wait appears inside gateway/catalog timings and was not a quota suspension. Its cause is unproven. Do not attribute that wall-time ratio to the index optimization. All samples are retained.
+
+| Rich workload | Warm median before → after (ms) | Candidate maximum (ms) | Warm workerd HWM before → after (MiB) |
+| ------------- | ------------------------------: | ---------------------: | ------------------------------------: |
+| 64 rare terms |                    131.1 → 37.2 |                   66.7 |                         208.9 → 172.8 |
+| Dense any     |                     30.4 → 35.0 |                   53.9 |                         163.3 → 154.4 |
+| Dense all     |                     34.4 → 34.2 |                   54.2 |                         164.0 → 156.0 |
+| Phrase        |                     32.7 → 31.7 |                  177.8 |                         162.9 → 155.0 |
+
+Results are mixed when there are no attributes to discard. Lean prepared all-query medians rise 793.0 → 839.7 ms, absent phrase medians rise 1,001.3 → 1,065.0 ms, and some cold HWM medians increase up to about five MiB. Rich dense-any warm medians also rise 30.4 → 35.0 ms. Byte preservation does not imply uniform latency improvement.
+
+The first 30,000-document ingestion observations were rich 12.41 → 24.41 seconds and lean 9.61 → 6.77 seconds. A separate serialized write control uses two alternating cohorts, six 1,000-document batches per variant/cohort and closed HTTP connections. Across twelve samples per variant, client time totals 5.376 → 4.315 seconds, gateway time 5.327 → 4.270 seconds, and native group CPU 4.807 → 3.774 seconds, with no quota throttling. Different corpus size and transport conditions limit that control; it does not erase the slower initial rich ingestion or establish sustained throughput.
+
+The one-million-document synthetic fixture already has only its declared group/year attributes, so no equivalent byte reduction is implied there. General cold recovery remains seconds; the 200 ms cold target remains unmet. Rich phrase warm maximum is 177.8 ms, so a universal 100 ms warm bound is also unproven. No Cloudflare deployment or matched competitor result is claimed.
+
+A preceding identical-artifact control found prepared rare cold reads spanning 1,552–1,898 ms without affinity and 1,262–1,385 ms on the fixed CPU; query quota suspensions disappeared in the pinned control. The public benchmark now reports native available parallelism. Pinning changes local conditions and must not be reported as an engine speedup.
+
+Four discarded prototypes remain outside the repository: deferred filter grouping, repeated-attribute decoder caching, faster inner compression and uncompressed inner frames. Some improved selected medians but regressed cold/RSS or cache admission. Uncompressed frames admitted no batch objects in the tested recovery control and made subsequent cold reuse slower; those changes were removed. No cache budgets, dependencies or integrity checks were relaxed.
+
+The full gate passes 324 Bun/workerd/tooling tests with 11,700 assertions and 64 Rust tests, formatting, strict Effect/TypeScript lint/typecheck and native/WASM Clippy. Peak gate charge is 1.62 GiB under four GiB, two CPUs and no swap. Regression coverage includes filtered header contents, complete source payload bytes, every filter operator, field-name validation, empty/unconfigured schemas, worker restart, first schema installation, compaction and complete returned attributes.
+
+Rich corpus SHA-256: `79c6caa63160cc7502e98aed640c3cf35f9452ca0c716c5e2f5b80ee92b601bf`. Lean corpus SHA-256: `37ac47744ff11339f1eb94b106eacdbbebb62e6680ddccc13143bd8c2e3ec6a5`.

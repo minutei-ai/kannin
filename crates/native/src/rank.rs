@@ -288,14 +288,17 @@ mod tests {
     #[test]
     fn distant_posting_offsets_do_not_overflow_gap_accounting()
     -> Result<(), Box<dyn std::error::Error>> {
-        let built = build(vec![Document {
-            id: String::from("document"),
-            revision: 1,
-            title: String::new(),
-            text: String::from("alpha beta gamma"),
-            attributes: BTreeMap::new(),
-            vector: None,
-        }])?;
+        let built = build(
+            vec![Document {
+                id: String::from("document"),
+                revision: 1,
+                title: String::new(),
+                text: String::from("alpha beta gamma"),
+                attributes: BTreeMap::new(),
+                vector: None,
+            }],
+            None,
+        )?;
         let mut header = built.header;
         for (term, offset) in [("alpha", 0), ("beta", 10), ("gamma", u32::MAX - 5)] {
             let metadata = header.terms.get_mut(term).ok_or("Missing fixture term")?;

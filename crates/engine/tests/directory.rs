@@ -30,6 +30,7 @@ fn directory_budget_is_exact_and_unicode_and_u64_values_are_lossless()
                 vector: None,
             })
             .collect(),
+        None,
     )?;
     let mut header = built.header;
     header.total_title_length = u64::MAX;

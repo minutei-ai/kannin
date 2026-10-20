@@ -1,4 +1,4 @@
-import { Schema } from "effect";
+import { Effect, Schema, SchemaGetter, SchemaIssue } from "effect";
 
 const Unicode = Schema.String.check(
   Schema.makeFilter((text) => text.isWellFormed() || "Expected well-formed Unicode"),
@@ -436,7 +436,29 @@ export const TermCatalogBatch = Schema.Struct({
         (batch.filterDigest !== null) || "Exact term catalogs require a filter digest",
   ),
 );
-export const OverviewBatch = Schema.Array(Schema.Uint8ArrayFromBase64)
+const OverviewSource = Schema.String.pipe(
+  Schema.decodeTo(Schema.String, {
+    decode: SchemaGetter.transform((text) => text.replace(/[\r\n]/g, "")),
+    encode: SchemaGetter.passthrough(),
+  }),
+)
+  .check(
+    Schema.makeFilter(
+      (text) => (text.length % 4 === 0 && !/[^A-Za-z0-9+/=]/.test(text)) || "Invalid Base64 source",
+    ),
+  )
+  .pipe(
+    Schema.decodeTo(Schema.Uint8Array, {
+      decode: SchemaGetter.transformEffect((text) =>
+        Effect.try({
+          try: () => Uint8Array.fromBase64(text),
+          catch: () => new SchemaIssue.InvalidValue({ expected: "a valid Base64 string" }, text),
+        }),
+      ),
+      encode: SchemaGetter.transform((bytes) => bytes.toBase64()),
+    }),
+  );
+export const OverviewBatch = Schema.Array(OverviewSource)
   .check(Schema.isBetweenLength(1, 16))
   .check(
     Schema.makeFilter(
@@ -541,7 +563,7 @@ export const TermProjectionRange = Schema.Struct({
 export const CorrelatedOverview = Schema.Struct({
   bucket: Schema.String,
   source: TermProjectionRange,
-  overview: Schema.Uint8ArrayFromBase64.check(
+  overview: OverviewSource.check(
     Schema.makeFilter(
       (bytes) => bytes.byteLength <= 1024 * 1024 || "Correlated overview exceeds one MiB",
     ),

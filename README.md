@@ -35,6 +35,8 @@ Parallel ranking now tries validated R2 directory frames before the internal cac
 
 [Uniform attribute proofs now also cover ordinary postings and phrases](docs/performance.md#uniform-facts-in-posting-rankers). A paired 5,000-document WASM control reduces cold directory-plus-ranker preparation CPU about 38%; complete-query latency and RSS remain mixed. No cache quota increases.
 
+[Reusable overview attributes](docs/performance.md#reusable-overview-attributes) reduce isolated filtered projection CPU about 8% on four fixed frames. A separate million-document workerd matrix preserves all 144 responses across 72 exact pairs; complete-query latency and RSS remain mixed.
+
 [Physical phrase-frequency bounds](docs/performance.md#physical-phrase-frequency-bounds) now reject impossible repeated phrases directly from the canonical manifest. On a local million-document empty-phrase control, cold median changes **14,050.8 → 147.8 ms**, warm **10.1 → 5.9 ms**, and warm workerd RSS **364.4 → 150.9 MiB**. This is a specific empty-result shortcut; positive and selective controls still exceed the general targets. Existing [zero-score certificates](docs/performance.md#zero-score-certificates) also skip segments proved empty by earlier scoring.
 
 Rust `zlib-rs` directory inflation retains identical frames and cache limits; immutable frames also [reuse successful header validation](docs/performance.md#immutable-header-validation-reuse). In a million-document wide-query control, mean warm workerd CPU changes **268.8 → 257.5 ms** and warm HTTP **272.2 → 262.3 ms**. Cold and RSS results remain mixed. [Decoder controls](docs/performance.md#native-zlib-directory-inflation).
@@ -58,7 +60,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **330 Worker/tooling tests and 65 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **335 Worker/tooling tests and 65 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

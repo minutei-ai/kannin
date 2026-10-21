@@ -788,10 +788,11 @@ async function textQuery(
         segment.commonTerms === undefined
       )
         return [];
-      const saved = new Map(Object.entries(segment.commonTerms));
+      const saved = segment.commonTerms;
       const dictionary = Object.fromEntries(
         requested.flatMap((term) => {
-          const summary = saved.get(term);
+          if (!Object.hasOwn(saved, term)) return [];
+          const summary = saved[term];
           if (summary === undefined) return [];
           return [[term, summary] as const];
         }),
@@ -825,12 +826,14 @@ async function textQuery(
     });
     const frequencies = new Map<string, number>();
     for (const { segment, dictionary } of catalog) {
-      const removedFrequencies = new Map(Object.entries(segment.removedFrequencies));
-      for (const [term, metadata] of Object.entries(dictionary))
-        frequencies.set(
-          term,
-          (frequencies.get(term) ?? 0) + metadata.df - (removedFrequencies.get(term) ?? 0),
-        );
+      for (const [term, metadata] of Object.entries(dictionary)) {
+        const frequency = (frequencies.get(term) ?? 0) + metadata.df;
+        if (Object.hasOwn(segment.removedFrequencies, term)) {
+          frequencies.set(term, frequency - (segment.removedFrequencies[term] ?? 0));
+          continue;
+        }
+        frequencies.set(term, frequency);
+      }
     }
     const statistics = {
       documents: root.documents,
@@ -867,15 +870,17 @@ async function textQuery(
           const liveCount = entry.segment.count - entry.segment.dead.length;
           if (liveCount < 0)
             throw new Rejected({ status: 503, message: "Invalid live segment cardinality" });
-          const dictionary = new Map(Object.entries(entry.dictionary));
-          const removed = new Map(Object.entries(entry.segment.removedFrequencies));
-          const matches = { maximum: liveCount, union: 0 };
+          const matches = { maximum: liveCount, union: 0, frequency: 0 };
           for (const term of terms) {
-            const frequency = (dictionary.get(term)?.df ?? 0) - (removed.get(term) ?? 0);
-            if (frequency < 0 || frequency > liveCount)
+            matches.frequency = 0;
+            if (Object.hasOwn(entry.dictionary, term))
+              matches.frequency = entry.dictionary[term]?.df ?? 0;
+            if (Object.hasOwn(entry.segment.removedFrequencies, term))
+              matches.frequency -= entry.segment.removedFrequencies[term] ?? 0;
+            if (matches.frequency < 0 || matches.frequency > liveCount)
               throw new Rejected({ status: 503, message: "Invalid live term cardinality" });
-            matches.maximum = Math.min(matches.maximum, frequency);
-            matches.union += frequency;
+            matches.maximum = Math.min(matches.maximum, matches.frequency);
+            matches.union += matches.frequency;
           }
           if (input.match !== "all" && input.match !== "phrase")
             matches.maximum = Math.min(liveCount, matches.union);

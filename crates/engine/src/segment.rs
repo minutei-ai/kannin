@@ -568,63 +568,69 @@ impl Header {
     }
 
     fn allowed(&self, filters: &[Filter], dead: &[u32]) -> Result<Vec<bool>, String> {
-        let key = serde_json::to_string(filters).map_err(|cause| cause.to_string())?;
-        let cached = self
-            .filter_masks
-            .borrow()
-            .entries
-            .iter()
-            .find(|(existing, _, _)| existing == &key)
-            .map(|(_, mask, _)| mask.clone());
-        let mut allowed = vec![true; self.documents.len()];
-        if let Some(mask) = cached {
-            allowed = mask;
-        } else if !filters.is_empty() {
-            let fields: BTreeSet<_> = filters.iter().map(|filter| filter.field.as_str()).collect();
-            let mut values: BTreeMap<_, Option<serde_json::Value>> =
-                fields.iter().map(|field| (*field, None)).collect();
-            self.filter_masks
-                .borrow_mut()
-                .prepare_representatives(&self.documents, &fields)?;
-            let cache = self.filter_masks.borrow();
-            for (index, doc) in self.documents.iter().enumerate() {
-                if let Some((_, representatives)) = &cache.representatives {
-                    let representative = usize::from(representatives[index]);
-                    if representative != index {
-                        allowed[index] = allowed[representative];
-                        continue;
+        let mut allowed = if filters.is_empty() {
+            vec![true; self.documents.len()]
+        } else {
+            let key = serde_json::to_string(filters).map_err(|cause| cause.to_string())?;
+            let cached = self
+                .filter_masks
+                .borrow()
+                .entries
+                .iter()
+                .find(|(existing, _, _)| existing == &key)
+                .map(|(_, mask, _)| mask.clone());
+            if let Some(mask) = cached {
+                mask
+            } else {
+                let mut allowed = vec![true; self.documents.len()];
+                let fields: BTreeSet<_> =
+                    filters.iter().map(|filter| filter.field.as_str()).collect();
+                let mut values: BTreeMap<_, Option<serde_json::Value>> =
+                    fields.iter().map(|field| (*field, None)).collect();
+                self.filter_masks
+                    .borrow_mut()
+                    .prepare_representatives(&self.documents, &fields)?;
+                let cache = self.filter_masks.borrow();
+                for (index, doc) in self.documents.iter().enumerate() {
+                    if let Some((_, representatives)) = &cache.representatives {
+                        let representative = usize::from(representatives[index]);
+                        if representative != index {
+                            allowed[index] = allowed[representative];
+                            continue;
+                        }
+                    }
+                    for value in values.values_mut() {
+                        *value = None;
+                    }
+                    let mut decoder = serde_json::Deserializer::from_str(doc.attributes.get());
+                    serde::de::DeserializeSeed::deserialize(
+                        FilterAttributes {
+                            fields: &fields,
+                            values: &mut values,
+                        },
+                        &mut decoder,
+                    )
+                    .map_err(|cause| cause.to_string())?;
+                    decoder.end().map_err(|cause| cause.to_string())?;
+                    for filter in filters {
+                        if !filter
+                            .matches(values.get(filter.field.as_str()).and_then(Option::as_ref))?
+                        {
+                            allowed[index] = false;
+                            break;
+                        }
                     }
                 }
-                for value in values.values_mut() {
-                    *value = None;
+                drop(cache);
+                let bytes = key.capacity() + allowed.capacity() + 128;
+                let mut cache = self.filter_masks.borrow_mut();
+                if cache.reserve(bytes) {
+                    cache.bytes += bytes;
+                    cache.entries.push_back((key, allowed.clone(), bytes));
                 }
-                let mut decoder = serde_json::Deserializer::from_str(doc.attributes.get());
-                serde::de::DeserializeSeed::deserialize(
-                    FilterAttributes {
-                        fields: &fields,
-                        values: &mut values,
-                    },
-                    &mut decoder,
-                )
-                .map_err(|cause| cause.to_string())?;
-                decoder.end().map_err(|cause| cause.to_string())?;
-                for filter in filters {
-                    if !filter
-                        .matches(values.get(filter.field.as_str()).and_then(Option::as_ref))?
-                    {
-                        allowed[index] = false;
-                        break;
-                    }
-                }
+                allowed
             }
-            drop(cache);
-            let bytes = key.capacity() + allowed.capacity() + 128;
-            let mut cache = self.filter_masks.borrow_mut();
-            if cache.reserve(bytes) {
-                cache.bytes += bytes;
-                cache.entries.push_back((key, allowed.clone(), bytes));
-            }
-        }
+        };
         for row in dead {
             *allowed
                 .get_mut(*row as usize)
@@ -4274,13 +4280,26 @@ pub mod wasm {
             &self,
             query: &PreparedQuery,
             dead: &str,
+            constant_attributes: Option<String>,
         ) -> Result<Ranker, JsValue> {
             let dead: Vec<u32> = serde_json::from_str(dead)
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
-            let search = query
-                .query
-                .ranker(self.header.clone(), &dead)
-                .map_err(|cause| JsValue::from_str(&cause))?;
+            let filters = if uniform_filters(&query.query.filters, constant_attributes)
+                .map_err(|cause| JsValue::from_str(&cause))?
+            {
+                &[]
+            } else {
+                query.query.filters.as_slice()
+            };
+            let search = Search::with_terms(
+                self.header.clone(),
+                query.query.terms.clone(),
+                &query.query.mode,
+                query.query.top_k,
+                &dead,
+                filters,
+            )
+            .map_err(|cause| JsValue::from_str(&cause))?;
             Ok(Ranker { search })
         }
 

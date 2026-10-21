@@ -282,6 +282,7 @@ const encodeQueryResult = Schema.encodeSync(QueryResult);
 const decodePostingSpans = Schema.decodeEffect(Schema.fromJsonString(PostingSpans));
 const decodeSegmentHits = Schema.decodeEffect(Schema.fromJsonString(SegmentHits));
 const encodeRankingInput = Schema.encodeSync(Schema.fromJsonString(RankingInput));
+const encodeConstantAttributes = Schema.encodeSync(Schema.fromJsonString(ConstantAttributes));
 const isNamespaceName = Schema.is(NamespaceName);
 const isOperation = Schema.is(Operation);
 const encodeCatalogTelemetry = Schema.encodeEffect(Schema.fromJsonString(CatalogTelemetry));
@@ -647,21 +648,20 @@ async function textQuery(
     );
     for (const [index, segment] of root.segments.entries()) {
       const requested = bloomMatches[index];
-      const dictionary = segment.commonTerms;
-      if (
-        requested === undefined ||
-        requested.length === 0 ||
-        dictionary === undefined ||
-        !requested.every((term) => Object.hasOwn(dictionary, term))
-      )
-        continue;
+      if (requested === undefined || requested.length === 0) continue;
       const attributes = segment.constantAttributes;
       if (
         attributes === undefined ||
         !input.filters.every((filter) => Object.hasOwn(attributes, filter.field))
       )
         continue;
-      const encoded = Schema.encodeSync(Schema.fromJsonString(ConstantAttributes))(attributes);
+      const encoded = encodeConstantAttributes(
+        Object.fromEntries(
+          Object.entries(attributes).filter(([field]) =>
+            input.filters.some((filter) => filter.field === field),
+          ),
+        ),
+      );
       if (segment_filter(encoded, encodedFilters)) unrestricted.set(segment.key, encoded);
     }
   }
@@ -927,6 +927,7 @@ async function textQuery(
     bytes: 0,
     segments: 0,
     common: 0,
+    uniform: 0,
   };
   using plans = new DisposableStack();
   const compilation: { query: PreparedQuery | undefined } = { query: undefined };
@@ -1012,12 +1013,15 @@ async function textQuery(
               );
             }
           }
+          if (unrestricted.has(segment.key)) rankMetrics.uniform += 1;
           return withDirectory(
             segment.key,
             segment.headerBytes,
             (decoded) =>
               Effect.acquireUseRelease(
-                Effect.sync(() => decoded.ranker_prepared(prepared, dead)),
+                Effect.sync(() =>
+                  decoded.ranker_prepared(prepared, dead, unrestricted.get(segment.key)),
+                ),
                 (ranker) =>
                   Effect.gen(function* () {
                     rankMetrics.prepare += (yield* Clock.currentTimeNanos) - prepareStarted;
@@ -1265,6 +1269,7 @@ async function textQuery(
     }
   }
   timings.append("server-timing", `text_common_leaders;desc="segments=${rankMetrics.common}"`);
+  timings.append("server-timing", `text_uniform_postings;desc="segments=${rankMetrics.uniform}"`);
   timings.append("server-timing", `text_rank;dur=${Number(rankingEnded - dictionaryEnded) / 1e6}`);
   timings.append("server-timing", `text_rank_prepare;dur=${Number(rankMetrics.prepare) / 1e6}`);
   timings.append(

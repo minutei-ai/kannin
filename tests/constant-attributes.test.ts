@@ -112,6 +112,11 @@ test("native numeric representations cannot certify converted filter values", ()
         bytes.subarray(base + block.data.offset, base + block.data.offset + block.data.length),
       );
   expect(Schema.decodeSync(Schema.fromJsonString(SegmentHits))(ranker.finish())).toEqual([]);
+  expect(() => directory.ranker_prepared(prepared, "[]", '{"integral":2.0}')).toThrow();
+  expect(() => directory.ranker_prepared(prepared, "[]", '{"year":[]}')).toThrow();
+  expect(() =>
+    directory.ranker_prepared(prepared, "[]", JSON.stringify({ padding: "x".repeat(512) })),
+  ).toThrow();
   const proof = Schema.encodeSync(Schema.fromJsonString(ConstantAttributes))(
     Schema.decodeSync(Schema.fromJsonString(ConstantAttributes))(segment.constant_attributes()),
   );
@@ -204,17 +209,23 @@ test("uniform filtered leaders equal complete posting rankings and refuse incomp
           segment.constant_attributes(),
         );
         using ranker = directory.ranker_prepared(prepared, encodedDead);
+        using uniform = directory.ranker_prepared(
+          prepared,
+          encodedDead,
+          segment.constant_attributes(),
+        );
         for (const span of Schema.decodeSync(Schema.fromJsonString(PostingSpans))(
           ranker.posting_spans(),
         ))
-          for (const block of span.blocks)
-            ranker.add(
-              span.term,
-              bytes.subarray(
-                base + block.data.offset,
-                base + block.data.offset + block.data.length,
-              ),
+          for (const block of span.blocks) {
+            const page = bytes.subarray(
+              base + block.data.offset,
+              base + block.data.offset + block.data.length,
             );
+            ranker.add(span.term, page);
+            uniform.add(span.term, page);
+          }
+        expect(uniform.finish()).toBe(ranker.finish());
         expect(fast).toBeDefined();
         expect(Schema.decodeUnknownSync(Schema.fromJsonString(SegmentHits))(fast)).toEqual(
           Schema.decodeSync(Schema.fromJsonString(SegmentHits))(ranker.finish()),
@@ -283,11 +294,15 @@ test("manifest proofs preserve filtered reads through fallback, tombstones, rebu
   const namespace = "uniform-proof";
   for (const batch of [0, 1, 2, 3]) {
     const documents = Array.from({ length: 50 }, (_, index) =>
-      document(String(batch * 50 + index).padStart(3, "0"), "rust cloudflare", {
-        year: 2024,
-        group: batch % 2,
-        value: index,
-      }),
+      document(
+        String(batch * 50 + index).padStart(3, "0"),
+        `rust cloudflare unique${batch * 50 + index}`,
+        {
+          year: 2024,
+          group: batch % 2,
+          value: index,
+        },
+      ),
     );
     expect((await request(worker, namespace, "write", write(documents))).status).toBe(200);
   }
@@ -324,6 +339,10 @@ test("manifest proofs preserve filtered reads through fallback, tombstones, rebu
       original.rows.map((row) => row.id),
     ],
     [{ ...query, match: "phrase" }, original.rows.map((row) => row.id)],
+    [
+      textQuery("unique2 unique152", 10, [{ field: "year", op: "gte", value: 2020 }]),
+      ["002", "152"],
+    ],
   ] as const;
   const oracle = new Map<number, typeof original.rows>();
   for (const accelerated of [true, false]) {
@@ -342,6 +361,16 @@ test("manifest proofs preserve filtered reads through fallback, tombstones, rebu
       expect(response.status).toBe(200);
       const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
       expect(result.rows.map((row) => row.id)).toEqual([...ids]);
+      if (index === 5 || index === 6) {
+        if (accelerated)
+          expect(response.headers.get("server-timing")).toMatch(
+            /text_uniform_postings;desc="segments=[1-9]/,
+          );
+        else
+          expect(response.headers.get("server-timing")).toContain(
+            'text_uniform_postings;desc="segments=0"',
+          );
+      }
       if (accelerated) oracle.set(index, result.rows);
       else {
         const expected = oracle.get(index);

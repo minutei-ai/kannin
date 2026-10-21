@@ -18,6 +18,19 @@ export const Operation = Schema.Literals([
 export const Scalar = Schema.Union([Unicode, Schema.Finite, Schema.Boolean, Schema.Null]);
 export const FieldName = Schema.String.check(Schema.isPattern(/^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/));
 export const Attributes = Schema.Record(FieldName, Scalar);
+export const ConstantAttributes = Attributes.check(
+  Schema.makeFilter(
+    (attributes) =>
+      Object.values(attributes).every(
+        (value) => typeof value !== "number" || Number.isSafeInteger(value),
+      ) || "Numeric constants must be safe integers",
+  ),
+  Schema.makeFilter(
+    (attributes) =>
+      new TextEncoder().encode(Schema.encodeSync(Schema.fromJsonString(Attributes))(attributes))
+        .byteLength <= 512 || "Constant attributes exceed 512 bytes",
+  ),
+);
 export const VectorFilterFields = Schema.Array(FieldName).check(
   Schema.isMaxLength(5),
   Schema.makeFilter(
@@ -140,6 +153,7 @@ export const Root = Schema.Struct({
       removedFrequencies: Schema.Record(Schema.String, Schema.Int),
       commonTerms: Schema.optional(Schema.suspend(() => CommonTerms)),
       commonLeaders: Schema.optional(Schema.suspend(() => CommonLeaders)),
+      constantAttributes: Schema.optional(ConstantAttributes),
     }),
   ),
 });

@@ -49,6 +49,7 @@ import {
   Root,
   CommonTerms,
   CommonLeaders,
+  ConstantAttributes,
   SnapshotCacheHeaders,
   SegmentDocument,
   SegmentHits,
@@ -639,12 +640,37 @@ async function textQuery(
     }),
     Match.orElse(() => bloomCandidates(root.segments, terms, "termBloom")),
   );
+  const unrestricted = new Map<string, string>();
+  if (input.filters.length > 0) {
+    const encodedFilters = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Filter)))(
+      input.filters,
+    );
+    for (const [index, segment] of root.segments.entries()) {
+      const requested = bloomMatches[index];
+      const dictionary = segment.commonTerms;
+      if (
+        requested === undefined ||
+        requested.length === 0 ||
+        dictionary === undefined ||
+        !requested.every((term) => Object.hasOwn(dictionary, term))
+      )
+        continue;
+      const attributes = segment.constantAttributes;
+      if (
+        attributes === undefined ||
+        !input.filters.every((filter) => Object.hasOwn(attributes, filter.field))
+      )
+        continue;
+      const encoded = Schema.encodeSync(Schema.fromJsonString(ConstantAttributes))(attributes);
+      if (segment_filter(encoded, encodedFilters)) unrestricted.set(segment.key, encoded);
+    }
+  }
   const localRanking =
     covered &&
-    input.filters.length === 0 &&
     input.match !== "phrase" &&
     root.segments.every((segment) => {
       const leaders = segment.commonLeaders;
+      if (input.filters.length > 0 && !unrestricted.has(segment.key)) return false;
       if (segment.dead.length !== 0 || leaders === undefined) return false;
       return leaders.some(
         (leader) =>
@@ -724,7 +750,11 @@ async function textQuery(
   }
   if (planning.value === undefined) {
     const common = selections.flatMap(({ segment, terms: requested }) => {
-      if (input.filters.length !== 0 || segment.commonTerms === undefined) return [];
+      if (
+        (input.filters.length > 0 && !unrestricted.has(segment.key)) ||
+        segment.commonTerms === undefined
+      )
+        return [];
       const saved = new Map(Object.entries(segment.commonTerms));
       const dictionary = Object.fromEntries(
         requested.flatMap((term) => {
@@ -959,17 +989,20 @@ async function textQuery(
         ({ segment, identity }) => {
           const dead = Schema.encodeSync(integers)(segment.dead);
           const prepareStarted = Effect.runSync(Clock.currentTimeNanos);
+          const dictionary = segment.commonTerms;
           if (
-            input.filters.length === 0 &&
+            (input.filters.length === 0 || unrestricted.has(segment.key)) &&
             input.match !== "phrase" &&
-            segment.commonTerms !== undefined &&
-            segment.commonLeaders !== undefined
+            dictionary !== undefined &&
+            segment.commonLeaders !== undefined &&
+            terms.every((term) => Object.hasOwn(dictionary, term))
           ) {
             const common = prepared.common_hits(
-              Schema.encodeSync(Schema.fromJsonString(CommonTerms))(segment.commonTerms),
+              Schema.encodeSync(Schema.fromJsonString(CommonTerms))(dictionary),
               Schema.encodeSync(Schema.fromJsonString(CommonLeaders))(segment.commonLeaders),
               segment.count,
               dead,
+              unrestricted.get(segment.key),
             );
             if (common !== undefined) {
               rankMetrics.common += 1;
@@ -1821,6 +1854,7 @@ export class SearchNamespace extends DurableObject<Env> {
         termBloom: bloom(Object.keys(built.header.terms)),
         commonTerms: built.commonTerms,
         commonLeaders: built.commonLeaders,
+        constantAttributes: built.constantAttributes,
         dead: [],
         removedFrequencies: {},
       });
@@ -2240,6 +2274,7 @@ export class SearchNamespace extends DurableObject<Env> {
         termBloom: bloom(Object.keys(built.header.terms)),
         commonTerms: built.commonTerms,
         commonLeaders: built.commonLeaders,
+        constantAttributes: built.constantAttributes,
         dead: [],
         removedFrequencies: {},
       });
@@ -2462,14 +2497,20 @@ export class SearchNamespace extends DurableObject<Env> {
               if (
                 current.manifest.segments.some(
                   (segment) =>
-                    segment.commonTerms === undefined || segment.commonLeaders === undefined,
+                    segment.commonTerms === undefined ||
+                    segment.commonLeaders === undefined ||
+                    segment.constantAttributes === undefined,
                 )
               ) {
                 const segments = yield* Effect.forEach(
                   current.manifest.segments,
                   (segment) =>
                     Effect.gen(function* () {
-                      if (segment.commonTerms !== undefined && segment.commonLeaders !== undefined)
+                      if (
+                        segment.commonTerms !== undefined &&
+                        segment.commonLeaders !== undefined &&
+                        segment.constantAttributes !== undefined
+                      )
                         return segment;
                       const metadata = yield* withDirectory(
                         segment.key,
@@ -2482,7 +2523,10 @@ export class SearchNamespace extends DurableObject<Env> {
                             const commonLeaders = yield* Schema.decodeEffect(
                               Schema.fromJsonString(CommonLeaders),
                             )(directory.common_leaders());
-                            return { commonTerms, commonLeaders };
+                            const constantAttributes = yield* Schema.decodeEffect(
+                              Schema.fromJsonString(ConstantAttributes),
+                            )(directory.constant_attributes());
+                            return { commonTerms, commonLeaders, constantAttributes };
                           }),
                         undefined,
                         true,

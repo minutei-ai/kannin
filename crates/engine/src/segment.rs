@@ -2623,6 +2623,87 @@ pub mod wasm {
         serde_json::to_string(&leaders).map_err(|cause| cause.to_string())
     }
 
+    fn constant_number(number: &serde_json::Number) -> bool {
+        number
+            .as_i64()
+            .is_some_and(|value| (-9_007_199_254_740_991..=9_007_199_254_740_991).contains(&value))
+    }
+
+    fn constant_attributes(header: &Header) -> Result<String, String> {
+        let first = header.documents.first().ok_or("Segment has no documents")?;
+        let attributes: BTreeMap<String, &serde_json::value::RawValue> =
+            serde_json::from_str(first.attributes.get()).map_err(|cause| cause.to_string())?;
+        let mut selected = BTreeMap::new();
+        for (name, value) in attributes {
+            if value.get().len() > 512 || value.get().starts_with(['[', '{']) {
+                continue;
+            }
+            if !value.get().starts_with(['"', 't', 'f', 'n']) {
+                let number =
+                    serde_json::from_str(value.get()).map_err(|cause| cause.to_string())?;
+                if !constant_number(&number) {
+                    continue;
+                }
+            }
+            selected.insert(name.clone(), value);
+            if serde_json::to_vec(&selected)
+                .map_err(|cause| cause.to_string())?
+                .len()
+                > 512
+            {
+                selected.remove(&name);
+            }
+        }
+        for document in header.documents.iter().skip(1) {
+            if selected.is_empty() {
+                break;
+            }
+            let attributes: BTreeMap<String, &serde_json::value::RawValue> =
+                serde_json::from_str(document.attributes.get())
+                    .map_err(|cause| cause.to_string())?;
+            selected.retain(|name, value| {
+                attributes
+                    .get(name)
+                    .is_some_and(|candidate| candidate.get() == value.get())
+            });
+        }
+        serde_json::to_string(&selected).map_err(|cause| cause.to_string())
+    }
+
+    fn uniform_filters(filters: &[Filter], attributes: Option<String>) -> Result<bool, String> {
+        if filters.is_empty() {
+            return Ok(true);
+        }
+        let Some(attributes) = attributes
+            .map(|encoded| {
+                if encoded.len() > 512 {
+                    return Err("Constant attributes exceed 512 bytes".to_owned());
+                }
+                serde_json::from_str::<BTreeMap<String, serde_json::Value>>(&encoded)
+                    .map_err(|cause| cause.to_string())
+            })
+            .transpose()?
+        else {
+            return Ok(false);
+        };
+        if attributes.values().any(|value| {
+            value.is_array()
+                || value.is_object()
+                || value
+                    .as_number()
+                    .is_some_and(|number| !constant_number(number))
+        }) {
+            return Err("Constant attributes must round-trip losslessly".to_owned());
+        }
+        if filters
+            .iter()
+            .any(|filter| !attributes.contains_key(&filter.field))
+        {
+            return Ok(false);
+        }
+        matches(&attributes, filters)
+    }
+
     fn common_terms(header: &Header) -> Result<String, String> {
         let mut entries: Vec<_> = header
             .terms
@@ -3859,6 +3940,10 @@ pub mod wasm {
         pub fn common_leaders(&self) -> Result<String, JsValue> {
             common_leaders(&self.built.header).map_err(|cause| JsValue::from_str(&cause))
         }
+        #[doc = "# Errors\nRejects invalid document metadata or serialization."]
+        pub fn constant_attributes(&self) -> Result<String, JsValue> {
+            constant_attributes(&self.built.header).map_err(|cause| JsValue::from_str(&cause))
+        }
 
         #[doc = "# Errors\nRejects directory serialization errors."]
         pub fn header_json(&self) -> Result<String, JsValue> {
@@ -4097,6 +4182,10 @@ pub mod wasm {
         #[doc = "# Errors\nRejects common-leader serialization errors."]
         pub fn common_leaders(&self) -> Result<String, JsValue> {
             common_leaders(&self.header).map_err(|cause| JsValue::from_str(&cause))
+        }
+        #[doc = "# Errors\nRejects invalid document metadata or serialization."]
+        pub fn constant_attributes(&self) -> Result<String, JsValue> {
+            constant_attributes(&self.header).map_err(|cause| JsValue::from_str(&cause))
         }
 
         #[doc = "# Errors\nRejects invalid filters, attributes, or minimum serialization."]
@@ -4405,8 +4494,12 @@ pub mod wasm {
             leaders: &str,
             count: u32,
             dead: &str,
+            constant_attributes: Option<String>,
         ) -> Result<Option<String>, JsValue> {
-            if !self.query.filters.is_empty() || self.query.mode == "phrase" {
+            if self.query.mode == "phrase"
+                || !uniform_filters(&self.query.filters, constant_attributes)
+                    .map_err(|cause| JsValue::from_str(&cause))?
+            {
                 return Ok(None);
             }
             if leaders.len() > 16384 {

@@ -52,6 +52,7 @@ import {
   SegmentCacheProps,
   Rejected,
   NamespaceSchema,
+  ConstantAttributes,
   TextPlan,
   type SegmentScoreBound,
 } from "./protocol";
@@ -1922,7 +1923,10 @@ export const buildSegment = Effect.fn("raio.buildSegment")(
           const commonLeaders = yield* Schema.decodeEffect(Schema.fromJsonString(CommonLeaders))(
             segment.common_leaders(),
           );
-          return { bytes: segment.bytes(), header, commonTerms, commonLeaders };
+          const constantAttributes = yield* Schema.decodeEffect(
+            Schema.fromJsonString(ConstantAttributes),
+          )(segment.constant_attributes());
+          return { bytes: segment.bytes(), header, commonTerms, commonLeaders, constantAttributes };
         }),
       (segment) => Effect.sync(() => segment.free()),
     ),

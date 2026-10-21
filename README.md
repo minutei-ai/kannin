@@ -11,19 +11,21 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 ## Performance
 
-Configured namespaces now keep only declared filter attributes in new segment headers. On a local 30,000-document corpus with large unselected attributes, headers shrink **50.2 → 3.1 MB**, and complete segment storage **54.9 → 7.8 MB**. Complete document/posting payloads remain identical. A control where every attribute is declared preserves complete segment bytes.
+Segments now record a bounded proof of attributes shared by every document. Filters that match that proof can use existing exact common-term leaders without loading the full filter catalog. On a local 30,000-document, thirty-segment corpus:
 
-| Rich-attribute workload | State                  | Before median (ms) | Current median (ms) |
-| ----------------------- | ---------------------- | -----------------: | ------------------: |
-| 64 rare terms + filter  | prepared cold          |             2020.4 |              1189.6 |
-| Dense all + filter      | prepared cold          |              944.2 |               541.7 |
-| Phrase + filter         | prepared cold          |              855.3 |               557.0 |
-| 64 rare terms + filter  | absent-derivative cold |             2932.1 |              1046.3 |
-| 64 rare terms + filter  | warm                   |              131.1 |                37.2 |
+| Rich-attribute workload        | State         | Before median (ms) | Current median (ms) |
+| ------------------------------ | ------------- | -----------------: | ------------------: |
+| Dense any + uniform filter     | prepared cold |              486.8 |               178.7 |
+| Dense all + uniform filter     | prepared cold |              473.8 |               177.6 |
+| Phrase + uniform filter        | prepared cold |              499.1 |               350.1 |
+| 64 rare terms + uniform filter | prepared cold |             1103.9 |              1030.9 |
+| Dense any + uniform filter     | warm          |               31.7 |                17.4 |
 
-Two alternating paired cohorts use thirty segments, a fixed logical CPU, a two-GiB cap and no swap. Process/Cache API state is empty for cold reads; backend/filesystem caches may remain warm. All **640 complete responses match across 320 pairs**. Rare recovery workerd RSS high-water falls **226 → 158 MiB**; this includes local emulation and is not Cloudflare isolate heap. [All workloads, methods and tradeoffs](docs/performance.md#namespace-header-projection).
+Two alternating paired cohorts use a fixed logical CPU, a two-GiB cap and no swap. Cold reads start with empty process/Cache API state; backend/filesystem caches may remain warm. All **832 complete responses match across 416 pairs**, including unfiltered and selective controls. Dense-any prepared cold workerd high-water falls **134.5 → 127.3 MiB**; rare-query high-water rises **153.0 → 156.9 MiB**. These local emulation measurements do not establish Cloudflare isolate heap. [Methods, all workloads and write costs](docs/performance.md#uniform-segment-filter-proofs).
 
-**The general 200 ms cold / 100 ms warm targets remain unmet.** Cold reads still exceed one second in some workloads; phrase warm maximum reaches 177.8 ms. Dense warm results and controls without discarded attributes remain mixed. The earlier million-document fixture already contains only its declared attributes, so this reduction does not establish a gain there. [Million-document results](docs/performance.md#bounded-filter-row-reuse-and-benchmark-coverage).
+**The general 200 ms cold / 100 ms warm targets remain unmet.** Rich dense cold reads with missing derivatives still reach 248.6 ms, phrases reach 537.9 ms, and rare reads exceed one second. Selective filters retain the ordinary catalog path. The earlier million-document fixture has variable attributes; this experiment does not establish a gain there. [Million-document results](docs/performance.md#bounded-filter-row-reuse-and-benchmark-coverage).
+
+The preceding header projection reduced headers **50.2 → 3.1 MB** and total segment storage **54.9 → 7.8 MB** when large attributes were not selected for filtering. Full document/posting payloads remain intact. [Projection measurements](docs/performance.md#namespace-header-projection).
 
 Earlier unfiltered synthetic controls observed common-query medians **139–146 ms** and maxima **161–184 ms** across eight fresh candidate processes with two CPUs. Those workloads and capacity differ from the table above; this is not a general bound or a Cloudflare result. [Capacity control](docs/performance.md#exact-minimum-length-document-indexes).
 
@@ -46,7 +48,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **324 Worker/tooling tests and 64 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **328 Worker/tooling tests and 64 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

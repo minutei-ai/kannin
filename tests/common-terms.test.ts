@@ -145,7 +145,7 @@ test("manifest prefixes preserve global scores, tombstones, filters and partial 
   for (const mode of ["any", "all", "phrase"] as const) {
     const fast = await read(name, { ...textQuery("constructor rust"), match: mode });
     const control = await read(name, {
-      ...textQuery("constructor rust", 10, [{ field: "year", op: "gte", value: 0 }]),
+      ...textQuery("constructor rust", 10, [{ field: "group", op: "ne", value: -1 }]),
       match: mode,
     });
     expect(fast.result).toEqual(control.result);
@@ -170,7 +170,7 @@ test("manifest prefixes preserve global scores, tombstones, filters and partial 
   const deleted = await read(name, textQuery("constructor rust"));
   expect(deleted.timing).toContain("catalog_root_prefix");
   expect(deleted.result).toEqual(
-    (await read(name, textQuery("constructor rust", 10, [{ field: "year", op: "gte", value: 0 }])))
+    (await read(name, textQuery("constructor rust", 10, [{ field: "group", op: "ne", value: -1 }])))
       .result,
   );
   expect(deleted.result.rows.every((row) => !["0-0", "1-0", "2-0"].includes(row.id))).toBe(true);
@@ -187,7 +187,7 @@ test("manifest prefixes preserve global scores, tombstones, filters and partial 
   const mixed = await read(name, textQuery("constructor rust"));
   expect(mixed.timing).not.toContain("catalog_root_prefix");
   expect(mixed.result).toEqual(
-    (await read(name, textQuery("constructor rust", 10, [{ field: "year", op: "gte", value: 0 }])))
+    (await read(name, textQuery("constructor rust", 10, [{ field: "group", op: "ne", value: -1 }])))
       .result,
   );
   expect((await request(worker, name, "compact", {})).status).toBe(200);

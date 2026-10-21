@@ -1462,6 +1462,59 @@ test("oversized field projections retain the original minimum fallback", () => {
   );
 });
 
+test("overview projections keep exact filters after eligibility scratch reuse begins", () => {
+  const prefix = Array.from({ length: 257 }, (_, index) => `[{"year":${index}},0,0]`).join(",");
+  const json = `[{},[${prefix},[{"year":800,"year":650},5,6],[{},0,0],[{"year":700,"year":800},1,1],[{"year":650},2,3]],null,[]]`;
+  const filters =
+    '[{"field":"year","op":"gte","value":600},{"field":"year","op":"lte","value":700}]';
+  const projected = Schema.decodeSync(Schema.fromJsonString(ProjectedTermCatalog))(
+    segment_overview_project(pack(json).subarray(8), '["alpha"]', filters),
+  );
+  expect(projected.minimum).toEqual([2, 3]);
+  expect(projected.eligibility).toBeNull();
+
+  const wideFilters = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Filter)))([
+    { field: "year", op: "gte", value: 600 },
+    { field: "year", op: "lte", value: 700 },
+    ...Array.from({ length: 8 }, (_, index) => ({
+      field: `missing${index}`,
+      op: "exists" as const,
+      value: false,
+    })),
+  ]);
+  const wideProjection = Schema.decodeSync(Schema.fromJsonString(ProjectedTermCatalog))(
+    segment_overview_project(pack(json).subarray(8), '["alpha"]', wideFilters),
+  );
+  expect(wideProjection.minimum).toEqual([2, 3]);
+  expect(wideProjection.eligibility).toBeNull();
+
+  for (const value of ["[]", "{}", JSON.stringify("x".repeat(4097))]) {
+    const overview = `[{},[[{"note":${value}},5,6],[{},0,0]],null,[]]`;
+    const result = Schema.decodeSync(Schema.fromJsonString(ProjectedTermCatalog))(
+      segment_overview_project(
+        pack(overview).subarray(8),
+        '["alpha"]',
+        '[{"field":"note","op":"exists","value":true}]',
+      ),
+    );
+    expect(result.minimum).toEqual([5, 6]);
+    expect(result.eligibility).toBeNull();
+  }
+});
+
+test("overview projection still rejects malformed groups after eligibility scratch reuse begins", () => {
+  const prefix = Array.from({ length: 257 }, (_, index) => `[{"year":${index}},0,0]`).join(",");
+  const filters = '[{"field":"year","op":"exists","value":true}]';
+  for (const group of [
+    '[{"year":300,"extra":{"nested":1e400}},0,0]',
+    '[{"year":300},4294967296,0]',
+    '[{"year":300},0,0,1]',
+  ]) {
+    const overview = pack(`[{},[${prefix},${group}],null,[]]`).subarray(8);
+    expect(() => segment_overview_project(overview, '["alpha"]', filters)).toThrow();
+  }
+});
+
 test("indexed eligibility predicates preserve field order, duplicates and every scalar operator", () => {
   using segment = new Segment(
     JSON.stringify(

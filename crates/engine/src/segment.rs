@@ -2788,6 +2788,9 @@ pub mod wasm {
 
     impl EligibilityProjectionBuilder {
         fn new(fields: Vec<String>) -> Result<Self, String> {
+            if fields.len() > 16 {
+                return Err("Eligibility exceeds sixteen fields".into());
+            }
             let bytes = serde_json::to_vec(&fields)
                 .map_err(|cause| cause.to_string())?
                 .len()
@@ -2829,24 +2832,36 @@ pub mod wasm {
             }
         }
 
-        fn push(
+        fn push<'a>(
             &mut self,
-            attributes: &BTreeMap<String, serde_json::Value>,
+            attributes: impl Fn(&str) -> Option<&'a serde_json::Value>,
             title: u32,
             body: u32,
         ) -> Result<(), String> {
             if self.groups.is_none() && self.columns.is_none() {
                 return Ok(());
             }
-            if self
-                .fields
+            let mut values = [None; 16];
+            for (value, field) in values.iter_mut().zip(&self.fields) {
+                *value = attributes(field);
+            }
+            self.push_values(&values[..self.fields.len()], title, body)
+        }
+
+        fn push_values(
+            &mut self,
+            attributes: &[Option<&serde_json::Value>],
+            title: u32,
+            body: u32,
+        ) -> Result<(), String> {
+            if attributes
                 .iter()
-                .filter_map(|field| attributes.get(field))
+                .flatten()
                 .any(|value| value.is_array() || value.is_object())
-                || self
-                    .fields
+                || attributes
                     .iter()
-                    .filter_map(|field| attributes.get(field))
+                    .copied()
+                    .flatten()
                     .filter_map(serde_json::Value::as_str)
                     .map(str::len)
                     .sum::<usize>()
@@ -2860,9 +2875,9 @@ pub mod wasm {
                 let Some(columns) = &mut self.columns else {
                     return Ok(());
                 };
-                for (field, column) in self.fields.iter().zip(columns.iter_mut()) {
+                for (value, column) in attributes.iter().zip(columns.iter_mut()) {
                     self.scalar.clear();
-                    if let Some(value) = attributes.get(field) {
+                    if let Some(value) = value {
                         serde_json::to_writer(&mut self.scalar, value)
                             .map_err(|cause| cause.to_string())?;
                     }
@@ -2885,12 +2900,10 @@ pub mod wasm {
                 }
                 return Ok(());
             }
-            let values: Vec<Vec<_>> = self
-                .fields
+            let values: Vec<Vec<_>> = attributes
                 .iter()
-                .map(|field| {
-                    attributes
-                        .get(field)
+                .map(|value| {
+                    value
                         .map(serde_json::to_string)
                         .transpose()
                         .map(|value| value.into_iter().collect())
@@ -3452,6 +3465,55 @@ pub mod wasm {
         projection: Option<EligibilityProjection>,
     }
 
+    struct FilteredGroup<'a, 'b> {
+        fields: &'a BTreeSet<&'a str>,
+        values: &'b mut BTreeMap<&'a str, Option<serde_json::Value>>,
+    }
+
+    impl<'de> serde::de::DeserializeSeed<'de> for FilteredGroup<'_, '_> {
+        type Value = (u32, u32);
+
+        fn deserialize<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_tuple(3, self)
+        }
+    }
+
+    impl<'de> serde::de::Visitor<'de> for FilteredGroup<'_, '_> {
+        type Value = (u32, u32);
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("attributes and two unsigned minimum lengths")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> Result<Self::Value, A::Error> {
+            for value in self.values.values_mut() {
+                *value = None;
+            }
+            sequence
+                .next_element_seed(super::FilterAttributes {
+                    fields: self.fields,
+                    values: &mut *self.values,
+                })?
+                .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+            let title = sequence
+                .next_element::<u32>()?
+                .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+            let body = sequence
+                .next_element::<u32>()?
+                .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
+            if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(serde::de::Error::invalid_length(4, &self));
+            }
+            Ok((title, body))
+        }
+    }
+
     struct EligibleGroups<'a>(&'a [Filter]);
 
     impl<'de> serde::de::DeserializeSeed<'de> for EligibleGroups<'_> {
@@ -3476,37 +3538,78 @@ pub mod wasm {
             self,
             mut sequence: A,
         ) -> Result<Self::Value, A::Error> {
+            if self.0.is_empty() {
+                let fields = BTreeSet::new();
+                if sequence
+                    .next_element_seed(SelectedGroup(&fields))?
+                    .is_none()
+                {
+                    return Err(serde::de::Error::custom("Overview eligibility is empty"));
+                }
+                while sequence
+                    .next_element_seed(SelectedGroup(&fields))?
+                    .is_some()
+                {}
+                return Ok(EligibleSelection {
+                    minimum: Some((0, 0)),
+                    projection: None,
+                });
+            }
             let mut minimum = None;
             let fields: BTreeSet<_> = self.0.iter().map(|filter| filter.field.as_str()).collect();
+            let reusable = fields.len() <= 8;
             let mut groups = EligibilityProjectionBuilder::new(
                 fields.iter().map(|field| (*field).to_owned()).collect(),
             )
             .map_err(serde::de::Error::custom)?;
             let mut present = false;
-            while let Some((attributes, title, body)) =
-                sequence.next_element_seed(SelectedGroup(&fields))?
-            {
-                present = true;
-                groups
-                    .push(&attributes, title, body)
-                    .map_err(serde::de::Error::custom)?;
-                if matches(&attributes, self.0).map_err(serde::de::Error::custom)? {
-                    minimum = Some(match minimum {
-                        Some((minimum_title, minimum_body)) => {
-                            (title.min(minimum_title), body.min(minimum_body))
+            if reusable {
+                let mut values = fields.iter().map(|field| (*field, None)).collect();
+                while let Some((title, body)) = sequence.next_element_seed(FilteredGroup {
+                    fields: &fields,
+                    values: &mut values,
+                })? {
+                    present = true;
+                    groups
+                        .push(
+                            |field| values.get(field).and_then(Option::as_ref),
+                            title,
+                            body,
+                        )
+                        .map_err(serde::de::Error::custom)?;
+                    let mut matched = true;
+                    for filter in self.0 {
+                        let actual = values.get(filter.field.as_str()).and_then(Option::as_ref);
+                        if !filter.matches(actual).map_err(serde::de::Error::custom)? {
+                            matched = false;
+                            break;
                         }
-                        None => (title, body),
-                    });
+                    }
+                    if matched {
+                        minimum = Some(match minimum {
+                            Some((a, b)) => (title.min(a), body.min(b)),
+                            None => (title, body),
+                        });
+                    }
+                }
+            } else {
+                while let Some((attributes, title, body)) =
+                    sequence.next_element_seed(SelectedGroup(&fields))?
+                {
+                    present = true;
+                    groups
+                        .push(|field| attributes.get(field), title, body)
+                        .map_err(serde::de::Error::custom)?;
+                    if matches(&attributes, self.0).map_err(serde::de::Error::custom)? {
+                        minimum = Some(match minimum {
+                            Some((a, b)) => (title.min(a), body.min(b)),
+                            None => (title, body),
+                        });
+                    }
                 }
             }
             if !present {
                 return Err(serde::de::Error::custom("Overview eligibility is empty"));
-            }
-            if self.0.is_empty() {
-                return Ok(EligibleSelection {
-                    minimum: Some((0, 0)),
-                    projection: None,
-                });
             }
             Ok(EligibleSelection {
                 minimum,
@@ -4150,7 +4253,7 @@ pub mod wasm {
                         .end()
                         .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
                     groups
-                        .push(&attributes, title, body)
+                        .push(|field| attributes.get(field), title, body)
                         .map_err(|cause| JsValue::from_str(&cause))?;
                     if matches(&attributes, &filters).map_err(|cause| JsValue::from_str(&cause))? {
                         minimum = Some(match minimum {

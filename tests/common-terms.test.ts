@@ -258,3 +258,134 @@ test("rebuild backfills legacy manifest prefixes once without changing sequence 
   expect((await request(worker, name, "rebuild", {})).status).toBe(200);
   expect((await bucket.head(key))?.etag).toBe(version);
 });
+
+test("phrase term-frequency bounds skip impossible segments and preserve exact global scores", async () => {
+  const impossibleDocuments = [
+    { ...document("once-a", "Café rust"), title: "" },
+    { ...document("once-b", "cafe\u0301 rust"), title: "" },
+  ];
+  const phraseDocuments = [
+    ...Array.from({ length: 128 }, (_, index) => ({
+      ...document(`a-${String(index).padStart(3, "0")}`, "cafe rust filler"),
+      title: "",
+    })),
+    { ...document("b-gap", "cafe rust filler cafe"), title: "" },
+    { ...document("z-phrase", "Café rust cafe\u0301"), title: "" },
+  ];
+  const splitDocuments = [
+    { ...document("split-a", "rust cafe\u0301"), title: "Café" },
+    { ...document("split-b", "rust cafe"), title: "cafe\u0301" },
+  ];
+  const sources = [impossibleDocuments, phraseDocuments, splitDocuments];
+  const encodeDocuments = (documents: typeof impossibleDocuments) =>
+    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(
+      documents.map((doc) => ({
+        ...doc,
+        revision: 0,
+      })),
+    );
+  using impossibleSegment = new Segment(encodeDocuments(impossibleDocuments));
+  using phraseSegment = new Segment(encodeDocuments(phraseDocuments));
+  using splitSegment = new Segment(encodeDocuments(splitDocuments));
+  const segments = [impossibleSegment, phraseSegment, splitSegment];
+  const headers = segments.map((segment) =>
+    Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json()),
+  );
+  const frequencies = new Map<string, number>();
+  for (const header of headers)
+    for (const [term, metadata] of Object.entries(header.terms))
+      frequencies.set(term, (frequencies.get(term) ?? 0) + metadata.df);
+  const statistics = {
+    documents: headers.reduce((total, header) => total + header.documents.length, 0),
+    title_length: headers.reduce((total, header) => total + header.total_title_length, 0),
+    body_length: headers.reduce((total, header) => total + header.total_body_length, 0),
+    frequencies: Object.fromEntries(frequencies),
+  };
+  const query = {
+    text: "CAFÉ rust cafe\u0301",
+    mode: "phrase" as const,
+    top_k: 20,
+    dead: [],
+    filters: [],
+    statistics,
+  };
+  const expected = [];
+  for (const [index, segment] of segments.entries()) {
+    const header = headers[index];
+    if (header === undefined) throw new Error("Missing oracle segment header");
+    const bytes = segment.bytes();
+    const base = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
+    using directory = Directory.canonical(bytes.subarray(0, base), base);
+    using ranker = directory.ranker(Schema.encodeSync(Schema.fromJsonString(RankingInput))(query));
+    for (const span of Schema.decodeSync(Schema.fromJsonString(PostingSpans))(
+      ranker.posting_spans(),
+    ))
+      for (const block of span.blocks)
+        ranker.add(
+          span.term,
+          bytes.subarray(base + block.data.offset, base + block.data.offset + block.data.length),
+        );
+    for (const hit of Schema.decodeSync(Schema.fromJsonString(SegmentHits))(ranker.finish())) {
+      const doc = header.documents[hit.row];
+      if (doc === undefined) throw new Error("Missing oracle hit document");
+      expected.push({ id: doc.id, score: hit.score });
+    }
+  }
+  expected.sort((left, right) => {
+    if (left.score !== right.score) return right.score - left.score;
+    if (left.id < right.id) return -1;
+    if (left.id > right.id) return 1;
+    return 0;
+  });
+  const wanted = expected.slice(0, query.top_k);
+  expect(wanted.map(({ id }) => id)).toEqual(["z-phrase"]);
+  const impossibleCommon = Schema.decodeSync(Schema.fromJsonString(CommonTerms))(
+    impossibleSegment.common_terms(),
+  );
+  const splitCommon = Schema.decodeSync(Schema.fromJsonString(CommonTerms))(
+    splitSegment.common_terms(),
+  );
+  const impossibleBound = impossibleCommon.cafe?.bounds[0];
+  const splitBound = splitCommon.cafe?.bounds[0];
+  if (impossibleBound === undefined || splitBound === undefined)
+    throw new Error("Missing repeated-term summary");
+  expect(impossibleBound[0] + impossibleBound[1]).toBeLessThan(2);
+  expect(splitBound[0] + splitBound[1]).toBeGreaterThanOrEqual(2);
+  const phraseTerms = headers[1]?.terms.cafe;
+  if (phraseTerms === undefined) throw new Error("Missing multi-block repeated term");
+  expect(phraseTerms.blocks.some((block) => block.max_title_tf + block.max_body_tf < 2)).toBe(true);
+  expect(phraseTerms.blocks.some((block) => block.max_title_tf + block.max_body_tf >= 2)).toBe(
+    true,
+  );
+
+  for (const accelerated of [true, false]) {
+    const name = `phrase-frequency-${String(accelerated)}`;
+    for (const documents of sources)
+      expect((await request(worker, name, "write", write(documents))).status).toBe(200);
+    const bucket = await worker.getR2Bucket("STORAGE", "raio");
+    const key = `namespaces/${name}/root.json`;
+    const stored = await bucket.get(key);
+    if (stored === null) throw new Error("Missing phrase-frequency manifest");
+    const original = Schema.decodeUnknownSync(Root)(await stored.json());
+    const root = {
+      ...original,
+      segments: original.segments.map((segment) => {
+        if (accelerated) return segment;
+        return Struct.omit(segment, ["commonTerms"]);
+      }),
+    };
+    await bucket.put(key, Schema.encodeSync(Schema.fromJsonString(Root))(root));
+    await worker.unsafeEvictDurableObject("raio", "SearchNamespace", { name });
+    const result = await read(name, {
+      ...textQuery("CAFÉ rust cafe\u0301", query.top_k),
+      match: "phrase",
+    });
+    expect(result.result.rows.map(({ id, score }) => ({ id, score }))).toEqual(wanted);
+    expect(result.timing).toMatch(/text_score;dur=[^,]*;desc="segments=2"/u);
+    if (accelerated) expect(result.timing).toContain("catalog_root_prefix");
+    else {
+      expect(result.timing).not.toContain("catalog_root_prefix");
+      expect(result.timing).toContain("catalog_rpc_sum");
+    }
+  }
+});

@@ -489,7 +489,7 @@ for (const match of ["all", "phrase"] as const)
       await (await fetch(new URL("/health", await worker.ready))).json(),
     );
     if (match === "all") expect(after.rangeReads - before.rangeReads).toBe(3);
-    else expect(after.rangeReads - before.rangeReads).toBe(2);
+    else expect(after.rangeReads - before.rangeReads).toBe(0);
     const any = Schema.decodeUnknownSync(QueryResult)(
       await (
         await request(worker, namespace, "query", textQuery("cloudflare rust cloudflare", 100))
@@ -831,7 +831,7 @@ test("zero score certificates skip repeated empty phrases and respect revisions"
       "write",
       write([document(`${batch}-a`, "cloudflare rust"), document(`${batch}-b`, "cloudflare rust")]),
     );
-  const input = { ...textQuery("cloudflare rust cloudflare"), match: "phrase" };
+  const input = { ...textQuery("rust cloudflare"), match: "phrase" };
   const initial = await request(worker, namespace, "query", input);
   expect(initial.status).toBe(200);
   const first = Schema.decodeUnknownSync(QueryResult)(await initial.json());
@@ -841,7 +841,7 @@ test("zero score certificates skip repeated empty phrases and respect revisions"
   expect(repeated.status).toBe(200);
   expect(Schema.decodeUnknownSync(QueryResult)(await repeated.json())).toEqual(first);
   expect(repeated.headers.get("server-timing")).toMatch(/text_score;dur=[^,]*;desc="segments=0"/u);
-  await request(worker, namespace, "write", write([document("0-a", "cloudflare rust cloudflare")]));
+  await request(worker, namespace, "write", write([document("0-a", "rust cloudflare")]));
   const changed = Schema.decodeUnknownSync(QueryResult)(
     await (await request(worker, namespace, "query", { ...input, minimumSequence: 7 })).json(),
   );

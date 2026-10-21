@@ -26,7 +26,7 @@ import {
   directory_compress,
 } from "../dist/wasm/raio_engine";
 import module from "raio:wasm";
-import type { Row, Snapshot, TextPlan } from "./protocol";
+import type { Row, Snapshot, TextPlan, TermSummaries } from "./protocol";
 import {
   Attributes,
   Filter,
@@ -613,6 +613,23 @@ async function acquireSharedTextPlan(
   return acquired;
 }
 
+function excludesPhrase(
+  dictionary: typeof TermSummaries.Type,
+  occurrences: ReadonlyMap<string, number>,
+) {
+  for (const [term, required] of occurrences) {
+    if (required < 2 || !Object.hasOwn(dictionary, term)) continue;
+    const summary = dictionary[term];
+    if (
+      summary !== undefined &&
+      summary.bounds.length > 0 &&
+      summary.bounds.every(([title, body]) => title + body < required)
+    )
+      return true;
+  }
+  return false;
+}
+
 async function textQuery(
   input: typeof Query.Type,
   root: typeof Root.Type,
@@ -629,6 +646,22 @@ async function textQuery(
   if (input.match === "phrase" && words.length > 64)
     throw new Rejected({ status: 400, message: "Phrase exceeds 64 normalized tokens" });
   if (terms.length === 0 || root.documents === 0) return [];
+  const phraseOccurrences = new Map<string, number>();
+  if (input.match === "phrase" && words.length > terms.length) {
+    for (const word of words) phraseOccurrences.set(word, (phraseOccurrences.get(word) ?? 0) + 1);
+    if (
+      root.segments.length > 0 &&
+      root.segments.every((segment) => {
+        const dictionary = segment.commonTerms;
+        if (dictionary === undefined) return false;
+        return excludesPhrase(dictionary, phraseOccurrences);
+      })
+    ) {
+      timings.append("server-timing", 'text_phrase_frequency;desc="manifest"');
+      timings.append("server-timing", 'text_score;dur=0;desc="segments=0"');
+      return [];
+    }
+  }
   const covered = root.segments.every((segment) => {
     const dictionary = segment.commonTerms;
     if (dictionary === undefined) return false;
@@ -846,6 +879,7 @@ async function textQuery(
           }
           if (input.match !== "all" && input.match !== "phrase")
             matches.maximum = Math.min(liveCount, matches.union);
+          if (excludesPhrase(entry.dictionary, phraseOccurrences)) matches.maximum = 0;
           if (entry.minimum === null) matches.maximum = 0;
           return {
             bound,

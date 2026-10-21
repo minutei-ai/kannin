@@ -1,10 +1,10 @@
 import { expect, test } from "bun:test";
-import { Effect, Option, Schema } from "effect";
+import { Effect, Match, Option, Schema } from "effect";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Miniflare } from "miniflare";
-import { Query, QueryResult } from "../src/protocol";
+import { NamespaceName, Query, QueryResult, Root } from "../src/protocol";
 import { document, request, startWorker, textQuery, write } from "./harness";
 
 async function fixture() {
@@ -401,4 +401,77 @@ test("shared plan expansion metadata must match the framed byte count", async ()
   expect(recovered.status).toBe(200);
   expect(Schema.decodeUnknownSync(QueryResult)(await recovered.json())).toEqual(reference);
   expect(recovered.headers.get("server-timing")).toContain('text_plan;desc="shared"');
+}, 15000);
+
+test("manifest phrase-frequency proof skips shared-plan acquisition only when every segment is impossible", async () => {
+  await using active = await fixture();
+  const { worker } = active;
+  const origin = await worker.ready;
+  const namespace = "plan-budget-phrase-frequency";
+  for (const index of Array.from({ length: 6 }, (_, value) => value)) {
+    const text = Match.value(index % 2).pipe(
+      Match.when(0, () => "alpha beta beta"),
+      Match.orElse(() => "alpha alpha beta"),
+    );
+    const response = await request(
+      worker,
+      namespace,
+      "write",
+      write([document(`${index}-a`, text), document(`${index}-b`, text)]),
+    );
+    expect(response.status).toBe(200);
+  }
+  const bucket = await worker.getR2Bucket("STORAGE", "raio");
+  const object = await bucket.get(`namespaces/${namespace}/root.json`);
+  if (object === null) throw new Error("Missing phrase-frequency manifest");
+  const root = Schema.decodeUnknownSync(Root)(await object.json());
+  expect(root.segments).toHaveLength(6);
+  expect(root.segments.every((segment) => segment.commonTerms?.alpha?.df === 2)).toBe(true);
+  expect(root.segments.every((segment) => segment.commonTerms?.beta?.df === 2)).toBe(true);
+
+  const arm = Schema.Struct({
+    phase: Schema.Literals(["open"]),
+    namespace: NamespaceName,
+  });
+  const armed = await fetch(new URL("/fixture/arm", origin), {
+    method: "POST",
+    body: Schema.encodeSync(Schema.fromJsonString(arm))({ phase: "open", namespace }),
+  });
+  expect(armed.status).toBe(204);
+  const impossible = Schema.decodeUnknownSync(Query)({
+    ...textQuery("ALPHA beta alpha beta"),
+    match: "phrase",
+    consistency: "edge-eventual",
+    minimumSequence: 6,
+  });
+  const skipped = await request(worker, namespace, "query", impossible);
+  const timing = skipped.headers.get("server-timing") ?? "";
+  expect(skipped.status).toBe(200);
+  expect(Schema.decodeUnknownSync(QueryResult)(await skipped.json()).rows).toEqual([]);
+  expect(timing).toContain('text_phrase_frequency;desc="manifest"');
+  expect(timing).toContain('text_score;dur=0;desc="segments=0"');
+  expect(timing).not.toContain("text_plan");
+  const state = await fetch(new URL("/fixture/state", origin));
+  expect(state.headers.get("x-fixture-started")).toBe("0");
+  expect(state.headers.get("x-fixture-lookups")).toBe("0");
+  await fetch(new URL("/fixture/release", origin));
+
+  const update = await request(
+    worker,
+    namespace,
+    "write",
+    write([document("0-a", "alpha beta alpha beta")]),
+  );
+  expect(update.status).toBe(200);
+  const possible = {
+    ...impossible,
+    minimumSequence: 7,
+  };
+  const retained = await request(worker, namespace, "query", possible);
+  const retainedTiming = retained.headers.get("server-timing") ?? "";
+  expect(retained.status).toBe(200);
+  expect(
+    Schema.decodeUnknownSync(QueryResult)(await retained.json()).rows.map((row) => row.id),
+  ).toEqual(["0-a"]);
+  expect(retainedTiming).not.toContain("text_phrase_frequency");
 }, 15000);

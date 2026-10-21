@@ -23,13 +23,15 @@ Segments now record a bounded proof of attributes shared by every document. Filt
 
 Two alternating paired cohorts use a fixed logical CPU, a two-GiB cap and no swap. Cold reads start with empty process/Cache API state; backend/filesystem caches may remain warm. All **832 complete responses match across 416 pairs**, including unfiltered and selective controls. Dense-any prepared cold workerd high-water falls **134.5 → 127.3 MiB**; rare-query high-water rises **153.0 → 156.9 MiB**. These local emulation measurements do not establish Cloudflare isolate heap. [Methods, all workloads and write costs](docs/performance.md#uniform-segment-filter-proofs).
 
-**The general 200 ms cold / 100 ms warm targets remain unmet.** Rich dense cold reads with missing derivatives still reach 248.6 ms, phrases reach 537.9 ms, and rare reads exceed one second. Selective filters retain the ordinary catalog path. The earlier million-document fixture has variable attributes; this experiment does not establish a gain there. [Million-document results](docs/performance.md#bounded-filter-row-reuse-and-benchmark-coverage).
+**The general 200 ms cold / 100 ms warm targets remain unmet.** Rich dense cold reads with missing derivatives still reach 248.6 ms, phrases reach 537.9 ms, and rare reads exceed one second. A million-document query returning all 64 rare matches still takes about 281 ms warm. Selective filters retain the ordinary catalog path. The earlier million-document fixture has variable attributes; this experiment does not establish a gain there. [Million-document results](docs/performance.md#bounded-filter-row-reuse-and-benchmark-coverage).
 
 The preceding header projection reduced headers **50.2 → 3.1 MB** and total segment storage **54.9 → 7.8 MB** when large attributes were not selected for filtering. Full document/posting payloads remain intact. [Projection measurements](docs/performance.md#namespace-header-projection).
 
 Earlier unfiltered synthetic controls observed common-query medians **139–146 ms** and maxima **161–184 ms** across eight fresh candidate processes with two CPUs. Those workloads and capacity differ from the table above; this is not a general bound or a Cloudflare result. [Capacity control](docs/performance.md#exact-minimum-length-document-indexes).
 
 An ASCII normalization path makes the isolated Rust/WASM tokenizer **2.2–3.8× faster** in paired controls while retaining Unicode word segmentation. End-to-end cold results remain mixed; this does not establish a general search latency gain. [Tokenizer and ingestion controls](docs/performance.md#native-ascii-normalization).
+
+Parallel ranking now tries validated R2 directory frames before the internal cache service, preserving compressed-cache admission and native recovery. On a separate lean 30,000-document control, rare prepared cold medians fall **1,054 → 820 ms**, warm **54.4 → 52.0 ms**, and workerd HWM **165.2 → 160.8 MiB**. Restart results after derivative loss remain mixed. [Full paired controls](docs/performance.md#r2-first-parallel-directory-acquisition).
 
 Five complete public BEIR test splits cover **3,677 queries**: SciFact **0.6731**, NFCorpus **0.3068**, ArguAna **0.4064**, SCIDOCS **0.1583** and FiQA **0.2378 nDCG@10**. NIST trec_eval independently confirmed NFCorpus, ArguAna, SCIDOCS and FiQA aggregates. [Collection metrics and reproduction](docs/quality.md). Local Vectorize fixtures do not prove provider recall.
 
@@ -50,7 +52,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **328 Worker/tooling tests and 65 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **330 Worker/tooling tests and 65 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

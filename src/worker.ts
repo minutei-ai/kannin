@@ -1177,6 +1177,8 @@ async function textQuery(
                 (ranker) => Effect.sync(() => ranker.free()),
               ),
             rankIo,
+            false,
+            eligible.length > 1,
           ).pipe(Effect.map((hits) => hits.map((hit) => ({ ...hit, segment }))));
         },
         { concurrency: rankingConcurrency },

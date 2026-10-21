@@ -216,7 +216,8 @@ async function probe(request: Request, env: Env) {
   }
   if (
     new URL(request.url).pathname === "/decoded" ||
-    new URL(request.url).pathname === "/decoded-canonical"
+    new URL(request.url).pathname === "/decoded-canonical" ||
+    new URL(request.url).pathname === "/decoded-r2"
   ) {
     const before = cacheUsage();
     const responses = await Effect.runPromise(
@@ -246,6 +247,7 @@ async function probe(request: Request, env: Env) {
               ),
             undefined,
             new URL(request.url).pathname === "/decoded-canonical",
+            new URL(request.url).pathname === "/decoded-r2",
           ),
         { concurrency: "unbounded" },
       ),

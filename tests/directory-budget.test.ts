@@ -1248,3 +1248,37 @@ test("coordinator contexts keep a losing directory body alive through native wai
     await Effect.runPromise(Effect.sleep("50 millis"));
   }
 }, 15000);
+
+test("parallel R2-first directory readers share one delayed body", async () => {
+  await using active = await fixture();
+  const worker = active.worker;
+  const key = "namespaces/r2-first-concurrent/segments/source.rsix";
+  await (
+    await worker.getR2Bucket("STORAGE")
+  ).put(`cache/directory-v3/${key}/${length}`, frame, {
+    customMetadata: {
+      source: Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))({
+        key,
+        headerBytes: length,
+      }),
+    },
+  });
+  expect((await fetch(new URL("/frame-burst", await worker.ready))).status).toBe(204);
+  const response = await fetch(new URL("/decoded-r2", await worker.ready), {
+    method: "POST",
+    body: Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
+      key,
+      offset: 0,
+      length,
+      count: 8,
+    }),
+  });
+  expect(response.status).toBe(200);
+  using expected = new Directory(canonical);
+  expect(await response.text()).toBe(expected.terms('["unique3711"]'));
+  const state = await fetch(new URL("/state", await worker.ready));
+  expect(state.headers.get("x-directory-r2-reads")).toBe("1");
+  expect(state.headers.get("x-r2-completed")).toBe("1");
+  expect(state.headers.get("x-r2-active")).toBe("0");
+  expect(state.headers.get("x-canonical-reads")).toBe("0");
+});

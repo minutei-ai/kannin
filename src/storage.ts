@@ -135,7 +135,7 @@ const activeDirectories = new Map<
     readers: number;
     directory: Directory | undefined;
     fingerprint: ArrayBuffer | undefined;
-    canonical: Option.Option<Promise<Exit.Exit<void, Cause.UnknownError | Rejected>>>;
+    acquisition: Option.Option<Promise<Exit.Exit<void, Cause.UnknownError | Rejected>>>;
   }
 >();
 const decodedBudget = { bytes: 0 };
@@ -745,7 +745,7 @@ export async function range(
 }
 
 const acquireDirectory = Effect.fn("kannin.acquireDirectory")(
-  (key: string, headerBytes: number, canonical: boolean) =>
+  (key: string, headerBytes: number, canonical: boolean, preferR2: boolean) =>
     Effect.gen(function* () {
       const identity = `${env.STORAGE_CACHE_SCOPE}:${key}`;
       const admissionIdentity = `${identity}/0/${headerBytes}/directory-v3`;
@@ -762,15 +762,19 @@ const acquireDirectory = Effect.fn("kannin.acquireDirectory")(
         noteDirectoryRequest(admissionIdentity);
         return retained.directory.retain();
       }
-      if (canonical && retained !== undefined && Option.isSome(retained.canonical)) {
-        const completion = retained.canonical.value;
+      if (
+        (canonical || preferR2) &&
+        retained !== undefined &&
+        Option.isSome(retained.acquisition)
+      ) {
+        const completion = retained.acquisition.value;
         const exit = yield* Effect.promise(() => completion);
         yield* exit;
         const shared = activeDirectories.get(admissionIdentity)?.directory;
         if (shared === undefined)
           return yield* new Rejected({
             status: 503,
-            message: "Canonical directory acquisition did not retain metadata",
+            message: "Shared directory acquisition did not retain metadata",
           });
         return shared.retain();
       }
@@ -794,13 +798,17 @@ const acquireDirectory = Effect.fn("kannin.acquireDirectory")(
       }
       const acquire = Effect.gen(function* () {
         const frame = yield* Effect.gen(function* () {
-          if (!canonical) return Option.none<Uint8Array>();
+          if (!canonical && !preferR2) return Option.none<Uint8Array>();
           return yield* acquireDirectoryFrame(key, headerBytes).pipe(
             Effect.flatMap(waitDirectoryFrame),
             Effect.map(Option.flatten),
           );
         });
         if (Option.isSome(frame)) {
+          if (preferR2) {
+            noteDirectoryRequest(admissionIdentity);
+            rememberEncodedDirectory(admissionIdentity, frame.value, headerBytes);
+          }
           const recovered =
             activeDirectories.get(admissionIdentity)?.directory ??
             directories.get(identity)?.directory;
@@ -896,10 +904,10 @@ const acquireDirectory = Effect.fn("kannin.acquireDirectory")(
             ),
           );
       });
-      if (canonical) {
+      if (canonical || preferR2) {
         if (retained === undefined) return yield* acquire;
         const completion = Promise.withResolvers<Exit.Exit<void, Cause.UnknownError | Rejected>>();
-        retained.canonical = Option.some(completion.promise);
+        retained.acquisition = Option.some(completion.promise);
         return yield* acquire.pipe(
           Effect.onExit((exit) =>
             Effect.sync(() => completion.resolve(Exit.map(exit, () => undefined))),
@@ -917,6 +925,7 @@ export const withDirectory = Effect.fn("raio.withDirectory")(
     use: (directory: Directory) => Effect.Effect<A, E, R>,
     permits?: Semaphore.Semaphore,
     canonical = false,
+    preferR2 = false,
   ) =>
     Effect.acquireUseRelease(
       Effect.sync(() => {
@@ -930,7 +939,7 @@ export const withDirectory = Effect.fn("raio.withDirectory")(
           readers: 1,
           directory: undefined,
           fingerprint: undefined,
-          canonical: Option.none<Promise<Exit.Exit<void, Cause.UnknownError | Rejected>>>(),
+          acquisition: Option.none<Promise<Exit.Exit<void, Cause.UnknownError | Rejected>>>(),
         };
         if (activeDirectories.size < MAX_PENDING_RANGES) activeDirectories.set(identity, active);
         return { identity, active };
@@ -942,6 +951,7 @@ export const withDirectory = Effect.fn("raio.withDirectory")(
               key,
               headerBytes,
               canonical && headerBytes <= MAX_DIRECTORY_CACHE_LENGTH,
+              preferR2,
             );
             if (permits === undefined) return yield* acquire;
             return yield* permits.withPermit(acquire);

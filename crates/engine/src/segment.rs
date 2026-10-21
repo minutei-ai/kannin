@@ -13,6 +13,14 @@ const BLOCK_SIZE: usize = 128;
 const FILTER_CACHE_BYTES: usize = 32 * 1024;
 const MAX_QUERY_TERMS: usize = 512;
 
+fn compare_document_ids(left: &str, right: &str) -> Ordering {
+    if left.is_ascii() {
+        left.cmp(right)
+    } else {
+        left.encode_utf16().cmp(right.encode_utf16())
+    }
+}
+
 #[derive(Clone, Default)]
 struct FilterMasks {
     representatives: Option<(String, Box<[u16]>)>,
@@ -976,7 +984,7 @@ pub fn build(
         return Err("Segment exceeds 10000 documents".into());
     }
     let filterable = filterable.map(filterable_fields).transpose()?;
-    documents.sort_by(|a, b| a.id.encode_utf16().cmp(b.id.encode_utf16()));
+    documents.sort_by(|a, b| compare_document_ids(&a.id, &b.id));
     if documents.windows(2).any(|pair| pair[0].id == pair[1].id) {
         return Err("Duplicate segment ids".into());
     }
@@ -1096,7 +1104,7 @@ fn validate_header(header: &Header) -> Result<(), String> {
     if header
         .documents
         .windows(2)
-        .any(|p| p[0].id.encode_utf16().cmp(p[1].id.encode_utf16()) != Ordering::Less)
+        .any(|p| compare_document_ids(&p[0].id, &p[1].id) != Ordering::Less)
     {
         return Err("Segment ids are not strictly sorted".into());
     }
@@ -1869,10 +1877,10 @@ impl Search {
                 .iter()
                 .position(|allowed| *allowed)
                 .is_some_and(|offset| {
-                    let order = self.header.documents[candidate.first as usize + offset]
-                        .id
-                        .encode_utf16()
-                        .cmp(id.encode_utf16());
+                    let order = compare_document_ids(
+                        &self.header.documents[candidate.first as usize + offset].id,
+                        id,
+                    );
                     order == Ordering::Less || (inclusive && order == Ordering::Equal)
                 })
         }))
@@ -2448,8 +2456,8 @@ pub mod wasm {
     use super::{
         BlockMeta, BuiltSegment, Document, DocumentMeta, Filter, Header, MAX_BYTES,
         MAX_QUERY_TERMS, Range, Search, SelectedAttributes, Statistics, TermDictionary, TermMeta,
-        TermScorer, append, bloom_build, bloom_filter_many, build, decode_page, document_terms,
-        matches, parse_header,
+        TermScorer, append, bloom_build, bloom_filter_many, build, compare_document_ids,
+        decode_page, document_terms, matches, parse_header,
     };
     use serde::{Deserialize, Serialize};
     use std::cell::RefCell;
@@ -4339,7 +4347,7 @@ pub mod wasm {
             for id in &ids {
                 if let Ok(index) = header
                     .documents
-                    .binary_search_by(|doc| doc.id.encode_utf16().cmp(id.encode_utf16()))
+                    .binary_search_by(|doc| compare_document_ids(&doc.id, id))
                 {
                     let row = u32::try_from(index)
                         .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
@@ -4668,11 +4676,7 @@ pub mod wasm {
                     })
                     || leader.documents.windows(2).any(|pair| {
                         pair[0].row >= pair[1].row
-                            || pair[0]
-                                .id
-                                .encode_utf16()
-                                .cmp(pair[1].id.encode_utf16())
-                                .is_ge()
+                            || compare_document_ids(&pair[0].id, &pair[1].id).is_ge()
                     })
                 {
                     return Err(JsValue::from_str("Invalid common-leader rows"));
@@ -5997,8 +6001,41 @@ mod eligible_bound_tests {
 
 #[cfg(test)]
 mod cutoff_certificate_tests {
-    use super::{BuiltSegment, Document, Filter, Hit, Search, Statistics, build};
+    use super::{
+        BuiltSegment, Document, Filter, Hit, Search, Statistics, build, compare_document_ids,
+    };
     use std::{cmp::Ordering, collections::BTreeMap};
+
+    #[test]
+    fn document_id_order_preserves_utf16_for_ascii_and_unicode_pairs() {
+        let ids = [
+            "",
+            "a",
+            "a\0",
+            "a-a",
+            "a0",
+            "a9",
+            "a\u{7f}",
+            "a\u{80}",
+            "ação",
+            "\u{80}",
+            "\u{d7ff}",
+            "\u{e000}",
+            "\u{ffff}",
+            "\u{10000}",
+            "😀",
+            "😀a",
+        ];
+        for left in ids {
+            for right in ids {
+                assert_eq!(
+                    compare_document_ids(left, right),
+                    left.encode_utf16().cmp(right.encode_utf16()),
+                    "{left:?} versus {right:?}"
+                );
+            }
+        }
+    }
 
     fn fixture() -> Result<BuiltSegment, String> {
         let documents = (0..384)

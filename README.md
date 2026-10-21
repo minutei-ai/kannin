@@ -41,6 +41,8 @@ Parallel ranking now tries validated R2 directory frames before the internal cac
 
 Rust `zlib-rs` handles directory and page inflation without changing persisted bytes or cache limits; immutable frames also [reuse successful header validation](docs/performance.md#immutable-header-validation-reuse). [Directory controls](docs/performance.md#native-zlib-directory-inflation) record mean warm workerd CPU **268.8 → 257.5 ms**. The newer [page control](docs/performance.md#fixed-size-page-inflation) reduces isolated projection CPU about **14%** and retained WASM linear-memory capacity **1.75 → 1.56 MiB**. Neither isolated measurements nor earlier mixed cold/RSS results establish a general latency bound.
 
+[Native document ID ordering](docs/performance.md#native-document-id-ordering) preserves UTF-16 order while reducing isolated WASM directory-lookup CPU **26–33%** for three ASCII ID distributions. Two Unicode controls cost **4–5% more**; isolated WASM capacity stays unchanged. The SDK binding matrix preserves **144 responses across 72 exact pairs**; complete-query latency and RSS remain mixed.
+
 Five complete public BEIR test splits cover **3,677 queries**: SciFact **0.6731**, NFCorpus **0.3068**, ArguAna **0.4064**, SCIDOCS **0.1583** and FiQA **0.2378 nDCG@10**. NIST trec_eval independently confirmed NFCorpus, ArguAna, SCIDOCS and FiQA aggregates. [Collection metrics and reproduction](docs/quality.md). Local Vectorize fixtures do not prove provider recall.
 
 This change has not been deployed to Cloudflare. An earlier native experiment with GRU ingress reduced first strong reads after derived-cache loss **2,786.88 → 1,911.42 ms** on 4,000 documents/eight segments, with EWR query placement. These conditions differ from the local table. [Native measurements](docs/performance.md#small-header-recovery-overlap).
@@ -60,7 +62,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **335 Worker/tooling tests and 65 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The suite contains **336 Worker/tooling tests and 66 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

@@ -25,6 +25,7 @@ import {
   StoredDocument,
   PostingSpans,
   SegmentHeader,
+  LocatedDocument,
   Filter,
   TermCatalog,
   ProjectedTermCatalog,
@@ -897,6 +898,37 @@ test("frequency page validation follows exact directory lifetime and never memoi
   using fresh = reparsed.ranker(query);
   fresh.add_frequency("alpha", page);
   expect(fresh.finish()).toBe(reference);
+});
+
+test("directory lookup preserves UTF-16 rows, duplicate requests and tombstones", () => {
+  const ids = ["\uE000", "a😀", "\u{10000}", "ação", "a", "a-b", "😀"];
+  using segment = new Segment(
+    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(
+      ids.map((id) => ({ id, revision: 1, title: "", text: "alpha", attributes: {} })),
+    ),
+  );
+  const bytes = segment.bytes();
+  const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
+  const sorted = ids.toSorted();
+  expect(header.documents.map((document) => document.id)).toEqual(sorted);
+  const requested = ["a😀", "\u{10000}", "missing", "a", "a", "\uE000", "ação", "😀"];
+  const encoded = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Schema.String)))(requested);
+  const dead = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Schema.Int)))([
+    sorted.indexOf("a😀"),
+  ]);
+  const expected = ["\u{10000}", "a", "a", "\uE000", "ação", "😀"];
+  const length = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
+  const frame = directory_compress(bytes.subarray(0, length));
+  using direct = new Directory(bytes);
+  using compressed = Directory.compressed(frame, length, 32 * 1024 * 1024);
+  for (const directory of [direct, compressed]) {
+    const located = Schema.decodeSync(Schema.fromJsonString(Schema.Array(LocatedDocument)))(
+      directory.lookup(encoded, dead),
+    );
+    expect(located.map((result) => result.document.id)).toEqual(expected);
+    expect(located.map((result) => result.row)).toEqual(expected.map((id) => sorted.indexOf(id)));
+    for (const result of located) expect(header.documents[result.row]).toEqual(result.document);
+  }
 });
 
 test("cutoff posting pages preserve every competitive hit across modes, masks and Unicode ties", () => {

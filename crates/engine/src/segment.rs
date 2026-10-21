@@ -1231,7 +1231,7 @@ fn decode_directory_frame(
     bytes: &[u8],
     expected: usize,
     max_heap_bytes: usize,
-    checksum_verified: Option<&std::cell::Cell<bool>>,
+    validated: Option<&std::cell::Cell<bool>>,
 ) -> Result<Header, String> {
     if bytes.len() < 20 || &bytes[..8] != DIRECTORY_MAGIC || bytes.len() > MAX_BYTES + 8192 {
         return Err("Invalid compressed directory frame".into());
@@ -1268,7 +1268,8 @@ fn decode_directory_frame(
             "Compressed directory integrity check failed: {status:?}"
         ));
     }
-    if !checksum_verified.is_some_and(std::cell::Cell::get) {
+    let previously_validated = validated.is_some_and(std::cell::Cell::get);
+    if !previously_validated {
         let mut verified = crc32fast::Hasher::new();
         verified.update(&bytes[..16]);
         verified.update(&decoded);
@@ -1277,9 +1278,11 @@ fn decode_directory_frame(
         }
     }
     let header = binary_directory::decode(&decoded, max_heap_bytes)?;
-    validate_header(&header)?;
-    if let Some(verified) = checksum_verified {
-        verified.set(true);
+    if !previously_validated {
+        validate_header(&header)?;
+        if let Some(verified) = validated {
+            verified.set(true);
+        }
     }
     Ok(header)
 }
@@ -3955,7 +3958,7 @@ pub mod wasm {
     struct CachedDirectoryFrame {
         bytes: Box<[u8]>,
         expected: usize,
-        checksum_verified: std::cell::Cell<bool>,
+        validated: std::cell::Cell<bool>,
     }
 
     #[wasm_bindgen]
@@ -3980,7 +3983,7 @@ pub mod wasm {
                 frame: Rc::new(CachedDirectoryFrame {
                     bytes: bytes.into_boxed_slice(),
                     expected,
-                    checksum_verified: std::cell::Cell::new(false),
+                    validated: std::cell::Cell::new(false),
                 }),
             })
         }
@@ -4008,7 +4011,7 @@ pub mod wasm {
                 &self.frame.bytes,
                 self.frame.expected,
                 max_heap_bytes as usize,
-                Some(&self.frame.checksum_verified),
+                Some(&self.frame.validated),
             )
             .map_err(|cause| JsValue::from_str(&cause))?;
             Ok(Directory {

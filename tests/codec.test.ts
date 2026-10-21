@@ -1238,6 +1238,12 @@ test("compact directories validate framing, checksums and header semantics", () 
   covered.set(invalid, 16);
   new DataView(forged.buffer).setUint32(16, crc32(covered), true);
   expect(() => Directory.compressed(forged, length, 40 * 1024 * 1024)).toThrow("version");
+  using cached = new CompressedDirectory(forged, length);
+  expect(() => cached.directory(1)).toThrow("budget");
+  expect(() => cached.directory(40 * 1024 * 1024)).toThrow("version");
+  expect(() => cached.directory(40 * 1024 * 1024)).toThrow("version");
+  using retained = cached.retain();
+  expect(() => retained.directory(40 * 1024 * 1024)).toThrow("version");
   const damaged = encoded.slice();
   const checksum = damaged[16];
   if (checksum === undefined) throw new Error("Missing directory checksum");
@@ -1761,7 +1767,7 @@ test("failed checksum validation never becomes trusted cached directory state", 
   expect(() => cached.directory(40 * 1024 * 1024)).toThrow("integrity");
 });
 
-test("cached integrity never bypasses decoded budgets or expected header lengths", () => {
+test("cached validation never bypasses decoded budgets or expected header lengths", () => {
   const source = compressedDirectoryFixture();
   using cached = new CompressedDirectory(source.bytes, source.length);
   using first = cached.directory(40 * 1024 * 1024);

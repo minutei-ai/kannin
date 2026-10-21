@@ -1258,15 +1258,15 @@ fn decode_directory_frame(
             .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
     );
     let mut decoded = vec![0; compact_length];
-    let length = miniz_oxide::inflate::decompress_slice_iter_to_slice(
+    let (output, status) = zlib_rs::decompress_slice(
         &mut decoded,
-        std::iter::once(&bytes[20..]),
-        true,
-        false,
-    )
-    .map_err(|cause| format!("{cause:?}"))?;
-    if length != compact_length {
-        return Err("Compressed directory integrity check failed".into());
+        &bytes[20..],
+        zlib_rs::InflateConfig::default(),
+    );
+    if status != zlib_rs::ReturnCode::Ok || output.len() != compact_length {
+        return Err(format!(
+            "Compressed directory integrity check failed: {status:?}"
+        ));
     }
     if !checksum_verified.is_some_and(std::cell::Cell::get) {
         let mut verified = crc32fast::Hasher::new();

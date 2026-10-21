@@ -33,6 +33,8 @@ An ASCII normalization path makes the isolated Rust/WASM tokenizer **2.2–3.8×
 
 Parallel ranking now tries validated R2 directory frames before the internal cache service, preserving compressed-cache admission and native recovery. On a separate lean 30,000-document control, rare prepared cold medians fall **1,054 → 820 ms**, warm **54.4 → 52.0 ms**, and workerd HWM **165.2 → 160.8 MiB**. Restart results after derivative loss remain mixed. [Full paired controls](docs/performance.md#r2-first-parallel-directory-acquisition).
 
+Rust `zlib-rs` directory inflation retains identical frames and cache limits. In a million-document wide-query control, mean warm workerd CPU changes **268.8 → 257.5 ms** and warm HTTP **272.2 → 262.3 ms**. Cold and RSS results remain mixed. [Decoder controls](docs/performance.md#native-zlib-directory-inflation).
+
 Five complete public BEIR test splits cover **3,677 queries**: SciFact **0.6731**, NFCorpus **0.3068**, ArguAna **0.4064**, SCIDOCS **0.1583** and FiQA **0.2378 nDCG@10**. NIST trec_eval independently confirmed NFCorpus, ArguAna, SCIDOCS and FiQA aggregates. [Collection metrics and reproduction](docs/quality.md). Local Vectorize fixtures do not prove provider recall.
 
 This change has not been deployed to Cloudflare. An earlier native experiment with GRU ingress reduced first strong reads after derived-cache loss **2,786.88 → 1,911.42 ms** on 4,000 documents/eight segments, with EWR query placement. These conditions differ from the local table. [Native measurements](docs/performance.md#small-header-recovery-overlap).

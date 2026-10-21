@@ -35,6 +35,8 @@ Parallel ranking now tries validated R2 directory frames before the internal cac
 
 [Uniform attribute proofs now also cover ordinary postings and phrases](docs/performance.md#uniform-facts-in-posting-rankers). A paired 5,000-document WASM control reduces cold directory-plus-ranker preparation CPU about 38%; complete-query latency and RSS remain mixed. No cache quota increases.
 
+[Zero-score certificates](docs/performance.md#zero-score-certificates) now skip segments already proved empty for the same scoring inputs. A local million-document empty-phrase control improves warm median **1,844.7 → 8.2 ms** and warm workerd RSS **399.2 → 350.2 MiB**. Cold reads remain far above the target; positive controls have mixed latency and memory results.
+
 Rust `zlib-rs` directory inflation retains identical frames and cache limits; immutable frames also [reuse successful header validation](docs/performance.md#immutable-header-validation-reuse). In a million-document wide-query control, mean warm workerd CPU changes **268.8 → 257.5 ms** and warm HTTP **272.2 → 262.3 ms**. Cold and RSS results remain mixed. [Decoder controls](docs/performance.md#native-zlib-directory-inflation).
 
 Five complete public BEIR test splits cover **3,677 queries**: SciFact **0.6731**, NFCorpus **0.3068**, ArguAna **0.4064**, SCIDOCS **0.1583** and FiQA **0.2378 nDCG@10**. NIST trec_eval independently confirmed NFCorpus, ArguAna, SCIDOCS and FiQA aggregates. [Collection metrics and reproduction](docs/quality.md). Local Vectorize fixtures do not prove provider recall.

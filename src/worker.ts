@@ -878,7 +878,11 @@ async function textQuery(
     if (planned === undefined)
       throw new Rejected({ status: 503, message: "Text plan omitted a segment" });
     const identity = `${workerEnv.STORAGE_CACHE_SCOPE}:${segment.key}:${segment.headerBytes}:${Schema.encodeSync(integers)(segment.dead)}:${selection.digest}`;
-    const retained = { bound: planned.bound, minimumId: planned.minimumId };
+    const retained = {
+      bound: planned.bound,
+      minimumId: planned.minimumId,
+      maximumMatches: planned.maximumMatches,
+    };
     if (selection.digest !== "") {
       const learned = segmentScoreBound(identity);
       if (learned !== undefined) {
@@ -890,11 +894,12 @@ async function textQuery(
         reuse.bounds += 1;
       }
     }
+    if (retained.bound === 0) retained.maximumMatches = 0;
     return {
       segment,
       index,
-      eligible: planned.eligible,
-      maximumMatches: planned.maximumMatches,
+      eligible: planned.eligible && retained.maximumMatches > 0,
+      maximumMatches: retained.maximumMatches,
       bound: retained.bound,
       minimumId: retained.minimumId,
       identity,

@@ -822,6 +822,32 @@ test("cached negative filter eligibility avoids all directory and posting reads"
   expect(changed.rows.map((row) => row.id)).toEqual(["a"]);
 });
 
+test("zero score certificates skip repeated empty phrases and respect revisions", async () => {
+  const namespace = "zero-score-phrase";
+  for (const batch of [0, 1, 2, 3, 4, 5])
+    await request(
+      worker,
+      namespace,
+      "write",
+      write([document(`${batch}-a`, "cloudflare rust"), document(`${batch}-b`, "cloudflare rust")]),
+    );
+  const input = { ...textQuery("cloudflare rust cloudflare"), match: "phrase" };
+  const initial = await request(worker, namespace, "query", input);
+  expect(initial.status).toBe(200);
+  const first = Schema.decodeUnknownSync(QueryResult)(await initial.json());
+  expect(first.rows).toEqual([]);
+  expect(initial.headers.get("server-timing")).toMatch(/text_score;dur=[^,]*;desc="segments=6"/u);
+  const repeated = await request(worker, namespace, "query", input);
+  expect(repeated.status).toBe(200);
+  expect(Schema.decodeUnknownSync(QueryResult)(await repeated.json())).toEqual(first);
+  expect(repeated.headers.get("server-timing")).toMatch(/text_score;dur=[^,]*;desc="segments=0"/u);
+  await request(worker, namespace, "write", write([document("0-a", "cloudflare rust cloudflare")]));
+  const changed = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", { ...input, minimumSequence: 7 })).json(),
+  );
+  expect(changed.rows.map((row) => row.id)).toEqual(["0-a"]);
+});
+
 test("retained Bloom candidates stay bounded across root updates and namespace rebuilds", async () => {
   const namespace = "retained-bloom-lifecycle";
   await request(worker, namespace, "write", write([document("a", "alpha"), document("b", "beta")]));

@@ -54,7 +54,7 @@ test("shared match ceilings preserve unions, intersections and excluded filters"
     { text: "alpha beta", mode: "any", filters: [], maximum: 2, rows: 16 },
     { text: "alpha beta", mode: "all", filters: [], maximum: 1, rows: 0 },
     { text: "alpha beta", mode: "phrase", filters: [], maximum: 1, rows: 0 },
-    { text: "alpha alpha", mode: "phrase", filters: [], maximum: 1, rows: 0 },
+    { text: "alpha alpha", mode: "phrase", filters: [], maximum: 0, rows: 0 },
     { text: "constructor", mode: "any", filters: [], maximum: 1, rows: 8 },
     {
       text: "alpha beta",

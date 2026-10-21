@@ -680,9 +680,13 @@ pub fn decode_page(bytes: &[u8]) -> Result<Vec<u8>, String> {
             .try_into()
             .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
     );
-    let decoded = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&bytes[8..], MAX_BYTES)
-        .map_err(|cause| format!("Invalid compressed page: {cause}"))?;
-    if decoded.len() != length || crc32fast::hash(&decoded) != crc {
+    let mut decoded = vec![0; length];
+    let (output, status) =
+        zlib_rs::decompress_slice(&mut decoded, &bytes[8..], zlib_rs::InflateConfig::default());
+    if status != zlib_rs::ReturnCode::Ok || output.len() != length {
+        return Err(format!("Invalid compressed page: {status:?}"));
+    }
+    if crc32fast::hash(&decoded) != crc {
         return Err("Page integrity check failed".into());
     }
     Ok(decoded)

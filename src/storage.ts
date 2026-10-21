@@ -644,7 +644,7 @@ export async function range(
             });
           if (compressedDirectory) {
             reads.directoryR2FallbackBytes += body.byteLength;
-            const frame = yield* Effect.try(() => directory_compress(new Uint8Array(body)).slice());
+            const frame = yield* Effect.try(() => directory_compress(new Uint8Array(body)));
             publishDirectoryFrame(key, length, frame);
             return frame;
           }
@@ -1889,9 +1889,7 @@ export const storeSegmentCaches = Effect.fn("kannin.storeSegmentCaches")(
   (key: string, headerBytes: number, bytes: Uint8Array) =>
     Effect.gen(function* () {
       if (headerBytes <= MAX_DIRECTORY_CACHE_LENGTH) {
-        const frame = yield* Effect.try(() =>
-          directory_compress(bytes.subarray(0, headerBytes)).slice(),
-        );
+        const frame = yield* Effect.try(() => directory_compress(bytes.subarray(0, headerBytes)));
         publishDirectoryFrame(key, headerBytes, frame);
       }
       const overview = yield* Effect.try(() => segment_correlated_overview(bytes));

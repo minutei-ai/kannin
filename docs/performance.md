@@ -5006,3 +5006,32 @@ This optimization is not deployed to Cloudflare. General cold ≤200 ms and warm
 Two subsequent local cold-read prototypes were rejected. Both used the same thirty-segment lean corpus, alternating paired processes pinned to CPU 27, one CPU, a two-GiB cap and no swap. Each checked 80 full responses across 40 pairs, with no mismatch or sampled quota suspension. Increasing catalog windows from eight to sixteen while reducing concurrent windows from eight to four cut RPC count four → two, but rare prepared cold medians rose 1,115.3 → 1,190.8 ms and recovery medians 985.5 → 1,012.0 ms; changed batch identities also missed existing eight-segment derived objects. That experiment's phrase comparison had different manifest proof availability and is excluded. Peak cgroup charge was 225 MiB.
 
 The second prototype used identical proof-bearing manifest copies and omitted catalog eligibility projection only when every selected segment certified the original filter as all-pass; the ranker retained the original filter. Rare prepared cold medians rose 1,064.9 → 1,162.9 ms, despite group CPU falling 686.4 → 663.5 ms and workerd HWM 164.6 → 161.4 MiB. Recovery medians rose 1,024.0 → 1,037.8 ms. Phrase cold rose 279.1 → 285.9 ms and warm 29.1 → 34.0 ms; rare warm improved 53.0 → 49.6 ms. Peak charge was 226 MiB. Small samples and warm backend state limit both experiments; neither change remains in the engine.
+
+## Native ASCII normalization
+
+Rust now uses `str::is_ascii` and native ASCII lowercasing before the existing Unicode word segmenter for ASCII input. Non-ASCII input retains NFKD, combining-mark removal and Unicode lowercasing. No new dependency, cache, storage format or ranking parameter is introduced. A differential native regression checks every pair of 128 ASCII values embedded between letters/digits, including controls and punctuation: 16,384 cases match the preceding Unicode pipeline. Existing accent, ligature, combining-mark, CJK and search tests also pass.
+
+Two paired WASM computation controls use 256 alternating rounds per case, discarding 32 warmups and measuring 224 batches per variant. Short ASCII uses 128 calls/batch, rare-64 uses 32 and long bodies use eight. The second control reverses case order. Both modules live in the same Bun process pinned to logical CPU 27 under one CPU, 512 MiB and no swap. These are tokenizer timings, including the WASM call, not whole-query latency or provider CPU.
+
+| Input                        | First control before → after (µs/call) | Reversed-case control before → after (µs/call) |
+| ---------------------------- | -------------------------------------: | ---------------------------------------------: |
+| Short ASCII with punctuation |                            3.69 → 1.68 |                                    3.75 → 1.70 |
+| 64 ASCII rare terms          |                           32.60 → 8.58 |                                   31.59 → 9.79 |
+| Long ASCII body              |                         204.56 → 77.29 |                                291.80 → 107.54 |
+| Long mixed Unicode body      |                        342.67 → 359.46 |                                423.67 → 419.20 |
+
+ASCII benefits repeat; Unicode has no consistent gain. Its paired median ratio changes from 1.045 in the first control to 1.001 with reversed case order. The different absolute timings show why cross-run wall-time differences should not be attributed to the engine. Both modules retain 1,376,256 bytes of linear-memory capacity after these workloads; this does not bound native Worker heap. Peak cgroup charges are 56 MiB and 34 MiB respectively.
+
+A separate thirty-segment, 30,000-document lean query control uses identical proof-bearing persistence copies, fresh workerd processes, alternating variant order across two cohorts and the same CPU affinity. Prepared cases run eight rounds and retain rounds four through seven for warm medians; absent-derived cases run four rounds and count only the first as cold. All 80 complete responses match across 40 pairs, with no sampled quota suspension. Memory is capped at two GiB with no swap; observed peak is 224 MiB. Backend/filesystem caches may remain warm; two cold samples per variant/cell do not establish a tail bound.
+
+| Query/state                | Cold median before → after (ms) | Warm median before → after (ms) | Cold group CPU before → after (ms) | Cold workerd HWM before → after (MiB) |
+| -------------------------- | ------------------------------: | ------------------------------: | ---------------------------------: | ------------------------------------: |
+| Rare-64 prepared           |               1,127.3 → 1,197.2 |                   55.18 → 55.37 |                      688.8 → 680.3 |                         162.4 → 163.9 |
+| Phrase prepared            |                   338.5 → 307.6 |                   30.58 → 30.71 |                      221.0 → 200.4 |                         129.0 → 130.7 |
+| Rare-64 absent derivatives |                 1,031.5 → 993.4 |                               — |                      768.9 → 741.6 |                         167.1 → 168.2 |
+
+A separate write control uses two alternating cohorts, six 1,000-document rich ASCII batches per variant/cohort and closed HTTP connections. All four namespaces acknowledge sequence six and contain 6,000 documents. Every complete canonical segment hash and byte length matches across all four runs. Across twelve samples per variant, client time totals 6.369 → 5.741 seconds, gateway 6.304 → 5.683 seconds and group CPU 5.223 → 5.130 seconds, with no sampled quota suspension. Peak charge is 362 MiB under two GiB. This small local control does not establish sustained throughput.
+
+The full gate passes 328 Bun/workerd/tooling tests, 11,986 assertions and 65 Rust tests, formatting, strict Effect/TypeScript checks and native/WASM Clippy. Observed gate peak is 2.03 GiB under four GiB, two CPUs and no swap. The unchanged Worker bundle SHA-256 remains `90453181c6a543b2d8e10022757382b74049cebbafac79b1cda53236bb2cf72f`; WASM grows 1,022,873 → 1,023,348 bytes, candidate SHA-256 `c39d64e2f4d40c4f9abe8f66a6e8c35061c324545534e2a5ca32b43bba222ef9`.
+
+The isolated ASCII speedup does not establish a general cold or warm query gain: prepared rare cold slows in this control, warm medians are effectively unchanged and some workerd high-water measurements rise. No Cloudflare deployment or new ranking-quality result is claimed. General cold ≤200 ms and warm ≤100 ms remain unproven.

@@ -29,6 +29,8 @@ The preceding header projection reduced headers **50.2 → 3.1 MB** and total se
 
 Earlier unfiltered synthetic controls observed common-query medians **139–146 ms** and maxima **161–184 ms** across eight fresh candidate processes with two CPUs. Those workloads and capacity differ from the table above; this is not a general bound or a Cloudflare result. [Capacity control](docs/performance.md#exact-minimum-length-document-indexes).
 
+An ASCII normalization path makes the isolated Rust/WASM tokenizer **2.2–3.8× faster** in paired controls while retaining Unicode word segmentation. End-to-end cold results remain mixed; this does not establish a general search latency gain. [Tokenizer and ingestion controls](docs/performance.md#native-ascii-normalization).
+
 Five complete public BEIR test splits cover **3,677 queries**: SciFact **0.6731**, NFCorpus **0.3068**, ArguAna **0.4064**, SCIDOCS **0.1583** and FiQA **0.2378 nDCG@10**. NIST trec_eval independently confirmed NFCorpus, ArguAna, SCIDOCS and FiQA aggregates. [Collection metrics and reproduction](docs/quality.md). Local Vectorize fixtures do not prove provider recall.
 
 This change has not been deployed to Cloudflare. An earlier native experiment with GRU ingress reduced first strong reads after derived-cache loss **2,786.88 → 1,911.42 ms** on 4,000 documents/eight segments, with EWR query placement. These conditions differ from the local table. [Native measurements](docs/performance.md#small-header-recovery-overlap).
@@ -48,7 +50,7 @@ bun run check
 RAIO_BENCH_DOCUMENTS=100000 bun run bench
 ```
 
-The verified suite has **328 Worker/tooling tests and 64 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
+The verified suite has **328 Worker/tooling tests and 65 Rust tests**. The gate includes formatting, strict type-aware Effect/Oxlint rules, full native and WASM Clippy (all/pedantic/nursery), Effect tsgo compiler checks and workerd tests. Local Vectorize is a contract fixture; real provider recall and visibility require separate measurements.
 
 For deployment, configure Alchemy's `minutei` profile and supply `RAIO_API_TOKEN` privately, then run `bun run deploy --stage prod`. Existing `Raio` stack and `RAIO_*` identifiers preserve infrastructure identity. [Deployment details](docs/deployment.md).
 

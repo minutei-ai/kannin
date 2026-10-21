@@ -76,11 +76,14 @@ pub fn decode_log(bytes: &[u8]) -> Result<String, LogError> {
 }
 
 pub fn normalize_text(text: &str) -> String {
-    let normalized: String = text
-        .nfkd()
-        .filter(|c| !is_combining_mark(*c))
-        .flat_map(char::to_lowercase)
-        .collect();
+    let normalized: String = if text.is_ascii() {
+        text.to_ascii_lowercase()
+    } else {
+        text.nfkd()
+            .filter(|c| !is_combining_mark(*c))
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
     normalized
         .unicode_words()
         .filter(|word| word.chars().any(char::is_alphanumeric))
@@ -124,6 +127,26 @@ mod tests {
         assert_eq!(normalize_text("cafe\u{301}"), "cafe");
         assert_eq!(normalize_text("日本語 中文 rust🔥"), "日 本 語 中 文 rust");
         assert_eq!(normalize_text("\" OR * NEAR(a)"), "or near a");
+    }
+
+    #[test]
+    fn ascii_normalization_preserves_unicode_word_boundaries() {
+        for first in 0_u8..=127 {
+            for second in 0_u8..=127 {
+                let text = format!("AA{}Bb{}42", char::from(first), char::from(second));
+                let normalized: String = text
+                    .nfkd()
+                    .filter(|character| !is_combining_mark(*character))
+                    .flat_map(char::to_lowercase)
+                    .collect();
+                let expected = normalized
+                    .unicode_words()
+                    .filter(|word| word.chars().any(char::is_alphanumeric))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert_eq!(normalize_text(&text), expected, "{text:?}");
+            }
+        }
     }
 
     #[test]

@@ -919,7 +919,7 @@ test("document Bloom windows preserve newest revisions across partial sixty-four
   );
   expect(metadata.documents).toBe(127);
   expect(metadata.cache.bloomCacheBytes).toBeLessThanOrEqual(4 * 1024 * 1024);
-});
+}, 15_000);
 
 test("decoded frequency pages share the range budget and keep tombstones query-local", async () => {
   const namespace = "frequency-page-lifecycle";

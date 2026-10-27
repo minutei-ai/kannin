@@ -173,10 +173,13 @@ test("hot metadata can reject large directories without lowering the forty-MiB v
       Object.fromEntries(Array.from({ length: 840000 }, (_, index) => [String(index), [0, []]])),
       original.total_title_length,
       original.total_body_length,
+      original.metadata_end,
+      original.vector_end,
+      original.vector_ranges,
     ]),
   );
   const frame = new Uint8Array(16 + json.byteLength);
-  frame.set(new TextEncoder().encode("RAIOSEG1"));
+  frame.set(new TextEncoder().encode("RAIOSEG2"));
   const view = new DataView(frame.buffer);
   view.setUint32(8, json.byteLength, true);
   view.setUint32(12, crc32(json), true);
@@ -267,7 +270,7 @@ test("repeated directory scans retain a hot subset when the namespace exceeds ad
     }),
   );
   const frame = new Uint8Array(16 + json.byteLength);
-  frame.set(new TextEncoder().encode("RAIOSEG1"));
+  frame.set(new TextEncoder().encode("RAIOSEG2"));
   const view = new DataView(frame.buffer);
   view.setUint32(8, json.byteLength, true);
   view.setUint32(12, crc32(json), true);
@@ -312,7 +315,7 @@ test("decoded directory scans retain validated metadata beyond cache capacity", 
     }),
   );
   const frame = new Uint8Array(16 + json.byteLength);
-  frame.set(new TextEncoder().encode("RAIOSEG1"));
+  frame.set(new TextEncoder().encode("RAIOSEG2"));
   const view = new DataView(frame.buffer);
   view.setUint32(8, json.byteLength, true);
   view.setUint32(12, crc32(json), true);

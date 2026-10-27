@@ -20,7 +20,7 @@
   "scripts": {
     "build": "bun tooling/build.ts",
     "test": "bun run build && bun run test:built",
-    "test:built": "cargo test --workspace --locked && bun test",
+    "test:built": "cargo test --workspace --locked && bun tooling/test.ts",
     "check": "bun run format:check && bun run build && bun run lint:ts && bun run lint:rust && bun run typecheck && bun run test:built",
     "format": "oxfmt . && cargo fmt --all",
     "format:check": "oxfmt --check . && cargo fmt --all -- --check",
@@ -32,7 +32,7 @@
     "lint:ts": "oxlint --deny-warnings --report-unused-disable-directives .",
     "lint:rust": "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings && cargo clippy --workspace --lib --target wasm32-unknown-unknown --release --locked -- -D warnings",
     "quality": "bun run build && bun tooling/quality.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --singleThreaded --noEmit"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20261013.1",

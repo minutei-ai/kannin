@@ -1,10 +1,11 @@
+import { decodeRoot } from "../src/manifest";
 import { expect, test } from "bun:test";
 import { Response } from "miniflare";
 import { Effect, Schema } from "effect";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Health, QueryResult, Root, SnapshotCacheHeaders } from "../src/protocol";
+import { Health, QueryResult, SnapshotCacheHeaders } from "../src/protocol";
 import { snapshotFrame } from "../src/snapshot";
 import { document, request, startWorker, textQuery, write } from "./harness";
 
@@ -50,16 +51,14 @@ test("a stalled snapshot cache cannot delay R2 selection or replace its newer ro
   const old = await bucket.get(`namespaces/${namespace}/root.json`);
   if (old === null) throw new Error("Missing old root");
   const payload = new Uint8Array(await old.arrayBuffer());
-  const manifest = Schema.decodeSync(Schema.fromJsonString(Root))(
-    new TextDecoder().decode(payload),
-  );
+  const manifest = decodeRoot(new TextDecoder().decode(payload));
   expect(
     (await request(worker, namespace, "write", write([document("a", "alpha new")]))).status,
   ).toBe(200);
   const observedAt = Date.now();
-  const cache = await (await worker.getCaches()).open("raio-snapshots-v2");
+  const cache = await (await worker.getCaches()).open("raio-snapshots-v5");
   await cache.put(
-    `https://raio-cache.internal/snapshots/${namespace}?bucket=raio-test`,
+    `https://raio-cache.internal/snapshots-v5/${namespace}?bucket=raio-test`,
     new Response(await snapshotFrame({ observedAt, manifest }, payload).arrayBuffer(), {
       headers: {
         "cache-control": "public, max-age=60",

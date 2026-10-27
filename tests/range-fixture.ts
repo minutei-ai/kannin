@@ -40,6 +40,7 @@ export default {
             input.source.headerBytes,
             input.pages,
             input.bytes,
+            input.metadataEnd,
             permits,
           );
         }).pipe(
@@ -54,6 +55,7 @@ export default {
       response.headers.set("x-reads", String(after.rangeReads - before.rangeReads));
       response.headers.set("x-bytes", String(after.rangeBytes - before.rangeBytes));
       response.headers.set("x-charged", String(after.rangeCacheChargedBytes));
+      response.headers.set("x-cache-hits", String(after.rangeCacheHits - before.rangeCacheHits));
       return response;
     }
     if (new URL(request.url).pathname === "/decoded-directory-scan") {

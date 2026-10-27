@@ -1,3 +1,4 @@
+import { encodeRoot } from "../src/manifest";
 import { expect, test } from "bun:test";
 import { Effect, Schema } from "effect";
 import { Root } from "../src/protocol";
@@ -13,9 +14,10 @@ const manifest = Schema.decodeSync(Root)({
   vectorEpoch: "test",
   vectorJobs: [],
   lastReceipt: null,
+  bloomPacks: [],
   segments: [],
 });
-const payload = new TextEncoder().encode(Schema.encodeSync(Schema.fromJsonString(Root))(manifest));
+const payload = new TextEncoder().encode(encodeRoot(manifest));
 
 test("snapshot frames retain manifest bytes and the original observation timestamp", async () => {
   const snapshot = { observedAt: 12345, manifest };
@@ -39,17 +41,17 @@ test("snapshot frames reject truncation, invalid versions, lengths and mismatche
     expect(Effect.runSync(Effect.exit(readSnapshotFrame(bytes.slice(0, length))))._tag).toBe(
       "Failure",
     );
-  const version = bytes.slice(0);
-  new Uint8Array(version)[7] = 51;
-  expect(Effect.runSync(Effect.exit(readSnapshotFrame(version)))._tag).toBe("Failure");
+  for (const unsupported of [49, 50, 51, 52, 54]) {
+    const version = bytes.slice(0);
+    new Uint8Array(version)[7] = unsupported;
+    expect(Effect.runSync(Effect.exit(readSnapshotFrame(version)))._tag).toBe("Failure");
+  }
   for (const length of [0, 4097, 4294967295]) {
     const frame = bytes.slice(0);
     new DataView(frame).setUint32(8, length, true);
     expect(Effect.runSync(Effect.exit(readSnapshotFrame(frame)))._tag).toBe("Failure");
   }
-  const other = new TextEncoder().encode(
-    Schema.encodeSync(Schema.fromJsonString(Root))({ ...manifest, sequence: 8 }),
-  );
+  const other = new TextEncoder().encode(encodeRoot({ ...manifest, sequence: 8 }));
   expect(
     Effect.runSync(
       Effect.exit(

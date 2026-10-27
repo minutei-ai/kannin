@@ -1,3 +1,4 @@
+import { decodeRoot } from "../src/manifest";
 import { afterAll, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -8,7 +9,6 @@ import {
   Metadata,
   NamespaceSchema,
   QueryResult,
-  Root,
   WriteResult,
 } from "../src/protocol";
 import { request, startWorker, textQuery } from "./harness";
@@ -54,7 +54,7 @@ test("declared headers stay compact across reload and compaction while source at
       const stored = await bucket.get(`namespaces/projection-${name}/root.json`);
       expect(stored).not.toBeNull();
       if (stored === null) return;
-      const root = Schema.decodeUnknownSync(Root)(await stored.json());
+      const root = decodeRoot(await stored.text());
       expect(root.documents).toBe(20);
       expect(root.segments).toHaveLength(2);
       headers[name] = root.segments.reduce((sum, segment) => sum + segment.headerBytes, 0);
@@ -106,7 +106,7 @@ test("declared headers stay compact across reload and compaction while source at
     const stored = await bucket.get(`namespaces/${namespace}/root.json`);
     expect(stored).not.toBeNull();
     if (stored === null) return;
-    const root = Schema.decodeUnknownSync(Root)(await stored.json());
+    const root = decodeRoot(await stored.text());
     expect(root.segments.reduce((sum, segment) => sum + segment.headerBytes, 0)).toBeLessThan(
       headers.unconfigured / 8,
     );

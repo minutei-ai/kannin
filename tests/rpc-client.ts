@@ -10,6 +10,7 @@ export default {
         const text = yield* Effect.tryPromise(() => request.text());
         const command = yield* Schema.decodeEffect(Schema.fromJsonString(RpcCommand))(text);
         const value = yield* Match.value(command).pipe(
+          Match.when({ operation: "namespaces" }, (c) => Kannin.namespaces(c.input)),
           Match.when({ operation: "query" }, (c) => Kannin.query(c.namespace, c.input)),
           Match.when({ operation: "write" }, (c) => Kannin.write(c.namespace, c.input)),
           Match.when({ operation: "metadata" }, (c) => Kannin.metadata(c.namespace)),
@@ -20,6 +21,7 @@ export default {
           Match.when({ operation: "vector-rebuild" }, (c) =>
             Kannin.rebuildVectors(c.namespace, c.input),
           ),
+          Match.when({ operation: "migrate-root" }, (c) => Kannin.migrateRoot(c.namespace)),
           Match.exhaustive,
         );
         return Response.json(value);

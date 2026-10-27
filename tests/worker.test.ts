@@ -1,6 +1,6 @@
 import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
-import { QueryResult, WriteResult, Metadata } from "../src/protocol";
+import { QueryResult, WriteResult, Metadata, ErrorBody } from "../src/protocol";
 import { document, request, startWorker, textQuery, write } from "./harness";
 
 const state = { worker: await startWorker() };
@@ -20,6 +20,100 @@ test("health and authorization run inside workerd", async () => {
     ).status,
   ).toBe(401);
   expect((await request(state.worker, "bad.name", "metadata")).status).toBe(404);
+});
+
+test("HTTP errors preserve statuses and use the public error envelope", async () => {
+  for (const sample of [
+    {
+      path: "/v1/namespaces/private/metadata",
+      method: "GET",
+      authenticated: false,
+      body: "",
+      status: 401,
+      error: "Unauthorized",
+    },
+    {
+      path: "/v2/namespaces/missing/query",
+      method: "POST",
+      authenticated: true,
+      body: "{}",
+      status: 404,
+      error: "Unknown route",
+    },
+    {
+      path: "/v1/namespaces/error-contract/query",
+      method: "GET",
+      authenticated: true,
+      body: "",
+      status: 405,
+      error: "Method not allowed",
+    },
+    {
+      path: "/v1/namespaces/error-contract/query",
+      method: "POST",
+      authenticated: true,
+      body: "{",
+      status: 400,
+      error: "Invalid query contract",
+    },
+    {
+      path: "/v1/namespaces/error-contract/write",
+      method: "POST",
+      authenticated: true,
+      body: "{",
+      status: 400,
+      error: "Invalid JSON body",
+    },
+    {
+      path: "/v1/namespaces/error-contract/write",
+      method: "POST",
+      authenticated: true,
+      body: "{}",
+      status: 400,
+      error: "Invalid operation contract",
+    },
+  ]) {
+    const headers = new Headers({ "content-type": "application/json" });
+    if (sample.authenticated) headers.set("authorization", "Bearer local-test-token");
+    const options: RequestInit = { method: sample.method, headers };
+    if (sample.method === "POST") options.body = sample.body;
+    const response = await fetch(new URL(sample.path, await state.worker.ready), options);
+    expect(response.status).toBe(sample.status);
+    expect(response.headers.get("content-type")).toContain("application/json");
+    expect(Schema.decodeUnknownSync(ErrorBody)(await response.json())).toEqual({
+      status: "error",
+      error: sample.error,
+    });
+  }
+  const input = write([document("one", "first")]);
+  expect((await request(state.worker, "error-conflict", "write", input)).status).toBe(200);
+  const conflict = await request(state.worker, "error-conflict", "write", {
+    ...input,
+    upserts: [document("one", "second")],
+  });
+  expect(conflict.status).toBe(409);
+  expect(Schema.decodeUnknownSync(ErrorBody)(await conflict.json())).toEqual({
+    status: "error",
+    error: "requestId already used with a different payload",
+  });
+  const bucket = await state.worker.getR2Bucket("STORAGE");
+  await bucket.put("namespaces/error-backend/root.json", "private broken root detail");
+  const unavailable = await request(state.worker, "error-backend", "metadata");
+  expect(unavailable.status).toBe(503);
+  expect(Schema.decodeUnknownSync(ErrorBody)(await unavailable.json())).toEqual({
+    status: "error",
+    error: "Storage or search backend unavailable",
+  });
+  await bucket.put("namespaces/error-invalid!name/root.json", "{}");
+  const enumeration = await fetch(new URL("/admin/namespaces", await state.worker.ready), {
+    headers: { authorization: "Bearer local-test-token" },
+  });
+  expect(enumeration.status).toBe(503);
+  expect(enumeration.headers.get("cache-control")).toBe("private, no-store");
+  expect(Schema.decodeUnknownSync(ErrorBody)(await enumeration.json())).toEqual({
+    status: "error",
+    error: "Storage or search backend unavailable",
+  });
 });
 
 test("committed documents are immediately searchable and isolated", async () => {

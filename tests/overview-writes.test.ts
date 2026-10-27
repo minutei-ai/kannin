@@ -1,9 +1,10 @@
+import { decodeRoot } from "../src/manifest";
 import { expect, test } from "bun:test";
 import { Effect, Schema } from "effect";
 import { mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Root, QueryResult, StoredOverviewBatch } from "../src/protocol";
+import { QueryResult, StoredOverviewBatch } from "../src/protocol";
 import { initSync, unpack } from "../dist/wasm/raio_engine";
 import { document, request, startWorker, textQuery, write } from "./harness";
 
@@ -43,13 +44,13 @@ for (const sample of [
       const manifest = await bucket.get(`namespaces/${namespace}/root.json`);
       if (manifest === null) throw new Error("Missing canonical manifest");
       const encodedRoot = await manifest.text();
-      const root = Schema.decodeSync(Schema.fromJsonString(Root))(encodedRoot);
+      const root = decodeRoot(encodedRoot);
       const source = root.segments[0];
       if (source === undefined) throw new Error("Missing committed segment");
       const found: { key: string | undefined } = { key: undefined };
       for (const attempt of Array.from({ length: 100 }, (_, index) => index)) {
         const objects = await bucket.list({
-          prefix: `cache/correlated-pool-batches-v1/${source.key}/`,
+          prefix: `cache/correlated-pool-batches-v3/${source.key}/`,
         });
         found.key = objects.objects[0]?.key;
         if (found.key !== undefined || attempt === 99) break;

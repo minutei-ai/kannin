@@ -1,7 +1,8 @@
+import { decodeRoot, encodeRoot } from "../src/manifest";
 import { afterAll, expect, test } from "bun:test";
 import { Response } from "miniflare";
 import { Clock, Effect, Schema } from "effect";
-import { Health, QueryResult, Root, SnapshotCacheHeaders, WriteResult } from "../src/protocol";
+import { Health, QueryResult, SnapshotCacheHeaders, WriteResult } from "../src/protocol";
 import { document, request, startWorker, textQuery, write } from "./harness";
 
 import { snapshotFrame, readSnapshotFrame } from "../src/snapshot";
@@ -80,8 +81,8 @@ test("R2 snapshot frames retain validated original UTF-8 bytes without reseriali
   const rootKey = `namespaces/${namespace}/root.json`;
   const object = await bucket.get(rootKey);
   if (object === null) throw new Error("Missing canonical manifest");
-  const manifest = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
-  const payload = `\n${Schema.encodeSync(Schema.fromJsonString(Root))(manifest)}\n`;
+  const manifest = decodeRoot(await object.text());
+  const payload = `\n${encodeRoot(manifest)}\n`;
   await bucket.put(rootKey, payload);
   const response = await request(worker, namespace, "query", {
     ...textQuery("café 日本語"),
@@ -91,8 +92,8 @@ test("R2 snapshot frames retain validated original UTF-8 bytes without reseriali
   expect(response.status).toBe(200);
   const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
   expect(result.rows.map((row) => row.id)).toEqual(["café-日本語"]);
-  const cache = await (await worker.getCaches()).open("raio-snapshots-v2");
-  const key = `https://raio-cache.internal/snapshots/${namespace}?bucket=raio-test`;
+  const cache = await (await worker.getCaches()).open("raio-snapshots-v5");
+  const key = `https://raio-cache.internal/snapshots-v5/${namespace}?bucket=raio-test`;
   const cached = await cache.match(key);
   if (cached === undefined) throw new Error("Missing snapshot frame");
   const decoded = await Effect.runPromise(readSnapshotFrame(await cached.arrayBuffer()));
@@ -104,16 +105,16 @@ async function seedSnapshot(namespace: string, observedAt: number, advertisedAt 
   const bucket = await worker.getR2Bucket("STORAGE");
   const object = await bucket.get(`namespaces/${namespace}/root.json`);
   if (object === null) throw new Error("Missing manifest");
-  const manifest = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
-  const cache = await (await worker.getCaches()).open("raio-snapshots-v2");
-  const key = new URL(`https://raio-cache.internal/snapshots/${namespace}`);
+  const manifest = decodeRoot(await object.text());
+  const cache = await (await worker.getCaches()).open("raio-snapshots-v5");
+  const key = new URL(`https://raio-cache.internal/snapshots-v5/${namespace}`);
   key.searchParams.set("bucket", "raio-test");
   await cache.put(
     key,
     new Response(
       await snapshotFrame(
         { observedAt, manifest },
-        new TextEncoder().encode(Schema.encodeSync(Schema.fromJsonString(Root))(manifest)),
+        new TextEncoder().encode(encodeRoot(manifest)),
       ).arrayBuffer(),
       {
         headers: {
@@ -133,8 +134,8 @@ test("malformed binary cache frames recover through canonical R2", async () => {
   const namespace = "broken-binary-cache";
   await request(worker, namespace, "write", write([document("a", "canonical text")]));
   await seedSnapshot(namespace, Effect.runSync(Clock.currentTimeMillis));
-  const cache = await (await worker.getCaches()).open("raio-snapshots-v2");
-  const key = new URL(`https://raio-cache.internal/snapshots/${namespace}?bucket=raio-test`);
+  const cache = await (await worker.getCaches()).open("raio-snapshots-v5");
+  const key = new URL(`https://raio-cache.internal/snapshots-v5/${namespace}?bucket=raio-test`);
   const cached = await cache.match(key);
   if (cached === undefined) throw new Error("Missing seeded snapshot");
   const bytes = new Uint8Array(await cached.arrayBuffer());
@@ -185,14 +186,12 @@ test("identical cache rehydration preserves R2 conditional-read provenance", asy
   ).get(`namespaces/${namespace}/root.json`);
   if (object === null) throw new Error("Missing canonical manifest");
   const payload = new Uint8Array(await object.arrayBuffer());
-  const manifest = Schema.decodeSync(Schema.fromJsonString(Root))(
-    new TextDecoder().decode(payload),
-  );
+  const manifest = decodeRoot(new TextDecoder().decode(payload));
   await Effect.runPromise(Effect.sleep(1100));
   const observedAt = Effect.runSync(Clock.currentTimeMillis);
-  const cache = await (await worker.getCaches()).open("raio-snapshots-v2");
+  const cache = await (await worker.getCaches()).open("raio-snapshots-v5");
   await cache.put(
-    `https://raio-cache.internal/snapshots/${namespace}?bucket=raio-test`,
+    `https://raio-cache.internal/snapshots-v5/${namespace}?bucket=raio-test`,
     new Response(await snapshotFrame({ observedAt, manifest }, payload).arrayBuffer(), {
       headers: {
         "cache-control": "public, max-age=60",
@@ -228,7 +227,7 @@ test("same-sequence cache bodies with different bytes discard R2 provenance", as
     ).get(`namespaces/${namespace}/root.json`);
     if (object === null) throw new Error("Missing canonical manifest");
     const original = await object.text();
-    const manifest = Schema.decodeSync(Schema.fromJsonString(Root))(original);
+    const manifest = decodeRoot(original);
     const changed = { manifest, text: `\n${original}\n` };
     if (kind === "same-length") {
       changed.manifest = {
@@ -236,14 +235,14 @@ test("same-sequence cache bodies with different bytes discard R2 provenance", as
         vectorEpoch: `${manifest.vectorEpoch.slice(0, 14)}${((Number.parseInt(manifest.vectorEpoch.slice(14, 15), 16) + 1) % 16).toString(16)}${manifest.vectorEpoch.slice(15)}`,
       };
       expect(changed.manifest.vectorEpoch).not.toBe(manifest.vectorEpoch);
-      changed.text = Schema.encodeSync(Schema.fromJsonString(Root))(changed.manifest);
+      changed.text = encodeRoot(changed.manifest);
       expect(changed.text.length).toBe(original.length);
     }
     await Effect.runPromise(Effect.sleep(1100));
     const observedAt = Effect.runSync(Clock.currentTimeMillis);
-    const cache = await (await worker.getCaches()).open("raio-snapshots-v2");
+    const cache = await (await worker.getCaches()).open("raio-snapshots-v5");
     await cache.put(
-      `https://raio-cache.internal/snapshots/${namespace}?bucket=raio-test`,
+      `https://raio-cache.internal/snapshots-v5/${namespace}?bucket=raio-test`,
       new Response(
         await snapshotFrame(
           { observedAt, manifest: changed.manifest },
@@ -294,8 +293,8 @@ test("recent unchanged snapshot publications coalesce without hiding changes or 
   expect(grouped.snapshotR2BodyBytes - before.snapshotR2BodyBytes).toBe(0);
   expect(grouped.snapshotCachePutAttempts - before.snapshotCachePutAttempts).toBeLessThan(8);
   expect(grouped.snapshotCachePutSkipped - before.snapshotCachePutSkipped).toBeGreaterThan(0);
-  const cache = await (await worker.getCaches()).open("raio-snapshots-v2");
-  const key = `https://raio-cache.internal/snapshots/${namespace}?bucket=raio-test`;
+  const cache = await (await worker.getCaches()).open("raio-snapshots-v5");
+  const key = `https://raio-cache.internal/snapshots-v5/${namespace}?bucket=raio-test`;
   await cache.delete(key);
   expect((await request(worker, namespace, "query", input)).status).toBe(200);
   await Effect.runPromise(Effect.sleep(550));
@@ -327,8 +326,8 @@ test("expired warm snapshots revalidate unchanged R2 content without transferrin
   const input = { ...textQuery("unchanged"), consistency: "edge-eventual", minimumSequence: 1 };
   expect((await request(worker, namespace, "query", input)).status).toBe(200);
   await Effect.runPromise(Effect.sleep(1100));
-  const cache = await (await worker.getCaches()).open("raio-snapshots-v2");
-  await cache.delete(`https://raio-cache.internal/snapshots/${namespace}?bucket=raio-test`);
+  const cache = await (await worker.getCaches()).open("raio-snapshots-v5");
+  await cache.delete(`https://raio-cache.internal/snapshots-v5/${namespace}?bucket=raio-test`);
   const before = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
@@ -593,8 +592,8 @@ test("a still-valid older snapshot serves immediately while native background wo
   );
   expect(result.sequence).toBe(1);
   expect(result.rows.map((row) => row.id)).toEqual(["a"]);
-  const cache = await (await worker.getCaches()).open("raio-snapshots-v2");
-  const key = new URL("https://raio-cache.internal/snapshots/edge-refresh?bucket=raio-test");
+  const cache = await (await worker.getCaches()).open("raio-snapshots-v5");
+  const key = new URL("https://raio-cache.internal/snapshots-v5/edge-refresh?bucket=raio-test");
   const state = { refreshed: false };
   for (const attempt of Array.from({ length: 20 }, (_, index) => index)) {
     const cached = await cache.match(key);
@@ -639,8 +638,8 @@ test("warm namespace snapshots survive Cache API eviction only within their orig
   await request(worker, "warm-memory", "write", write([document("a", "warm namespace")]));
   const input = { ...textQuery("warm"), consistency: "edge-eventual" };
   expect((await request(worker, "warm-memory", "query", input)).status).toBe(200);
-  const cache = await (await worker.getCaches()).open("raio-snapshots-v2");
-  const key = new URL("https://raio-cache.internal/snapshots/warm-memory");
+  const cache = await (await worker.getCaches()).open("raio-snapshots-v5");
+  const key = new URL("https://raio-cache.internal/snapshots-v5/warm-memory");
   key.searchParams.set("bucket", "raio-test");
   expect(await cache.delete(key)).toBe(true);
   const bucket = await worker.getR2Bucket("STORAGE");
@@ -660,20 +659,24 @@ test("large warm snapshots retain the same age limit after Cache API eviction", 
   const bucket = await worker.getR2Bucket("STORAGE");
   const object = await bucket.get(`namespaces/${namespace}/root.json`);
   if (object === null) throw new Error("Missing manifest");
-  const manifest = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
-  await bucket.put(
-    `namespaces/${namespace}/root.json`,
-    Schema.encodeSync(Schema.fromJsonString(Root))({
-      ...manifest,
-      segments: manifest.segments.map((segment) =>
-        Object.assign({}, segment, { documentBloom: btoa("\xff".repeat(900000)) }),
-      ),
-    }),
-  );
+  const manifest = decodeRoot(await object.text());
+  const encoded = encodeRoot({
+    ...manifest,
+    segments: manifest.segments.map((segment) =>
+      Object.assign({}, segment, {
+        removedFrequencies: {
+          ...segment.removedFrequencies,
+          ["padding".repeat(180000)]: 0,
+        },
+      }),
+    ),
+  });
+  expect(new TextEncoder().encode(encoded).byteLength).toBeGreaterThan(1024 * 1024);
+  await bucket.put(`namespaces/${namespace}/root.json`, encoded);
   const input = { ...textQuery("warm"), consistency: "edge-eventual", minimumSequence: 1 };
   expect((await request(worker, namespace, "query", input)).status).toBe(200);
-  const cache = await (await worker.getCaches()).open("raio-snapshots-v2");
-  const key = new URL(`https://raio-cache.internal/snapshots/${namespace}?bucket=raio-test`);
+  const cache = await (await worker.getCaches()).open("raio-snapshots-v5");
+  const key = new URL(`https://raio-cache.internal/snapshots-v5/${namespace}?bucket=raio-test`);
   expect(await cache.delete(key)).toBe(true);
   await bucket.put(`namespaces/${namespace}/root.json`, "corrupted canonical root");
   const cached = await request(worker, namespace, "query", input);

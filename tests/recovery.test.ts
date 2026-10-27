@@ -1,6 +1,6 @@
 import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
-import { Metadata, QueryResult, Root } from "../src/protocol";
+import { Metadata, QueryResult, StoredRoot } from "../src/protocol";
 import { document, request, startWorker, textQuery, write } from "./harness";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -47,8 +47,15 @@ test("a stale manifest ETag rejects the commit and its segment stays invisible",
   const rootKey = `${await prefix("cas")}/root.json`;
   const current = await bucket.get(rootKey);
   if (current === null) throw new Error("Missing R2 root");
-  const root = Schema.decodeSync(Schema.fromJsonString(Root))(await current.text());
-  await bucket.put(rootKey, JSON.stringify({ ...root, testRace: true }));
+  const root = Schema.decodeSync(Schema.fromJsonString(StoredRoot))(await current.text());
+  const racingRoot = StoredRoot.mapFields((fields) => ({
+    ...fields,
+    testRace: Schema.Boolean,
+  }));
+  await bucket.put(
+    rootKey,
+    Schema.encodeSync(Schema.fromJsonString(racingRoot))({ ...root, testRace: true }),
+  );
   const input = write([document("b", "after")]);
   expect((await request(worker, "cas", "write", input)).status).toBe(409);
   expect(

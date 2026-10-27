@@ -57,7 +57,12 @@ fn search(
     Ok(search
         .finish()?
         .into_iter()
-        .map(|hit| (header.documents[hit.row as usize].id.clone(), hit.score))
+        .map(|hit| {
+            (
+                header.documents.row(hit.row as usize).id.to_string(),
+                hit.score,
+            )
+        })
         .collect())
 }
 
@@ -68,12 +73,12 @@ fn object_ranges_are_self_contained_and_crc_checked() -> Result<(), Box<dyn std:
         None,
     )?;
     let (header, base) = segment::parse_header(&built.bytes)?;
-    assert_eq!(header.documents[0].id, "a");
-    for metadata in &header.documents {
+    assert_eq!(header.documents.row(0).id, "a");
+    for metadata in header.documents.iter() {
         let start = base + metadata.data.offset as usize;
         let mut page = built.bytes[start..start + metadata.data.length as usize].to_vec();
         let decoded: Document = serde_json::from_slice(&segment::decode_page(&page)?)?;
-        assert_eq!(decoded.id, metadata.id);
+        assert_eq!(decoded.id.as_str(), metadata.id);
         page[4] ^= 1;
         assert!(segment::decode_page(&page).is_err());
     }
@@ -312,7 +317,7 @@ fn posting_directory_rejects_reordered_and_overlapping_rows()
             blocks.swap(0, 1);
         }
         let json = serde_json::to_vec(&header)?;
-        let mut bytes = b"RAIOSEG1".to_vec();
+        let mut bytes = b"RAIOSEG2".to_vec();
         bytes.extend_from_slice(&u32::try_from(json.len())?.to_le_bytes());
         bytes.extend_from_slice(&crc32fast::hash(&json).to_le_bytes());
         bytes.extend_from_slice(&json);
@@ -663,7 +668,7 @@ fn compressed_directories_preserve_headers_and_reject_frame_corruption()
     let compact = miniz_oxide::inflate::decompress_to_vec_zlib(&encoded[20..])
         .map_err(|cause| cause.to_string())?;
     let mut payload = compact;
-    payload[0] = 2;
+    payload[0] = 3;
     let mut forged = encoded[..12].to_vec();
     forged.extend_from_slice(&u32::try_from(payload.len())?.to_le_bytes());
     let mut checksum = crc32fast::Hasher::new();
@@ -706,9 +711,9 @@ fn compressed_directories_exceed_the_separate_mutation_log_budget()
     let compressed = segment::compress_directory(&built.bytes[..length])?;
     let decoded = segment::parse_compressed_directory(&compressed, length, 40 * 1024 * 1024)?;
     assert_eq!(decoded.documents.len(), 260);
-    assert_eq!(decoded.documents[0].id, "large0000");
+    assert_eq!(decoded.documents.row(0).id, "large0000");
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(decoded.documents[0].attributes.get())?["context"],
+        serde_json::from_str::<serde_json::Value>(decoded.documents.row(0).attributes.get())?["context"],
         "x".repeat(8192)
     );
     Ok(())
@@ -952,7 +957,7 @@ fn canonical_headers_reuse_compact_tuples_and_preserve_object_readers()
     );
     let json = serde_json::to_vec(&built.header)?;
     assert!(base < json.len() + 16);
-    let mut object = b"RAIOSEG1".to_vec();
+    let mut object = b"RAIOSEG2".to_vec();
     object.extend_from_slice(&u32::try_from(json.len())?.to_le_bytes());
     object.extend_from_slice(&crc32fast::hash(&json).to_le_bytes());
     object.extend_from_slice(&json);
@@ -963,5 +968,42 @@ fn canonical_headers_reuse_compact_tuples_and_preserve_object_readers()
         serde_json::to_string(&compact)?
     );
     assert_eq!(&object[original_base..], &built.bytes[base..]);
+    Ok(())
+}
+
+#[test]
+fn unordered_unicode_query_terms_reject_unknown_pages_before_decode()
+-> Result<(), Box<dyn std::error::Error>> {
+    let built = segment::build(vec![document("match", "中文 rust rust éclair Ωμέγα")], None)?;
+    let (header, base) = segment::parse_header(&built.bytes)?;
+    for mode in ["any", "all", "phrase"] {
+        let mut ranker = Search::new(
+            header.clone(),
+            statistics(&header),
+            "中文 rust rust éclair Ωμέγα",
+            mode,
+            10,
+            &[],
+            &[],
+        )?;
+        for term in ["rustx", "RUST", "中文x", "éclair", "missing"] {
+            assert_eq!(
+                ranker.add(term, &[]),
+                Err("Unrequested posting term".into())
+            );
+        }
+        for (term, metadata) in header.terms.iter().collect::<Vec<_>>().into_iter().rev() {
+            for block in &metadata.blocks {
+                let start = base + block.data.offset as usize;
+                ranker.add(
+                    term,
+                    &built.bytes[start..start + block.data.length as usize],
+                )?;
+            }
+        }
+        let hits = ranker.finish()?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].row, 0);
+    }
     Ok(())
 }

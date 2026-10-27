@@ -1,14 +1,8 @@
+import { decodeRoot } from "../src/manifest";
 import { expect, test } from "bun:test";
 import { Clock, Effect, Option, Schema } from "effect";
 import { createHash } from "node:crypto";
-import {
-  CollectionResult,
-  Metadata,
-  QueryResult,
-  Retirement,
-  Root,
-  WriteResult,
-} from "../src/protocol";
+import { CollectionResult, Metadata, QueryResult, Retirement, WriteResult } from "../src/protocol";
 import { document, request, startWorker, textQuery, write } from "./harness";
 import { ageRetirementUploads, retentionFixture } from "./retention-fixture";
 
@@ -46,7 +40,11 @@ test("a blocked query preserves its captured root while writes and reads progres
   const bucket = await worker.getR2Bucket("STORAGE");
   const object = await bucket.get(`namespaces/${namespace}/root.json`);
   if (object === null) throw new Error("Missing fixture root");
-  const root = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
+  const root = decodeRoot(await object.text());
+  const capturedKeys = [
+    ...root.segments.map((segment) => segment.key),
+    ...root.bloomPacks.map((descriptor) => descriptor.key),
+  ];
   await backend.fetch("http://fixture/pause-query", { method: "POST", body: gate.url.href });
   const blocked = request(worker, namespace, "query", {
     kind: "hybrid",
@@ -81,13 +79,13 @@ test("a blocked query preserves its captured root while writes and reads progres
   expect(current.rows.map((row) => row.id)).toEqual(["new"]);
   await ageRetirementUploads(worker, namespace);
   const timestamp = Effect.runSync(Clock.currentTimeMillis) - 25 * 60 * 60 * 1000;
-  for (const segment of root.segments) {
-    const source = await bucket.get(segment.key);
+  for (const key of capturedKeys) {
+    const source = await bucket.get(key);
     if (source === null) throw new Error("Missing fixture segment");
     await bucket.put(
-      `namespaces/${namespace}/retired/${createHash("sha256").update(segment.key).digest("hex")}.json`,
+      `namespaces/${namespace}/retired/${createHash("sha256").update(key).digest("hex")}.json`,
       Schema.encodeSync(Schema.fromJsonString(Retirement))({
-        key: segment.key,
+        key,
         etag: source.etag,
         observedAt: timestamp,
       }),
@@ -97,8 +95,8 @@ test("a blocked query preserves its captured root while writes and reads progres
     await (await request(worker, namespace, "collect", {})).json(),
   );
   expect(collection.deleted).toBe(0);
-  expect(collection.pinned).toBe(4);
-  for (const segment of root.segments) expect(await bucket.head(segment.key)).not.toBeNull();
+  expect(collection.pinned).toBe(6);
+  for (const key of capturedKeys) expect(await bucket.head(key)).not.toBeNull();
   release.resolve(new Response("released"));
   const captured = Schema.decodeUnknownSync(QueryResult)(await (await blocked).json());
   expect(captured.sequence).toBe(3);
@@ -107,14 +105,14 @@ test("a blocked query preserves its captured root while writes and reads progres
   const retired = Schema.decodeUnknownSync(CollectionResult)(
     await (await request(worker, namespace, "collect", {})).json(),
   );
-  expect(retired.marked).toBe(3);
-  for (const segment of root.segments) {
-    const source = await bucket.head(segment.key);
+  expect(retired.marked).toBe(4);
+  for (const key of capturedKeys) {
+    const source = await bucket.head(key);
     if (source === null) throw new Error("Missing released segment");
     await bucket.put(
-      `namespaces/${namespace}/retired/${createHash("sha256").update(segment.key).digest("hex")}.json`,
+      `namespaces/${namespace}/retired/${createHash("sha256").update(key).digest("hex")}.json`,
       Schema.encodeSync(Schema.fromJsonString(Retirement))({
-        key: segment.key,
+        key,
         etag: source.etag,
         observedAt: timestamp,
       }),
@@ -123,7 +121,7 @@ test("a blocked query preserves its captured root while writes and reads progres
   const collected = Schema.decodeUnknownSync(CollectionResult)(
     await (await request(worker, namespace, "collect", {})).json(),
   );
-  expect(collected.deleted).toBe(3);
+  expect(collected.deleted).toBe(4);
   const metadata = Schema.decodeUnknownSync(Metadata)(
     await (await request(worker, namespace, "metadata")).json(),
   );
@@ -198,6 +196,6 @@ test("query admission stays bounded and backend failures release all reader slot
   const collected = Schema.decodeUnknownSync(CollectionResult)(
     await (await request(worker, namespace, "collect", {})).json(),
   );
-  expect(collected.pinned).toBe(1);
-  expect(collected.marked).toBe(1);
+  expect(collected.pinned).toBe(2);
+  expect(collected.marked).toBe(2);
 }, 15000);

@@ -4,7 +4,16 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { QueryResult } from "../src/protocol";
-import { clearLeaderIndex, document, request, startWorker, textQuery, write } from "./harness";
+import {
+  clearLeaderIndex,
+  document,
+  request,
+  startWorker,
+  textQuery,
+  write,
+  evictWrittenOverviews,
+} from "./harness";
+import { useHeaderOnlyCommonFrames } from "./common-posting-fixture";
 
 test("sparse ranking overlaps reads before top-k fills within the existing four-reader limit", async () => {
   const artifacts = await mkdtemp(join(tmpdir(), "kannin-ranking-window-"));
@@ -37,7 +46,19 @@ test("sparse ranking overlaps reads before top-k fills within the existing four-
   );
   const worker = await startWorker(undefined, false, artifacts);
   cleanup.defer(() => worker.dispose());
-  const documents = Array.from({ length: 8 }, (_, index) => document(String(index), "alpha beta"));
+  async function evictSingletonProofs(namespace: string) {
+    await evictWrittenOverviews(worker, namespace);
+    const bucket = await worker.getR2Bucket("STORAGE");
+    const objects = await bucket.list({
+      prefix: `cache/correlated-pool-v3/namespaces/${namespace}/`,
+    });
+    expect(objects.truncated).toBe(false);
+    if (objects.objects.length > 0)
+      await bucket.delete(objects.objects.map((object) => object.key));
+  }
+  const documents = Array.from({ length: 8 }, (_, index) =>
+    document(String(index), "alpha alpha beta beta"),
+  );
   expect((await request(worker, "window-reference", "write", write(documents))).status).toBe(200);
   const reference = Schema.decodeUnknownSync(QueryResult)(
     await (await request(worker, "window-reference", "query", textQuery("alpha beta", 10))).json(),
@@ -45,8 +66,10 @@ test("sparse ranking overlaps reads before top-k fills within the existing four-
   for (const value of documents)
     expect((await request(worker, "window-sparse", "write", write([value]))).status).toBe(200);
   await clearLeaderIndex(worker, "window-sparse");
+  await evictSingletonProofs("window-sparse");
   const response = await request(worker, "window-sparse", "query", textQuery("alpha beta", 10));
   expect(response.status).toBe(200);
+  expect(response.headers.get("server-timing")).toContain('text_uniform_hits;desc="segments=0"');
   const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
   expect(result.sequence).toBe(8);
   expect(result.rows).toEqual(
@@ -63,10 +86,14 @@ test("sparse ranking overlaps reads before top-k fills within the existing four-
   for (const segment of [0, 1, 2, 3, 4]) {
     const count = Math.min(10, 9 + segment);
     const values = Array.from({ length: count }, (_, row) =>
-      document(`${String(segment).padStart(2, "0")}-${String(row).padStart(2, "0")}`, "alpha beta"),
+      document(
+        `${String(segment).padStart(2, "0")}-${String(row).padStart(2, "0")}`,
+        "alpha alpha beta beta",
+      ),
     );
     expect((await request(worker, "window-nearly-full", "write", write(values))).status).toBe(200);
   }
+  await useHeaderOnlyCommonFrames(worker, "window-nearly-full");
   await clearLeaderIndex(worker, "window-nearly-full");
   const nearlyFull = await request(
     worker,
@@ -97,6 +124,7 @@ test("sparse ranking overlaps reads before top-k fills within the existing four-
         )
       ).status,
     ).toBe(200);
+  await evictSingletonProofs("window-empty");
   const empty = await request(worker, "window-empty", "query", {
     ...textQuery("alpha beta", 1),
     match: "all",
@@ -117,10 +145,11 @@ test("sparse ranking overlaps reads before top-k fills within the existing four-
           worker,
           "window-final-slot",
           "write",
-          write([document(String(index).padStart(2, "0"), "alpha beta")]),
+          write([document(String(index).padStart(2, "0"), "alpha alpha beta beta")]),
         )
       ).status,
     ).toBe(200);
+  await evictSingletonProofs("window-final-slot");
   const finalSlot = await request(
     worker,
     "window-final-slot",
@@ -146,7 +175,7 @@ test("sparse ranking overlaps reads before top-k fills within the existing four-
           "window-deleted",
           "write",
           write([
-            document(`deleted-${index}`, "alpha beta"),
+            document(`deleted-${index}`, "alpha alpha beta beta"),
             document(`retained-${index}`, "gamma"),
           ]),
         )
@@ -165,10 +194,11 @@ test("sparse ranking overlaps reads before top-k fills within the existing four-
           worker,
           "window-exact-ceiling",
           "write",
-          write([document(String(index), "alpha beta")]),
+          write([document(String(index), "alpha alpha beta beta")]),
         )
       ).status,
     ).toBe(200);
+  await evictSingletonProofs("window-exact-ceiling");
   const exact = await request(worker, "window-exact-ceiling", "query", textQuery("alpha beta", 4));
   expect(exact.status).toBe(200);
   expect(

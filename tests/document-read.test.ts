@@ -1,11 +1,12 @@
+import { decodeRoot } from "../src/manifest";
 import { expect, test } from "bun:test";
 import { Match, Schema } from "effect";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Directory, initSync } from "../dist/wasm/raio_engine";
-import { Root, SegmentHeader, SegmentRange, QueryResult } from "../src/protocol";
-import { request, startWorker, write } from "./harness";
+import { SegmentRange, QueryResult, Metadata, LocatedDocument } from "../src/protocol";
+import { document, request, startWorker, textQuery, write } from "./harness";
 
 initSync({
   module: new WebAssembly.Module(
@@ -75,7 +76,7 @@ for (const kind of ["text", "vector"])
       const bucket = await worker.getR2Bucket("STORAGE");
       const rootObject = await bucket.get(`namespaces/${namespace}/root.json`);
       if (rootObject === null) throw new Error("Missing root");
-      const root = Schema.decodeUnknownSync(Root)(await rootObject.json());
+      const root = decodeRoot(await rootObject.text());
       const ranges = [];
       const payloadBytes = { total: 0 };
       for (const segment of root.segments) {
@@ -85,22 +86,24 @@ for (const kind of ["text", "vector"])
         if (object === null) throw new Error("Missing segment");
         const bytes = new Uint8Array(await object.arrayBuffer());
         using directory = Directory.canonical(bytes, segment.headerBytes);
-        const documents = Schema.decodeSync(Schema.fromJsonString(SegmentHeader.fields.documents))(
+        const documents = Schema.decodeSync(Schema.fromJsonString(Schema.Array(LocatedDocument)))(
           directory.rows(JSON.stringify(Array.from({ length: segment.count }, (_, row) => row))),
         );
-        for (const document of documents) {
-          payloadBytes.total += document.data.length;
+        for (const { document: stored } of documents) {
+          payloadBytes.total += stored.data.length;
           const range = {
             key: segment.key,
-            offset: segment.headerBytes + document.data.offset,
-            length: document.data.length,
+            offset: segment.headerBytes + stored.data.offset,
+            length: stored.data.length,
           };
-          if (range.length <= 32768) {
+          if (range.length <= 4096) {
             const end = Math.min(
-              segment.bytes,
-              Math.ceil((range.offset + range.length) / 32768) * 32768,
+              segment.metadataEnd,
+              segment.headerBytes +
+                Math.ceil((range.offset - segment.headerBytes + range.length) / 4096) * 4096,
             );
-            range.offset = Math.floor(range.offset / 32768) * 32768;
+            range.offset =
+              segment.headerBytes + Math.floor((range.offset - segment.headerBytes) / 4096) * 4096;
             range.length = end - range.offset;
           }
           ranges.push(range);
@@ -145,3 +148,53 @@ for (const kind of ["text", "vector"])
         expect(starts.slice(4).every((completed) => completed >= 1)).toBe(true);
       }
     }, 20000);
+
+test("sparse leader materialization bounds document overread without changing the row", async () => {
+  const worker = await startWorker();
+  await using cleanup = new AsyncDisposableStack();
+  cleanup.defer(() => worker.dispose());
+  const state = { value: 0x6d2b79f5 };
+  const padding = Uint8Array.from({ length: 512 }, () => {
+    state.value ^= state.value << 13;
+    state.value ^= state.value >>> 17;
+    state.value ^= state.value << 5;
+    return state.value & 255;
+  }).toHex();
+  const namespace = "sparse-document-window";
+  expect(
+    (
+      await request(
+        worker,
+        namespace,
+        "write",
+        write(
+          Array.from({ length: 64 }, (_, index) =>
+            document(String(index).padStart(3, "0"), "alpha beta", { padding }),
+          ),
+        ),
+      )
+    ).status,
+  ).toBe(200);
+  const bucket = await worker.getR2Bucket("STORAGE");
+  const object = await bucket.get(`namespaces/${namespace}/root.json`);
+  if (object === null) throw new Error("Missing sparse document Root");
+  const root = decodeRoot(await object.text());
+  expect(root.segments).toHaveLength(1);
+  const segment = root.segments[0];
+  if (segment === undefined) throw new Error("Missing sparse document segment");
+  expect(segment.bytes).toBeGreaterThan(32768);
+  const before = Schema.decodeUnknownSync(Metadata)(
+    await (await request(worker, namespace, "metadata")).json(),
+  );
+  const response = await request(worker, namespace, "query", textQuery("alpha", 1));
+  expect(response.status).toBe(200);
+  expect(response.headers.get("server-timing")).toContain('text_common_leaders;desc="segments=1"');
+  const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+  expect(result.rows.map((row) => row.id)).toEqual(["000"]);
+  expect(result.rows[0]?.attributes).toEqual({ padding });
+  const after = Schema.decodeUnknownSync(Metadata)(
+    await (await request(worker, namespace, "metadata")).json(),
+  );
+  expect(after.cache.rangeReads - before.cache.rangeReads).toBe(1);
+  expect(after.cache.rangeBytes - before.cache.rangeBytes).toBeLessThanOrEqual(8192);
+});

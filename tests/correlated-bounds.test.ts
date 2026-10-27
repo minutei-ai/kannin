@@ -1,3 +1,4 @@
+import { decodeRoot } from "../src/manifest";
 import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
 import { crc32 } from "node:zlib";
@@ -13,7 +14,6 @@ import {
   QueryResult,
   SegmentHeader,
   TermCatalog,
-  Root,
   CorrelatedOverview,
   SegmentHits,
 } from "../src/protocol";
@@ -122,7 +122,7 @@ test("cold queries prune equivalent segments and cache loss preserves exact rows
     }
     const bucket = await worker.getR2Bucket("STORAGE");
     const objects = await bucket.list({
-      prefix: `cache/correlated-pool-v1/namespaces/${namespace}/`,
+      prefix: `cache/correlated-pool-v3/namespaces/${namespace}/`,
     });
     expect(objects.objects).toHaveLength(12);
     if (variant === "absent") await bucket.delete(objects.objects.map((object) => object.key));
@@ -160,9 +160,7 @@ test("cold queries prune equivalent segments and cache loss preserves exact rows
     else expect(response.headers.get("server-timing")).toContain('desc="segments=12"');
     const root = await bucket.get(`namespaces/${namespace}/root.json`);
     if (root === null) throw new Error("Missing root");
-    expect(Schema.decodeSync(Schema.fromJsonString(Root))(await root.text()).segments).toHaveLength(
-      12,
-    );
+    expect(decodeRoot(await root.text()).segments).toHaveLength(12);
   }
   const expected = results.get("present");
   if (expected === undefined) throw new Error("Missing reference result");
@@ -263,14 +261,17 @@ test("derived overview ranges reject WASM integer overflow without trapping", ()
   const term = header.terms.alpha;
   const block = term?.blocks[0];
   if (term === undefined || block === undefined) throw new Error("Missing fixture term");
-  for (const data of [
-    { offset: 4294967295, length: 8 },
-    { offset: 0, length: 4294967295 },
+  for (const sample of [
+    { data: { offset: 4294967295, length: 8 }, expected: "Posting range overflow" },
+    {
+      data: { offset: 0, length: 4294967295 },
+      expected: "Posting block overlaps document columns",
+    },
   ]) {
     const json = new TextEncoder().encode(
       Schema.encodeSync(Schema.fromJsonString(SegmentHeader))({
         ...header,
-        terms: { alpha: { ...term, blocks: [{ ...block, data }] } },
+        terms: { alpha: { ...term, blocks: [{ ...block, data: sample.data }] } },
       }),
     );
     const forged = new Uint8Array(16 + json.byteLength);
@@ -278,6 +279,6 @@ test("derived overview ranges reject WASM integer overflow without trapping", ()
     new DataView(forged.buffer).setUint32(8, json.byteLength, true);
     new DataView(forged.buffer).setUint32(12, crc32(json), true);
     forged.set(json, 16);
-    expect(() => segment_correlated_overview(forged)).toThrow("Invalid posting range");
+    expect(() => segment_correlated_overview(forged)).toThrow(sample.expected);
   }
 });

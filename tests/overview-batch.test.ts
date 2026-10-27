@@ -1,10 +1,11 @@
+import { decodeRoot } from "../src/manifest";
 import { expect, test } from "bun:test";
 import { Effect, Schema } from "effect";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { crc32, deflateSync, inflateSync } from "node:zlib";
-import { CorrelatedOverview, QueryResult, Root, StoredOverviewBatch } from "../src/protocol";
+import { CorrelatedOverview, QueryResult, StoredOverviewBatch } from "../src/protocol";
 import { initSync, pack, unpack } from "../dist/wasm/raio_engine";
 import { document, request, startWorker, textQuery, write } from "./harness";
 
@@ -68,7 +69,7 @@ async function seed(worker: Awaited<ReturnType<typeof startWorker>>, namespace =
   const bucket = await worker.getR2Bucket("STORAGE");
   for (const attempt of Array.from({ length: 100 }, (_, i) => i)) {
     const objects = await bucket.list({
-      prefix: `cache/correlated-pool-batches-v1/namespaces/${namespace}/`,
+      prefix: `cache/correlated-pool-batches-v3/namespaces/${namespace}/`,
     });
     const first = objects.objects[0];
     if (first !== undefined) return { reference, bucket, key: first.key };
@@ -96,10 +97,10 @@ test("oversized combined sources recover through admissible physical batches", a
   const bucket = await worker.getR2Bucket("STORAGE");
   const object = await bucket.get("namespaces/large-overviews/root.json");
   if (object === null) throw new Error("Missing manifest");
-  const root = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
+  const root = decodeRoot(await object.text());
   const sources = [];
   for (const segment of root.segments) {
-    const key = `cache/correlated-pool-v1/${segment.key}`;
+    const key = `cache/correlated-pool-v3/${segment.key}`;
     const cached = await bucket.get(key);
     if (cached === null) throw new Error("Missing correlated source");
     const source = Schema.decodeSync(Schema.fromJsonString(CorrelatedOverview))(
@@ -152,12 +153,12 @@ test("oversized combined sources recover through admissible physical batches", a
         .slice(0, 10),
     );
     for (const attempt of Array.from({ length: 50 }, (_, i) => i)) {
-      const objects = await bucket.list({ prefix: "cache/correlated-pool-batches-v1/" });
+      const objects = await bucket.list({ prefix: "cache/correlated-pool-batches-v3/" });
       if (objects.objects.length >= pass + 1 || attempt === 49) break;
       await Effect.runPromise(Effect.sleep("10 millis"));
     }
   }
-  const persisted = await bucket.list({ prefix: "cache/correlated-pool-batches-v1/" });
+  const persisted = await bucket.list({ prefix: "cache/correlated-pool-batches-v3/" });
   expect(persisted.objects).toHaveLength(2);
   expect((await request(worker, "large-overviews", "rebuild", {})).status).toBe(200);
   const recovered = await request(
@@ -236,7 +237,9 @@ for (const phase of ["headers", "body"]) {
     expect(response.status).toBe(200);
     expect(Schema.decodeUnknownSync(QueryResult)(await response.json())).toEqual(reference);
     expect(response.headers.get("server-timing")).toContain("timeouts=1");
-    expect(performance.now() - started).toBeLessThan(1500);
+    expect(performance.now() - started, response.headers.get("server-timing") ?? "").toBeLessThan(
+      1500,
+    );
     const before = await fetch(new URL("/fixture/state", await worker.ready));
     expect((await request(worker, "batch", "rebuild", {})).status).toBe(200);
     const joinedAt = performance.now();
@@ -301,7 +304,7 @@ test("failed R2 batch publication preserves rows and a later request can publish
   expect(first.status).toBe(200);
   const reference = Schema.decodeUnknownSync(QueryResult)(await first.json());
   const bucket = await worker.getR2Bucket("STORAGE");
-  expect((await bucket.list({ prefix: "cache/correlated-pool-batches-v1/" })).objects).toHaveLength(
+  expect((await bucket.list({ prefix: "cache/correlated-pool-batches-v3/" })).objects).toHaveLength(
     0,
   );
   await fetch(new URL("/fixture/normal", await worker.ready));
@@ -310,7 +313,7 @@ test("failed R2 batch publication preserves rows and a later request can publish
   expect(recovered.status).toBe(200);
   expect(Schema.decodeUnknownSync(QueryResult)(await recovered.json())).toEqual(reference);
   for (const attempt of Array.from({ length: 100 }, (_, i) => i)) {
-    if ((await bucket.list({ prefix: "cache/correlated-pool-batches-v1/" })).objects.length === 1)
+    if ((await bucket.list({ prefix: "cache/correlated-pool-batches-v3/" })).objects.length === 1)
       return;
     if (attempt === 99) throw new Error("Publication did not recover");
     await Effect.runPromise(Effect.sleep("10 millis"));

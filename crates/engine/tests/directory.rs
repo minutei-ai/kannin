@@ -2,7 +2,7 @@ use raio_engine::segment::{self, Document};
 use std::collections::BTreeMap;
 
 fn frame(payload: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let mut encoded = b"RAIODIR3".to_vec();
+    let mut encoded = b"RAIODIR5".to_vec();
     encoded.extend_from_slice(&4096_u32.to_le_bytes());
     encoded.extend_from_slice(&u32::try_from(payload.len())?.to_le_bytes());
     let mut checksum = crc32fast::Hasher::new();
@@ -36,7 +36,7 @@ fn directory_budget_is_exact_and_unicode_and_u64_values_are_lossless()
     header.total_title_length = u64::MAX;
     header.total_body_length = u64::MAX;
     let json = serde_json::to_vec(&header)?;
-    let mut canonical = b"RAIOSEG1".to_vec();
+    let mut canonical = b"RAIOSEG2".to_vec();
     canonical.extend_from_slice(&u32::try_from(json.len())?.to_le_bytes());
     canonical.extend_from_slice(&crc32fast::hash(&json).to_le_bytes());
     canonical.extend_from_slice(&json);
@@ -63,8 +63,11 @@ fn directory_budget_is_exact_and_unicode_and_u64_values_are_lossless()
 fn directory_counts_are_rejected_before_reserving_unsupported_arrays()
 -> Result<(), Box<dyn std::error::Error>> {
     for (payload, expected) in [
-        (vec![1, 145, 78], "Directory document limit exceeded"),
-        (vec![1, 0, 160, 194, 30, 0, 0], "Truncated directory terms"),
+        (vec![2, 145, 78], "Directory document limit exceeded"),
+        (
+            vec![2, 0, 0, 160, 194, 30, 0, 0],
+            "Truncated directory terms",
+        ),
         (vec![255, 255, 255, 255, 16], "Overflowing varint"),
     ] {
         let encoded = frame(&payload)?;
@@ -77,7 +80,9 @@ fn directory_counts_are_rejected_before_reserving_unsupported_arrays()
 #[test]
 fn directory_rejects_invalid_strings_flags_order_overflows_and_trailing_data()
 -> Result<(), Box<dyn std::error::Error>> {
-    let valid = vec![1, 1, 1, b'a', 0, 0, 0, 2, b'{', b'}', 0, 0, 0, 0, 0, 0];
+    let valid = vec![
+        2, 1, 0, 1, b'a', 0, 0, 0, 2, b'{', b'}', 0, 8, 0, 0, 0, 0, 8, 8, 0,
+    ];
     let encoded = frame(&valid)?;
     assert!(segment::parse_compressed_directory(&encoded, 4096, 40 * 1024 * 1024).is_ok());
     for end in 0..valid.len() {
@@ -85,25 +90,25 @@ fn directory_rejects_invalid_strings_flags_order_overflows_and_trailing_data()
         assert!(segment::parse_compressed_directory(&encoded, 4096, 40 * 1024 * 1024).is_err());
     }
     let mut invalid_utf8 = valid.clone();
-    invalid_utf8[3] = 255;
+    invalid_utf8[4] = 255;
     let mut invalid_flag = valid.clone();
-    invalid_flag[12] = 2;
+    invalid_flag[13] = 2;
     let mut invalid_attributes = valid.clone();
-    invalid_attributes[9] = b'[';
+    invalid_attributes[10] = b'[';
     let mut trailing = valid.clone();
     trailing.push(0);
     let mut overflowing_revision = valid;
-    overflowing_revision.splice(4..5, [128, 128, 128, 128, 128, 128, 128, 128, 128, 2]);
+    overflowing_revision.splice(5..6, [128, 128, 128, 128, 128, 128, 128, 128, 128, 2]);
     for payload in [
         invalid_utf8,
-        vec![1, 0, 1, 1, 255, 0, 0, 0, 0],
-        vec![1, 0, 1, 127, b'a', 0, 0, 0, 0],
+        vec![2, 0, 0, 1, 1, 255, 0, 0, 0, 0],
+        vec![2, 0, 0, 1, 127, b'a', 0, 0, 0, 0],
         invalid_flag,
         invalid_attributes,
         trailing,
         overflowing_revision,
-        vec![1, 0, 2, 1, b'b', 0, 0, 1, b'a', 0, 0, 0, 0],
-        vec![1, 0, 2, 1, b'b', 0, 0, 1, b'b', 0, 0, 0, 0],
+        vec![2, 0, 0, 2, 1, b'b', 0, 0, 1, b'a', 0, 0, 0, 0],
+        vec![2, 0, 0, 2, 1, b'b', 0, 0, 1, b'b', 0, 0, 0, 0],
     ] {
         let encoded = frame(&payload)?;
         assert!(segment::parse_compressed_directory(&encoded, 4096, 40 * 1024 * 1024).is_err());
@@ -158,10 +163,16 @@ fn pooled_terms_preserve_unicode_order_last_duplicate_and_independent_clones()
 #[test]
 fn directory_rejects_zlib_corruption_and_declared_size_mismatches()
 -> Result<(), Box<dyn std::error::Error>> {
-    let payload = [1, 0, 0, 0, 0];
+    let payload = [
+        2, 1, 0, 1, b'a', 0, 0, 0, 2, b'{', b'}', 0, 8, 0, 0, 0, 0, 8, 8, 0,
+    ];
     let encoded = frame(&payload)?;
     assert!(segment::parse_compressed_directory(&encoded, 4096, 40 * 1024 * 1024).is_ok());
-    for declared in [4_u32, 6, u32::MAX] {
+    for declared in [
+        u32::try_from(payload.len())? - 1,
+        u32::try_from(payload.len())? + 1,
+        u32::MAX,
+    ] {
         let mut mismatched = encoded.clone();
         mismatched[12..16].copy_from_slice(&declared.to_le_bytes());
         let mut checksum = crc32fast::Hasher::new();

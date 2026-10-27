@@ -1,6 +1,7 @@
+import { decodeRoot, encodeRoot } from "../src/manifest";
 import { Miniflare } from "miniflare";
 import { join } from "node:path";
-import { Metadata, Root, type Write, type Attributes } from "../src/protocol";
+import { Metadata, type Write, type Attributes } from "../src/protocol";
 import { Effect, Schema } from "effect";
 
 const root = join(import.meta.dir, "..");
@@ -32,6 +33,7 @@ export async function workerOptions(
       })),
     );
   const options = {
+    cf: false,
     telemetry: { enabled: false },
     workers: [
       {
@@ -143,7 +145,7 @@ export async function evictWrittenOverviews(
   const count = Math.floor(metadata.segments / 8);
   for (const attempt of Array.from({ length: 100 }, (_, index) => index)) {
     const batches = await bucket.list({
-      prefix: `cache/correlated-pool-batches-v1/namespaces/${namespace}/`,
+      prefix: `cache/correlated-pool-batches-v3/namespaces/${namespace}/`,
     });
     if (batches.objects.length >= count) {
       if (batches.objects.length > 0)
@@ -162,10 +164,10 @@ export async function clearLeaderIndex(worker: Miniflare, namespace: string) {
   const key = `namespaces/${namespace}/root.json`;
   const object = await bucket.get(key);
   if (object === null) throw new Error("Missing fixture manifest");
-  const manifest = Schema.decodeUnknownSync(Root)(await object.json());
+  const manifest = decodeRoot(await object.text());
   await bucket.put(
     key,
-    Schema.encodeSync(Schema.fromJsonString(Root))({
+    encodeRoot({
       ...manifest,
       segments: manifest.segments.map((segment) =>
         Object.assign({}, segment, { commonLeaders: [] }),

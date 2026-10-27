@@ -18,18 +18,28 @@ const state = {
   peak: 0,
   started: 0,
   completed: 0,
+  holdCache: false,
   cacheDelay: 5000,
   bodyDelay: 80,
   directoryBodyDelay: 80,
+  holdDirectoryBody: false,
   directoryHeaderDelay: 0,
   failDirectoryCache: false,
   failDirectoryWrites: false,
   rejectedWrites: 0,
   canonicalReads: 0,
   directoryParses: 0,
+  canonicalParses: 0,
   corruptDirectory: false,
 };
 const parseDirectory = Directory.compressed.bind(Directory);
+const parseCanonical = Directory.canonical.bind(Directory);
+Object.defineProperty(Directory, "canonical", {
+  value: (...input: Parameters<typeof Directory.canonical>) => {
+    state.canonicalParses += 1;
+    return parseCanonical(...input);
+  },
+});
 Object.defineProperty(Directory, "compressed", {
   value: (...input: Parameters<typeof Directory.compressed>) => {
     state.directoryParses += 1;
@@ -71,13 +81,17 @@ export class Segments extends CachedSegments {
         response,
       );
     }
-    await Effect.runPromise(Effect.sleep(state.cacheDelay));
+    if (state.holdCache)
+      await Effect.runPromise(
+        Effect.sleep("10 millis").pipe(Effect.repeat({ while: () => state.holdCache })),
+      );
+    else await Effect.runPromise(Effect.sleep(state.cacheDelay));
     const response = await super.fetch(request);
     state.cacheCompleted += 1;
     if (
       state.corruptDirectory &&
       response.ok &&
-      new URL(request.url).pathname === "/directory-v3"
+      new URL(request.url).pathname === "/directory-v5"
     ) {
       const bytes = new Uint8Array(await response.arrayBuffer());
       new DataView(bytes.buffer, bytes.byteOffset).setUint32(12, 0xffffffff, true);
@@ -94,7 +108,7 @@ async function probe(request: Request, env: Env) {
     const put = env.STORAGE.put.bind(env.STORAGE);
     Object.defineProperty(env.STORAGE, "put", {
       value: (...args: Parameters<R2Bucket["put"]>) => {
-        if (state.failDirectoryWrites && args[0].startsWith("cache/directory-v3/")) {
+        if (state.failDirectoryWrites && args[0].startsWith("cache/directory-v5/")) {
           state.rejectedWrites += 1;
           return Promise.reject(new Error("Injected directory cache publication failure"));
         }
@@ -103,9 +117,9 @@ async function probe(request: Request, env: Env) {
     });
     Object.defineProperty(env.STORAGE, "get", {
       value: async (...args: Parameters<R2Bucket["get"]>) => {
-        if (state.directoryHeaderDelay > 0 && args[0].startsWith("cache/directory-v3/"))
+        if (state.directoryHeaderDelay > 0 && args[0].startsWith("cache/directory-v5/"))
           await Effect.runPromise(Effect.sleep(state.directoryHeaderDelay));
-        if (state.failDirectoryCache && args[0].startsWith("cache/directory-v3/"))
+        if (state.failDirectoryCache && args[0].startsWith("cache/directory-v5/"))
           return Promise.reject(new Error("Injected directory cache read failure"));
         if (args[0].startsWith("namespaces/")) state.canonicalReads += 1;
         const object = await get(...args);
@@ -117,12 +131,22 @@ async function probe(request: Request, env: Env) {
             state.active += 1;
             state.peak = Math.max(state.peak, state.active);
             return Effect.runPromise(
-              Effect.sleep(
-                Match.value(args[0].startsWith("cache/directory-v3/")).pipe(
-                  Match.when(true, () => state.directoryBodyDelay),
-                  Match.orElse(() => state.bodyDelay),
-                ),
+              Match.value(
+                state.holdDirectoryBody && args[0].startsWith("cache/directory-v5/"),
               ).pipe(
+                Match.when(true, () =>
+                  Effect.sleep("10 millis").pipe(
+                    Effect.repeat({ while: () => state.holdDirectoryBody }),
+                  ),
+                ),
+                Match.orElse(() =>
+                  Effect.sleep(
+                    Match.value(args[0].startsWith("cache/directory-v5/")).pipe(
+                      Match.when(true, () => state.directoryBodyDelay),
+                      Match.orElse(() => state.bodyDelay),
+                    ),
+                  ),
+                ),
                 Effect.andThen(Effect.tryPromise(read)),
                 Effect.tap(() =>
                   Effect.sync(() => {
@@ -146,6 +170,14 @@ async function probe(request: Request, env: Env) {
     state.failDirectoryCache = true;
     return new Response(null, { status: 204 });
   }
+  if (new URL(request.url).pathname === "/hold-cache") {
+    state.holdCache = true;
+    return new Response(null, { status: 204 });
+  }
+  if (new URL(request.url).pathname === "/release-cache") {
+    state.holdCache = false;
+    return new Response(null, { status: 204 });
+  }
   if (new URL(request.url).pathname === "/corrupt-directory") {
     state.corruptDirectory = true;
     state.cacheDelay = 0;
@@ -164,6 +196,14 @@ async function probe(request: Request, env: Env) {
   }
   if (new URL(request.url).pathname === "/cache-stall") {
     state.directoryBodyDelay = 1600;
+    return new Response(null, { status: 204 });
+  }
+  if (new URL(request.url).pathname === "/hold-directory-body") {
+    state.holdDirectoryBody = true;
+    return new Response(null, { status: 204 });
+  }
+  if (new URL(request.url).pathname === "/release-directory-body") {
+    state.holdDirectoryBody = false;
     return new Response(null, { status: 204 });
   }
   if (new URL(request.url).pathname === "/fast-origin") {
@@ -198,6 +238,7 @@ async function probe(request: Request, env: Env) {
         "x-canonical-reads": String(state.canonicalReads),
         "x-rejected-writes": String(state.rejectedWrites),
         "x-directory-parses": String(state.directoryParses),
+        "x-canonical-parses": String(state.canonicalParses),
         "x-directory-r2-reads": String(cacheUsage().directoryR2CacheReads),
         "x-directory-r2-bytes": String(cacheUsage().directoryR2CacheBytes),
         "x-directory-publications": String(cacheUsage().directoryR2CachePublications),
@@ -257,7 +298,7 @@ async function probe(request: Request, env: Env) {
     return first;
   }
   if (new URL(request.url).pathname === "/origin") {
-    const url = new URL("https://segments.internal/directory-v3");
+    const url = new URL("https://segments.internal/directory-v5");
     url.searchParams.set("key", input.key);
     url.searchParams.set("offset", String(input.offset));
     url.searchParams.set("length", String(input.length));

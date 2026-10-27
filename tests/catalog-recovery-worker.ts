@@ -106,6 +106,6 @@ export default {
     const props = Schema.decodeUnknownSync(TermProjectionProps)(await request.json());
     return ctx.exports
       .Terms({ props: Schema.encodeSync(TermProjectionProps)(props) })
-      .fetch("https://terms.internal/catalog-v9", { headers: request.headers });
+      .fetch("https://terms.internal/catalog-v12", { headers: request.headers });
   },
 };

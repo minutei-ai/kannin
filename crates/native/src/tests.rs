@@ -205,8 +205,8 @@ fn ranged_ranking_matches_full_segment_with_filters_tombstones_and_cutoffs() -> 
             for (hit, expected) in hits.iter().zip(&expected) {
                 assert_eq!(hit.row, expected.row);
                 assert_eq!(hit.score.to_bits(), expected.score.to_bits());
-                let document = &fixture.header.documents[usize::try_from(expected.row)?];
-                assert_eq!(hit.id, document.id);
+                let document = fixture.header.documents.row(usize::try_from(expected.row)?);
+                assert_eq!(hit.id.as_str(), document.id);
                 assert_eq!(hit.data.offset, document.data.offset);
                 assert_eq!(hit.data.length, document.data.length);
             }

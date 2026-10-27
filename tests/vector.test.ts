@@ -1,10 +1,10 @@
+import { decodeRoot } from "../src/manifest";
 import { afterAll, expect, test } from "bun:test";
 import { Effect, Schema } from "effect";
 import {
   QueryResult,
   Metadata,
   VectorRebuildResult,
-  Root,
   VectorMessage,
   VectorSyncResult,
   Health,
@@ -433,7 +433,7 @@ test("one queue delivery drains sixteen committed jobs with one vector mutation 
   const bucket = await worker.getR2Bucket("STORAGE");
   const object = await bucket.get(`namespaces/${namespace}/root.json`);
   if (object === null) throw new Error("Missing queued root");
-  const root = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
+  const root = decodeRoot(await object.text());
   const first = root.vectorJobs[0];
   const last = root.vectorJobs[16];
   if (first === undefined || last === undefined) throw new Error("Expected seventeen queued jobs");
@@ -575,7 +575,10 @@ test("small vector top-k avoids locating every candidate segment", async () => {
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(5);
+  expect(after.rangeReads - before.rangeReads).toBe(1);
+  expect(after.directoryR2CacheReads - before.directoryR2CacheReads).toBe(0);
+  expect(after.directoryR2CacheHits - before.directoryR2CacheHits).toBe(0);
+  expect(after.cacheApiHits - before.cacheApiHits).toBe(1);
 });
 
 test("candidate windows continue through stale revisions and residual filters before top-k", async () => {
@@ -612,19 +615,31 @@ test("candidate windows continue through stale revisions and residual filters be
   );
   expect(found.rows.map((row) => row.id)).toEqual(["0012", "0013", "0014"]);
   expect(found.rows.every((row) => row.revision === 1)).toBe(true);
+  const single = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", { ...input, topK: 1 })).json(),
+  );
+  expect(single.rows).toEqual(found.rows.slice(0, 1));
   await request(worker, namespace, "compact", {});
   const compacted = Schema.decodeUnknownSync(QueryResult)(
     await (await request(worker, namespace, "query", input)).json(),
   );
   expect(compacted.rows).toEqual(found.rows);
+  const compactedSingle = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", { ...input, topK: 1 })).json(),
+  );
+  expect(compactedSingle.rows).toEqual(single.rows);
 });
 
 test("bounded ANN cache avoids provider calls and expires without caching document authority", async () => {
   const namespace = "ann-cache";
+  const filtered = {
+    ...vectorQuery(),
+    filters: [{ field: "group", op: "in", value: ["a", "b", "c", "d"] }],
+  };
   await request(worker, namespace, "write", {
     schema,
     requestId: "seed",
-    upserts: [{ id: "a", text: "lexical", attributes: {}, vector: vector(1) }],
+    upserts: [{ id: "a", text: "lexical", attributes: { group: "a" }, vector: vector(1) }],
     deletes: [],
   });
   await request(worker, namespace, "vector-sync", {});
@@ -633,9 +648,9 @@ test("bounded ANN cache avoids provider calls and expires without caching docume
   const before = Schema.decodeUnknownSync(controlSchema)(
     await (await service.fetch("http://fixture/healthy")).json(),
   );
-  const first = await request(worker, namespace, "query", vectorQuery());
+  const first = await request(worker, namespace, "query", filtered);
   expect(first.headers.get("server-timing")).toContain('vector_cache;desc="miss"');
-  const next = await request(worker, namespace, "query", vectorQuery());
+  const next = await request(worker, namespace, "query", filtered);
   expect(next.headers.get("server-timing")).toContain('vector_cache;desc="hit"');
   expect(Schema.decodeUnknownSync(QueryResult)(await next.json()).rows).toEqual(
     Schema.decodeUnknownSync(QueryResult)(await first.json()).rows,
@@ -645,7 +660,7 @@ test("bounded ANN cache avoids provider calls and expires without caching docume
   );
   expect(reused.queryCalls).toBe(before.queryCalls + 1);
   await Effect.runPromise(Effect.sleep("1100 millis"));
-  const expired = await request(worker, namespace, "query", vectorQuery());
+  const expired = await request(worker, namespace, "query", filtered);
   expect(expired.headers.get("server-timing")).toContain('vector_cache;desc="miss"');
   const renewed = Schema.decodeUnknownSync(controlSchema)(
     await (await service.fetch("http://fixture/healthy")).json(),
@@ -654,11 +669,11 @@ test("bounded ANN cache avoids provider calls and expires without caching docume
   await request(worker, namespace, "write", {
     schema,
     requestId: "replace",
-    upserts: [{ id: "a", text: "new", attributes: {}, vector: vector(0.6, 0.8) }],
+    upserts: [{ id: "a", text: "new", attributes: { group: "b" }, vector: vector(0.6, 0.8) }],
     deletes: [],
   });
   await request(worker, namespace, "vector-sync", {});
-  const updated = await request(worker, namespace, "query", vectorQuery());
+  const updated = await request(worker, namespace, "query", filtered);
   expect(updated.headers.get("server-timing")).toContain('vector_cache;desc="miss"');
   expect(Schema.decodeUnknownSync(QueryResult)(await updated.json()).rows[0]?.text).toBe("new");
 });

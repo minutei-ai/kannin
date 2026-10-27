@@ -11,7 +11,7 @@ import {
   SegmentHits,
   QueryResult,
 } from "../src/protocol";
-import { document, request, startWorker, textQuery, write } from "./harness";
+import { clearLeaderIndex, document, request, startWorker, textQuery, write } from "./harness";
 
 initSync({
   module: new WebAssembly.Module(
@@ -65,46 +65,53 @@ test("canonical leaders equal complete posting rankings only when their proof is
         ),
       };
       for (const topK of [1, 10, 16, 17]) {
-        for (const mode of ["any", "all", "phrase"] as const) {
-          for (const dead of [[], [0], chosen.documents.slice(0, 7).map((hit) => hit.row)]) {
-            const input = {
-              text: "RUST cloudflare ação rust",
-              mode,
-              top_k: topK,
-              dead: [],
-              filters: [],
-              statistics,
-            };
-            using prepared = new PreparedQuery(
-              Schema.encodeSync(Schema.fromJsonString(RankingInput))(input),
-            );
-            const fast = prepared.common_hits(
-              JSON.stringify(catalog),
-              JSON.stringify(leaders),
-              documents.length,
-              JSON.stringify(dead),
-            );
-            const available = chosen.documents.filter((hit) => !dead.includes(hit.row));
-            if (mode === "phrase" || available.length < topK) {
-              expect(fast).toBeUndefined();
-              continue;
+        for (const [text, phraseLeader] of [
+          ["RUST cloudflare ação rust", false],
+          ["RUST", true],
+          ["AÇÃO!!!", true],
+          ["rust rust", false],
+        ] as const) {
+          for (const mode of ["any", "all", "phrase"] as const) {
+            for (const dead of [[], [0], chosen.documents.slice(0, 7).map((hit) => hit.row)]) {
+              const input = {
+                text,
+                mode,
+                top_k: topK,
+                dead: [],
+                filters: [],
+                statistics,
+              };
+              using prepared = new PreparedQuery(
+                Schema.encodeSync(Schema.fromJsonString(RankingInput))(input),
+              );
+              const fast = prepared.common_hits(
+                JSON.stringify(catalog),
+                JSON.stringify(leaders),
+                documents.length,
+                JSON.stringify(dead),
+              );
+              const available = chosen.documents.filter((hit) => !dead.includes(hit.row));
+              if ((mode === "phrase" && !phraseLeader) || available.length < topK) {
+                expect(fast).toBeUndefined();
+                continue;
+              }
+              using ranker = directory.ranker_prepared(prepared, JSON.stringify(dead));
+              for (const span of Schema.decodeSync(Schema.fromJsonString(PostingSpans))(
+                ranker.posting_spans(),
+              ))
+                for (const block of span.blocks)
+                  ranker.add(
+                    span.term,
+                    bytes.subarray(
+                      base + block.data.offset,
+                      base + block.data.offset + block.data.length,
+                    ),
+                  );
+              expect(fast).toBeDefined();
+              expect(Schema.decodeUnknownSync(Schema.fromJsonString(SegmentHits))(fast)).toEqual(
+                Schema.decodeSync(Schema.fromJsonString(SegmentHits))(ranker.finish()),
+              );
             }
-            using ranker = directory.ranker_prepared(prepared, JSON.stringify(dead));
-            for (const span of Schema.decodeSync(Schema.fromJsonString(PostingSpans))(
-              ranker.posting_spans(),
-            ))
-              for (const block of span.blocks)
-                ranker.add(
-                  span.term,
-                  bytes.subarray(
-                    base + block.data.offset,
-                    base + block.data.offset + block.data.length,
-                  ),
-                );
-            expect(fast).toBeDefined();
-            expect(Schema.decodeUnknownSync(Schema.fromJsonString(SegmentHits))(fast)).toEqual(
-              Schema.decodeSync(Schema.fromJsonString(SegmentHits))(ranker.finish()),
-            );
           }
         }
       }
@@ -227,6 +234,32 @@ test("leader ranking survives mutations and compaction with exact filtered contr
         /text_common_leaders;desc="segments=[1-9]/,
       );
   }
+  const phrase = await request(worker, name, "query", {
+    ...textQuery("RUST"),
+    match: "phrase",
+  });
+  expect(phrase.status).toBe(200);
+  expect(phrase.headers.get("server-timing")).toMatch(/text_common_leaders;desc="segments=[1-9]/);
+  expect(phrase.headers.get("server-timing")).toContain('catalog_root_prefix;desc="hit"');
+  expect(phrase.headers.get("server-timing")).not.toContain('catalog_root_joint;desc="hit"');
+  const phraseResult = Schema.decodeUnknownSync(QueryResult)(await phrase.json());
+  const phraseControl = await request(worker, name, "query", {
+    ...textQuery("RUST", 10, [{ field: "year", op: "gte", value: 0 }]),
+    match: "phrase",
+  });
+  expect(phraseControl.status).toBe(200);
+  expect(Schema.decodeUnknownSync(QueryResult)(await phraseControl.json())).toEqual(phraseResult);
+  await clearLeaderIndex(worker, name);
+  const withoutLeaders = await request(worker, name, "query", {
+    ...textQuery("RUST"),
+    match: "phrase",
+  });
+  expect(withoutLeaders.status).toBe(200);
+  expect(withoutLeaders.headers.get("server-timing")).toContain(
+    'text_common_leaders;desc="segments=0"',
+  );
+  expect(Schema.decodeUnknownSync(QueryResult)(await withoutLeaders.json())).toEqual(phraseResult);
+  expect(withoutLeaders.headers.get("server-timing")).toContain('catalog_root_joint;desc="hit"');
   const deletes = Array.from({ length: 8 }, (_, batch) =>
     Array.from(
       { length: 7 },

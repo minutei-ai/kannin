@@ -1,7 +1,8 @@
+import { decodeRoot } from "../src/manifest";
 import { expect, test } from "bun:test";
 import { Schema } from "effect";
 import { BloomBatch, initSync } from "../dist/wasm/raio_engine";
-import { Health, Metadata, QueryResult, Root } from "../src/protocol";
+import { Health, Metadata, QueryResult } from "../src/protocol";
 import { document, request, startWorker, textQuery, write } from "./harness";
 
 initSync({
@@ -42,8 +43,27 @@ test("Bloom term masks reuse projections and preserve global scoring across spar
   const bucket = await worker.getR2Bucket("STORAGE");
   const object = await bucket.get("namespaces/masked/root.json");
   if (object === null) throw new Error("Missing masked manifest");
-  const root = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
-  const bitsets = root.segments.map((segment) => Uint8Array.fromBase64(segment.termBloom));
+  const root = decodeRoot(await object.text());
+  const columns = await Promise.all(
+    root.bloomPacks.map(async (pack) => {
+      const columnObject = await bucket.get(pack.key, {
+        range: { offset: pack.term.offset, length: pack.term.length },
+      });
+      if (columnObject === null) throw new Error("Missing term Bloom column");
+      const column = new Uint8Array(await columnObject.arrayBuffer());
+      expect(column.byteLength).toBe(pack.term.length);
+      return column;
+    }),
+  );
+  const bitsets = root.segments.map((segment) => {
+    const pack = root.bloomPacks[segment.bloom.packIndex];
+    const column = columns[segment.bloom.packIndex];
+    if (pack === undefined || column === undefined) throw new Error("Missing Bloom pack");
+    return column.slice(
+      pack.term.offsets[segment.bloom.row],
+      pack.term.offsets[segment.bloom.row + 1],
+    );
+  });
   const bytes = new Uint8Array(bitsets.flatMap((bits) => Array.from(bits)));
   const offsets = new Uint32Array(bitsets.length + 1);
   const cursor = { offset: 0 };

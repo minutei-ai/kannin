@@ -1,9 +1,10 @@
 import { Effect, Schema } from "effect";
-import { Rejected, Root, SnapshotFrameMetadata } from "./protocol";
+import { Rejected, SnapshotFrameMetadata } from "./protocol";
+import { decodeRootEffect } from "./manifest";
 
 import type { Snapshot } from "./protocol";
 
-const magic = new TextEncoder().encode("KANSNP02");
+const magic = new TextEncoder().encode("KANSNP05");
 
 export function snapshotFrameHeader(snapshot: typeof Snapshot.Type) {
   const metadata = new TextEncoder().encode(
@@ -35,9 +36,7 @@ export const readSnapshotFrame = Effect.fn("kannin.readSnapshotFrame")(function*
     onExcessProperty: "error",
   })(new TextDecoder().decode(bytes.subarray(12, 12 + length)));
   const payload = bytes.subarray(12 + length);
-  const manifest = yield* Schema.decodeEffect(Schema.fromJsonString(Root))(
-    new TextDecoder().decode(payload),
-  );
+  const manifest = yield* decodeRootEffect(new TextDecoder().decode(payload));
   if (metadata.sequence !== manifest.sequence)
     return yield* new Rejected({
       status: 503,

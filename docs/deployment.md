@@ -4,6 +4,12 @@ Alchemy declares the Worker, R2 bucket, coordinator namespace, 768-dimensional c
 
 The public project is Kannin. The existing `Raio` Alchemy stack, `RAIO_*` configuration keys, Rust artifact names and internal cache identifiers retain their deployment identity so renaming the repository does not recreate infrastructure or abandon data.
 
+After publishing the Worker, the stack runs RootFormatMigration before VectorMetadataMigration, without memoization. It inventories namespaces and invokes authenticated migrate-root serially. Stored v1–v4 Roots and rebuild checkpoints convert to StoredRoot v5 and RAIOSEG2 segments. Converted segments are published before their references; checkpoints activate through their captured ETags before canonical Root. Document identities, revisions, logical sequences, vector epochs and checkpoint expiry are preserved. Common-leader offsets and Bloom segment-key references change with the segment layout. V4 Bloom object bytes and hashes are reused; inline Bloom versions create validated packs. Models are derived once for v1/v2 and preserved for v3/v4. New keys separate older cached ranges and directory formats; snapshot caches recover through R2 under their v5 identity.
+
+Normal reads require the converted format. Interrupted migrations may be retried without extending expiry or rewriting converted checkpoints. Segment output above sixteen MiB and checkpoint objects above eight MiB are rejected before publishing their manifest or checkpoint CAS. Migration reads and converted checkpoint states also have the existing 32-MiB batch budget. Source objects remain available for retry and normal retirement; these limits must be validated before a production cutover.
+
+Local integration checks and performance evidence are recorded in [performance](performance.md). The generic cold-200-ms target remains unproven. Cloudflare deployment, actual provider latency and execution of the v5 stack hook remain unverified.
+
 Commands default to the native Alchemy `minutei` profile. Configure Cloudflare credentials through Alchemy and supply `RAIO_API_TOKEN` privately:
 
 ```sh

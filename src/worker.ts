@@ -1,4 +1,14 @@
+import { listNamespaces, namespaceCatalogPrefix, namespaceCatalogReadyKey } from "./namespaces";
 import { TextExecutions } from "./text-executions";
+import {
+  decodeRoot,
+  encodeRoot,
+  decodeRootEffect,
+  encodeVectorRebuildSnapshot,
+  decodeVectorRebuildSnapshot,
+  decodeRootForMigration,
+  decodeVectorRebuildSnapshotForMigration,
+} from "./manifest";
 import { DurableObject, WorkerEntrypoint, env as workerEnv } from "cloudflare:workers";
 import {
   Array as EffectArray,
@@ -20,13 +30,18 @@ import {
   unpack,
   tokenize,
   segment_document_terms,
+  segment_migrate,
+  segment_header,
   segment_filter,
   segment_term_bounds,
+  segment_term_bounds_compact,
+  segment_term_bounds_compact_minimum,
+  EligibilityQuery,
   PreparedQuery,
   directory_compress,
 } from "../dist/wasm/raio_engine";
 import module from "raio:wasm";
-import type { Row, Snapshot, TextPlan, TermSummaries } from "./protocol";
+import type { Snapshot, TextPlan } from "./protocol";
 import {
   Attributes,
   Filter,
@@ -47,7 +62,17 @@ import {
   Receipt,
   Rejected,
   Root,
+  type LegacyPackedRoot,
+  type ConvertedInlineRoot,
+  SegmentHeader,
+  type LegacyInlineRoot,
   CommonTerms,
+  TermSummaries,
+  CommonTermProjection,
+  CompactTermBounds,
+  CompactMinimumTermBounds,
+  EligibleMinimum,
+  EligibilityProjection,
   CommonLeaders,
   ConstantAttributes,
   SnapshotCacheHeaders,
@@ -75,14 +100,21 @@ import {
   VectorCandidates,
   VectorCandidateFrame,
   type VectorRebuild,
-  VectorRebuildSnapshot,
+  VectorRebuildCheckpointMetadata,
+  VECTOR_REBUILD_CHECKPOINT_BYTES,
+  RootMigrationResult,
   VectorRebuildResult,
   NamespacePage,
-  type Collection,
+  NamespaceCatalogActivation,
+  NamespaceRpcCommand,
+  NamespacesQuery,
+  Collection,
+  CollectionCursor,
   CollectionResult,
   Retirement,
   IndexMessage,
   SegmentRange,
+  DirectoryCacheMiss,
   TermProjectionProps,
   SegmentCacheProps,
 } from "./protocol";
@@ -90,6 +122,7 @@ import {
   range,
   publishQueryCache,
   acquireDirectoryFrame,
+  readSegmentCache,
   waitDirectoryFrame,
   publishDirectoryFrame,
   withDirectory,
@@ -97,13 +130,17 @@ import {
   addFrequencyPosting,
   readTermProjections,
   buildSegment,
+  rebuildEligibility,
+  rebuildCommonProjection,
   storeSegmentCaches,
   warmTermBatch,
   bloom,
   bloomCandidates,
+  appendBloomSegment,
+  packBloomRoot,
+  pruneBloomPacks,
   readDocument,
-  readDocuments,
-  documentReadConcurrency,
+  readDocumentHits,
   sha256,
   clearImmutableCache,
   cacheUsage,
@@ -125,6 +162,9 @@ export class Segments extends WorkerEntrypoint<Env, typeof SegmentCacheProps.Typ
   override async fetch(request: Request) {
     const url = new URL(request.url);
     const props = Schema.decodeExit(SegmentCacheProps)(this.ctx.props);
+    const directoryMiss = Schema.decodeUnknownExit(Schema.NullOr(DirectoryCacheMiss))(
+      request.headers.get("x-kannin-directory-miss"),
+    );
     const decoded = Schema.decodeUnknownExit(SegmentRange)({
       key: url.searchParams.get("key"),
       offset: Number(url.searchParams.get("offset")),
@@ -132,33 +172,24 @@ export class Segments extends WorkerEntrypoint<Env, typeof SegmentCacheProps.Typ
     });
     if (
       decoded._tag === "Failure" ||
+      directoryMiss._tag === "Failure" ||
+      (directoryMiss.value !== null && url.pathname !== "/directory-v5") ||
       request.method !== "GET" ||
       props._tag === "Failure" ||
       props.value.bucket !== this.env.STORAGE_CACHE_SCOPE ||
-      (url.pathname !== "/range" && url.pathname !== "/directory-v3") ||
-      (url.pathname === "/directory-v3" && decoded.value.offset !== 0)
+      (url.pathname !== "/range" && url.pathname !== "/directory-v5") ||
+      (url.pathname === "/directory-v5" && decoded.value.offset !== 0)
     )
       return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });
     const input = decoded.value;
-    const cacheKey = new URL(request.url);
-    cacheKey.hostname = "raio-cache.internal";
-    cacheKey.searchParams.set("bucket", this.env.STORAGE_CACHE_SCOPE);
-    cacheKey.searchParams.set("format", props.value.format);
-    const cache = await Effect.runPromise(
-      Effect.tryPromise(() => caches.open("raio-segments-v1")).pipe(
-        Effect.orElseSucceed(() => undefined),
-      ),
-    );
-    if (cache !== undefined) {
-      const cached = await Effect.runPromise(
-        Effect.tryPromise(() => cache.match(cacheKey)).pipe(Effect.orElseSucceed(() => undefined)),
-      );
-      if (cached !== undefined) {
-        const response = new Response(cached.body, cached);
-        response.headers.delete("cf-cache-status");
-        response.headers.set("x-raio-cache", "api-hit");
-        return response;
-      }
+    const selected = await Effect.runPromise(readSegmentCache(url, props.value));
+    const cacheKey = selected.key;
+    const cache = selected.cache;
+    if (selected.response !== undefined) {
+      const response = new Response(selected.response.body, selected.response);
+      response.headers.delete("cf-cache-status");
+      response.headers.set("x-raio-cache", "api-hit");
+      return response;
     }
     const storage = this.env.STORAGE;
     const context = this.ctx;
@@ -185,13 +216,13 @@ export class Segments extends WorkerEntrypoint<Env, typeof SegmentCacheProps.Typ
                 });
               const encoded = yield* Effect.try(() =>
                 Match.value(url.pathname).pipe(
-                  Match.when("/directory-v3", () =>
+                  Match.when("/directory-v5", () =>
                     directory_compress(new Uint8Array(bytes)).slice(),
                   ),
                   Match.orElse(() => bytes),
                 ),
               );
-              if (url.pathname === "/directory-v3")
+              if (url.pathname === "/directory-v5")
                 publishDirectoryFrame(input.key, input.length, new Uint8Array(encoded), context);
               return new Response(encoded, {
                 headers: {
@@ -207,7 +238,8 @@ export class Segments extends WorkerEntrypoint<Env, typeof SegmentCacheProps.Typ
             return Effect.tryPromise(() => object.body.cancel()).pipe(Effect.ignore);
           },
         );
-        if (url.pathname !== "/directory-v3") return yield* canonical;
+        if (url.pathname !== "/directory-v5" || directoryMiss.value !== null)
+          return yield* canonical;
         const reader = yield* acquireDirectoryFrame(input.key, input.length);
         const observed = yield* waitDirectoryFrame(reader);
         const cached = Fiber.join(reader).pipe(
@@ -271,8 +303,6 @@ export class Segments extends WorkerEntrypoint<Env, typeof SegmentCacheProps.Typ
     return response;
   }
 }
-const decodeRoot = Schema.decodeSync(Schema.fromJsonString(Root));
-const encodeRoot = Schema.encodeSync(Schema.fromJsonString(Root));
 const decodeLog = Schema.decodeSync(Schema.fromJsonString(Log));
 const encodeLog = Schema.encodeSync(Schema.fromJsonString(Log));
 const decodeQuery = Schema.decodeEffect(Schema.fromJsonString(Query), {
@@ -283,6 +313,15 @@ const decodePostingSpans = Schema.decodeEffect(Schema.fromJsonString(PostingSpan
 const decodeSegmentHits = Schema.decodeEffect(Schema.fromJsonString(SegmentHits));
 const encodeRankingInput = Schema.encodeSync(Schema.fromJsonString(RankingInput));
 const encodeConstantAttributes = Schema.encodeSync(Schema.fromJsonString(ConstantAttributes));
+const encodeCompactBoundIdentity = Schema.encodeSync(
+  Schema.fromJsonString(
+    Schema.Tuple([
+      CommonTermProjection.fields.terms,
+      CompactTermBounds.value.elements[1],
+      EligibleMinimum,
+    ]),
+  ),
+);
 const isNamespaceName = Schema.is(NamespaceName);
 const isOperation = Schema.is(Operation);
 const encodeCatalogTelemetry = Schema.encodeEffect(Schema.fromJsonString(CatalogTelemetry));
@@ -295,7 +334,7 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
     if (
       request.method !== "GET" ||
       props._tag === "Failure" ||
-      url.pathname !== "/catalog-v9" ||
+      url.pathname !== "/catalog-v12" ||
       props.value.bucket !== this.env.STORAGE_CACHE_SCOPE
     )
       return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });
@@ -309,6 +348,12 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
     const actual = filters.value.value;
     const fields = [...new Set(actual.map((filter) => filter.field))].toSorted();
     const selection = props.value.selection;
+    const prefixes = props.value.prefixes;
+    if (
+      prefixes !== undefined &&
+      (actual.length > 0 || prefixes.length !== props.value.ranges.length)
+    )
+      return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });
     if (
       selection.kind === "fields" &&
       (fields.length !== selection.fields.length ||
@@ -317,8 +362,8 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
       return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });
     const encodedFilters = Schema.encodeSync(TermFilters)(actual);
     return Effect.runPromise(
-      readTermProjections(props.value.ranges, this.ctx.props.terms, encodedFilters, this.ctx).pipe(
-        Effect.flatMap(({ catalogs, telemetry }) =>
+      readTermProjections(props.value.ranges, props.value.terms, actual, prefixes, this.ctx).pipe(
+        Effect.flatMap(({ catalogs, telemetry, rootFallback }) =>
           Effect.gen(function* () {
             const entryEnded = yield* Clock.currentTimeNanos;
             const hasMinimum = catalogs.some((catalog) => catalog.eligibility === null);
@@ -340,12 +385,16 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
               };
             });
             const cacheControl = { value: "public, max-age=31536000, immutable" };
-            if (props.value.selection.kind === "fields" && actual.length > 0 && hasMinimum)
+            if (
+              rootFallback ||
+              (props.value.selection.kind === "fields" && actual.length > 0 && hasMinimum)
+            )
               cacheControl.value = "no-store";
             return yield* Effect.all([
               Schema.encodeEffect(TermCatalogBatch)({
                 catalogs: wire,
                 filterDigest: Option.getOrNull(filterDigest.value),
+                rootFallback,
               }),
               encodeCatalogTelemetry({
                 ...telemetry,
@@ -369,7 +418,10 @@ export class Terms extends WorkerEntrypoint<Env, typeof TermProjectionProps.Enco
         ),
         Effect.orElseSucceed(() =>
           Response.json(
-            Schema.encodeSync(ErrorBody)({ error: "Immutable term catalog unavailable" }),
+            Schema.encodeSync(ErrorBody)({
+              status: "error",
+              error: "Immutable term catalog unavailable",
+            }),
             { status: 503, headers: { "cache-control": "no-store" } },
           ),
         ),
@@ -382,12 +434,7 @@ const strings = Schema.fromJsonString(Schema.Array(Schema.String));
 const integers = Schema.fromJsonString(Schema.Array(Schema.Int));
 const Located = LocatedDocument.mapFields((fields) => ({
   ...fields,
-  segment: Schema.Struct({
-    key: Schema.String,
-    sequence: Schema.Int,
-    headerBytes: Schema.Int,
-    bytes: Schema.Int,
-  }),
+  segment: Root.fields.segments.value,
 }));
 
 const readBody = Effect.fn("raio.readBody")(function* (request: Pick<Request, "headers" | "body">) {
@@ -429,7 +476,11 @@ const readBody = Effect.fn("raio.readBody")(function* (request: Pick<Request, "h
   return new TextDecoder().decode(bytes);
 });
 
-async function locate(ids: ReadonlyArray<string>, root: typeof Root.Type) {
+async function locate(
+  ids: ReadonlyArray<string>,
+  root: typeof Root.Type,
+  preferR2: boolean = false,
+) {
   const found = new Map<string, typeof Located.Type>();
   for (const offset of Array.from(
     { length: Math.ceil(root.segments.length / 64) },
@@ -438,12 +489,8 @@ async function locate(ids: ReadonlyArray<string>, root: typeof Root.Type) {
     const segments = root.segments.slice(offset, offset + 64).toReversed();
     const remaining = ids.filter((id) => !found.has(id));
     if (remaining.length === 0) break;
-    const matches = bloomCandidates(
-      root.segments,
-      remaining,
-      "documentBloom",
-      offset,
-      64,
+    const matches = (
+      await Effect.runPromise(bloomCandidates(root, remaining, "document", offset, 64))
     ).toReversed();
     for (const [index, segment] of segments.entries()) {
       const selected = matches[index];
@@ -452,14 +499,22 @@ async function locate(ids: ReadonlyArray<string>, root: typeof Root.Type) {
       const candidates = selected.filter((id) => !found.has(id));
       if (candidates.length === 0) continue;
       const rows = await Effect.runPromise(
-        withDirectory(segment.key, segment.headerBytes, (decoded) =>
-          Effect.gen(function* () {
-            const lookup = yield* Schema.encodeEffect(strings)(candidates);
-            const dead = yield* Schema.encodeEffect(integers)(segment.dead);
-            return yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Array(LocatedDocument)))(
-              decoded.lookup(lookup, dead),
-            );
-          }),
+        withDirectory(
+          segment.key,
+          segment.headerBytes,
+          (decoded) =>
+            Effect.gen(function* () {
+              const lookup = yield* Schema.encodeEffect(strings)(candidates);
+              const dead = yield* Schema.encodeEffect(integers)(segment.dead);
+              return yield* Schema.decodeEffect(
+                Schema.fromJsonString(Schema.Array(LocatedDocument)),
+              )(decoded.lookup(lookup, dead));
+            }),
+          undefined,
+          false,
+          preferR2,
+          undefined,
+          true,
         ),
       );
       for (const row of rows) found.set(row.document.id, { ...row, segment });
@@ -630,7 +685,28 @@ function excludesPhrase(
   return false;
 }
 
-async function textQuery(
+const rootEligibilityMinimums = new WeakMap<
+  typeof EligibilityProjection.Type,
+  ReadonlyMap<string, typeof EligibleMinimum.Type>
+>();
+
+function rootEligibilityMinimum(
+  model: typeof EligibilityProjection.Type,
+  filters: (typeof Query.Type)["filters"],
+) {
+  const encodedFilters = Schema.encodeSync(TermFilters)(filters);
+  const retained = rootEligibilityMinimums.get(model)?.get(encodedFilters);
+  if (retained !== undefined) return retained;
+  using modelQuery = new EligibilityQuery(encodedFilters);
+  const minimum = Schema.decodeSync(Schema.fromJsonString(EligibleMinimum))(
+    modelQuery.minimum(Schema.encodeSync(Schema.fromJsonString(EligibilityProjection))(model)),
+  );
+  if (encodedFilters.length <= 512)
+    rootEligibilityMinimums.set(model, new Map([[encodedFilters, minimum]]));
+  return minimum;
+}
+
+async function rankText(
   input: typeof Query.Type,
   root: typeof Root.Type,
   timings: Headers,
@@ -667,18 +743,21 @@ async function textQuery(
     if (dictionary === undefined) return false;
     return terms.every((term) => Object.hasOwn(dictionary, term));
   });
-  const bloomMatches = Match.value(covered).pipe(
-    Match.when(true, () => {
-      timings.append("server-timing", 'text_membership;desc="manifest"');
-      return root.segments.map(() => terms);
-    }),
-    Match.orElse(() => bloomCandidates(root.segments, terms, "termBloom")),
+  const bloomMatches = await Effect.runPromise(
+    Match.value(covered).pipe(
+      Match.when(true, () => {
+        timings.append("server-timing", 'text_membership;desc="manifest"');
+        return Effect.succeed(root.segments.map(() => terms));
+      }),
+      Match.orElse(() => bloomCandidates(root, terms, "term")),
+    ),
   );
   const unrestricted = new Map<string, string>();
   if (input.filters.length > 0) {
     const encodedFilters = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Filter)))(
       input.filters,
     );
+    using constantQuery = new EligibilityQuery(encodedFilters);
     for (const [index, segment] of root.segments.entries()) {
       const requested = bloomMatches[index];
       if (requested === undefined || requested.length === 0) continue;
@@ -695,12 +774,12 @@ async function textQuery(
           ),
         ),
       );
-      if (segment_filter(encoded, encodedFilters)) unrestricted.set(segment.key, encoded);
+      if (constantQuery.matches(encoded)) unrestricted.set(segment.key, encoded);
     }
   }
   const localRanking =
     covered &&
-    input.match !== "phrase" &&
+    (input.match !== "phrase" || words.length === 1) &&
     root.segments.every((segment) => {
       const leaders = segment.commonLeaders;
       if (input.filters.length > 0 && !unrestricted.has(segment.key)) return false;
@@ -725,6 +804,58 @@ async function textQuery(
   const selections = candidates.filter((candidate) => candidate.terms.length > 0);
   if (selections.length === 0) return [];
   const selected = selections.map((candidate) => candidate.segment);
+  const correlatedPhrase =
+    input.match === "phrase" && !localRanking && selected.length > 1 && input.filters.length === 0;
+  const rootCorrelated =
+    correlatedPhrase &&
+    selections.every(({ segment, terms: requested }) => {
+      const projection = segment.commonProjection;
+      const dictionary = segment.commonTerms;
+      return (
+        projection !== undefined &&
+        projection !== null &&
+        dictionary !== undefined &&
+        requested.every(
+          (term) => Object.hasOwn(dictionary, term) && projection.terms.includes(term),
+        )
+      );
+    });
+  const filterFields = [...new Set(input.filters.map((filter) => filter.field))].toSorted();
+  const rootFiltered =
+    input.filters.length > 0 &&
+    selections.every(({ segment, terms: requested }) => {
+      const model = segment.eligibility;
+      const projection = segment.commonProjection;
+      const dictionary = segment.commonTerms;
+      return (
+        model !== undefined &&
+        model !== null &&
+        filterFields.every((field) => model.fields.includes(field)) &&
+        projection !== undefined &&
+        projection !== null &&
+        dictionary !== undefined &&
+        requested.every(
+          (term) => Object.hasOwn(dictionary, term) && projection.terms.includes(term),
+        )
+      );
+    });
+  const rootMinimums = new Map<string, typeof EligibleMinimum.Type>();
+  const rootBounded = rootCorrelated || rootFiltered;
+  const sharedEligibility = selections[0]?.segment.eligibility;
+  if (
+    rootFiltered &&
+    sharedEligibility !== undefined &&
+    sharedEligibility !== null &&
+    selections.every(({ segment }) => segment.eligibility === sharedEligibility)
+  ) {
+    const minimum = rootEligibilityMinimum(sharedEligibility, input.filters);
+    if (minimum === null) {
+      timings.append("server-timing", 'text_root_eligibility;desc="early-none"');
+      timings.append("server-timing", 'text_score;dur=0;desc="segments=0"');
+      return [];
+    }
+    for (const { segment } of selections) rootMinimums.set(segment.key, minimum);
+  }
   const identityText = Match.value(input.match).pipe(
     Match.when("phrase", () => words.join(" ")),
     Match.orElse(() =>
@@ -743,6 +874,7 @@ async function textQuery(
   const firstSelected = selected[0];
   if (selected.length > 4 && firstSelected !== undefined) {
     const identity = Schema.encodeSync(Schema.fromJsonString(TextPlanIdentity))({
+      correlatedRoot: rootBounded,
       text: identityText,
       mode: input.match ?? "any",
       filters: input.filters,
@@ -782,29 +914,83 @@ async function textQuery(
     }
   }
   if (planning.value === undefined) {
+    if (rootFiltered && rootMinimums.size !== selected.length) {
+      const encodedFilters = Schema.encodeSync(TermFilters)(input.filters);
+      const modelMinimums = new Map<
+        typeof EligibilityProjection.Type,
+        typeof EligibleMinimum.Type
+      >();
+      const minimums = Effect.runSync(
+        Effect.acquireUseRelease(
+          Effect.sync(() => new EligibilityQuery(encodedFilters)),
+          (modelQuery) =>
+            Effect.sync(() =>
+              selections.map(({ segment }) => {
+                const model = segment.eligibility;
+                if (model === undefined || model === null)
+                  throw new Rejected({ status: 503, message: "Missing Root eligibility model" });
+                const retained = modelMinimums.get(model);
+                if (retained !== undefined) return [segment.key, retained] as const;
+                const minimum = Schema.decodeSync(Schema.fromJsonString(EligibleMinimum))(
+                  modelQuery.minimum(
+                    Schema.encodeSync(Schema.fromJsonString(EligibilityProjection))(model),
+                  ),
+                );
+                modelMinimums.set(model, minimum);
+                return [segment.key, minimum] as const;
+              }),
+            ),
+          (modelQuery) => Effect.sync(() => modelQuery.free()),
+        ),
+      );
+      for (const [key, minimum] of minimums) rootMinimums.set(key, minimum);
+    }
     const common = selections.flatMap(({ segment, terms: requested }) => {
       if (
-        (input.filters.length > 0 && !unrestricted.has(segment.key)) ||
+        (input.filters.length > 0 && !rootFiltered && !unrestricted.has(segment.key)) ||
         segment.commonTerms === undefined
       )
         return [];
       const saved = segment.commonTerms;
+      const projection = segment.commonProjection;
       const dictionary = Object.fromEntries(
         requested.flatMap((term) => {
           if (!Object.hasOwn(saved, term)) return [];
           const summary = saved[term];
           if (summary === undefined) return [];
+          if (rootBounded && projection !== undefined && projection !== null) {
+            const bounds = projection.independent[projection.terms.indexOf(term)];
+            if (bounds === undefined) return [];
+            return [[term, { df: summary.df, bounds }] as const];
+          }
           return [[term, summary] as const];
         }),
       );
       if (Object.keys(dictionary).length !== requested.length) return [];
+      const minimum = rootMinimums.get(segment.key);
+      if (minimum !== undefined) return [{ dictionary, minimum, partitions: null }];
       return [{ dictionary, minimum: [0, 0] as const, partitions: null }];
     });
+    const rootPrefixes = Match.value(
+      correlatedPhrase &&
+        !rootCorrelated &&
+        common.length === selected.length &&
+        common.every((projection) =>
+          terms.every((term) => Object.hasOwn(projection.dictionary, term)),
+        ),
+    ).pipe(
+      Match.when(true, () => common.map((projection) => projection.dictionary)),
+      Match.orElse(() => undefined),
+    );
     const projections = await Effect.runPromise(
-      Match.value(common.length === selected.length).pipe(
+      Match.value(common.length === selected.length && (!correlatedPhrase || rootBounded)).pipe(
         Match.when(true, () =>
           Effect.sync(() => {
-            timings.append("server-timing", 'catalog_root_prefix;desc="hit"');
+            if (rootFiltered)
+              timings.append("server-timing", 'catalog_root_eligibility;desc="hit"');
+            else if (rootCorrelated)
+              timings.append("server-timing", 'catalog_root_joint;desc="hit"');
+            else timings.append("server-timing", 'catalog_root_prefix;desc="hit"');
             return common;
           }),
         ),
@@ -814,6 +1000,7 @@ async function textQuery(
             selections.map((candidate) => candidate.terms),
             input.filters,
             timings,
+            rootPrefixes,
           ),
         ),
       ),
@@ -845,21 +1032,131 @@ async function textQuery(
       statistics,
     );
     const segments = [];
+    const compactResults = new Map<typeof CommonTermProjection.Type, Map<string, number>>();
+    const compactReuse = { inputs: 0, unique: 0, batches: 0 };
     for (const offset of Array.from(
       { length: Math.ceil(catalog.length / 64) },
       (_, index) => index * 64,
     )) {
       const window = catalog.slice(offset, offset + 64);
-      const encoded = Schema.encodeSync(Schema.fromJsonString(Schema.Array(TermCatalog)))(
-        window.map((entry) => ({
-          dictionary: entry.dictionary,
-          minimum: entry.minimum,
-          partitions: entry.partitions,
-        })),
+      const values = Match.value(rootBounded).pipe(
+        Match.when(true, () => {
+          const compact: Array<(typeof CompactMinimumTermBounds.Type)[number]> = [];
+          const pending = new Map<typeof CommonTermProjection.Type, Map<string, number>>();
+          compactReuse.inputs += window.length;
+          const references = window.map((entry) => {
+            const projection = entry.segment.commonProjection;
+            if (projection === undefined || projection === null)
+              throw new Rejected({ status: 503, message: "Missing Root joint projection" });
+            const selectedTerms = projection.terms.filter((term) =>
+              Object.hasOwn(entry.dictionary, term),
+            );
+            const summaries = selectedTerms.map((term) => {
+              const summary = entry.dictionary[term];
+              if (summary === undefined)
+                throw new Rejected({ status: 503, message: "Missing Root joint term" });
+              return summary;
+            });
+            const segmentFrequencies = summaries.map((summary) => summary.df);
+            const key = encodeCompactBoundIdentity([
+              selectedTerms,
+              segmentFrequencies,
+              entry.minimum,
+            ]);
+            const retained = compactResults.get(projection) ?? new Map<string, number>();
+            compactResults.set(projection, retained);
+            const bound = retained.get(key);
+            if (bound !== undefined) return { retained, key, bound, index: undefined };
+            const indexes = pending.get(projection) ?? new Map<string, number>();
+            pending.set(projection, indexes);
+            const queued = indexes.get(key);
+            if (queued !== undefined) return { retained, key, bound: undefined, index: queued };
+            const index = compact.length;
+            indexes.set(key, index);
+            if (selectedTerms.length === projection.terms.length) {
+              compact.push([projection, segmentFrequencies, entry.minimum]);
+              return { retained, key, bound: undefined, index };
+            }
+            const columns = selectedTerms.map((term) => projection.terms.indexOf(term));
+            compact.push([
+              {
+                terms: selectedTerms,
+                independent: columns.map((column) => {
+                  const bounds = projection.independent[column];
+                  if (bounds === undefined)
+                    throw new Rejected({ status: 503, message: "Missing Root independent column" });
+                  return bounds;
+                }),
+                partitions: projection.partitions.map((partition) =>
+                  columns.map((column) => {
+                    const cell = partition[column];
+                    if (cell === undefined)
+                      throw new Rejected({ status: 503, message: "Missing Root joint column" });
+                    return cell;
+                  }),
+                ),
+              },
+              segmentFrequencies,
+              entry.minimum,
+            ]);
+            return { retained, key, bound: undefined, index };
+          });
+          const decoded: number[] = [];
+          if (compact.length > 0) {
+            compactReuse.unique += compact.length;
+            compactReuse.batches += 1;
+            const nativeBounds = Match.value(rootFiltered).pipe(
+              Match.when(true, () =>
+                segment_term_bounds_compact_minimum(
+                  encodedStatistics,
+                  Schema.encodeSync(Schema.fromJsonString(CompactMinimumTermBounds))(compact),
+                ),
+              ),
+              Match.orElse(() =>
+                segment_term_bounds_compact(
+                  encodedStatistics,
+                  Schema.encodeSync(Schema.fromJsonString(CompactTermBounds), {
+                    disableChecks: true,
+                  })(
+                    compact.map(([projection, physicalDfs]) => [projection, physicalDfs] as const),
+                  ),
+                ),
+              ),
+            );
+            decoded.push(
+              ...Schema.decodeSync(Schema.Array(Schema.Finite))(Array.from(nativeBounds)),
+            );
+            if (decoded.length !== compact.length)
+              throw new Rejected({
+                status: 503,
+                message: "Term bound batch omitted a unique input",
+              });
+          }
+          return references.map((reference) => {
+            if (reference.bound !== undefined) return reference.bound;
+            if (reference.index === undefined)
+              throw new Rejected({ status: 503, message: "Missing compact bound reference" });
+            const bound = decoded[reference.index];
+            if (bound === undefined)
+              throw new Rejected({ status: 503, message: "Missing compact bound output" });
+            reference.retained.set(reference.key, bound);
+            return bound;
+          });
+        }),
+        Match.orElse(() =>
+          segment_term_bounds(
+            encodedStatistics,
+            Schema.encodeSync(Schema.fromJsonString(Schema.Array(TermCatalog)))(
+              window.map((entry) => ({
+                dictionary: entry.dictionary,
+                minimum: entry.minimum,
+                partitions: entry.partitions,
+              })),
+            ),
+          ),
+        ),
       );
-      const bounds = Schema.decodeSync(Schema.Array(Schema.Finite))(
-        Array.from(segment_term_bounds(encodedStatistics, encoded)),
-      );
+      const bounds = Schema.decodeSync(Schema.Array(Schema.Finite))(Array.from(values));
       if (bounds.length !== window.length)
         throw new Rejected({ status: 503, message: "Term bound batch omitted a segment" });
       segments.push(
@@ -891,10 +1188,24 @@ async function textQuery(
             minimumId: entry.segment.minimumId,
             eligible: matches.maximum > 0,
             maximumMatches: matches.maximum,
+            singleton: Match.value(
+              Object.values(entry.dictionary).some((summary) => summary.single !== undefined) &&
+                Object.values(entry.dictionary).every(
+                  (summary) => summary.df === 1 && summary.single !== undefined,
+                ),
+            ).pipe(
+              Match.when(true, () => entry.dictionary),
+              Match.orElse(() => undefined),
+            ),
           };
         }),
       );
     }
+    if (compactReuse.inputs > 0)
+      timings.append(
+        "server-timing",
+        `text_bound_reuse;desc="inputs=${compactReuse.inputs} unique=${compactReuse.unique} batches=${compactReuse.batches}"`,
+      );
     planning.value = { statistics, segments };
     if (planning.key !== undefined) rememberTextPlan(planning.key, planning.value);
   }
@@ -939,6 +1250,7 @@ async function textQuery(
       index,
       eligible: planned.eligible && retained.maximumMatches > 0,
       maximumMatches: retained.maximumMatches,
+      singleton: planned.singleton,
       bound: retained.bound,
       minimumId: retained.minimumId,
       identity,
@@ -972,6 +1284,8 @@ async function textQuery(
     segments: 0,
     common: 0,
     uniform: 0,
+    uniformHits: 0,
+    singletons: 0,
   };
   using plans = new DisposableStack();
   const compilation: { query: PreparedQuery | undefined } = { query: undefined };
@@ -1031,204 +1345,241 @@ async function textQuery(
     const batches = await Effect.runPromise(
       Effect.forEach(
         eligible,
-        ({ segment, identity }) => {
-          const dead = Schema.encodeSync(integers)(segment.dead);
-          const prepareStarted = Effect.runSync(Clock.currentTimeNanos);
-          const dictionary = segment.commonTerms;
-          if (
-            (input.filters.length === 0 || unrestricted.has(segment.key)) &&
-            input.match !== "phrase" &&
-            dictionary !== undefined &&
-            segment.commonLeaders !== undefined &&
-            terms.every((term) => Object.hasOwn(dictionary, term))
-          ) {
-            const common = prepared.common_hits(
-              Schema.encodeSync(Schema.fromJsonString(CommonTerms))(dictionary),
-              Schema.encodeSync(Schema.fromJsonString(CommonLeaders))(segment.commonLeaders),
-              segment.count,
-              dead,
-              unrestricted.get(segment.key),
-            );
-            if (common !== undefined) {
-              rankMetrics.common += 1;
-              rankMetrics.prepare += Effect.runSync(Clock.currentTimeNanos) - prepareStarted;
-              return Effect.map(decodeSegmentHits(common), (hits) =>
-                hits.map((hit) => ({ ...hit, segment })),
+        ({ segment, identity, singleton }) =>
+          Effect.gen(function* () {
+            const dead = yield* Schema.encodeEffect(integers)(segment.dead);
+            const prepareStarted = yield* Clock.currentTimeNanos;
+            if (
+              singleton !== undefined &&
+              (input.match !== "phrase" || words.length === 1) &&
+              (input.filters.length === 0 || unrestricted.has(segment.key))
+            ) {
+              const exact = prepared.singleton_hits(
+                yield* Schema.encodeEffect(Schema.fromJsonString(TermSummaries))(singleton),
+                segment.count,
+                dead,
+                unrestricted.get(segment.key),
               );
+              if (exact !== undefined) {
+                rankMetrics.singletons += 1;
+                rankMetrics.prepare += (yield* Clock.currentTimeNanos) - prepareStarted;
+                return yield* decodeSegmentHits(exact);
+              }
             }
-          }
-          if (unrestricted.has(segment.key)) rankMetrics.uniform += 1;
-          return withDirectory(
-            segment.key,
-            segment.headerBytes,
-            (decoded) =>
-              Effect.acquireUseRelease(
-                Effect.sync(() =>
-                  decoded.ranker_prepared(prepared, dead, unrestricted.get(segment.key)),
+            const dictionary = segment.commonTerms;
+            if (
+              (input.filters.length === 0 || unrestricted.has(segment.key)) &&
+              (input.match !== "phrase" || words.length === 1) &&
+              dictionary !== undefined &&
+              segment.commonLeaders !== undefined &&
+              terms.every((term) => Object.hasOwn(dictionary, term))
+            ) {
+              const common = prepared.common_hits(
+                yield* Schema.encodeEffect(Schema.fromJsonString(CommonTerms))(dictionary),
+                yield* Schema.encodeEffect(Schema.fromJsonString(CommonLeaders))(
+                  segment.commonLeaders,
                 ),
-                (ranker) =>
-                  Effect.gen(function* () {
-                    rankMetrics.prepare += (yield* Clock.currentTimeNanos) - prepareStarted;
-                    const encodedSpans = Match.value(cutoff).pipe(
-                      Match.when(undefined, () => ranker.posting_spans_seeded()),
-                      Match.orElse((hit) => ranker.posting_spans_after(hit.score, hit.id)),
-                    );
-                    const requested = yield* decodePostingSpans(encodedSpans);
-                    const spans = yield* Effect.forEach(requested, (metadata) =>
-                      Effect.gen(function* () {
-                        const first = metadata.blocks[0];
-                        if (first === undefined)
-                          return yield* new Rejected({
-                            status: 503,
-                            message: "Empty posting directory",
-                          });
-                        const span = { end: first.data.offset };
-                        for (const block of metadata.blocks) {
-                          if (
-                            block.data.offset < span.end ||
-                            block.data.offset - span.end > 4096 ||
-                            block.data.length <= 0
-                          )
-                            return yield* new Rejected({
-                              status: 503,
-                              message: "Invalid posting span gap",
-                            });
-                          span.end = block.data.offset + block.data.length;
-                        }
-                        const start = segment.headerBytes + first.data.offset;
-                        const length = span.end - first.data.offset;
-                        if (
-                          start < segment.headerBytes ||
-                          start + length > segment.bytes ||
-                          length > 16777216
-                        )
-                          return yield* new Rejected({
-                            status: 503,
-                            message: "Invalid posting range",
-                          });
-                        return {
-                          offset: first.data.offset,
-                          end: span.end,
-                          gaps: 0,
-                          postings: [{ metadata, offset: first.data.offset, length }],
-                        };
-                      }),
-                    );
-                    const groups: typeof spans = [];
-                    for (const span of spans) {
-                      const previous = groups.at(-1);
-                      if (
-                        previous !== undefined &&
-                        span.offset >= previous.end &&
-                        previous.gaps + span.offset - previous.end <= 16384 &&
-                        span.end - previous.offset <= 1048576
-                      ) {
-                        previous.gaps += span.offset - previous.end;
-                        previous.end = span.end;
-                        previous.postings.push(...span.postings);
-                      } else groups.push(span);
-                    }
-                    for (const offset of Array.from(
-                      { length: Math.ceil(groups.length / 4) },
-                      (_, index) => index * 4,
-                    )) {
-                      const window = groups.slice(offset, offset + 4);
-                      const acquireStarted = yield* Clock.currentTimeNanos;
-                      const acquiredGroups = yield* Effect.forEach(
-                        window,
-                        (group) =>
+                segment.count,
+                dead,
+                unrestricted.get(segment.key),
+              );
+              if (common !== undefined) {
+                rankMetrics.common += 1;
+                rankMetrics.prepare += (yield* Clock.currentTimeNanos) - prepareStarted;
+                return yield* decodeSegmentHits(common);
+              }
+            }
+            if (unrestricted.has(segment.key)) rankMetrics.uniform += 1;
+            return yield* withDirectory(
+              segment.key,
+              segment.headerBytes,
+              (decoded) =>
+                Effect.acquireUseRelease(
+                  Effect.sync(() =>
+                    decoded.ranker_prepared(prepared, dead, unrestricted.get(segment.key)),
+                  ),
+                  (ranker) =>
+                    Effect.gen(function* () {
+                      const uniform = ranker.uniform_hits();
+                      rankMetrics.prepare += (yield* Clock.currentTimeNanos) - prepareStarted;
+                      if (uniform !== undefined) rankMetrics.uniformHits += 1;
+                      if (uniform === undefined) {
+                        const encodedSpans = Match.value(cutoff).pipe(
+                          Match.when(undefined, () => ranker.posting_spans_seeded()),
+                          Match.orElse((hit) => ranker.posting_spans_after(hit.score, hit.id)),
+                        );
+                        const requested = yield* decodePostingSpans(encodedSpans);
+                        const spans = yield* Effect.forEach(requested, (metadata) =>
                           Effect.gen(function* () {
-                            const bytes = yield* rankIo.withPermit(
-                              Effect.tryPromise({
-                                try: () =>
-                                  range(
-                                    segment.key,
-                                    segment.headerBytes + group.offset,
-                                    group.end - group.offset,
-                                  ),
-                                catch: (cause) => {
-                                  if (Schema.is(Rejected)(cause)) return cause;
-                                  return new Cause.UnknownError(cause);
-                                },
-                              }),
-                            );
+                            const first = metadata.blocks[0];
+                            if (first === undefined)
+                              return yield* new Rejected({
+                                status: 503,
+                                message: "Empty posting directory",
+                              });
+                            const span = { end: first.data.offset };
+                            for (const block of metadata.blocks) {
+                              if (
+                                block.data.offset < span.end ||
+                                block.data.offset - span.end > 4096 ||
+                                block.data.length <= 0
+                              )
+                                return yield* new Rejected({
+                                  status: 503,
+                                  message: "Invalid posting span gap",
+                                });
+                              span.end = block.data.offset + block.data.length;
+                            }
+                            const start = segment.headerBytes + first.data.offset;
+                            const length = span.end - first.data.offset;
+                            if (
+                              start < segment.headerBytes ||
+                              start + length > segment.bytes ||
+                              length > 16777216
+                            )
+                              return yield* new Rejected({
+                                status: 503,
+                                message: "Invalid posting range",
+                              });
                             return {
-                              bytes: bytes.byteLength,
-                              postings: group.postings.map((posting) => ({
-                                term: posting.metadata.term,
-                                metadata: posting.metadata,
-                                bytes: bytes.subarray(
-                                  posting.offset - group.offset,
-                                  posting.offset - group.offset + posting.length,
-                                ),
-                                offset: posting.offset,
-                              })),
+                              offset: first.data.offset,
+                              end: span.end,
+                              gaps: 0,
+                              postings: [{ metadata, offset: first.data.offset, length }],
                             };
                           }),
-                        { concurrency: 4 },
-                      );
-                      const loaded = acquiredGroups.flatMap((group) => group.postings);
-                      const acquired = yield* Clock.currentTimeNanos;
-                      rankMetrics.acquire += acquired - acquireStarted;
-                      rankMetrics.spans += loaded.length;
-                      rankMetrics.ranges += window.length;
-                      rankMetrics.bytes += acquiredGroups.reduce(
-                        (total, group) => total + group.bytes,
-                        0,
-                      );
-                      rankMetrics.blocks += loaded.reduce(
-                        (total, posting) => total + posting.metadata.blocks.length,
-                        0,
-                      );
-                      for (const posting of loaded)
-                        for (const block of posting.metadata.blocks) {
-                          const start = block.data.offset - posting.offset;
-                          const bytes = posting.bytes.subarray(start, start + block.data.length);
+                        );
+                        const groups: typeof spans = [];
+                        for (const span of spans) {
+                          const previous = groups.at(-1);
                           if (
-                            input.match === "phrase" ||
-                            (block.max_title_tf <= 1 && block.max_body_tf <= 1)
-                          )
-                            ranker.add(posting.term, bytes);
-                          else
-                            addFrequencyPosting(
-                              ranker,
-                              segment.key,
-                              posting.term,
-                              segment.headerBytes + block.data.offset,
-                              bytes,
-                            );
+                            previous !== undefined &&
+                            span.offset >= previous.end &&
+                            previous.gaps + span.offset - previous.end <= 16384 &&
+                            span.end - previous.offset <= 1048576
+                          ) {
+                            previous.gaps += span.offset - previous.end;
+                            previous.end = span.end;
+                            previous.postings.push(...span.postings);
+                          } else groups.push(span);
                         }
-                      rankMetrics.decode += (yield* Clock.currentTimeNanos) - acquired;
-                    }
-                    const scoreStarted = yield* Clock.currentTimeNanos;
-                    const hits = yield* decodeSegmentHits(ranker.finish());
-                    if (selection.digest !== "") {
-                      const upper = {
-                        bound: cutoff?.score ?? 0,
-                        minimumId: segment.minimumId,
-                      };
-                      if (cutoff !== undefined && cutoff.id > upper.minimumId)
-                        upper.minimumId = cutoff.id;
-                      for (const hit of hits) {
-                        if (hit.score > upper.bound) {
-                          upper.bound = hit.score;
-                          upper.minimumId = hit.id;
-                        } else if (hit.score === upper.bound && hit.id < upper.minimumId)
-                          upper.minimumId = hit.id;
+                        for (const offset of Array.from(
+                          { length: Math.ceil(groups.length / 4) },
+                          (_, index) => index * 4,
+                        )) {
+                          const window = groups.slice(offset, offset + 4);
+                          const acquireStarted = yield* Clock.currentTimeNanos;
+                          const acquiredGroups = yield* Effect.forEach(
+                            window,
+                            (group) =>
+                              Effect.gen(function* () {
+                                const bytes = yield* rankIo.withPermit(
+                                  Effect.tryPromise({
+                                    try: () =>
+                                      range(
+                                        segment.key,
+                                        segment.headerBytes + group.offset,
+                                        group.end - group.offset,
+                                      ),
+                                    catch: (cause) => {
+                                      if (Schema.is(Rejected)(cause)) return cause;
+                                      return new Cause.UnknownError(cause);
+                                    },
+                                  }),
+                                );
+                                return {
+                                  bytes: bytes.byteLength,
+                                  postings: group.postings.map((posting) => ({
+                                    term: posting.metadata.term,
+                                    metadata: posting.metadata,
+                                    bytes: bytes.subarray(
+                                      posting.offset - group.offset,
+                                      posting.offset - group.offset + posting.length,
+                                    ),
+                                    offset: posting.offset,
+                                  })),
+                                };
+                              }),
+                            { concurrency: 4 },
+                          );
+                          const loaded = acquiredGroups.flatMap((group) => group.postings);
+                          const acquired = yield* Clock.currentTimeNanos;
+                          rankMetrics.acquire += acquired - acquireStarted;
+                          rankMetrics.spans += loaded.length;
+                          rankMetrics.ranges += window.length;
+                          rankMetrics.bytes += acquiredGroups.reduce(
+                            (total, group) => total + group.bytes,
+                            0,
+                          );
+                          rankMetrics.blocks += loaded.reduce(
+                            (total, posting) => total + posting.metadata.blocks.length,
+                            0,
+                          );
+                          for (const posting of loaded)
+                            for (const block of posting.metadata.blocks) {
+                              const start = block.data.offset - posting.offset;
+                              const bytes = posting.bytes.subarray(
+                                start,
+                                start + block.data.length,
+                              );
+                              if (
+                                input.match === "phrase" ||
+                                (block.max_title_tf <= 1 && block.max_body_tf <= 1)
+                              )
+                                ranker.add(posting.term, bytes);
+                              else
+                                addFrequencyPosting(
+                                  ranker,
+                                  segment.key,
+                                  posting.term,
+                                  segment.headerBytes + block.data.offset,
+                                  bytes,
+                                );
+                            }
+                          rankMetrics.decode += (yield* Clock.currentTimeNanos) - acquired;
+                        }
                       }
-                      rememberSegmentScoreBound(identity, upper);
-                    }
-                    rankMetrics.score += (yield* Clock.currentTimeNanos) - scoreStarted;
-                    rankMetrics.segments += 1;
-                    return hits;
-                  }),
-                (ranker) => Effect.sync(() => ranker.free()),
+                      const scoreStarted = yield* Clock.currentTimeNanos;
+                      const encodedHits = Match.value(uniform).pipe(
+                        Match.when(undefined, () => ranker.finish()),
+                        Match.orElse((hits) => hits),
+                      );
+                      const hits = yield* decodeSegmentHits(encodedHits);
+                      rankMetrics.score += (yield* Clock.currentTimeNanos) - scoreStarted;
+                      rankMetrics.segments += 1;
+                      return hits;
+                    }),
+                  (ranker) => Effect.sync(() => ranker.free()),
+                ),
+              rankIo,
+              false,
+              eligible.length > 1 || (rootFiltered && reuse.plan === "miss"),
+              Match.value(dictionary).pipe(
+                Match.when(undefined, () => undefined),
+                Match.orElse((common) => {
+                  if (terms.every((term) => Object.hasOwn(common, term))) return prepared;
+                  return undefined;
+                }),
               ),
-            rankIo,
-            false,
-            eligible.length > 1,
-          ).pipe(Effect.map((hits) => hits.map((hit) => ({ ...hit, segment }))));
-        },
+            );
+          }).pipe(
+            Effect.map((hits) => {
+              if (selection.digest !== "") {
+                const upper = { bound: cutoff?.score ?? 0, minimumId: segment.minimumId };
+                if (cutoff !== undefined && cutoff.id > upper.minimumId)
+                  upper.minimumId = cutoff.id;
+                for (const hit of hits) {
+                  if (hit.score > upper.bound) {
+                    upper.bound = hit.score;
+                    upper.minimumId = hit.id;
+                  } else if (hit.score === upper.bound && hit.id < upper.minimumId)
+                    upper.minimumId = hit.id;
+                }
+                rememberSegmentScoreBound(identity, upper);
+              }
+              return hits.map((hit) => ({ ...hit, segment }));
+            }),
+          ),
         { concurrency: rankingConcurrency },
       ),
     );
@@ -1313,7 +1664,9 @@ async function textQuery(
     }
   }
   timings.append("server-timing", `text_common_leaders;desc="segments=${rankMetrics.common}"`);
+  timings.append("server-timing", `text_singleton_hits;desc="segments=${rankMetrics.singletons}"`);
   timings.append("server-timing", `text_uniform_postings;desc="segments=${rankMetrics.uniform}"`);
+  timings.append("server-timing", `text_uniform_hits;desc="segments=${rankMetrics.uniformHits}"`);
   timings.append("server-timing", `text_rank;dur=${Number(rankingEnded - dictionaryEnded) / 1e6}`);
   timings.append("server-timing", `text_rank_prepare;dur=${Number(rankMetrics.prepare) / 1e6}`);
   timings.append(
@@ -1328,76 +1681,10 @@ async function textQuery(
     "server-timing",
     `text_score;dur=${Number(rankMetrics.score) / 1e6};desc="segments=${rankMetrics.segments}"`,
   );
-  timings.append("server-timing", 'text_phase;desc="documents"');
-  const documentsStarted = Effect.runSync(Clock.currentTimeNanos);
-  const hits = ranked.slice(0, input.topK);
-  const concurrency = documentReadConcurrency(hits.map((hit) => hit.data));
-  const windows = EffectArray.chunksOf(hits, 4).flatMap((window) => {
-    const first = window[0];
-    if (first === undefined) return [];
-    const physicalRows = window.map((hit) => hit.row).toSorted((left, right) => left - right);
-    const firstRow = physicalRows[0];
-    if (
-      window.every(
-        (hit) =>
-          hit.segment.key === first.segment.key &&
-          hit.segment.headerBytes === first.segment.headerBytes &&
-          hit.segment.bytes === first.segment.bytes,
-      ) &&
-      physicalRows.every((row, index) => firstRow !== undefined && row === firstRow + index)
-    )
-      return [window];
-    return window.map((hit) => [hit]);
-  });
-  const batches = await Effect.runPromise(
-    Effect.gen(function* () {
-      const permits = yield* Semaphore.make(concurrency);
-      return yield* Effect.forEach(
-        windows,
-        (window) =>
-          Effect.gen(function* () {
-            const first = window[0];
-            if (first === undefined) return [];
-            const documents = yield* readDocuments(
-              first.segment.key,
-              first.segment.headerBytes,
-              window.map((hit) => hit.data),
-              first.segment.bytes,
-              permits,
-            );
-            return yield* Effect.forEach(documents, (document, index) =>
-              Effect.gen(function* () {
-                const hit = window[index];
-                if (hit === undefined)
-                  return yield* new Rejected({
-                    status: 503,
-                    message: "Document batch omitted its hit",
-                  });
-                return {
-                  id: document.id,
-                  title: document.title ?? "",
-                  text: document.text,
-                  attributes: document.attributes,
-                  revision: document.revision,
-                  score: hit.score,
-                };
-              }),
-            );
-          }),
-        { concurrency },
-      );
-    }),
-  );
-  const rows = batches.flat();
-  const documentsEnded = Effect.runSync(Clock.currentTimeNanos);
-  timings.append(
-    "server-timing",
-    `text_documents;dur=${Number(documentsEnded - documentsStarted) / 1e6}`,
-  );
-  return rows;
+  return ranked.slice(0, input.topK);
 }
 
-async function vectorQuery(
+async function rankVectors(
   env: Env,
   input: typeof Query.Type,
   root: typeof Root.Type,
@@ -1417,13 +1704,6 @@ async function vectorQuery(
     input.filters,
   );
   const fields = root.schema?.vectorFilterFields ?? [];
-  const prefilter = await Effect.runPromise(vectorPrefilter(input.filters, fields));
-  const options: VectorizeQueryOptions = {
-    namespace: root.vectorEpoch,
-    topK: 50,
-    returnMetadata: "all",
-  };
-  if (Object.keys(prefilter).length > 0) options.filter = prefilter;
   const indexStarted = Effect.runSync(Clock.currentTimeNanos);
   const selector = Schema.encodeSync(Schema.fromJsonString(VectorSelection))({
     epoch: root.vectorEpoch,
@@ -1461,6 +1741,13 @@ async function vectorQuery(
     }
   }
   if (candidates.value === undefined) {
+    const prefilter = await Effect.runPromise(vectorPrefilter(input.filters, fields));
+    const options: VectorizeQueryOptions = {
+      namespace: root.vectorEpoch,
+      topK: 50,
+      returnMetadata: "all",
+    };
+    if (Object.keys(prefilter).length > 0) options.filter = prefilter;
     const observedAt = Effect.runSync(Clock.currentTimeMillis);
     const result = await env.VECTORS.query([...input.vector], options);
     candidates.value = Schema.decodeUnknownSync(VectorCandidates)(result.matches);
@@ -1491,18 +1778,16 @@ async function vectorQuery(
   } else timings.append("server-timing", 'vector_cache;desc="hit"');
   const indexEnded = Effect.runSync(Clock.currentTimeNanos);
   timings.append("server-timing", `vector_index;dur=${Number(indexEnded - indexStarted) / 1e6}`);
-  const metadata = candidates.value.map((match) => ({ match, metadata: match.metadata }));
+  const matches = candidates.value;
   const eligible = [];
-  const cursor = { offset: 0 };
-  while (cursor.offset < metadata.length && eligible.length < input.topK) {
-    const window = metadata.slice(
-      cursor.offset,
-      cursor.offset + Math.max(4, input.topK - eligible.length),
-    );
+  const cursor = { offset: 0, size: input.topK };
+  while (cursor.offset < matches.length && eligible.length < input.topK) {
+    const window = matches.slice(cursor.offset, cursor.offset + cursor.size);
     cursor.offset += window.length;
     const current = await locate(
       window.map((item) => item.metadata.id),
       root,
+      input.kind === "vector",
     );
     const validated = await Effect.runPromise(
       Effect.forEach(
@@ -1519,87 +1804,30 @@ async function vectorQuery(
             const expected = yield* Effect.tryPromise(() =>
               vectorId(root.vectorEpoch, item.metadata.id, item.metadata.revision),
             );
-            if (item.match.id !== expected) return Option.none();
-            const attributes = yield* Schema.encodeEffect(Schema.fromJsonString(Attributes))(
-              location.document.attributes,
-            );
-            if (!segment_filter(attributes, encodedFilters)) return Option.none();
-            return Option.some({ location, score: item.match.score });
+            if (item.id !== expected) return Option.none();
+            if (input.filters.length > 0) {
+              const attributes = yield* Schema.encodeEffect(Schema.fromJsonString(Attributes))(
+                location.document.attributes,
+              );
+              if (!segment_filter(attributes, encodedFilters)) return Option.none();
+            }
+            return Option.some({ location, score: item.score });
           }),
         { concurrency: 4 },
       ).pipe(Effect.map(EffectArray.getSomes)),
     );
     eligible.push(...validated);
+    cursor.size = Math.max(4, input.topK - eligible.length);
   }
   const reconciled = Effect.runSync(Clock.currentTimeNanos);
   timings.append("server-timing", `vector_reconcile;dur=${Number(reconciled - indexEnded) / 1e6}`);
-  const hits = eligible.slice(0, input.topK);
-  const concurrency = documentReadConcurrency(hits.map((hit) => hit.location.document.data));
-  const windows = EffectArray.chunksOf(hits, 4).flatMap((window) => {
-    const first = window[0];
-    if (first === undefined) return [];
-    const physicalRows = window
-      .map((item) => item.location.row)
-      .toSorted((left, right) => left - right);
-    const firstRow = physicalRows[0];
-    if (
-      window.every(
-        (item) =>
-          item.location.segment.key === first.location.segment.key &&
-          item.location.segment.headerBytes === first.location.segment.headerBytes &&
-          item.location.segment.bytes === first.location.segment.bytes,
-      ) &&
-      physicalRows.every((row, index) => firstRow !== undefined && row === firstRow + index)
-    )
-      return [window];
-    return window.map((item) => [item]);
-  });
-  const batches = await Effect.runPromise(
-    Effect.gen(function* () {
-      const permits = yield* Semaphore.make(concurrency);
-      return yield* Effect.forEach(
-        windows,
-        (window) =>
-          Effect.gen(function* () {
-            const first = window[0];
-            if (first === undefined) return [];
-            const documents = yield* readDocuments(
-              first.location.segment.key,
-              first.location.segment.headerBytes,
-              window.map((item) => item.location.document.data),
-              first.location.segment.bytes,
-              permits,
-            );
-            return yield* Effect.forEach(documents, (document, index) =>
-              Effect.gen(function* () {
-                const item = window[index];
-                if (item === undefined)
-                  return yield* new Rejected({
-                    status: 503,
-                    message: "Vector document batch omitted its candidate",
-                  });
-                return {
-                  id: document.id,
-                  title: document.title ?? "",
-                  text: document.text,
-                  attributes: document.attributes,
-                  revision: document.revision,
-                  score: item.score,
-                };
-              }),
-            );
-          }),
-        { concurrency },
-      );
-    }),
-  );
-  const rows = batches.flat();
-  const materialized = Effect.runSync(Clock.currentTimeNanos);
-  timings.append(
-    "server-timing",
-    `vector_documents;dur=${Number(materialized - reconciled) / 1e6}`,
-  );
-  return rows;
+  return eligible.slice(0, input.topK).map(({ location, score }) => ({
+    row: location.row,
+    id: location.document.id,
+    score,
+    data: location.document.data,
+    segment: location.segment,
+  }));
 }
 
 async function query(
@@ -1617,11 +1845,20 @@ async function query(
     if (!filterable.includes(filter.field))
       throw new Rejected({ status: 400, message: `Attribute is not filterable: ${filter.field}` });
   if (input.kind === "text") {
+    const materialize = async () => {
+      const hits = await rankText(input, manifest, timings, ctx);
+      timings.append("server-timing", 'text_phase;desc="documents"');
+      const started = Effect.runSync(Clock.currentTimeNanos);
+      const rows = await Effect.runPromise(
+        readDocumentHits(hits.map((hit) => [hit.segment, hit.data, hit.score] as const)),
+      );
+      const ended = Effect.runSync(Clock.currentTimeNanos);
+      timings.append("server-timing", `text_documents;dur=${Number(ended - started) / 1e6}`);
+      return rows;
+    };
     const rows = await Match.value(executions).pipe(
-      Match.when(undefined, () => textQuery(input, manifest, timings, ctx)),
-      Match.orElse((active) =>
-        active.evaluate(manifest, input, timings, () => textQuery(input, manifest, timings, ctx)),
-      ),
+      Match.when(undefined, materialize),
+      Match.orElse((active) => active.evaluate(manifest, input, timings, materialize)),
     );
     return encodeQueryResult({
       rows,
@@ -1630,16 +1867,16 @@ async function query(
     });
   }
   const [text, vectors] = await Promise.all([
-    textQuery(input, manifest, timings, ctx),
-    vectorQuery(env, input, manifest, timings, ctx),
+    rankText(input, manifest, timings, ctx),
+    rankVectors(env, input, manifest, timings, ctx),
   ]);
-  const scores = new Map<string, typeof Row.Type>();
+  const scores = new Map<string, Awaited<ReturnType<typeof rankText>>[number]>();
   if (input.kind === "hybrid") {
     for (const list of [text, vectors])
-      for (const [rank, row] of list.entries())
-        scores.set(row.id, { ...row, score: (scores.get(row.id)?.score ?? 0) + 1 / (61 + rank) });
-  } else for (const row of [...text, ...vectors]) scores.set(row.id, row);
-  const rows = [...scores.values()]
+      for (const [rank, hit] of list.entries())
+        scores.set(hit.id, { ...hit, score: (scores.get(hit.id)?.score ?? 0) + 1 / (61 + rank) });
+  } else for (const hit of [...text, ...vectors]) scores.set(hit.id, hit);
+  const hits = [...scores.values()]
     .sort((a, b) => {
       if (a.score !== b.score) return b.score - a.score;
       if (a.id < b.id) return -1;
@@ -1647,6 +1884,24 @@ async function query(
       return 0;
     })
     .slice(0, input.topK);
+  const started = Effect.runSync(Clock.currentTimeNanos);
+  const rows = await Effect.runPromise(
+    readDocumentHits(hits.map((hit) => [hit.segment, hit.data, hit.score] as const)),
+  );
+  if (input.kind === "hybrid") {
+    if (rows.length !== hits.length)
+      throw new Rejected({ status: 503, message: "Hybrid document projection omitted a hit" });
+    for (const [index, row] of rows.entries()) {
+      const hit = hits[index];
+      if (hit === undefined || row.id !== hit.id)
+        throw new Rejected({
+          status: 503,
+          message: "Hybrid document identity differs from its header",
+        });
+    }
+  }
+  const ended = Effect.runSync(Clock.currentTimeNanos);
+  timings.append("server-timing", `${input.kind}_documents;dur=${Number(ended - started) / 1e6}`);
   return encodeQueryResult({
     rows,
     sequence: manifest.sequence,
@@ -1656,12 +1911,19 @@ async function query(
 
 export class SearchNamespace extends DurableObject<Env> {
   private readonly semaphore = Semaphore.makeUnsafe(1);
+  private namespacePublished = false;
   private readonly querySlots = Semaphore.makeUnsafe(4);
   private readonly readers = new Map<symbol, typeof Root.Type>();
   private readonly textExecutions = new TextExecutions();
   private namespace: typeof NamespaceName.Type | undefined;
   private acknowledgedReceipt: typeof Receipt.Type | undefined;
-  private current: { manifest: typeof Root.Type; etag: string | null } | undefined;
+  private current:
+    | {
+        manifest: typeof Root.Type;
+        etag: string | null;
+        manifestEncodedBytes?: number;
+      }
+    | undefined;
 
   private get prefix() {
     if (this.namespace === undefined) throw new Error("Namespace must be bound before R2 access");
@@ -1694,10 +1956,282 @@ export class SearchNamespace extends DurableObject<Env> {
       vectorEpoch: await sha256(`${this.prefix}\0${crypto.randomUUID()}`),
       vectorJobs: [],
       lastReceipt: null,
+      bloomPacks: [],
       segments: [],
     };
     this.current = { manifest, etag: null };
     return this.current;
+  }
+
+  private async readRebuildCheckpoint(object: R2ObjectBody) {
+    if (object.size > VECTOR_REBUILD_CHECKPOINT_BYTES) {
+      await object.body.cancel();
+      throw new Rejected({ status: 503, message: "Rebuild checkpoint exceeds byte budget" });
+    }
+    const bytes = await object.arrayBuffer();
+    if (bytes.byteLength !== object.size)
+      throw new Rejected({ status: 503, message: "Rebuild checkpoint body size mismatch" });
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  }
+
+  private async migrateSegment<
+    Segment extends
+      | (typeof LegacyInlineRoot.Type.segments)[number]
+      | (typeof LegacyPackedRoot.Type.segments)[number],
+  >(segment: Segment) {
+    const object = await this.env.STORAGE.get(segment.key);
+    if (object === null || object.size !== segment.bytes || object.size > 16 * 1024 * 1024)
+      throw new Rejected({
+        status: 503,
+        message: "Migration segment unavailable or exceeds size budget",
+      });
+    const source = new Uint8Array(await object.arrayBuffer());
+    if (source.byteLength !== segment.bytes)
+      throw new Rejected({ status: 503, message: "Migration segment body size mismatch" });
+    const bytes = new Uint8Array(segment_migrate(source));
+    const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment_header(bytes));
+    const headerBytes = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
+    if (header.documents.length !== segment.count || header.documents[0].id !== segment.minimumId)
+      throw new Rejected({ status: 503, message: "Migration changed segment row identity" });
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)).toHex();
+    const key = `${this.prefix}/segments/${digest}-${await sha256(segment.key)}.rsix`;
+    const stored = await this.env.STORAGE.put(key, bytes, { onlyIf: { etagDoesNotMatch: "*" } });
+    if (stored === null) {
+      const existing = await this.env.STORAGE.get(key);
+      if (existing === null || existing.size !== bytes.byteLength)
+        throw new Rejected({ status: 503, message: "Migrated segment identity conflict" });
+      const existingBytes = await existing.arrayBuffer();
+      if (
+        existingBytes.byteLength !== bytes.byteLength ||
+        new Uint8Array(await crypto.subtle.digest("SHA-256", existingBytes)).toHex() !== digest
+      )
+        throw new Rejected({ status: 503, message: "Migrated segment digest mismatch" });
+    }
+    await Effect.runPromise(
+      storeSegmentCaches(
+        key,
+        headerBytes,
+        bytes,
+        segment.commonTerms !== undefined && Object.keys(segment.commonTerms).length > 0,
+      ),
+    );
+    const commonLeaders = segment.commonLeaders?.map((leader) => ({
+      ...leader,
+      documents: leader.documents.map((document) => {
+        const row = header.documents[document.row];
+        if (row === undefined || row.id !== document.id)
+          throw new Rejected({ status: 503, message: "Migration leader row identity mismatch" });
+        return { ...document, data: row.data };
+      }),
+    }));
+    return {
+      ...segment,
+      key,
+      headerBytes,
+      bytes: bytes.byteLength,
+      metadataEnd: headerBytes + header.metadata_end,
+      commonLeaders,
+    };
+  }
+
+  private async migrateManifest(
+    saved:
+      | ReturnType<typeof decodeRootForMigration>
+      | ReturnType<typeof decodeVectorRebuildSnapshotForMigration>,
+  ) {
+    if (saved.kind === "current") {
+      if ("snapshot" in saved) return saved.snapshot.root;
+      return saved.root;
+    }
+    if (saved.kind === "legacy") {
+      const root = (() => {
+        if ("snapshot" in saved) return saved.snapshot.root;
+        return saved.root;
+      })();
+      const segments = [];
+      for (const segment of root.segments) segments.push(await this.migrateSegment(segment));
+      const prepared: { value: typeof ConvertedInlineRoot.Type } = {
+        value: { ...root, segments },
+      };
+      if (saved.needsEligibility)
+        prepared.value = {
+          ...prepared.value,
+          segments: await Effect.runPromise(
+            Effect.forEach(
+              segments,
+              (segment) =>
+                Effect.map(rebuildEligibility(segment, root.schema?.filterable), (eligibility) => ({
+                  ...segment,
+                  eligibility,
+                })),
+              { concurrency: 1 },
+            ),
+          ),
+        };
+      return Effect.runPromise(packBloomRoot(this.prefix, prepared.value));
+    }
+    const root = (() => {
+      if ("snapshot" in saved) return saved.snapshot.root;
+      return saved.root;
+    })();
+    const segments = [];
+    const replacements = new Map<string, string>();
+    for (const segment of root.segments) {
+      const converted = await this.migrateSegment(segment);
+      segments.push(converted);
+      replacements.set(segment.key, converted.key);
+    }
+    return {
+      ...root,
+      segments,
+      bloomPacks: root.bloomPacks.map((descriptor) =>
+        Object.assign({}, descriptor, {
+          segmentKeys: descriptor.segmentKeys.map((key) => replacements.get(key) ?? key),
+        }),
+      ),
+    };
+  }
+
+  private async migrateRoot() {
+    this.current = undefined;
+    this.acknowledgedReceipt = undefined;
+    const key = `${this.prefix}/root.json`;
+    const object = await this.env.STORAGE.get(key);
+    if (object === null) {
+      const receipts = await this.env.STORAGE.list({
+        prefix: `${this.prefix}/receipts/`,
+        limit: 1,
+      });
+      if (receipts.objects.length > 0)
+        throw new Rejected({
+          status: 503,
+          message: "R2 manifest missing for an acknowledged namespace",
+        });
+    }
+    const root = await Option.getOrUndefined(
+      Option.map(Option.fromNullishOr(object), async (captured) =>
+        decodeRootForMigration(await captured.text()),
+      ),
+    );
+    const now = Effect.runSync(Clock.currentTimeMillis);
+    const snapshots: R2ListOptions = {
+      prefix: `${this.prefix}/vector-rebuild/`,
+      limit: 100,
+      include: ["customMetadata"],
+    };
+    const progress = { count: 0, bytes: 0, migrated: 0, expired: 0 };
+    for (;;) {
+      const page = await this.env.STORAGE.list(snapshots);
+      progress.count += page.objects.length;
+      if (progress.count > 1024)
+        throw new Rejected({
+          status: 503,
+          message: "Too many rebuild checkpoints for bounded migration",
+        });
+      for (const checkpoint of page.objects) {
+        if (
+          checkpoint.customMetadata?.expiresAt === undefined &&
+          now - checkpoint.uploaded.getTime() >= SNAPSHOT_RETENTION_MS
+        ) {
+          await this.env.STORAGE.delete(checkpoint.key);
+          progress.expired += 1;
+          continue;
+        }
+        progress.bytes += checkpoint.size;
+        if (checkpoint.size > VECTOR_REBUILD_CHECKPOINT_BYTES || progress.bytes > 32 * 1024 * 1024)
+          throw new Rejected({
+            status: 503,
+            message: "Rebuild checkpoints exceed migration byte budget",
+          });
+        const captured = await this.env.STORAGE.get(checkpoint.key);
+        if (captured === null)
+          throw new Rejected({
+            status: 409,
+            message: "Rebuild checkpoint disappeared during migration",
+          });
+        const chargedBytes = Math.max(checkpoint.size, captured.size);
+        progress.bytes += chargedBytes - checkpoint.size;
+        if (progress.bytes > 32 * 1024 * 1024) {
+          await captured.body.cancel();
+          throw new Rejected({
+            status: 503,
+            message: "Captured rebuild checkpoints exceed migration byte budget",
+          });
+        }
+        const saved = decodeVectorRebuildSnapshotForMigration(
+          await this.readRebuildCheckpoint(captured),
+        );
+        const expiration = { value: captured.uploaded.getTime() + SNAPSHOT_RETENTION_MS };
+        if (
+          captured.customMetadata?.expiresAt !== undefined ||
+          saved.kind === "current" ||
+          saved.sourceVersion === 3 ||
+          saved.sourceVersion === 4
+        )
+          expiration.value = Schema.decodeUnknownSync(VectorRebuildCheckpointMetadata)(
+            captured.customMetadata,
+          ).expiresAt;
+        if (now >= expiration.value) {
+          await this.env.STORAGE.delete(checkpoint.key);
+          progress.expired += 1;
+          continue;
+        }
+        if (saved.kind === "current") continue;
+        const manifest = await this.migrateManifest(saved);
+        const encodedSnapshot = encodeVectorRebuildSnapshot({ ...saved.snapshot, root: manifest });
+        progress.bytes += Math.max(chargedBytes, encodedSnapshot.byteLength) - chargedBytes;
+        if (progress.bytes > 32 * 1024 * 1024)
+          throw new Rejected({
+            status: 503,
+            message: "Converted rebuild checkpoints exceed migration byte budget",
+          });
+        const converted = await this.env.STORAGE.put(checkpoint.key, encodedSnapshot, {
+          onlyIf: { etagMatches: captured.etag },
+          customMetadata: Schema.encodeSync(VectorRebuildCheckpointMetadata)({
+            expiresAt: expiration.value,
+          }),
+        });
+        if (converted === null)
+          throw new Rejected({
+            status: 409,
+            message: "Rebuild checkpoint changed during migration",
+          });
+        progress.migrated += 1;
+      }
+      if (!page.truncated) break;
+      snapshots.cursor = page.cursor;
+    }
+    if (root === undefined || object === null)
+      return Schema.encodeSync(RootMigrationResult)({
+        version: 5,
+        sequence: 0,
+        rootRewritten: false,
+        migratedSnapshots: progress.migrated,
+        expiredSnapshots: progress.expired,
+      });
+    if (root.kind !== "current") {
+      const manifest = await this.migrateManifest(root);
+      const converted = await this.env.STORAGE.put(key, encodeRoot(manifest), {
+        onlyIf: { etagMatches: object.etag },
+      });
+      if (converted === null)
+        throw new Rejected({ status: 409, message: "R2 manifest changed during migration" });
+      this.current = { manifest, etag: converted.etag };
+    } else {
+      const confirmed = await this.env.STORAGE.head(key);
+      if (confirmed === null || confirmed.etag !== object.etag)
+        throw new Rejected({ status: 409, message: "R2 manifest changed during migration" });
+      this.current = { manifest: root.root, etag: object.etag };
+    }
+    this.namespacePublished = false;
+    await this.publishNamespace();
+    return Schema.encodeSync(RootMigrationResult)({
+      version: 5,
+      sequence: root.root.sequence,
+      rootRewritten: root.kind !== "current",
+      migratedSnapshots: progress.migrated,
+      expiredSnapshots: progress.expired,
+    });
   }
 
   private async commit(manifest: typeof Root.Type, etag: string | null) {
@@ -1718,6 +2252,33 @@ export class SearchNamespace extends DurableObject<Env> {
       });
     this.current = { manifest, etag: result.object.etag };
     return this.current;
+  }
+
+  private async publishNamespace() {
+    if (this.namespacePublished) return;
+    const key = `${namespaceCatalogPrefix}${this.prefix.slice("namespaces/".length)}`;
+    for (const attempt of [0, 1]) {
+      const existing = await this.env.STORAGE.head(key);
+      if (existing !== null && existing.size === 0) {
+        this.namespacePublished = true;
+        return;
+      }
+      const onlyIf: R2Conditional = {};
+      if (existing === null) onlyIf.etagDoesNotMatch = "*";
+      else onlyIf.etagMatches = existing.etag;
+      const stored = await this.env.STORAGE.put(key, "", {
+        onlyIf,
+      });
+      if (stored !== null) {
+        this.namespacePublished = true;
+        return;
+      }
+      if (attempt === 1)
+        throw new Rejected({
+          status: 503,
+          message: "Namespace catalog publication did not settle",
+        });
+    }
   }
 
   private async persistReceipt(receipt: typeof Receipt.Type) {
@@ -1752,6 +2313,7 @@ export class SearchNamespace extends DurableObject<Env> {
       )
         throw new Rejected({ status: 503, message: "Committed receipt conflict" });
     }
+    await this.publishNamespace();
     this.acknowledgedReceipt = receipt;
   }
 
@@ -1822,6 +2384,7 @@ export class SearchNamespace extends DurableObject<Env> {
         location.segment.headerBytes,
         location.document.data,
         location.segment.bytes,
+        location.vectorData,
       );
       const terms = Schema.decodeSync(strings)(
         segment_document_terms(Schema.encodeSync(Schema.fromJsonString(StoredDocument))(source)),
@@ -1865,6 +2428,11 @@ export class SearchNamespace extends DurableObject<Env> {
       totals.body = 0;
       epoch.value = await sha256(`${current.manifest.vectorEpoch}\0reset\0${sequence}`);
     }
+    const packs = { value: current.manifest.bloomPacks };
+    if (input.reset === true) packs.value = [];
+    const projected: { manifest: typeof Root.Type } = {
+      manifest: { ...current.manifest, segments, bloomPacks: packs.value },
+    };
     const writes: Array<() => Promise<R2Object | null>> = [];
     const logKey = `${this.prefix}/log/${sequence}-${fingerprint}.bin`;
     const log = {
@@ -1888,26 +2456,43 @@ export class SearchNamespace extends DurableObject<Env> {
       const key = `${this.prefix}/segments/${sequence}-${fingerprint}.rsix`;
       const headerBytes =
         16 + new DataView(built.bytes.buffer, built.bytes.byteOffset).getUint32(8, true);
-      writes.push(async () => {
-        const stored = await this.env.STORAGE.put(key, built.bytes);
-        if (stored !== null)
-          await Effect.runPromise(storeSegmentCaches(key, headerBytes, built.bytes));
-        return stored;
-      });
-      segments.push({
+      const metadata = {
         key,
         sequence,
         headerBytes,
         bytes: built.bytes.byteLength,
+        metadataEnd: headerBytes + built.header.metadata_end,
         count: built.header.documents.length,
         minimumId: built.header.documents[0].id,
-        documentBloom: bloom(built.header.documents.map((document) => document.id)),
-        termBloom: bloom(Object.keys(built.header.terms)),
         commonTerms: built.commonTerms,
+        commonProjection: built.commonProjection,
         commonLeaders: built.commonLeaders,
         constantAttributes: built.constantAttributes,
+        eligibility: built.eligibility,
         dead: [],
         removedFrequencies: {},
+      };
+      writes.push(async () => {
+        const stored = await this.env.STORAGE.put(key, built.bytes);
+        if (stored === null) return null;
+        await Effect.runPromise(
+          storeSegmentCaches(
+            key,
+            headerBytes,
+            built.bytes,
+            built.commonTerms !== undefined && Object.keys(built.commonTerms).length > 0,
+          ),
+        );
+        projected.manifest = await Effect.runPromise(
+          appendBloomSegment(
+            this.prefix,
+            projected.manifest,
+            metadata,
+            bloom(built.header.documents.map((document) => document.id)),
+            bloom(Object.keys(built.header.terms)),
+          ),
+        );
+        return stored;
       });
       totals.documents += built.header.documents.length;
       totals.title += built.header.total_title_length;
@@ -1931,7 +2516,8 @@ export class SearchNamespace extends DurableObject<Env> {
       vectorEpoch: epoch.value,
       vectorJobs: jobs,
       lastReceipt: receipt,
-      segments,
+      segments: projected.manifest.segments,
+      bloomPacks: projected.manifest.bloomPacks,
     } as const;
     await this.commit(manifest, current.etag);
     await this.persistReceipt(receipt);
@@ -1953,21 +2539,27 @@ export class SearchNamespace extends DurableObject<Env> {
     const key = `${this.prefix}/vector-rebuild/${snapshot}.json`;
     const saved = { root: (await this.root()).manifest, fields };
     if (input.snapshot === undefined) {
-      await this.env.STORAGE.put(
-        key,
-        Schema.encodeSync(Schema.fromJsonString(VectorRebuildSnapshot))(saved),
-        { onlyIf: { etagDoesNotMatch: "*" } },
-      );
+      const created = await this.env.STORAGE.put(key, encodeVectorRebuildSnapshot(saved), {
+        onlyIf: { etagDoesNotMatch: "*" },
+        customMetadata: Schema.encodeSync(VectorRebuildCheckpointMetadata)({
+          expiresAt: Effect.runSync(Clock.currentTimeMillis) + SNAPSHOT_RETENTION_MS,
+        }),
+      });
+      if (created === null)
+        throw new Rejected({ status: 409, message: "Rebuild snapshot identity already exists" });
     } else {
       const object = await this.env.STORAGE.get(key);
       if (object === null)
         throw new Rejected({ status: 410, message: "Rebuild snapshot no longer exists" });
       const now = Effect.runSync(Clock.currentTimeMillis);
-      if (now - object.uploaded.getTime() >= SNAPSHOT_RETENTION_MS)
-        throw new Rejected({ status: 410, message: "Rebuild snapshot expired after seven days" });
-      const prior = Schema.decodeSync(Schema.fromJsonString(VectorRebuildSnapshot))(
-        await object.text(),
+      const metadata = Schema.decodeUnknownSync(VectorRebuildCheckpointMetadata)(
+        object.customMetadata,
       );
+      if (now >= metadata.expiresAt) {
+        await object.body.cancel();
+        throw new Rejected({ status: 410, message: "Rebuild snapshot expired after seven days" });
+      }
+      const prior = decodeVectorRebuildSnapshot(await this.readRebuildCheckpoint(object));
       if (JSON.stringify(prior.fields) !== JSON.stringify(fields))
         throw new Rejected({ status: 409, message: "Indexed fields changed during rebuild" });
       saved.root = prior.root;
@@ -2024,6 +2616,7 @@ export class SearchNamespace extends DurableObject<Env> {
           location.segment.headerBytes,
           location.document.data,
           location.segment.bytes,
+          location.vectorData,
         );
         if (document.vector === undefined)
           throw new Rejected({ status: 503, message: "Rebuild vector payload missing" });
@@ -2120,25 +2713,38 @@ export class SearchNamespace extends DurableObject<Env> {
   }
 
   private async collect(input: typeof Collection.Type) {
+    const position: { value: typeof CollectionCursor.Type } = {
+      value: { version: 1, phase: "bloom-packs", cursor: null },
+    };
+    if (input.cursor !== undefined) {
+      const decoded = Schema.decodeExit(Schema.fromJsonString(CollectionCursor))(input.cursor);
+      if (decoded._tag === "Failure")
+        throw new Rejected({ status: 400, message: "Invalid collection cursor" });
+      position.value = decoded.value;
+    }
     const current = await this.root();
     const now = Effect.runSync(Clock.currentTimeMillis);
-    if (current.manifest.segments.length > 16384)
-      throw new Rejected({
-        status: 503,
-        message: "Active root exceeds collection reference budget",
-      });
-    const pinned = new Set(current.manifest.segments.map((segment) => segment.key));
-    for (const manifest of this.readers.values())
-      for (const segment of manifest.segments) {
-        pinned.add(segment.key);
-        if (pinned.size > 16384)
-          throw new Rejected({
-            status: 503,
-            message: "Reader references exceed collection memory budget",
-          });
-      }
+    const pinned = {
+      segments: new Set<string>(),
+      "bloom-packs": new Set<string>(),
+    };
+    const pin = (manifest: typeof Root.Type, source: string) => {
+      for (const segment of manifest.segments) pinned.segments.add(segment.key);
+      for (const descriptor of manifest.bloomPacks) pinned["bloom-packs"].add(descriptor.key);
+      if (pinned.segments.size > 16384 || pinned["bloom-packs"].size > 16384)
+        throw new Rejected({
+          status: 503,
+          message: `${source} references exceed collection memory budget`,
+        });
+    };
+    pin(current.manifest, "Active root");
+    for (const manifest of this.readers.values()) pin(manifest, "Reader");
     const counters = { scanned: 0, pinned: 0, marked: 0, deleted: 0, expiredSnapshots: 0 };
-    const snapshots: R2ListOptions = { prefix: `${this.prefix}/vector-rebuild/`, limit: 100 };
+    const snapshots: R2ListOptions = {
+      prefix: `${this.prefix}/vector-rebuild/`,
+      limit: 100,
+      include: ["customMetadata"],
+    };
     const checkpointBudget = { count: 0, bytes: 0 };
     for (;;) {
       const page = await this.env.STORAGE.list(snapshots);
@@ -2149,13 +2755,19 @@ export class SearchNamespace extends DurableObject<Env> {
           message: "Too many rebuild checkpoints for bounded collection",
         });
       for (const checkpoint of page.objects) {
-        if (now - checkpoint.uploaded.getTime() >= SNAPSHOT_RETENTION_MS) {
+        const metadata = Schema.decodeUnknownSync(VectorRebuildCheckpointMetadata)(
+          checkpoint.customMetadata,
+        );
+        if (now >= metadata.expiresAt) {
           await this.env.STORAGE.delete(checkpoint.key);
           counters.expiredSnapshots += 1;
           continue;
         }
         checkpointBudget.bytes += checkpoint.size;
-        if (checkpoint.size > 8 * 1024 * 1024 || checkpointBudget.bytes > 32 * 1024 * 1024)
+        if (
+          checkpoint.size > VECTOR_REBUILD_CHECKPOINT_BYTES ||
+          checkpointBudget.bytes > 32 * 1024 * 1024
+        )
           throw new Rejected({
             status: 503,
             message: "Rebuild checkpoints exceed collection byte budget",
@@ -2166,68 +2778,85 @@ export class SearchNamespace extends DurableObject<Env> {
             status: 503,
             message: "Rebuild checkpoint disappeared during collection",
           });
-        const saved = Schema.decodeSync(Schema.fromJsonString(VectorRebuildSnapshot))(
-          await object.text(),
-        );
-        for (const segment of saved.root.segments) {
-          pinned.add(segment.key);
-          if (pinned.size > 16384)
-            throw new Rejected({
-              status: 503,
-              message: "Checkpoint references exceed collection memory budget",
-            });
+        checkpointBudget.bytes += Math.max(0, object.size - checkpoint.size);
+        if (checkpointBudget.bytes > 32 * 1024 * 1024) {
+          await object.body.cancel();
+          throw new Rejected({
+            status: 503,
+            message: "Captured rebuild checkpoints exceed collection byte budget",
+          });
         }
+        pin(
+          decodeVectorRebuildSnapshot(await this.readRebuildCheckpoint(object)).root,
+          "Checkpoint",
+        );
       }
       if (!page.truncated) break;
       snapshots.cursor = page.cursor;
     }
-    const options: R2ListOptions = { prefix: `${this.prefix}/segments/`, limit: 100 };
-    if (input.cursor !== undefined) options.cursor = input.cursor;
-    const page = await this.env.STORAGE.list(options);
-    for (const object of page.objects) {
-      counters.scanned += 1;
-      const markerKey = `${this.prefix}/retired/${await sha256(object.key)}.json`;
-      if (pinned.has(object.key)) {
-        counters.pinned += 1;
-        await this.env.STORAGE.delete(markerKey);
-        continue;
-      }
-      const marker = await this.env.STORAGE.get(markerKey);
-      if (marker !== null) {
-        const retirement = Schema.decodeSync(Schema.fromJsonString(Retirement))(
-          await marker.text(),
-        );
-        if (retirement.key !== object.key)
-          throw new Rejected({
-            status: 503,
-            message: "Retirement marker belongs to another segment",
-          });
-        if (
-          retirement.etag === object.etag &&
-          retirement.observedAt >= object.uploaded.getTime() &&
-          retirement.observedAt <= now
-        ) {
-          if (now - retirement.observedAt >= SEGMENT_RETIREMENT_MS) {
-            await this.env.STORAGE.delete(object.key);
-            await this.env.STORAGE.delete(markerKey);
-            counters.deleted += 1;
-          }
+    const continuation: { value: typeof CollectionCursor.Type | null } = { value: null };
+    for (const phase of ["bloom-packs", "segments"] as const) {
+      if (position.value.phase === "segments" && phase === "bloom-packs") continue;
+      const options: R2ListOptions = { prefix: `${this.prefix}/${phase}/`, limit: 100 };
+      if (phase === position.value.phase && position.value.cursor !== null)
+        options.cursor = position.value.cursor;
+      const page = await this.env.STORAGE.list(options);
+      for (const object of page.objects) {
+        counters.scanned += 1;
+        const markerKey = `${this.prefix}/retired/${await sha256(object.key)}.json`;
+        if (pinned[phase].has(object.key)) {
+          counters.pinned += 1;
+          await this.env.STORAGE.delete(markerKey);
           continue;
         }
+        const marker = await this.env.STORAGE.get(markerKey);
+        if (marker !== null) {
+          const retirement = Schema.decodeSync(Schema.fromJsonString(Retirement))(
+            await marker.text(),
+          );
+          if (retirement.key !== object.key)
+            throw new Rejected({
+              status: 503,
+              message: "Retirement marker belongs to another object",
+            });
+          if (
+            retirement.etag === object.etag &&
+            retirement.observedAt >= object.uploaded.getTime() &&
+            retirement.observedAt <= now
+          ) {
+            if (now - retirement.observedAt >= SEGMENT_RETIREMENT_MS) {
+              await this.env.STORAGE.delete(object.key);
+              await this.env.STORAGE.delete(markerKey);
+              counters.deleted += 1;
+            }
+            continue;
+          }
+        }
+        await this.env.STORAGE.put(
+          markerKey,
+          Schema.encodeSync(Schema.fromJsonString(Retirement))({
+            key: object.key,
+            etag: object.etag,
+            observedAt: now,
+          }),
+        );
+        counters.marked += 1;
       }
-      await this.env.STORAGE.put(
-        markerKey,
-        Schema.encodeSync(Schema.fromJsonString(Retirement))({
-          key: object.key,
-          etag: object.etag,
-          observedAt: now,
-        }),
-      );
-      counters.marked += 1;
+      if (page.truncated) {
+        continuation.value = { version: 1, phase, cursor: page.cursor };
+        break;
+      }
     }
-    if (page.truncated)
-      return Schema.encodeSync(CollectionResult)({ ...counters, cursor: page.cursor });
-    return Schema.encodeSync(CollectionResult)({ ...counters, cursor: null });
+    const cursor: { value: typeof CollectionResult.Type.cursor } = { value: null };
+    if (continuation.value !== null) {
+      const encoded = Schema.encodeSync(Schema.fromJsonString(CollectionCursor))(
+        continuation.value,
+      );
+      if (!Schema.is(Collection.fields.cursor)(encoded))
+        throw new Rejected({ status: 503, message: "Collection cursor exceeds API budget" });
+      cursor.value = encoded;
+    }
+    return Schema.encodeSync(CollectionResult)({ ...counters, cursor: cursor.value });
   }
 
   private async compact() {
@@ -2259,7 +2888,7 @@ export class SearchNamespace extends DurableObject<Env> {
         withDirectory(segment.key, segment.headerBytes, (decoded) =>
           Effect.gen(function* () {
             const encoded = yield* Schema.encodeEffect(integers)(rows);
-            return yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Array(SegmentDocument)))(
+            return yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Array(LocatedDocument)))(
               decoded.rows(encoded),
             );
           }),
@@ -2270,12 +2899,14 @@ export class SearchNamespace extends DurableObject<Env> {
         segment.headerBytes,
         segment.bytes - segment.headerBytes,
       );
-      for (const document of metadata) {
+      for (const location of metadata) {
+        const document = location.document;
         const source = await readDocument(
           segment.key,
           segment.headerBytes,
           document.data,
           segment.bytes,
+          location.vectorData,
           payload,
         );
         const bytes = encoder.encode(encodeDocument(source)).byteLength;
@@ -2298,6 +2929,11 @@ export class SearchNamespace extends DurableObject<Env> {
     const retained = current.manifest.segments.filter(
       (segment) => !selected.some((source) => source.key === segment.key),
     );
+    const projected = {
+      manifest: await Effect.runPromise(
+        pruneBloomPacks({ ...current.manifest, segments: retained }),
+      ),
+    };
     if (documents.length > 0) {
       const built = await Effect.runPromise(
         buildSegment(documents, current.manifest.schema?.filterable),
@@ -2311,30 +2947,44 @@ export class SearchNamespace extends DurableObject<Env> {
           key,
           16 + new DataView(built.bytes.buffer, built.bytes.byteOffset).getUint32(8, true),
           built.bytes,
+          built.commonTerms !== undefined && Object.keys(built.commonTerms).length > 0,
         ),
       );
-      retained.push({
-        key,
-        sequence: current.manifest.sequence,
-        headerBytes:
-          16 + new DataView(built.bytes.buffer, built.bytes.byteOffset).getUint32(8, true),
-        bytes: built.bytes.byteLength,
-        count: built.header.documents.length,
-        minimumId: built.header.documents[0].id,
-        documentBloom: bloom(built.header.documents.map((document) => document.id)),
-        termBloom: bloom(Object.keys(built.header.terms)),
-        commonTerms: built.commonTerms,
-        commonLeaders: built.commonLeaders,
-        constantAttributes: built.constantAttributes,
-        dead: [],
-        removedFrequencies: {},
-      });
+      projected.manifest = await Effect.runPromise(
+        appendBloomSegment(
+          this.prefix,
+          projected.manifest,
+          {
+            key,
+            sequence: current.manifest.sequence,
+            headerBytes:
+              16 + new DataView(built.bytes.buffer, built.bytes.byteOffset).getUint32(8, true),
+            bytes: built.bytes.byteLength,
+            metadataEnd:
+              16 +
+              new DataView(built.bytes.buffer, built.bytes.byteOffset).getUint32(8, true) +
+              built.header.metadata_end,
+            count: built.header.documents.length,
+            minimumId: built.header.documents[0].id,
+            commonTerms: built.commonTerms,
+            commonProjection: built.commonProjection,
+            commonLeaders: built.commonLeaders,
+            constantAttributes: built.constantAttributes,
+            eligibility: built.eligibility,
+            dead: [],
+            removedFrequencies: {},
+          },
+          bloom(built.header.documents.map((document) => document.id)),
+          bloom(Object.keys(built.header.terms)),
+        ),
+      );
     }
-    await this.commit({ ...current.manifest, segments: retained }, current.etag);
-    if (documents.length > 0) await Effect.runPromise(warmTermBatch(retained, this.ctx));
+    await this.commit(projected.manifest, current.etag);
+    if (documents.length > 0)
+      await Effect.runPromise(warmTermBatch(projected.manifest.segments, this.ctx));
     return {
       compacted: selected.length,
-      segments: retained.length,
+      segments: projected.manifest.segments.length,
       documents: documents.length,
     };
   }
@@ -2403,6 +3053,14 @@ export class SearchNamespace extends DurableObject<Env> {
       } else
         result.value = yield* this.semaphore.withPermit(
           Effect.gen({ self: this }, function* () {
+            if (command.operation === "migrate-root")
+              return yield* Effect.tryPromise({
+                try: () => this.migrateRoot(),
+                catch: (cause) => {
+                  if (Schema.is(Rejected)(cause)) return cause;
+                  return new Cause.UnknownError(cause);
+                },
+              });
             if (command.operation === "write") {
               const input = command.input;
               return yield* Effect.tryPromise({
@@ -2434,19 +3092,24 @@ export class SearchNamespace extends DurableObject<Env> {
               });
             }
             if (command.operation === "metadata") {
-              const { manifest } = yield* Effect.tryPromise({
+              const current = yield* Effect.tryPromise({
                 try: () => this.root(),
                 catch: (cause) => {
                   if (Schema.is(Rejected)(cause)) return cause;
                   return new Cause.UnknownError(cause);
                 },
               });
+              const { manifest } = current;
+              const manifestEncodedBytes =
+                current.manifestEncodedBytes ??
+                new TextEncoder().encode(encodeRoot(manifest)).byteLength;
+              current.manifestEncodedBytes = manifestEncodedBytes;
               return yield* Schema.encodeEffect(Metadata)({
                 schema: manifest.schema ?? null,
                 sequence: manifest.sequence,
                 documents: manifest.documents,
                 segments: manifest.segments.length,
-                manifestEncodedBytes: new TextEncoder().encode(encodeRoot(manifest)).byteLength,
+                manifestEncodedBytes,
                 wasmMemoryBytes: wasm.memory.buffer.byteLength,
                 vectorOutbox: manifest.vectorJobs.length,
                 cache: cacheUsage(),
@@ -2550,7 +3213,8 @@ export class SearchNamespace extends DurableObject<Env> {
                   (segment) =>
                     segment.commonTerms === undefined ||
                     segment.commonLeaders === undefined ||
-                    segment.constantAttributes === undefined,
+                    segment.constantAttributes === undefined ||
+                    segment.commonProjection === undefined,
                 )
               ) {
                 const segments = yield* Effect.forEach(
@@ -2560,29 +3224,48 @@ export class SearchNamespace extends DurableObject<Env> {
                       if (
                         segment.commonTerms !== undefined &&
                         segment.commonLeaders !== undefined &&
-                        segment.constantAttributes !== undefined
+                        segment.constantAttributes !== undefined &&
+                        segment.commonProjection !== undefined
                       )
                         return segment;
-                      const metadata = yield* withDirectory(
-                        segment.key,
-                        segment.headerBytes,
-                        (directory) =>
-                          Effect.gen(function* () {
-                            const commonTerms = yield* Schema.decodeEffect(
-                              Schema.fromJsonString(CommonTerms),
-                            )(directory.common_terms());
-                            const commonLeaders = yield* Schema.decodeEffect(
-                              Schema.fromJsonString(CommonLeaders),
-                            )(directory.common_leaders());
-                            const constantAttributes = yield* Schema.decodeEffect(
-                              Schema.fromJsonString(ConstantAttributes),
-                            )(directory.constant_attributes());
-                            return { commonTerms, commonLeaders, constantAttributes };
-                          }),
-                        undefined,
-                        true,
-                      );
-                      return { ...segment, ...metadata };
+                      const metadata = yield* Effect.gen(function* () {
+                        if (
+                          segment.commonTerms !== undefined &&
+                          segment.commonLeaders !== undefined &&
+                          segment.constantAttributes !== undefined
+                        )
+                          return {
+                            commonTerms: segment.commonTerms,
+                            commonLeaders: segment.commonLeaders,
+                            constantAttributes: segment.constantAttributes,
+                          };
+                        return yield* withDirectory(
+                          segment.key,
+                          segment.headerBytes,
+                          (directory) =>
+                            Effect.gen(function* () {
+                              const commonTerms = yield* Schema.decodeEffect(
+                                Schema.fromJsonString(CommonTerms),
+                              )(directory.common_terms());
+                              const commonLeaders = yield* Schema.decodeEffect(
+                                Schema.fromJsonString(CommonLeaders),
+                              )(directory.common_leaders());
+                              const constantAttributes = yield* Schema.decodeEffect(
+                                Schema.fromJsonString(ConstantAttributes),
+                              )(directory.constant_attributes());
+                              return { commonTerms, commonLeaders, constantAttributes };
+                            }),
+                          undefined,
+                          true,
+                        );
+                      });
+                      const projection = { value: segment.commonProjection };
+                      if (projection.value === undefined)
+                        projection.value = yield* rebuildCommonProjection({
+                          ...segment,
+                          ...metadata,
+                        });
+                      return { ...segment, ...metadata, commonProjection: projection.value };
                     }),
                   { concurrency: 1 },
                 );
@@ -2612,9 +3295,12 @@ export class SearchNamespace extends DurableObject<Env> {
   async execute(input: typeof RpcCommand.Encoded): Promise<typeof RpcReply.Encoded> {
     const timings = new Headers();
     return Effect.runPromise(
-      Schema.decodeEffect(RpcCommand, { onExcessProperty: "error" })(input).pipe(
+      Schema.decodeUnknownEffect(NamespaceRpcCommand, { onExcessProperty: "error" })(input).pipe(
         Effect.flatMap((command) => this.perform(command, timings)),
-        Effect.map((value) => Schema.encodeSync(RpcReply)({ _tag: "Success", value })),
+        Effect.map((value) => {
+          if (input.operation === "query") return { _tag: "Success" as const, value };
+          return Schema.encodeSync(RpcReply)({ _tag: "Success", value });
+        }),
         Effect.tapError((error) => {
           if (Schema.is(Rejected)(error) && error.status < 500) return Effect.void;
           return Effect.logError("kannin.rpc", Cause.fail(error));
@@ -2695,14 +3381,20 @@ export class SearchNamespace extends DurableObject<Env> {
           }
           if (Schema.is(Rejected)(error))
             return Effect.succeed(
-              Response.json(Schema.encodeSync(ErrorBody)({ error: error.message }), {
-                status: error.status,
-                headers: queryTimings,
-              }),
+              Response.json(
+                Schema.encodeSync(ErrorBody)({ status: "error", error: error.message }),
+                {
+                  status: error.status,
+                  headers: queryTimings,
+                },
+              ),
             );
           return Effect.succeed(
             Response.json(
-              Schema.encodeSync(ErrorBody)({ error: "Storage or search backend unavailable" }),
+              Schema.encodeSync(ErrorBody)({
+                status: "error",
+                error: "Storage or search backend unavailable",
+              }),
               { status: 503, headers: queryTimings },
             ),
           );
@@ -2721,6 +3413,14 @@ export class KanninRpc extends WorkerEntrypoint<Env> {
         Effect.mapError(() => new Rejected({ status: 400, message: "Invalid RPC contract" })),
         Effect.flatMap(
           Effect.fn("kannin.binding.execute")(function* (command: typeof RpcCommand.Type) {
+            if (command.operation === "namespaces") {
+              const value = yield* listNamespaces(
+                env.STORAGE,
+                env.STORAGE_CACHE_SCOPE,
+                command.input ?? {},
+              );
+              return yield* Schema.encodeEffect(RpcReply)({ _tag: "Success", value });
+            }
             if (command.operation === "query" && command.input.consistency === "edge-eventual") {
               if (command.input.kind !== "text")
                 return yield* new Rejected({
@@ -2751,7 +3451,7 @@ export class KanninRpc extends WorkerEntrypoint<Env> {
                       }),
                   }),
                 );
-                return yield* Schema.encodeEffect(RpcReply)({ _tag: "Success", value });
+                return { _tag: "Success" as const, value };
               }
             }
             const coordinator = env.NAMESPACES.get(env.NAMESPACES.idFromName(command.namespace));
@@ -2880,9 +3580,9 @@ async function acquireSnapshot(
         }).pipe(
           Effect.flatMap((body) => {
             const payload = new Uint8Array(body);
-            return Schema.decodeEffect(Schema.fromJsonString(Root))(
-              new TextDecoder().decode(payload),
-            ).pipe(Effect.map((manifest) => ({ payload, manifest })));
+            return decodeRootEffect(new TextDecoder().decode(payload)).pipe(
+              Effect.map((manifest) => ({ payload, manifest })),
+            );
           }),
           Effect.uninterruptible,
         ),
@@ -3068,7 +3768,7 @@ const refreshSnapshot = Effect.fn("raio.refreshSnapshot")(function* (
 async function acquireCachedSnapshot(cacheKey: URL, minimumSequence: number) {
   return Effect.runPromise(
     Effect.gen(function* () {
-      const cache = yield* Effect.tryPromise(() => caches.open("raio-snapshots-v2")).pipe(
+      const cache = yield* Effect.tryPromise(() => caches.open("raio-snapshots-v5")).pipe(
         Effect.orElseSucceed(() => undefined),
       );
       if (cache === undefined) return { cache, snapshot: undefined, rejected: false };
@@ -3144,7 +3844,7 @@ const edgeSnapshot = Effect.fn("raio.edgeSnapshot")(function* (
   minimumSequence: number,
   timings: Headers,
 ) {
-  const cacheKey = new URL(`https://raio-cache.internal/snapshots/${namespace}`);
+  const cacheKey = new URL(`https://raio-cache.internal/snapshots-v5/${namespace}`);
   cacheKey.searchParams.set("bucket", env.STORAGE_CACHE_SCOPE);
   const cache: { value: Cache | undefined } = { value: undefined };
   const memory = warmSnapshots.get(cacheKey.href);
@@ -3223,7 +3923,7 @@ const edgeSnapshot = Effect.fn("raio.edgeSnapshot")(function* (
       const refresh = yield* Effect.forkDetach(
         Effect.gen(function* () {
           const refreshCache = yield* Effect.tryPromise(() =>
-            caches.open("raio-snapshots-v2"),
+            caches.open("raio-snapshots-v5"),
           ).pipe(Effect.orElseSucceed(() => undefined));
           yield* refreshSnapshot(ctx, env, namespace, 0, cacheKey, refreshCache);
         }).pipe(
@@ -3272,31 +3972,118 @@ export default {
         }),
       );
     if (request.headers.get("authorization") !== `Bearer ${env.API_TOKEN}`)
-      return Response.json(Schema.encodeSync(ErrorBody)({ error: "Unauthorized" }), {
-        status: 401,
-      });
+      return Response.json(
+        Schema.encodeSync(ErrorBody)({ status: "error", error: "Unauthorized" }),
+        {
+          status: 401,
+        },
+      );
+    if (url.pathname === "/v1/namespaces" || url.pathname === "/admin/namespaces/catalog") {
+      const completing = url.pathname === "/admin/namespaces/catalog";
+      if ((completing && request.method !== "POST") || (!completing && request.method !== "GET"))
+        return Response.json(
+          Schema.encodeSync(ErrorBody)({ status: "error", error: "Method not allowed" }),
+          { status: 405, headers: { "cache-control": "private, no-store" } },
+        );
+      return Effect.runPromise(
+        Effect.gen(function* () {
+          if (completing) {
+            const body = yield* readBody(request);
+            yield* Schema.decodeEffect(Schema.fromJsonString(NamespaceCatalogActivation), {
+              onExcessProperty: "error",
+            })(body).pipe(
+              Effect.mapError(
+                () => new Rejected({ status: 400, message: "Invalid catalog activation contract" }),
+              ),
+            );
+            yield* Effect.tryPromise(() => env.STORAGE.put(namespaceCatalogReadyKey, ""));
+            const value = yield* Schema.encodeEffect(NamespaceCatalogActivation)({ version: 1 });
+            return Response.json(value, { headers: { "cache-control": "private, no-store" } });
+          }
+          const keys = [...url.searchParams.keys()];
+          if (new Set(keys).size !== keys.length)
+            return yield* new Rejected({
+              status: 400,
+              message: "Duplicate namespace list parameter",
+            });
+          const input = yield* Schema.decodeEffect(NamespacesQuery, {
+            onExcessProperty: "error",
+          })(Object.fromEntries(url.searchParams)).pipe(
+            Effect.mapError(
+              () => new Rejected({ status: 400, message: "Invalid namespace list parameters" }),
+            ),
+          );
+          const value = yield* listNamespaces(env.STORAGE, env.STORAGE_CACHE_SCOPE, input);
+          return Response.json(value, { headers: { "cache-control": "private, no-store" } });
+        }).pipe(
+          Effect.tapError((error) => {
+            if (Schema.is(Rejected)(error) && error.status < 500) return Effect.void;
+            return Effect.logError("kannin.namespaces.list", error);
+          }),
+          Effect.catch((error) => {
+            if (Schema.is(Rejected)(error))
+              return Effect.succeed(
+                Response.json(
+                  Schema.encodeSync(ErrorBody)({ status: "error", error: error.message }),
+                  { status: error.status, headers: { "cache-control": "private, no-store" } },
+                ),
+              );
+            return Effect.succeed(
+              Response.json(
+                Schema.encodeSync(ErrorBody)({
+                  status: "error",
+                  error: "Storage or search backend unavailable",
+                }),
+                { status: 503, headers: { "cache-control": "private, no-store" } },
+              ),
+            );
+          }),
+        ),
+      );
+    }
     if (url.pathname === "/admin/namespaces" && request.method === "GET") {
       const options: R2ListOptions = { prefix: "namespaces/", delimiter: "/", limit: 100 };
       const cursor = url.searchParams.get("cursor");
       if (cursor !== null) options.cursor = cursor;
-      const result = await env.STORAGE.list(options);
-      const names = result.delimitedPrefixes.map((prefix) =>
-        prefix.slice("namespaces/".length, -1),
+      return Effect.runPromise(
+        Effect.tryPromise(() => env.STORAGE.list(options)).pipe(
+          Effect.flatMap((result) =>
+            Schema.decodeEffect(Schema.Array(NamespaceName))(
+              result.delimitedPrefixes.map((prefix) => prefix.slice("namespaces/".length, -1)),
+            ).pipe(
+              Effect.map((names) => {
+                if (result.truncated)
+                  return Response.json(
+                    Schema.encodeSync(NamespacePage)({ names, cursor: result.cursor }),
+                    { headers: { "cache-control": "private, no-store" } },
+                  );
+                return Response.json(Schema.encodeSync(NamespacePage)({ names, cursor: null }), {
+                  headers: { "cache-control": "private, no-store" },
+                });
+              }),
+            ),
+          ),
+          Effect.tapError((error) => Effect.logError("kannin.namespaces", error)),
+          Effect.orElseSucceed(() =>
+            Response.json(
+              Schema.encodeSync(ErrorBody)({
+                status: "error",
+                error: "Storage or search backend unavailable",
+              }),
+              { status: 503, headers: { "cache-control": "private, no-store" } },
+            ),
+          ),
+        ),
       );
-      const page = { names: Schema.decodeSync(Schema.Array(NamespaceName))(names) };
-      if (result.truncated)
-        return Response.json(Schema.encodeSync(NamespacePage)({ ...page, cursor: result.cursor }), {
-          headers: { "cache-control": "private, no-store" },
-        });
-      return Response.json(Schema.encodeSync(NamespacePage)({ ...page, cursor: null }), {
-        headers: { "cache-control": "private, no-store" },
-      });
     }
     const match = /^\/v1\/namespaces\/([^/]+)\/([^/]+)$/.exec(url.pathname);
     if (match === null || !isNamespaceName(match[1]) || !isOperation(match[2]))
-      return Response.json(Schema.encodeSync(ErrorBody)({ error: "Unknown route" }), {
-        status: 404,
-      });
+      return Response.json(
+        Schema.encodeSync(ErrorBody)({ status: "error", error: "Unknown route" }),
+        {
+          status: 404,
+        },
+      );
     const method = {
       write: "POST",
       query: "POST",
@@ -3306,11 +4093,15 @@ export default {
       rebuild: "POST",
       compact: "POST",
       collect: "POST",
+      "migrate-root": "POST",
     } satisfies Record<typeof Operation.Type, string>;
     if (request.method !== method[match[2]])
-      return Response.json(Schema.encodeSync(ErrorBody)({ error: "Method not allowed" }), {
-        status: 405,
-      });
+      return Response.json(
+        Schema.encodeSync(ErrorBody)({ status: "error", error: "Method not allowed" }),
+        {
+          status: 405,
+        },
+      );
     const namespace = match[1];
     const operation = match[2];
     const snapshotTimings = new Headers();
@@ -3380,13 +4171,19 @@ export default {
         Effect.catch((error) => {
           if (Schema.is(Rejected)(error))
             return Effect.succeed(
-              Response.json(Schema.encodeSync(ErrorBody)({ error: error.message }), {
-                status: error.status,
-              }),
+              Response.json(
+                Schema.encodeSync(ErrorBody)({ status: "error", error: error.message }),
+                {
+                  status: error.status,
+                },
+              ),
             );
           return Effect.succeed(
             Response.json(
-              Schema.encodeSync(ErrorBody)({ error: "Storage or search backend unavailable" }),
+              Schema.encodeSync(ErrorBody)({
+                status: "error",
+                error: "Storage or search backend unavailable",
+              }),
               { status: 503 },
             ),
           );

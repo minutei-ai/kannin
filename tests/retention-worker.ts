@@ -48,12 +48,14 @@ export default {
       const namespace = Schema.decodeSync(Schema.fromJsonString(NamespaceName))(
         await request.text(),
       );
-      const page = await env.STORAGE.list({
-        prefix: `namespaces/${namespace}/segments/`,
-        limit: 1000,
-      });
-      if (page.truncated) return new Response("Aging exceeds fixture budget", { status: 503 });
-      for (const object of page.objects) aged.set(object.key, object.version);
+      for (const phase of ["bloom-packs", "segments"]) {
+        const page = await env.STORAGE.list({
+          prefix: `namespaces/${namespace}/${phase}/`,
+          limit: 1000,
+        });
+        if (page.truncated) return new Response("Aging exceeds fixture budget", { status: 503 });
+        for (const object of page.objects) aged.set(object.key, object.version);
+      }
       return new Response(null, { status: 204 });
     }
     wrap(env.STORAGE);

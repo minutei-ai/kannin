@@ -12,9 +12,22 @@ test("posting timing counts remain request-local across concurrent edge queries"
     worker,
     namespace,
     "write",
-    write(Array.from({ length: 8 }, (_, index) => document(String(index), "alpha beta"))),
+    write(
+      Array.from({ length: 8 }, (_, index) => {
+        if (index === 0) return document(String(index), "alpha alpha beta beta");
+        return document(String(index), "alpha alpha gamma gamma");
+      }),
+    ),
   );
   await clearLeaderIndex(worker, namespace);
+  const primed = await request(worker, namespace, "query", {
+    ...textQuery("alpha beta"),
+    consistency: "edge-eventual",
+    minimumSequence: 1,
+  });
+  expect(primed.status).toBe(200);
+  expect(primed.headers.get("server-timing")).toContain('desc="spans=2 bytes=');
+  await primed.arrayBuffer();
   const responses = await Promise.all(
     Array.from({ length: 12 }, async (_, index) => {
       const text = "alpha";
@@ -34,6 +47,7 @@ test("posting timing counts remain request-local across concurrent edge queries"
         Array.from({ length: 8 }, (_value, row) => String(row)),
       );
       const timing = response.headers.get("server-timing");
+      expect(timing).toContain('text_uniform_hits;desc="segments=0"');
       expect(timing).toContain(`desc="spans=${terms.value} bytes=`);
       expect(timing).toContain(`desc="blocks=${terms.value}"`);
       expect(timing).toContain('desc="segments=1"');

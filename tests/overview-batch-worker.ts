@@ -22,7 +22,7 @@ caches.open = async (name) => {
   if (name === "kannin-text-plans-v1")
     return Promise.reject(new Error("Projected caches disabled for overview fixture"));
   const cache = await open(name);
-  if (name !== "raio-overview-batches-v6" || opened.has(cache)) return cache;
+  if (name !== "raio-overview-batches-v8" || opened.has(cache)) return cache;
   opened.add(cache);
   const match = cache.match.bind(cache);
   const put = cache.put.bind(cache);
@@ -45,14 +45,14 @@ function observeBucket(bucket: R2Bucket) {
     const put = bucket.put.bind(bucket);
     Object.defineProperty(bucket, "put", {
       value: (...args: Parameters<R2Bucket["put"]>) => {
-        if (state.failPut && args[0].startsWith("cache/correlated-pool-batches-v1/"))
+        if (state.failPut && args[0].startsWith("cache/correlated-pool-batches-v3/"))
           return Promise.reject(new Error("Injected batch publication failure"));
         return put(...args);
       },
     });
     Object.defineProperty(bucket, "get", {
       value: async (...args: Parameters<R2Bucket["get"]>) => {
-        if (!args[0].startsWith("cache/correlated-pool-batches-v1/")) return get(...args);
+        if (!args[0].startsWith("cache/correlated-pool-batches-v3/")) return get(...args);
         state.gets += 1;
         state.headerActive += 1;
         state.headerPeak = Math.max(state.headerPeak, state.headerActive);

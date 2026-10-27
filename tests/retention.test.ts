@@ -1,10 +1,11 @@
+import { decodeRoot } from "../src/manifest";
 import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
 import {
+  CollectionCursor,
   CollectionResult,
   QueryResult,
   Retirement,
-  Root,
   VectorRebuildResult,
 } from "../src/protocol";
 import { document, request, textQuery, write } from "./harness";
@@ -45,10 +46,10 @@ test("collection starts grace after retirement and preserves scores after physic
     await (await request(worker, "retire", "query", textQuery("rust"))).json(),
   );
   await request(worker, "retire", "compact", {});
-  expect(await collect("retire")).toMatchObject({ scanned: 4, pinned: 1, marked: 3, deleted: 0 });
+  expect(await collect("retire")).toMatchObject({ scanned: 8, pinned: 2, marked: 6, deleted: 0 });
   expect(await collect("retire")).toMatchObject({ marked: 0, deleted: 0 });
   await mature("retire");
-  expect(await collect("retire")).toMatchObject({ deleted: 3, pinned: 1 });
+  expect(await collect("retire")).toMatchObject({ deleted: 6, pinned: 2 });
   await worker.unsafeEvictDurableObject("raio", "SearchNamespace", { name: "retire" });
   expect(
     Schema.decodeUnknownSync(QueryResult)(
@@ -79,7 +80,7 @@ test("in-progress vector checkpoints pin retired segments across compaction", as
   );
   expect(cursor.complete).toBe(false);
   await request(worker, "checkpoint-pin", "compact", {});
-  expect(await collect("checkpoint-pin")).toMatchObject({ scanned: 3, pinned: 3, marked: 0 });
+  expect(await collect("checkpoint-pin")).toMatchObject({ scanned: 6, pinned: 5, marked: 1 });
   expect(
     (
       await request(worker, "checkpoint-pin", "vector-rebuild", {
@@ -96,7 +97,7 @@ test("a current segment cancels even an already mature retirement marker", async
   const bucket = await worker.getR2Bucket("STORAGE", "raio");
   const rootObject = await bucket.get("namespaces/repin/root.json");
   if (rootObject === null) throw new Error("Missing manifest");
-  const root = Schema.decodeSync(Schema.fromJsonString(Root))(await rootObject.text());
+  const root = decodeRoot(await rootObject.text());
   const segment = root.segments[0];
   if (segment === undefined) throw new Error("Missing segment");
   const object = await bucket.head(segment.key);
@@ -113,7 +114,7 @@ test("a current segment cancels even an already mature retirement marker", async
       observedAt: 0,
     }),
   );
-  expect(await collect("repin")).toMatchObject({ pinned: 1, deleted: 0 });
+  expect(await collect("repin")).toMatchObject({ pinned: 2, deleted: 0 });
   expect(await bucket.head(segment.key)).not.toBeNull();
   expect((await bucket.list({ prefix: "namespaces/repin/retired/" })).objects).toEqual([]);
 });
@@ -177,4 +178,71 @@ test("collection pages the native R2 listing without skipping candidates", async
   );
   expect(last).toMatchObject({ deleted: 7, cursor: null });
   expect((await bucket.list({ prefix: "namespaces/paged-gc/segments/" })).objects).toEqual([]);
+});
+
+test("collection cursors separate Bloom packs from segments and reject raw R2 cursors", async () => {
+  const namespace = "phased-gc";
+  const bucket = await worker.getR2Bucket("STORAGE", "raio");
+  await Promise.all([
+    ...Array.from({ length: 107 }, (_, index) =>
+      bucket.put(
+        `namespaces/${namespace}/bloom-packs/${String(index).padStart(64, "0")}.bin`,
+        "orphan",
+      ),
+    ),
+    ...Array.from({ length: 3 }, (_, index) =>
+      bucket.put(`namespaces/${namespace}/segments/${index}.rsix`, "orphan"),
+    ),
+  ]);
+  const first = await collect(namespace);
+  expect(first).toMatchObject({ scanned: 100, marked: 100 });
+  if (first.cursor === null) throw new Error("Missing pack collection cursor");
+  expect(Schema.decodeSync(Schema.fromJsonString(CollectionCursor))(first.cursor).phase).toBe(
+    "bloom-packs",
+  );
+  const second = await request(worker, namespace, "collect", { cursor: first.cursor });
+  expect(second.status).toBe(200);
+  expect(Schema.decodeUnknownSync(CollectionResult)(await second.json())).toMatchObject({
+    scanned: 10,
+    marked: 10,
+    cursor: null,
+  });
+  const native = await bucket.list({ prefix: `namespaces/${namespace}/bloom-packs/`, limit: 1 });
+  if (!native.truncated) throw new Error("Missing native R2 cursor");
+  const before = await bucket.list({ prefix: `namespaces/${namespace}/retired/`, limit: 1000 });
+  expect((await request(worker, namespace, "collect", { cursor: native.cursor })).status).toBe(400);
+  const after = await bucket.list({ prefix: `namespaces/${namespace}/retired/`, limit: 1000 });
+  expect(after.objects.map((object) => [object.key, object.etag])).toEqual(
+    before.objects.map((object) => [object.key, object.etag]),
+  );
+  expect(before.objects).toHaveLength(110);
+});
+
+test("retrying an orphaned Bloom pack starts a new retirement grace before cold readers can lose it", async () => {
+  const namespace = "revived-bloom-pack";
+  const bucket = await worker.getR2Bucket("STORAGE", "raio");
+  expect((await request(worker, namespace, "write", write([]))).status).toBe(200);
+  const rootKey = `namespaces/${namespace}/root.json`;
+  const original = await bucket.get(rootKey);
+  if (original === null) throw new Error("Missing initial root");
+  await bucket.put(rootKey, `${await original.text()}\n`);
+  const input = write([document("a", "rare rust")]);
+  expect((await request(worker, namespace, "write", input)).status).toBe(409);
+  expect(await collect(namespace)).toMatchObject({ scanned: 2, marked: 2, deleted: 0 });
+  await mature(namespace);
+  const orphaned = await bucket.list({ prefix: `namespaces/${namespace}/bloom-packs/` });
+  expect(orphaned.objects).toHaveLength(1);
+  const pack = orphaned.objects[0];
+  if (pack === undefined) throw new Error("Missing orphaned Bloom pack");
+  expect((await request(worker, namespace, "write", input)).status).toBe(200);
+  const published = await bucket.get(rootKey);
+  if (published === null) throw new Error("Missing retried root");
+  expect(decodeRoot(await published.text()).bloomPacks.map((item) => item.key)).toEqual([pack.key]);
+  expect((await request(worker, namespace, "write", { ...write([]), reset: true })).status).toBe(
+    200,
+  );
+  expect(await collect(namespace)).toMatchObject({ deleted: 0, marked: 2 });
+  expect(await bucket.head(pack.key)).not.toBeNull();
+  await mature(namespace);
+  expect(await collect(namespace)).toMatchObject({ deleted: 2 });
 });

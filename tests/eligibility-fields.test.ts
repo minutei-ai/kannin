@@ -3,7 +3,7 @@ import { Match, Schema } from "effect";
 import { Filter, Health, QueryResult } from "../src/protocol";
 import { document, request, startWorker, textQuery, write } from "./harness";
 
-test("cached field eligibility preserves correlated filters and global scores across values", async () => {
+test("Root field eligibility preserves subset filters and global scores without catalog reads", async () => {
   const worker = await startWorker();
   await using cleanup = new AsyncDisposableStack();
   cleanup.defer(() => worker.dispose());
@@ -45,7 +45,7 @@ test("cached field eligibility preserves correlated filters and global scores ac
       { field: "group", op: "eq", value: 0 },
     ],
   ]);
-  for (const [index, predicates] of filters.entries()) {
+  for (const predicates of filters) {
     const before = Schema.decodeUnknownSync(Health)(
       await (await fetch(new URL("/health", await worker.ready))).json(),
     );
@@ -60,7 +60,7 @@ test("cached field eligibility preserves correlated filters and global scores ac
       await (await request(worker, "fields-oracle", "query", input)).json(),
     );
     expect(actual).toEqual(expected);
-    if (index !== 0 && index !== 6) expect(after.termRequests - before.termRequests).toBe(0);
+    expect(after.termRequests - before.termRequests).toBe(0);
   }
 }, 15000);
 

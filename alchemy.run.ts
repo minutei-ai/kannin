@@ -105,6 +105,15 @@ export default Alchemy.Stack(
   },
   Effect.gen(function* () {
     const worker = yield* Worker;
+    yield* Command.Exec("RootFormatMigration", {
+      command: "bun tooling/root-migrate.ts",
+      cwd: import.meta.dir,
+      memo: false,
+      env: {
+        RAIO_URL: Output.map(Output.of(worker), (ready) => ready.url),
+        RAIO_API_TOKEN: yield* Config.Redacted("RAIO_API_TOKEN"),
+      },
+    });
     yield* Command.Exec("VectorMetadataMigration", {
       command: "bun tooling/vector-migrate.ts",
       cwd: import.meta.dir,

@@ -1,8 +1,17 @@
+import { useHeaderOnlyCommonFrames } from "./common-posting-fixture";
+import { Directory, initSync } from "../dist/wasm/raio_engine";
+import { decodeRoot, encodeRoot } from "../src/manifest";
 import { afterAll, expect, test } from "bun:test";
-import { Schema } from "effect";
+import { Array as EffectArray, Effect, Schema } from "effect";
 import { Response } from "miniflare";
 import { createHash } from "node:crypto";
-import { Root, QueryResult, Metadata, Health, TermProjectionProps } from "../src/protocol";
+import {
+  QueryResult,
+  Metadata,
+  Health,
+  TermProjectionProps,
+  LocatedDocument,
+} from "../src/protocol";
 import {
   clearLeaderIndex,
   document,
@@ -48,6 +57,73 @@ test("reverse-ranked adjacent pages share reads without changing rank order", as
   expect(smaller.rows).toEqual(initial.rows.slice(0, 1));
 });
 
+test("interleaved segment hits group bounded reads and restore global rank order", async () => {
+  initSync({
+    module: new WebAssembly.Module(
+      await Bun.file(`${import.meta.dir}/../dist/wasm/raio_engine_bg.wasm`).arrayBuffer(),
+    ),
+  });
+  const namespace = "interleaved-segment-document-groups";
+  const body = Array.from({ length: 256 }, (_, index) =>
+    createHash("sha256").update(`document-group-frame-${index}`).digest("hex"),
+  ).join(" ");
+  for (const parity of [0, 1]) {
+    const response = await request(
+      worker,
+      namespace,
+      "write",
+      write(
+        Array.from({ length: 5 }, (_, offset) => {
+          const index = offset * 2 + parity;
+          return document(String(index).padStart(3, "0"), `shared ${body}`);
+        }),
+      ),
+    );
+    expect(response.status).toBe(200);
+  }
+  const bucket = await worker.getR2Bucket("STORAGE");
+  const root = await bucket.get(`namespaces/${namespace}/root.json`);
+  if (root === null) throw new Error("Missing committed root");
+  const manifest = decodeRoot(await root.text());
+  expect(manifest.segments).toHaveLength(2);
+  for (const segment of manifest.segments) {
+    const object = await bucket.get(segment.key, {
+      range: { offset: 0, length: segment.headerBytes },
+    });
+    if (object === null) throw new Error("Missing committed segment");
+    const bytes = new Uint8Array(await object.arrayBuffer());
+    using directory = Directory.canonical(bytes, segment.headerBytes);
+    const documents = Schema.decodeSync(Schema.fromJsonString(Schema.Array(LocatedDocument)))(
+      directory.rows(
+        Schema.encodeSync(Schema.fromJsonString(Schema.Array(Schema.Int)))(
+          Array.from({ length: segment.count }, (_, row) => row),
+        ),
+      ),
+    );
+    expect(documents).toHaveLength(5);
+    expect(documents.every((stored) => stored.document.data.length > 4096)).toBe(true);
+  }
+  const before = Schema.decodeUnknownSync(Metadata)(
+    await (await request(worker, namespace, "metadata")).json(),
+  );
+  const coldResponse = await request(worker, namespace, "query", textQuery("shared", 10));
+  expect(coldResponse.status).toBe(200);
+  const cold = Schema.decodeUnknownSync(QueryResult)(await coldResponse.json());
+  const ids = Array.from({ length: 10 }, (_, index) => String(index).padStart(3, "0"));
+  expect(cold.rows.map((row) => row.id)).toEqual(ids);
+  expect(new Set(cold.rows.map((row) => row.score)).size).toBe(1);
+  expect(cold.rows.map((row) => [row.title, row.text, row.attributes])).toEqual(
+    ids.map(() => ["", `shared ${body}`, {}]),
+  );
+  const after = Schema.decodeUnknownSync(Metadata)(
+    await (await request(worker, namespace, "metadata")).json(),
+  );
+  expect(after.cache.rangeReads - before.cache.rangeReads).toBeLessThanOrEqual(6);
+  const warmResponse = await request(worker, namespace, "query", textQuery("shared", 10));
+  expect(warmResponse.status).toBe(200);
+  expect(Schema.decodeUnknownSync(QueryResult)(await warmResponse.json())).toEqual(cold);
+});
+
 test("contiguous top-k pages share bounded reads and retain individual memory cache hits", async () => {
   const namespace = "contiguous-result-pages";
   await request(
@@ -90,17 +166,20 @@ test("contiguous top-k pages share bounded reads and retain individual memory ca
 
 test("native Cache API retains compressed canonical directories after memory eviction", async () => {
   await request(worker, "cached", "write", write([document("a", "original cached content")]));
-  const initial = await request(worker, "cached", "query", textQuery("original"));
+  const initial = await request(worker, "cached", "query", {
+    ...textQuery("original cached"),
+    match: "phrase",
+  });
   expect(initial.status).toBe(200);
   const bucket = await worker.getR2Bucket("STORAGE");
   const root = await bucket.get("namespaces/cached/root.json");
   if (root === null) throw new Error("Missing root");
-  const manifest = Schema.decodeSync(Schema.fromJsonString(Root))(await root.text());
+  const manifest = decodeRoot(await root.text());
   const segment = manifest.segments[0];
   if (segment === undefined) throw new Error("Missing committed segment");
   const caches = await worker.getCaches();
   const cache = await caches.open("raio-segments-v1");
-  const key = new URL("https://raio-cache.internal/directory-v3");
+  const key = new URL("https://raio-cache.internal/directory-v5");
   key.searchParams.set("key", segment.key);
   key.searchParams.set("offset", "0");
   key.searchParams.set("length", String(segment.headerBytes));
@@ -111,7 +190,7 @@ test("native Cache API retains compressed canonical directories after memory evi
   if (cached === undefined) return;
   const encoded = new Uint8Array(await cached.arrayBuffer());
   expect(encoded.byteLength).toBeLessThan(segment.headerBytes);
-  expect(new TextDecoder().decode(encoded.subarray(0, 8))).toBe("RAIODIR3");
+  expect(new TextDecoder().decode(encoded.subarray(0, 8))).toBe("RAIODIR5");
   expect(new DataView(encoded.buffer, encoded.byteOffset).getUint32(8, true)).toBe(
     segment.headerBytes,
   );
@@ -121,9 +200,12 @@ test("native Cache API retains compressed canonical directories after memory evi
   if (canonical === null) throw new Error("Missing canonical header");
   expect(
     new TextDecoder().decode(new Uint8Array(await canonical.arrayBuffer()).subarray(0, 8)),
-  ).toBe("RAIOSEG1");
+  ).toBe("RAIOSEG2");
   await request(worker, "cached", "rebuild", {});
-  expect((await request(worker, "cached", "query", textQuery("original"))).status).toBe(200);
+  expect(
+    (await request(worker, "cached", "query", { ...textQuery("original cached"), match: "phrase" }))
+      .status,
+  ).toBe(200);
   const metadata = Schema.decodeUnknownSync(Metadata)(
     await (await request(worker, "cached", "metadata")).json(),
   );
@@ -152,7 +234,7 @@ test("cached old segments cannot resurrect updated or deleted documents", async 
 });
 
 test("the authenticated gateway never exposes immutable cache entrypoints", async () => {
-  for (const path of ["/range", "/directory-v3", "/catalog-v9"]) {
+  for (const path of ["/range", "/directory-v5", "/catalog-v12"]) {
     const url = new URL(path, await worker.ready);
     const anonymous = await fetch(url);
     expect(anonymous.status).toBe(401);
@@ -173,7 +255,13 @@ test("concurrent cold edge queries share immutable range acquisition", async () 
     "write",
     write(
       Array.from({ length: 128 }, (_, index) =>
-        document(String(index).padStart(4, "0"), "shared cold storage"),
+        document(
+          String(index).padStart(4, "0"),
+          (() => {
+            if (index === 0) return "shared shared cold storage";
+            return "shared cold storage";
+          })(),
+        ),
       ),
     ),
   );
@@ -188,6 +276,9 @@ test("concurrent cold edge queries share immutable range acquisition", async () 
         consistency: "edge-eventual",
       });
       expect(response.status).toBe(200);
+      expect(response.headers.get("server-timing")).toContain(
+        'text_uniform_hits;desc="segments=0"',
+      );
       return Schema.decodeUnknownSync(QueryResult)(await response.json());
     }),
   );
@@ -198,7 +289,9 @@ test("concurrent cold edge queries share immutable range acquisition", async () 
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(3);
+  expect(after.rangeReads - before.rangeReads).toBe(1);
+  expect(after.directoryR2CacheReads - before.directoryR2CacheReads).toBe(1);
+  expect(after.directoryCommonHits).toBeGreaterThan(before.directoryCommonHits);
 });
 
 test("term projection batches preserve global frequencies and filter eligibility at their boundary", async () => {
@@ -430,11 +523,11 @@ test("corrupted compressed overview cache falls back to verified immutable sourc
   const bucket = await worker.getR2Bucket("STORAGE");
   const object = await bucket.get(`namespaces/${namespace}/root.json`);
   if (object === null) throw new Error("Missing manifest");
-  const manifest = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
+  const manifest = decodeRoot(await object.text());
   const segment = manifest.segments[0];
   if (segment === undefined) throw new Error("Missing segment");
-  const cache = await (await worker.getCaches()).open("raio-overview-batches-v6");
-  const key = new URL("https://overviews.internal/batch-v6");
+  const cache = await (await worker.getCaches()).open("raio-overview-batches-v8");
+  const key = new URL("https://overviews.internal/batch-v8");
   key.searchParams.set("bucket", "raio-test");
   const ranges = Schema.encodeSync(Schema.fromJsonString(TermProjectionProps.fields.ranges))([
     { key: segment.key, headerBytes: segment.headerBytes },
@@ -463,7 +556,7 @@ test("corrupted compressed overview cache falls back to verified immutable sourc
 });
 
 for (const match of ["all", "phrase"] as const)
-  test(`${match} reads postings only from segments containing every query term`, async () => {
+  test(`${match} rejects incomplete segments before document materialization`, async () => {
     const namespace = `conjunctive-${match}`;
     for (const index of Array.from({ length: 29 }, (_, ordinal) => ordinal))
       await request(
@@ -472,7 +565,20 @@ for (const match of ["all", "phrase"] as const)
         "write",
         write([document(`partial-${index}`, "cloudflare storage")]),
       );
-    await request(worker, namespace, "write", write([document("complete", "cloudflare rust")]));
+    await request(
+      worker,
+      namespace,
+      "write",
+      write([
+        document(
+          "complete",
+          (() => {
+            if (match === "all") return "cloudflare cloudflare rust";
+            return "cloudflare rust";
+          })(),
+        ),
+      ]),
+    );
     const before = Schema.decodeUnknownSync(Health)(
       await (await fetch(new URL("/health", await worker.ready))).json(),
     );
@@ -482,14 +588,25 @@ for (const match of ["all", "phrase"] as const)
       consistency: "edge-eventual",
     });
     expect(response.status).toBe(200);
+    if (match === "all")
+      expect(response.headers.get("server-timing")).toContain(
+        'text_uniform_hits;desc="segments=0"',
+      );
     const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
     if (match === "all") expect(result.rows.map((row) => row.id)).toEqual(["complete"]);
     else expect(result.rows).toEqual([]);
     const after = Schema.decodeUnknownSync(Health)(
       await (await fetch(new URL("/health", await worker.ready))).json(),
     );
-    if (match === "all") expect(after.rangeReads - before.rangeReads).toBe(3);
-    else expect(after.rangeReads - before.rangeReads).toBe(0);
+    if (match === "all") {
+      expect(after.rangeReads - before.rangeReads).toBe(1);
+      expect(response.headers.get("server-timing")).toContain(
+        'text_singleton_hits;desc="segments=1"',
+      );
+      expect(response.headers.get("server-timing")).toMatch(
+        /text_posting_acquire;dur=[^,]*;desc="spans=0 bytes=0 ranges=0"/,
+      );
+    } else expect(after.rangeReads - before.rangeReads).toBe(0);
     const any = Schema.decodeUnknownSync(QueryResult)(
       await (
         await request(worker, namespace, "query", textQuery("cloudflare rust cloudflare", 100))
@@ -555,7 +672,12 @@ test("immutable query catalogs survive directory eviction without reloading irre
       "write",
       write([document(`partial-${index}`, "cloudflare storage")]),
     );
-  await request(worker, namespace, "write", write([document("complete", "cloudflare rust")]));
+  await request(
+    worker,
+    namespace,
+    "write",
+    write([document("complete", "cloudflare cloudflare rust")]),
+  );
   const input = { ...textQuery("cloudflare rust"), match: "all", consistency: "edge-eventual" };
   const original = Schema.decodeUnknownSync(QueryResult)(
     await (await request(worker, namespace, "query", input)).json(),
@@ -565,14 +687,19 @@ test("immutable query catalogs survive directory eviction without reloading irre
   const before = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  const restored = Schema.decodeUnknownSync(QueryResult)(
-    await (await request(worker, namespace, "query", input)).json(),
+  const restoredResponse = await request(worker, namespace, "query", input);
+  expect(restoredResponse.headers.get("server-timing")).toContain(
+    'text_uniform_hits;desc="segments=0"',
   );
+  const restored = Schema.decodeUnknownSync(QueryResult)(await restoredResponse.json());
   expect(restored.rows).toEqual(original.rows);
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(3);
+  expect(after.rangeReads - before.rangeReads).toBe(1);
+  expect(restoredResponse.headers.get("server-timing")).toContain(
+    'text_singleton_hits;desc="segments=1"',
+  );
 });
 
 test("cached term bounds prune uncompetitive segments after directory eviction", async () => {
@@ -584,7 +711,7 @@ test("cached term bounds prune uncompetitive segments after directory eviction",
       "write",
       write(
         Array.from({ length: 16 }, (_, row) =>
-          document(String(index * 16 + row).padStart(5, "0"), "equal terms"),
+          document(String(index * 16 + row).padStart(5, "0"), "equal equal terms"),
         ),
       ),
     );
@@ -598,14 +725,18 @@ test("cached term bounds prune uncompetitive segments after directory eviction",
   const before = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  const restored = Schema.decodeUnknownSync(QueryResult)(
-    await (await request(worker, namespace, "query", input)).json(),
+  const restoredResponse = await request(worker, namespace, "query", input);
+  expect(restoredResponse.headers.get("server-timing")).toContain(
+    'text_uniform_hits;desc="segments=0"',
   );
+  const restored = Schema.decodeUnknownSync(QueryResult)(await restoredResponse.json());
   expect(restored.rows).toEqual(original.rows);
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(3);
+  expect(after.rangeReads - before.rangeReads).toBe(1);
+  expect(after.directoryR2CacheReads - before.directoryR2CacheReads).toBe(1);
+  expect(after.directoryCommonHits).toBeGreaterThan(before.directoryCommonHits);
 });
 
 test("term projections keep phrase order, filter eligibility and revisions query scoped", async () => {
@@ -619,6 +750,19 @@ test("term projections keep phrase order, filter eligibility and revisions query
       document("right", "cloudflare rust", { group: 2 }),
     ]),
   );
+  const bucket = await worker.getR2Bucket("STORAGE");
+  const rootKey = `namespaces/${namespace}/root.json`;
+  const object = await bucket.get(rootKey);
+  if (object === null) throw new Error("Missing projection-isolation Root");
+  const root = decodeRoot(await object.text());
+  await bucket.put(
+    rootKey,
+    encodeRoot({
+      ...root,
+      segments: root.segments.map((segment) => Object.assign({}, segment, { eligibility: null })),
+    }),
+  );
+  expect((await request(worker, namespace, "rebuild", {})).status).toBe(200);
   const left = Schema.decodeUnknownSync(QueryResult)(
     await (
       await request(worker, namespace, "query", {
@@ -680,24 +824,23 @@ test("segment priority finds the equal-score winner before reading lower-priorit
       worker,
       namespace,
       "write",
-      write([document(String(index).padStart(5, "0"), "equal terms")]),
+      write([document(String(index).padStart(5, "0"), "equal equal terms")]),
     );
   const before = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  const found = Schema.decodeUnknownSync(QueryResult)(
-    await (
-      await request(worker, namespace, "query", {
-        ...textQuery("equal terms", 1),
-        consistency: "edge-eventual",
-      })
-    ).json(),
-  );
+  const response = await request(worker, namespace, "query", {
+    ...textQuery("equal terms", 1),
+    consistency: "edge-eventual",
+  });
+  expect(response.headers.get("server-timing")).toContain('text_uniform_hits;desc="segments=0"');
+  const found = Schema.decodeUnknownSync(QueryResult)(await response.json());
   expect(found.rows.map((row) => row.id)).toEqual(["00000"]);
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(3);
+  expect(after.rangeReads - before.rangeReads).toBe(1);
+  expect(response.headers.get("server-timing")).toContain('text_singleton_hits;desc="segments=1"');
 });
 
 test("filtered score projections prune headers after directory eviction", async () => {
@@ -707,7 +850,7 @@ test("filtered score projections prune headers after directory eviction", async 
       worker,
       namespace,
       "write",
-      write([document(String(index).padStart(5, "0"), "equal terms", { group: 1 })]),
+      write([document(String(index).padStart(5, "0"), "equal equal terms", { group: 1 })]),
     );
   const input = {
     ...textQuery("equal terms", 1, [{ field: "group", op: "eq", value: 1 }]),
@@ -721,14 +864,19 @@ test("filtered score projections prune headers after directory eviction", async 
   const before = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  const restored = Schema.decodeUnknownSync(QueryResult)(
-    await (await request(worker, namespace, "query", input)).json(),
+  const restoredResponse = await request(worker, namespace, "query", input);
+  expect(restoredResponse.headers.get("server-timing")).toContain(
+    'text_uniform_hits;desc="segments=0"',
   );
+  const restored = Schema.decodeUnknownSync(QueryResult)(await restoredResponse.json());
   expect(restored.rows).toEqual(original.rows);
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(3);
+  expect(after.rangeReads - before.rangeReads).toBe(1);
+  expect(restoredResponse.headers.get("server-timing")).toContain(
+    'text_singleton_hits;desc="segments=1"',
+  );
 });
 
 test("ineligible segments still contribute namespace-wide frequencies", async () => {
@@ -793,6 +941,19 @@ test("physical filter minima remain conservative after deleting the shortest eli
 test("cached negative filter eligibility avoids all directory and posting reads", async () => {
   const namespace = "projection-empty-filter";
   await request(worker, namespace, "write", write([document("a", "target", { group: 1 })]));
+  const bucket = await worker.getR2Bucket("STORAGE");
+  const rootKey = `namespaces/${namespace}/root.json`;
+  const object = await bucket.get(rootKey);
+  if (object === null) throw new Error("Missing negative-eligibility Root");
+  const root = decodeRoot(await object.text());
+  await bucket.put(
+    rootKey,
+    encodeRoot({
+      ...root,
+      segments: root.segments.map((segment) => Object.assign({}, segment, { eligibility: null })),
+    }),
+  );
+  expect((await request(worker, namespace, "rebuild", {})).status).toBe(200);
   const input = {
     ...textQuery("target", 10, [{ field: "group", op: "eq", value: 2 }]),
     consistency: "edge-eventual",
@@ -881,13 +1042,40 @@ test("retained Bloom candidates stay bounded across root updates and namespace r
 
 test("document Bloom windows preserve newest revisions across partial sixty-four-segment boundaries", async () => {
   const namespace = "document-bloom-boundaries";
-  for (const index of Array.from({ length: 130 }, (_, ordinal) => ordinal))
-    await request(
-      worker,
-      namespace,
-      "write",
-      write([document(String(index).padStart(3, "0"), "source common", { group: index })]),
+  const windows = EffectArray.chunksOf(
+    Array.from({ length: 130 }, (_, ordinal) => ordinal),
+    64,
+  );
+  for (const window of windows)
+    await Effect.runPromise(
+      Effect.forEach(
+        window,
+        (index) =>
+          Effect.tryPromise(() =>
+            request(
+              worker,
+              namespace,
+              "write",
+              write([document(String(index).padStart(3, "0"), "source common", { group: index })]),
+            ),
+          ),
+        { concurrency: 4 },
+      ),
     );
+  const rootObject = await (
+    await worker.getR2Bucket("STORAGE")
+  ).get(`namespaces/${namespace}/root.json`);
+  expect(rootObject).not.toBeNull();
+  if (rootObject === null) return;
+  const seeded = decodeRoot(await rootObject.text());
+  expect(seeded.segments).toHaveLength(130);
+  for (const [index, window] of windows.entries())
+    expect(
+      seeded.segments
+        .slice(index * 64, index * 64 + window.length)
+        .map((segment) => segment.minimumId)
+        .toSorted(),
+    ).toEqual(window.map((id) => String(id).padStart(3, "0")));
   await request(
     worker,
     namespace,
@@ -933,6 +1121,7 @@ test("decoded frequency pages share the range budget and keep tombstones query-l
       ),
     ),
   );
+  await useHeaderOnlyCommonFrames(worker, namespace);
   expect((await request(worker, namespace, "query", textQuery("alpha"))).status).toBe(200);
   const first = Schema.decodeUnknownSync(QueryResult)(
     await (await request(worker, namespace, "query", textQuery("alpha beta"))).json(),
@@ -1002,10 +1191,25 @@ test("a prior segment cutoff rejects noncompetitive posting pages before acquisi
   }
   const bucket = await worker.getR2Bucket("STORAGE");
   const derived = await bucket.list({
-    prefix: `cache/correlated-pool-v1/namespaces/${namespace}/`,
+    prefix: `cache/correlated-pool-v3/namespaces/${namespace}/`,
   });
   await bucket.delete(derived.objects.map((object) => object.key));
   await evictWrittenOverviews(worker, namespace);
+  await useHeaderOnlyCommonFrames(worker, namespace);
+  const rootKey = `namespaces/${namespace}/root.json`;
+  const object = await bucket.get(rootKey);
+  if (object === null) throw new Error("Missing posting-cutoff Root");
+  const root = decodeRoot(await object.text());
+  await bucket.put(
+    rootKey,
+    encodeRoot({
+      ...root,
+      segments: root.segments.map((segment) =>
+        Object.assign({}, segment, { commonProjection: null }),
+      ),
+    }),
+  );
+  await worker.unsafeEvictDurableObject("raio", "SearchNamespace", { name: namespace });
   for (const match of ["any", "all", "phrase"] as const) {
     const response = await request(worker, namespace, "query", {
       ...textQuery("alpha beta"),
@@ -1082,6 +1286,9 @@ test("the sequential ranking prefix preserves common-query pruning before parall
     "1048",
     "1056",
   ]);
-  expect(response.headers.get("server-timing")).toContain("blocks=10");
-  expect(response.headers.get("server-timing")).toContain("segments=2");
+  expect(response.headers.get("server-timing")).toContain('text_uniform_hits;desc="segments=2"');
+  expect(response.headers.get("server-timing")).toContain(
+    'text_posting_decode;dur=0;desc="blocks=0"',
+  );
+  expect(response.headers.get("server-timing")).toMatch(/text_score;dur=[^,]*;desc="segments=2"/);
 });

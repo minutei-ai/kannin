@@ -1,3 +1,4 @@
+import { decodeRoot, encodeRoot } from "../src/manifest";
 import { expect, test } from "bun:test";
 import { Effect, Schema } from "effect";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -8,7 +9,6 @@ import { Response } from "miniflare";
 import {
   Metadata,
   QueryResult,
-  Root,
   SharedTextPlan,
   SharedTextPlanCacheHeaders,
   TextPlanIdentity,
@@ -46,7 +46,7 @@ test("shared match ceilings preserve unions, intersections and excluded filters"
     await worker.getR2Bucket("STORAGE")
   ).get(`namespaces/${namespace}/root.json`);
   if (object === null) throw new Error("Missing fixture manifest");
-  const root = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
+  const root = decodeRoot(await object.text());
   const first = root.segments[0];
   if (first === undefined) throw new Error("Missing fixture segment");
   const cache = await (await worker.getCaches()).open("kannin-text-plans-v1");
@@ -73,6 +73,7 @@ test("shared match ceilings preserve unions, intersections and excluded filters"
     expect(result.sequence).toBe(8);
     expect(result.rows).toHaveLength(sample.rows);
     const identity = Schema.encodeSync(Schema.fromJsonString(TextPlanIdentity))({
+      correlatedRoot: false,
       text: sample.text,
       mode: sample.mode,
       filters: sample.filters,
@@ -105,10 +106,7 @@ test("shared match ceilings preserve unions, intersections and excluded filters"
   damaged.segments[0] = { ...first, count: 0 };
   await (
     await worker.getR2Bucket("STORAGE")
-  ).put(
-    `namespaces/${namespace}/root.json`,
-    Schema.encodeSync(Schema.fromJsonString(Root))(damaged),
-  );
+  ).put(`namespaces/${namespace}/root.json`, encodeRoot(damaged));
   const rejected = await request(worker, namespace, "query", {
     ...textQuery("alpha beta", 20),
     consistency: "edge-eventual",
@@ -147,7 +145,7 @@ test("shared tightened plans survive fresh workerd instances and reject corrupt 
     ).toBe(200);
   const bucket = await active.worker.getR2Bucket("STORAGE");
   const derived = await bucket.list({
-    prefix: `cache/correlated-pool-v1/namespaces/${namespace}/`,
+    prefix: `cache/correlated-pool-v3/namespaces/${namespace}/`,
   });
   await bucket.delete(derived.objects.map((object) => object.key));
   await evictWrittenOverviews(active.worker, namespace);
@@ -161,10 +159,11 @@ test("shared tightened plans survive fresh workerd instances and reject corrupt 
     await active.worker.getR2Bucket("STORAGE")
   ).get(`namespaces/${namespace}/root.json`);
   if (object === null) throw new Error("Missing fixture manifest");
-  const root = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
+  const root = decodeRoot(await object.text());
   const segment = root.segments[0];
   if (segment === undefined) throw new Error("Missing fixture segment");
   const identity = Schema.encodeSync(Schema.fromJsonString(TextPlanIdentity))({
+    correlatedRoot: false,
     text: "alpha beta delta gamma",
     mode: "any",
     filters: [],

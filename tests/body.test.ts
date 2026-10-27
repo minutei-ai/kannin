@@ -68,6 +68,6 @@ test("query bodies enforce the byte limit before both consistency paths", async 
     expect(result.rows.map((row) => row.id)).toEqual(["a"]);
     const rejected = await fetch(url, { method: "POST", headers, body: `${boundary} ` });
     expect(rejected.status).toBe(413);
-    await rejected.arrayBuffer();
+    expect(await rejected.json()).toMatchObject({ status: "error" });
   }
 });

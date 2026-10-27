@@ -258,12 +258,12 @@ impl Ranker {
             let ranked = hits
                 .into_iter()
                 .map(|hit| {
-                    let document = &header.documents[hit.row as usize];
+                    let document = header.documents.row(hit.row as usize);
                     Hit {
                         row: hit.row,
-                        id: document.id.clone(),
+                        id: document.id.to_string(),
                         score: hit.score,
-                        data: document.data.clone(),
+                        data: document.data,
                     }
                 })
                 .collect();

@@ -10,7 +10,8 @@ import {
 export const DocumentPageProbeInput = Schema.Struct({
   source: TermProjectionRange,
   bytes: SegmentRange.fields.length,
-  pages: Schema.Array(DataRange).check(Schema.isBetweenLength(1, 4)),
+  metadataEnd: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  pages: Schema.Array(DataRange).check(Schema.isBetweenLength(1, 17)),
 });
 
 export const RangeProbeInput = Schema.Struct({

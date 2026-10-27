@@ -1,10 +1,11 @@
+import { decodeRoot } from "../src/manifest";
 import { expect, test } from "bun:test";
 import { Effect, Match, Option, Schema } from "effect";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Miniflare } from "miniflare";
-import { NamespaceName, Query, QueryResult, Root } from "../src/protocol";
+import { NamespaceName, Query, QueryResult } from "../src/protocol";
 import { document, request, startWorker, textQuery, write } from "./harness";
 
 async function fixture() {
@@ -424,7 +425,7 @@ test("manifest phrase-frequency proof skips shared-plan acquisition only when ev
   const bucket = await worker.getR2Bucket("STORAGE", "raio");
   const object = await bucket.get(`namespaces/${namespace}/root.json`);
   if (object === null) throw new Error("Missing phrase-frequency manifest");
-  const root = Schema.decodeUnknownSync(Root)(await object.json());
+  const root = decodeRoot(await object.text());
   expect(root.segments).toHaveLength(6);
   expect(root.segments.every((segment) => segment.commonTerms?.alpha?.df === 2)).toBe(true);
   expect(root.segments.every((segment) => segment.commonTerms?.beta?.df === 2)).toBe(true);

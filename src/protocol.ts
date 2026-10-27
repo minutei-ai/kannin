@@ -1,4 +1,4 @@
-import { Effect, Schema, SchemaGetter, SchemaIssue } from "effect";
+import { Effect, Schema, SchemaGetter, SchemaIssue, Struct } from "effect";
 
 const Unicode = Schema.String.check(
   Schema.makeFilter((text) => text.isWellFormed() || "Expected well-formed Unicode"),
@@ -14,10 +14,15 @@ export const Operation = Schema.Literals([
   "rebuild",
   "compact",
   "collect",
+  "migrate-root",
 ]);
 export const Scalar = Schema.Union([Unicode, Schema.Finite, Schema.Boolean, Schema.Null]);
 export const FieldName = Schema.String.check(Schema.isPattern(/^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/));
 export const Attributes = Schema.Record(FieldName, Scalar);
+const textEncoder = new TextEncoder();
+const encodeAttributes = Schema.encodeSync(Schema.fromJsonString(Attributes), {
+  disableChecks: true,
+});
 export const ConstantAttributes = Attributes.check(
   Schema.makeFilter(
     (attributes) =>
@@ -27,8 +32,8 @@ export const ConstantAttributes = Attributes.check(
   ),
   Schema.makeFilter(
     (attributes) =>
-      new TextEncoder().encode(Schema.encodeSync(Schema.fromJsonString(Attributes))(attributes))
-        .byteLength <= 512 || "Constant attributes exceed 512 bytes",
+      textEncoder.encode(encodeAttributes(attributes)).byteLength <= 512 ||
+      "Constant attributes exceed 512 bytes",
   ),
 );
 export const VectorFilterFields = Schema.Array(FieldName).check(
@@ -52,12 +57,14 @@ export const NamespaceSchema = Schema.Struct({
       "Vector filter fields must be filterable",
   ),
 );
+const MIN_VECTOR_DIMENSIONS = 1;
+const MAX_VECTOR_DIMENSIONS = 4096;
 export const Vector = Schema.Array(
   Schema.Finite.check(
     Schema.isBetween({ minimum: -3.4028234663852886e38, maximum: 3.4028234663852886e38 }),
   ),
 ).check(
-  Schema.isBetweenLength(1, 4096),
+  Schema.isBetweenLength(MIN_VECTOR_DIMENSIONS, MAX_VECTOR_DIMENSIONS),
   Schema.makeFilter(
     (values) =>
       values.some((value) => Math.fround(value) !== 0) ||
@@ -79,6 +86,18 @@ export const Write = Schema.Struct({
   reset: Schema.optional(Schema.Boolean),
 });
 export const StoredDocument = Document.mapFields((fields) => ({ ...fields, revision: Schema.Int }));
+export const QueryDocument = StoredDocument.mapFields((fields) => ({
+  ...Struct.omit(fields, ["vector"]),
+  vectorSummary: Schema.NullOr(
+    Schema.Tuple([
+      Schema.Int.check(
+        Schema.isBetween({ minimum: MIN_VECTOR_DIMENSIONS, maximum: MAX_VECTOR_DIMENSIONS }),
+      ),
+      Schema.Literal(true),
+      Schema.Literal(true),
+    ]),
+  ),
+}));
 export const Filter = Schema.Union([
   Schema.Struct({
     field: FieldName,
@@ -125,7 +144,7 @@ export const Query = Schema.Union([
     ...VectorQueryFields,
   }),
 ]);
-export const Root = Schema.Struct({
+const RootFields = {
   schema: Schema.optional(NamespaceSchema),
   version: Schema.Literal(1),
   sequence: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
@@ -139,24 +158,74 @@ export const Root = Schema.Struct({
     Schema.Struct({ requestId: Id, digest: Schema.String, sequence: Schema.Int }),
     Schema.Null,
   ]),
-  segments: Schema.Array(
-    Schema.Struct({
-      key: Schema.String,
-      sequence: Schema.Int,
-      headerBytes: Schema.Int,
-      bytes: Schema.Int,
-      count: Schema.Int,
-      minimumId: Id,
-      documentBloom: Schema.String,
-      termBloom: Schema.String,
-      dead: Schema.Array(Schema.Int),
-      removedFrequencies: Schema.Record(Schema.String, Schema.Int),
-      commonTerms: Schema.optional(Schema.suspend(() => CommonTerms)),
-      commonLeaders: Schema.optional(Schema.suspend(() => CommonLeaders)),
-      constantAttributes: Schema.optional(ConstantAttributes),
-    }),
-  ),
+};
+const LegacyInlineSegment = Schema.Struct({
+  key: Schema.String,
+  sequence: Schema.Int,
+  headerBytes: Schema.Int,
+  bytes: Schema.Int,
+  count: Schema.Int,
+  minimumId: Id,
+  documentBloom: Schema.String,
+  termBloom: Schema.String,
+  dead: Schema.Array(Schema.Int),
+  removedFrequencies: Schema.Record(Schema.String, Schema.Int),
+  commonTerms: Schema.optional(Schema.suspend(() => CommonTerms)),
+  commonProjection: Schema.optional(Schema.NullOr(Schema.suspend(() => CommonTermProjection))),
+  commonLeaders: Schema.optional(Schema.suspend(() => CommonLeaders)),
+  constantAttributes: Schema.optional(ConstantAttributes),
+  eligibility: Schema.NullOr(Schema.suspend(() => EligibilityProjection)),
 });
+const BloomReference = Schema.Struct({
+  packIndex: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  row: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+});
+const LegacyPackedSegment = LegacyInlineSegment.mapFields((fields) => ({
+  ...Struct.omit(fields, ["documentBloom", "termBloom"]),
+  bloom: BloomReference,
+}));
+const PackedRootValue = Schema.Struct({
+  ...RootFields,
+  bloomPacks: Schema.Array(Schema.suspend(() => BloomPack)),
+  segments: Schema.Array(LegacyPackedSegment),
+});
+const validBloomReferences = (root: typeof PackedRootValue.Type) =>
+  root.segments.every(
+    (segment) =>
+      root.bloomPacks[segment.bloom.packIndex]?.segmentKeys[segment.bloom.row] === segment.key,
+  ) || "Invalid segment Bloom reference";
+export const LegacyPackedRoot = PackedRootValue.check(Schema.makeFilter(validBloomReferences));
+const MetadataSegment = LegacyPackedSegment.mapFields((fields) => ({
+  ...fields,
+  metadataEnd: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+}));
+const validMetadataBoundary = (
+  segment: Pick<typeof MetadataSegment.Type, "metadataEnd" | "headerBytes" | "bytes">,
+) =>
+  (segment.metadataEnd >= segment.headerBytes && segment.metadataEnd <= segment.bytes) ||
+  "Invalid segment metadata boundary";
+export const Root = PackedRootValue.mapFields((fields) => ({
+  ...fields,
+  segments: Schema.Array(MetadataSegment.check(Schema.makeFilter(validMetadataBoundary))),
+})).check(Schema.makeFilter(validBloomReferences));
+export const UnpackedSegment = Root.fields.segments.value
+  .mapFields((fields) => Struct.omit(fields, ["bloom"]))
+  .check(Schema.makeFilter(validMetadataBoundary));
+export const LegacyInlineRoot = Schema.Struct({
+  ...RootFields,
+  segments: Schema.Array(LegacyInlineSegment),
+});
+export const ConvertedInlineRoot = LegacyInlineRoot.mapFields((fields) => ({
+  ...fields,
+  segments: Schema.Array(
+    fields.segments.value
+      .mapFields((segment) => ({
+        ...segment,
+        metadataEnd: MetadataSegment.fields.metadataEnd,
+      }))
+      .check(Schema.makeFilter(validMetadataBoundary)),
+  ),
+}));
 export const Snapshot = Schema.Struct({
   observedAt: Schema.Finite,
   manifest: Root,
@@ -198,6 +267,11 @@ export const VectorRebuildResult = Schema.Struct({
 export const Collection = Schema.Struct({
   cursor: Schema.optional(Schema.String.check(Schema.isBetweenLength(1, 4096))),
 });
+export const CollectionCursor = Schema.Struct({
+  version: Schema.Literal(1),
+  phase: Schema.Literals(["bloom-packs", "segments"]),
+  cursor: Schema.NullOr(Schema.String.check(Schema.isBetweenLength(1, 4096))),
+});
 export const Retirement = Schema.Struct({
   key: Schema.String,
   etag: Schema.String,
@@ -215,6 +289,37 @@ export const NamespacePage = Schema.Struct({
   names: Schema.Array(NamespaceName),
   cursor: Schema.Union([Schema.String, Schema.Null]),
 });
+const namespacePageSize = Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 1000 }));
+export const NamespacesInput = Schema.Struct({
+  page_size: Schema.optional(namespacePageSize),
+  prefix: Schema.optional(Unicode),
+  cursor: Schema.optional(Schema.String),
+});
+export const NamespacesQuery = NamespacesInput.mapFields((fields) => ({
+  ...fields,
+  page_size: Schema.optional(
+    Schema.String.check(Schema.isPattern(/^[0-9]+$/)).pipe(
+      Schema.decodeTo(Schema.FiniteFromString.pipe(Schema.decodeTo(namespacePageSize))),
+    ),
+  ),
+}));
+export const NamespacesPage = Schema.Struct({
+  namespaces: Schema.Array(Schema.Struct({ id: NamespaceName })),
+  next_cursor: Schema.optional(Schema.String),
+});
+export const NamespaceCatalogActivation = Schema.Struct({ version: Schema.Literal(1) });
+export const NamespaceListCursor = Schema.StringFromBase64Url.pipe(
+  Schema.decodeTo(
+    Schema.fromJsonString(
+      Schema.Struct({
+        version: Schema.Literal(1),
+        bucket: Schema.String,
+        prefix: Unicode,
+        cursor: Schema.String,
+      }),
+    ),
+  ),
+);
 export const Log = Schema.Struct({
   version: Schema.Literal(1),
   sequence: Schema.Int.check(Schema.isGreaterThan(0)),
@@ -242,7 +347,7 @@ export const WriteResult = Schema.Struct({
   requestId: Id,
   vectorSync: Schema.Literal("queued"),
 });
-export const ErrorBody = Schema.Struct({ error: Schema.String });
+export const ErrorBody = Schema.Struct({ status: Schema.Literal("error"), error: Schema.String });
 export const CacheMetrics = Schema.Struct({
   rangeCacheBytes: Schema.Int,
   rangeCacheChargedBytes: Schema.Int,
@@ -257,6 +362,8 @@ export const CacheMetrics = Schema.Struct({
   encodedDirectoryAdmissionChargedBytes: Schema.Int,
   encodedDirectoryCacheEntries: Schema.Int,
   bloomCacheBytes: Schema.Int,
+  bloomR2Reads: Schema.Int,
+  bloomR2Bytes: Schema.Int,
   termCacheBytes: Schema.Int,
   overviewCacheBytes: Schema.Int,
   overviewMemoryHits: Schema.Int,
@@ -288,6 +395,7 @@ export const CacheMetrics = Schema.Struct({
   rangeBytes: Schema.Int,
   rangeCacheHits: Schema.Int,
   directoryCacheHits: Schema.Int,
+  directoryCommonHits: Schema.Int,
   encodedDirectoryCacheHits: Schema.Int,
   workerCacheHits: Schema.Int,
   workerCacheMisses: Schema.Int,
@@ -360,7 +468,13 @@ export const EligibleMinimum = Schema.Union([
     Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 4294967295 })),
   ]),
 ]);
+const TermDocument = Schema.Struct({
+  row: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 9999 })),
+  id: Id,
+  data: DataRange,
+});
 export const TermSummary = Schema.Struct({
+  single: Schema.optional(TermDocument),
   df: SegmentTerm.fields.df,
   bounds: Schema.Array(
     Schema.Tuple([
@@ -380,13 +494,7 @@ export const CommonLeaders = Schema.Array(
     ),
     length: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 4294967295 })),
     longer: Schema.Boolean,
-    documents: Schema.Array(
-      Schema.Struct({
-        row: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 9999 })),
-        id: Id,
-        data: DataRange,
-      }),
-    ).check(Schema.isMaxLength(16)),
+    documents: Schema.Array(TermDocument).check(Schema.isMaxLength(16)),
   }),
 ).check(Schema.isMaxLength(2));
 export const CommonTerms = Schema.Record(
@@ -399,10 +507,273 @@ export const CommonTerms = Schema.Record(
     ),
   ),
 ).check(Schema.isMaxProperties(16));
+const CommonTermBound = TermSummary.fields.bounds.value.check(
+  Schema.makeFilter(
+    (bound) =>
+      (bound.every((value) => value >= 0 && value <= 4294967295) &&
+        (bound[0] > 0 || bound[1] > 0)) ||
+      "Invalid common-term bound",
+  ),
+);
+const CommonTermProjectionValue = Schema.Struct({
+  terms: Schema.Array(CommonTerms.key).check(
+    Schema.isBetweenLength(1, 16),
+    Schema.makeFilter((terms) => new Set(terms).size === terms.length || "Duplicate common term"),
+  ),
+  partitions: Schema.Array(
+    Schema.Array(Schema.NullOr(CommonTermBound)).check(Schema.isBetweenLength(1, 16)),
+  ).check(Schema.isBetweenLength(1, 32)),
+  independent: Schema.Array(
+    Schema.Array(CommonTermBound).check(Schema.isBetweenLength(1, 128)),
+  ).check(Schema.isBetweenLength(1, 16)),
+}).check(
+  Schema.makeFilter(
+    (projection) =>
+      (projection.independent.length === projection.terms.length &&
+        projection.partitions.every((row) => row.length === projection.terms.length) &&
+        projection.terms.every((_term, index) =>
+          projection.partitions.some((row) => row[index] !== null),
+        )) ||
+      "Incomplete common-term projection",
+  ),
+);
+const encodeCommonTermProjection = Schema.encodeSync(
+  Schema.fromJsonString(CommonTermProjectionValue),
+  { disableChecks: true },
+);
+const emptyCommonTermProjectionBytes = encodeCommonTermProjection({
+  terms: [],
+  partitions: [],
+  independent: [],
+}).length;
+const commonTermBoundBytes = (bound: typeof CommonTermBound.Type) =>
+  bound.reduce((bytes, value) => bytes + String(value).length + 1, 3);
+export const CommonTermProjection = CommonTermProjectionValue.check(
+  Schema.makeFilter((projection) => {
+    const maximumBytes =
+      emptyCommonTermProjectionBytes +
+      projection.terms.reduce((bytes, term) => bytes + term.length * 6 + 3, 0) +
+      projection.partitions.reduce(
+        (bytes, row) =>
+          bytes +
+          row.reduce((total, bound) => {
+            if (bound === null) return total + 5;
+            return total + commonTermBoundBytes(bound);
+          }, 3),
+        0,
+      ) +
+      projection.independent.reduce(
+        (bytes, row) =>
+          bytes + row.reduce((total, bound) => total + commonTermBoundBytes(bound), 3),
+        0,
+      );
+    if (maximumBytes <= 4096) return true;
+    return (
+      textEncoder.encode(encodeCommonTermProjection(projection)).byteLength <= 4096 ||
+      "Common-term projection exceeds 4096 bytes"
+    );
+  }),
+);
+const BloomOffset = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
+const BloomColumn = Schema.Struct({
+  offset: BloomOffset,
+  length: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(16 * 1024 * 1024)),
+  sha256: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)),
+  offsets: Schema.Array(BloomOffset).check(Schema.isBetweenLength(2, 65)),
+}).check(
+  Schema.makeFilter(
+    (column) =>
+      (column.offsets[0] === 0 &&
+        column.offsets[column.offsets.length - 1] === column.length &&
+        column.offsets.every((offset, index) => {
+          const previous = column.offsets[index - 1];
+          return (
+            previous === undefined ||
+            (offset - previous >= 8 && offset - previous <= 16 * 1024 * 1024)
+          );
+        })) ||
+      "Invalid Bloom column offsets",
+  ),
+);
+export const BloomPack = Schema.Struct({
+  key: Schema.String.check(
+    Schema.isPattern(/^namespaces\/[a-zA-Z0-9_-]{1,64}\/bloom-packs\/[a-f0-9]{64}\.bin$/),
+  ),
+  bytes: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(32 * 1024 * 1024)),
+  segmentKeys: Schema.Array(Schema.suspend(() => SegmentRange.fields.key)).check(
+    Schema.isBetweenLength(1, 64),
+    Schema.makeFilter((keys) => new Set(keys).size === keys.length || "Duplicate Bloom pack key"),
+  ),
+  document: BloomColumn,
+  term: BloomColumn,
+}).check(
+  Schema.makeFilter(
+    (pack) =>
+      (pack.document.offset === 0 &&
+        pack.term.offset === pack.document.length &&
+        pack.term.offset + pack.term.length === pack.bytes &&
+        pack.segmentKeys.every((key) =>
+          key.startsWith(`${pack.key.split("/bloom-packs/")[0]}/segments/`),
+        ) &&
+        pack.document.offsets.length === pack.segmentKeys.length + 1 &&
+        pack.term.offsets.length === pack.segmentKeys.length + 1) ||
+      "Invalid Bloom pack layout",
+  ),
+);
+const PackedStoredRoot = LegacyPackedRoot.mapFields((fields) => ({
+  ...fields,
+  version: Schema.Literal(4),
+  commonProjections: Schema.Array(CommonTermProjection),
+  commonTermDictionaries: Schema.Array(CommonTerms),
+  eligibilityModels: Schema.Array(Schema.suspend(() => EligibilityProjection)),
+  segments: Schema.Array(
+    fields.segments.value.mapFields((segment) => ({
+      ...Struct.omit(segment, ["commonProjection", "commonTerms", "eligibility"]),
+      eligibilityIndex: Schema.NullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+      commonProjectionIndex: Schema.optional(
+        Schema.NullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+      ),
+      commonTermsIndex: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+    })),
+  ),
+}));
+const validStoredRootMetadata = (
+  root: Pick<
+    typeof PackedStoredRoot.Type,
+    "bloomPacks" | "segments" | "commonProjections" | "commonTermDictionaries" | "eligibilityModels"
+  >,
+) => {
+  const packedSegmentKeys = root.bloomPacks.flatMap((pack) => pack.segmentKeys);
+  return (
+    (new Set(packedSegmentKeys).size === packedSegmentKeys.length &&
+      root.segments.every(
+        (segment) =>
+          root.bloomPacks[segment.bloom.packIndex]?.segmentKeys[segment.bloom.row] ===
+            segment.key &&
+          (segment.commonProjectionIndex === undefined ||
+            segment.commonProjectionIndex === null ||
+            segment.commonProjectionIndex < root.commonProjections.length) &&
+          (segment.commonTermsIndex === undefined ||
+            segment.commonTermsIndex < root.commonTermDictionaries.length) &&
+          (segment.eligibilityIndex === null ||
+            segment.eligibilityIndex < root.eligibilityModels.length),
+      )) ||
+    "Invalid Root metadata reference"
+  );
+};
+export const LegacyStoredRootV4 = PackedStoredRoot.check(
+  Schema.makeFilter(validStoredRootMetadata),
+);
+export const StoredRoot = PackedStoredRoot.mapFields((fields) => ({
+  ...fields,
+  version: Schema.Literal(5),
+  segments: Schema.Array(
+    fields.segments.value
+      .mapFields((segment) => ({
+        ...segment,
+        metadataEnd: MetadataSegment.fields.metadataEnd,
+      }))
+      .check(Schema.makeFilter(validMetadataBoundary)),
+  ),
+})).check(Schema.makeFilter(validStoredRootMetadata));
+export const StoredVectorRebuildSnapshot = VectorRebuildSnapshot.mapFields((fields) => ({
+  ...fields,
+  root: StoredRoot,
+}));
+const LegacyRootV1WithoutEligibility = LegacyInlineRoot.mapFields((fields) => ({
+  ...fields,
+  segments: Schema.Array(
+    fields.segments.value.mapFields((segment) => Struct.omit(segment, ["eligibility"])),
+  ),
+}));
+export const LegacyRoot = LegacyRootV1WithoutEligibility;
+export const LegacyStoredRootV3 = LegacyInlineRoot.mapFields((fields) => ({
+  ...fields,
+  version: Schema.Literal(3),
+  commonProjections: Schema.Array(CommonTermProjection),
+  commonTermDictionaries: Schema.Array(CommonTerms),
+  eligibilityModels: Schema.Array(Schema.suspend(() => EligibilityProjection)),
+  segments: Schema.Array(
+    fields.segments.value.mapFields((segment) => ({
+      ...Struct.omit(segment, ["commonProjection", "commonTerms", "eligibility"]),
+      eligibilityIndex: Schema.NullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+      commonProjectionIndex: Schema.optional(
+        Schema.NullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+      ),
+      commonTermsIndex: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+    })),
+  ),
+})).check(
+  Schema.makeFilter(
+    (root) =>
+      root.segments.every(
+        (segment) =>
+          (segment.commonProjectionIndex === undefined ||
+            segment.commonProjectionIndex === null ||
+            segment.commonProjectionIndex < root.commonProjections.length) &&
+          (segment.commonTermsIndex === undefined ||
+            segment.commonTermsIndex < root.commonTermDictionaries.length) &&
+          (segment.eligibilityIndex === null ||
+            segment.eligibilityIndex < root.eligibilityModels.length),
+      ) || "Invalid legacy shared manifest metadata reference",
+  ),
+);
+export const LegacyStoredRoot = LegacyStoredRootV3.mapFields((fields) => ({
+  ...Struct.omit(fields, ["eligibilityModels"]),
+  version: Schema.Literal(2),
+  segments: Schema.Array(
+    fields.segments.value.mapFields((segment) => Struct.omit(segment, ["eligibilityIndex"])),
+  ),
+})).check(
+  Schema.makeFilter(
+    (root) =>
+      root.segments.every(
+        (segment) =>
+          (segment.commonProjectionIndex === undefined ||
+            segment.commonProjectionIndex === null ||
+            segment.commonProjectionIndex < root.commonProjections.length) &&
+          (segment.commonTermsIndex === undefined ||
+            segment.commonTermsIndex < root.commonTermDictionaries.length),
+      ) || "Invalid legacy shared manifest metadata reference",
+  ),
+);
+export const RootMigrationInput = Schema.Union([
+  LegacyRoot,
+  LegacyInlineRoot,
+  LegacyStoredRoot,
+  LegacyStoredRootV3,
+  LegacyStoredRootV4,
+  StoredRoot,
+]);
+export const VectorRebuildSnapshotMigrationInput = Schema.Union([
+  VectorRebuildSnapshot.mapFields((fields) => ({ ...fields, root: LegacyRoot })),
+  VectorRebuildSnapshot.mapFields((fields) => ({ ...fields, root: LegacyInlineRoot })),
+  VectorRebuildSnapshot.mapFields((fields) => ({ ...fields, root: LegacyStoredRoot })),
+  VectorRebuildSnapshot.mapFields((fields) => ({ ...fields, root: LegacyStoredRootV3 })),
+  VectorRebuildSnapshot.mapFields((fields) => ({ ...fields, root: LegacyStoredRootV4 })),
+  StoredVectorRebuildSnapshot,
+]);
+export const VECTOR_REBUILD_CHECKPOINT_BYTES = 8 * 1024 * 1024;
+export const VectorRebuildCheckpointMetadata = Schema.Struct({
+  expiresAt: Schema.NumberFromString.check(Schema.isFinite(), Schema.isGreaterThanOrEqualTo(0)),
+});
 export const TermProjection = Schema.Struct({
   dictionary: TermSummaries,
   partitions: Schema.NullOr(Schema.Array(TermSummaries).check(Schema.isBetweenLength(1, 32))),
 });
+export const CompactTermBounds = Schema.Array(
+  Schema.Tuple([
+    CommonTermProjection,
+    Schema.Array(
+      TermSummary.fields.df.check(Schema.isBetween({ minimum: 0, maximum: 10000 })),
+    ).check(Schema.isBetweenLength(1, 16)),
+  ]).check(
+    Schema.makeFilter(
+      ([projection, frequencies]) =>
+        frequencies.length === projection.terms.length || "Misaligned compact term frequencies",
+    ),
+  ),
+).check(Schema.isMaxLength(64));
 const decodeEligibilityScalar = Schema.decodeExit(Schema.fromJsonString(Scalar));
 const validatedEligibilityScalars = new Set<string>();
 const EncodedEligibilityScalar = Schema.String.check(
@@ -420,18 +791,26 @@ const EncodedEligibilityScalar = Schema.String.check(
     return true;
   }),
 );
-export const EligibilityProjection = Schema.Struct({
-  fields: Schema.Array(FieldName).check(Schema.isMaxLength(16)),
+const EligibilityProjectionValue = Schema.Struct({
+  fields: NamespaceSchema.fields.filterable.check(
+    Schema.makeFilter(
+      (fields) =>
+        fields.every((field, index) => {
+          const previous = fields[index - 1];
+          return previous === undefined || previous < field;
+        }) || "Eligibility fields must be sorted and unique",
+    ),
+  ),
   data: Schema.Union([
     Schema.Struct({
       kind: Schema.Literal("joint"),
       groups: Schema.Array(
         Schema.Tuple([
           Schema.Array(Schema.Array(EncodedEligibilityScalar).check(Schema.isMaxLength(1))).check(
-            Schema.isMaxLength(16),
+            Schema.isMaxLength(64),
           ),
-          SegmentBlock.fields.min_title_length,
-          SegmentBlock.fields.min_body_length,
+          EligibleMinimum.members[1].elements[0],
+          EligibleMinimum.members[1].elements[1],
         ]),
       ).check(Schema.isBetweenLength(1, 256)),
     }),
@@ -441,18 +820,49 @@ export const EligibilityProjection = Schema.Struct({
         Schema.Array(
           Schema.Tuple([
             Schema.NullOr(EncodedEligibilityScalar),
-            SegmentBlock.fields.min_title_length,
-            SegmentBlock.fields.min_body_length,
+            EligibleMinimum.members[1].elements[0],
+            EligibleMinimum.members[1].elements[1],
           ]),
         ).check(Schema.isBetweenLength(1, 256)),
-      ).check(Schema.isBetweenLength(1, 16)),
+      ).check(Schema.isBetweenLength(1, 64)),
     }),
   ]),
 });
+const encodeEligibilityProjection = Schema.encodeSync(
+  Schema.fromJsonString(EligibilityProjectionValue),
+);
+export const EligibilityProjection = EligibilityProjectionValue.check(
+  Schema.makeFilter((model) => {
+    if (model.fields.length === 0) return "Eligibility projection requires a field";
+    if (model.data.kind === "joint")
+      return (
+        model.data.groups.every(([values]) => values.length === model.fields.length) ||
+        "Eligibility projection omitted a field"
+      );
+    return (
+      (model.data.columns.length === model.fields.length &&
+        model.data.columns.reduce((total, column) => total + column.length, 0) <= 256) ||
+      "Eligibility projection omitted a field or exceeds its cell budget"
+    );
+  }),
+  Schema.makeFilter(
+    (model) =>
+      textEncoder.encode(encodeEligibilityProjection(model)).byteLength <= 4096 ||
+      "Eligibility projection exceeds four KiB",
+  ),
+);
 export const TermCatalog = TermProjection.mapFields((fields) => ({
   ...fields,
   minimum: EligibleMinimum,
 }));
+export const CompactMinimumTermBounds = Schema.Array(
+  Schema.Tuple([...CompactTermBounds.value.elements, EligibleMinimum]).check(
+    Schema.makeFilter(
+      ([projection, frequencies]) =>
+        frequencies.length === projection.terms.length || "Misaligned compact term frequencies",
+    ),
+  ),
+).check(Schema.isMaxLength(64));
 export const ProjectedTermCatalog = TermCatalog.mapFields((fields) => ({
   ...fields,
   eligibility: Schema.NullOr(EligibilityProjection),
@@ -481,6 +891,7 @@ export const CatalogTelemetry = Schema.Struct({
 });
 export const TermCatalogBatch = Schema.Struct({
   filterDigest: Schema.NullOr(Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/))),
+  rootFallback: Schema.Boolean,
   catalogs: Schema.Array(
     TermProjection.mapFields((fields) => ({
       ...fields,
@@ -529,13 +940,20 @@ export const OverviewBatch = Schema.Array(OverviewSource)
     ),
   );
 export const SegmentHeader = Schema.Struct({
-  version: Schema.Literal(1),
+  version: Schema.Literal(2),
   documents: Schema.NonEmptyArray(SegmentDocument),
   terms: SegmentTerms,
   total_title_length: Schema.Int,
   total_body_length: Schema.Int,
+  metadata_end: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  vector_end: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  vector_ranges: Schema.Array(DataRange),
 });
-export const LocatedDocument = Schema.Struct({ row: Schema.Int, document: SegmentDocument });
+export const LocatedDocument = Schema.Struct({
+  row: Schema.Int,
+  document: SegmentDocument,
+  vectorData: Schema.NullOr(DataRange),
+});
 export const SearchStatistics = Schema.Struct({
   documents: Schema.Int,
   title_length: Schema.Int,
@@ -551,6 +969,7 @@ export const RankingInput = Schema.Struct({
   statistics: SearchStatistics,
 });
 export const TextPlanIdentity = Schema.Struct({
+  correlatedRoot: Schema.Boolean,
   text: RankingInput.fields.text,
   mode: RankingInput.fields.mode,
   filters: RankingInput.fields.filters,
@@ -561,6 +980,7 @@ export const TextPlanIdentity = Schema.Struct({
     Schema.Struct({
       key: Root.fields.segments.value.fields.key,
       headerBytes: Root.fields.segments.value.fields.headerBytes,
+      metadataEnd: Root.fields.segments.value.fields.metadataEnd,
       minimumId: Root.fields.segments.value.fields.minimumId,
       count: Root.fields.segments.value.fields.count,
       dead: Root.fields.segments.value.fields.dead,
@@ -579,6 +999,7 @@ export const TextPlan = Schema.Struct({
       ...SegmentScoreBound.fields,
       eligible: Schema.Boolean,
       maximumMatches: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+      singleton: Schema.optional(TermSummaries),
     }),
   ),
 });
@@ -636,8 +1057,12 @@ export const TextTerms = Schema.Array(Schema.String).check(Schema.isMaxLength(51
 export const TermProjectionProps = Schema.Struct({
   bucket: Schema.String.check(Schema.isBetweenLength(1, 63)),
   terms: Schema.fromJsonString(TextTerms),
+  prefixes: Schema.optional(Schema.Array(CommonTerms).check(Schema.isBetweenLength(1, 16))),
   selection: Schema.Union([
-    Schema.Struct({ kind: Schema.Literal("fields"), fields: EligibilityProjection.fields.fields }),
+    Schema.Struct({
+      kind: Schema.Literal("fields"),
+      fields: EligibilityProjection.fields.fields.check(Schema.isMaxLength(16)),
+    }),
     Schema.Struct({ kind: Schema.Literal("filters"), filters: TermFilters }),
   ]),
   ranges: Schema.Array(TermProjectionRange).check(Schema.isBetweenLength(1, 16)),
@@ -653,6 +1078,7 @@ export const OverviewFrameMetadata = Schema.Struct({
     Schema.isBetween({ minimum: 1, maximum: 512 * 1024 }),
   ),
 });
+export const DirectoryCacheMiss = Schema.Literal("known");
 export const SegmentCacheProps = Schema.Struct({
   bucket: TermProjectionProps.fields.bucket,
   format: Schema.Literal("compact-json-v2"),
@@ -731,7 +1157,12 @@ export const RebuildResult = Schema.Struct({
   sequence: Schema.Int,
   rebuilt: Schema.Literal(true),
 });
-export const RpcCommand = Schema.Union([
+export const NamespaceRpcCommand = Schema.Union([
+  Schema.Struct({
+    namespace: NamespaceName,
+    operation: Schema.Literal("migrate-root"),
+    input: Schema.optional(Schema.Struct({})),
+  }),
   Schema.Struct({ namespace: NamespaceName, operation: Schema.Literal("write"), input: Write }),
   Schema.Struct({ namespace: NamespaceName, operation: Schema.Literal("query"), input: Query }),
   Schema.Struct({
@@ -765,8 +1196,15 @@ export const RpcCommand = Schema.Union([
     input: VectorRebuild,
   }),
 ]);
+export const RpcCommand = Schema.Union([
+  NamespaceRpcCommand,
+  Schema.Struct({
+    operation: Schema.Literal("namespaces"),
+    input: Schema.optional(NamespacesInput),
+  }),
+]);
 export const NamespaceCommand = Schema.Union([
-  RpcCommand,
+  NamespaceRpcCommand,
   Schema.Struct({
     namespace: NamespaceName,
     operation: Schema.Literal("internal-compact"),
@@ -778,7 +1216,16 @@ export const NamespaceCommand = Schema.Union([
     input: VectorMessage,
   }),
 ]);
+export const RootMigrationResult = Schema.Struct({
+  version: Schema.Literal(5),
+  sequence: Root.fields.sequence,
+  rootRewritten: Schema.Boolean,
+  migratedSnapshots: Schema.Int,
+  expiredSnapshots: Schema.Int,
+});
 export const RpcValue = Schema.Union([
+  NamespacesPage,
+  RootMigrationResult,
   QueryResult,
   WriteResult,
   Metadata,

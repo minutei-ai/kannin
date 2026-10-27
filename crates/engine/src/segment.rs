@@ -1,13 +1,14 @@
 mod binary_directory;
 
 use crate::normalize_text;
+use bit_vec::BitVec;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::rc::Rc;
 
-const MAGIC: &[u8; 8] = b"RAIOSEG1";
+const MAGIC: &[u8; 8] = b"RAIOSEG2";
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 const BLOCK_SIZE: usize = 128;
 const FILTER_CACHE_BYTES: usize = 32 * 1024;
@@ -24,7 +25,7 @@ fn compare_document_ids(left: &str, right: &str) -> Ordering {
 #[derive(Clone, Default)]
 struct FilterMasks {
     representatives: Option<(String, Box<[u16]>)>,
-    entries: VecDeque<(String, Vec<bool>, usize)>,
+    entries: VecDeque<(String, BitVec, usize)>,
     bytes: usize,
 }
 
@@ -47,7 +48,7 @@ impl FilterMasks {
 
     fn prepare_representatives(
         &mut self,
-        documents: &[DocumentMeta],
+        documents: &DocumentTable,
         fields: &BTreeSet<&str>,
     ) -> Result<(), String> {
         use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
@@ -80,21 +81,27 @@ impl FilterMasks {
             let hash = row_hasher.hash_one(sample).to_le_bytes();
             let row = usize::from(u16::from_le_bytes([hash[0], hash[1]])) % documents.len();
             observed
-                .insert(documents[row].attributes.get(), row)
+                .insert(documents.attributes.get(row).get(), row)
                 .is_some_and(|previous| previous != row)
         });
         if repeated {
             let mut raw_groups = std::collections::HashMap::new();
+            let mut shared_groups = hashbrown::HashMap::new();
             let mut groups = std::collections::HashMap::new();
             let mut group_bytes = 0;
             let mut values: BTreeMap<_, Option<serde_json::Value>> =
                 fields.iter().map(|field| (*field, None)).collect();
             let representatives = documents
-                .iter()
+                .metadata()
                 .enumerate()
                 .map(|(index, doc)| {
                     let row = u16::try_from(index).map_err(|cause| cause.to_string())?;
-                    if let Some(previous) = raw_groups.get(doc.attributes.get()) {
+                    let shared = doc.attributes.shared_identity();
+                    let previous = shared.map_or_else(
+                        || raw_groups.get(doc.attributes.get()),
+                        |key| shared_groups.get(&key),
+                    );
+                    if let Some(previous) = previous {
                         return Ok(*previous);
                     }
                     for value in values.values_mut() {
@@ -127,8 +134,11 @@ impl FilterMasks {
                     } else {
                         row
                     };
-                    if raw_groups.len() < 2048 {
-                        raw_groups.insert(doc.attributes.get(), representative);
+                    if raw_groups.len() + shared_groups.len() < 2048 {
+                        shared.map_or_else(
+                            || raw_groups.insert(doc.attributes.get(), representative),
+                            |key| shared_groups.insert(key, representative),
+                        );
                     }
                     Ok(representative)
                 })
@@ -153,25 +163,694 @@ pub struct Document {
     pub title: String,
     pub text: String,
     pub attributes: BTreeMap<String, serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "DocumentVectorSerialization::serialize_document_vector"
+    )]
     pub vector: Option<Vec<f32>>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+trait DocumentVectorSerialization {
+    fn serialize_document_vector<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>;
+}
+
+impl DocumentVectorSerialization for Option<Vec<f32>> {
+    fn serialize_document_vector<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq as _;
+
+        let Some(values) = self else {
+            return serializer.serialize_none();
+        };
+        if !values
+            .iter()
+            .any(|value| value.abs().to_bits() == f32::MAX.to_bits())
+        {
+            return values.serialize(serializer);
+        }
+        let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+        for value in values {
+            if value.abs().to_bits() == f32::MAX.to_bits() {
+                sequence.serialize_element(&f64::from(*value))?;
+            } else {
+                sequence.serialize_element(value)?;
+            }
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+struct QueryDocument<'a> {
+    #[serde(flatten)]
+    document: &'a Document,
+    #[serde(rename = "vectorSummary")]
+    vector_summary: Option<(usize, bool, bool)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct VectorFacts {
+    flags: u8,
+    dimensions: u32,
+}
+
+fn vector_facts(vector: Option<&[f32]>) -> Result<VectorFacts, String> {
+    vector.map_or(
+        Ok(VectorFacts {
+            flags: 0,
+            dimensions: 0,
+        }),
+        |values| {
+            let dimensions = u32::try_from(values.len()).map_err(|cause| cause.to_string())?;
+            let finite = values.iter().all(|value| value.is_finite());
+            let nonzero = values.iter().any(|value| *value != 0.0);
+            Ok(VectorFacts {
+                flags: 1 | (u8::from(finite) << 1) | (u8::from(nonzero) << 2),
+                dimensions,
+            })
+        },
+    )
+}
+
+fn write_vector_facts(facts: VectorFacts, output: &mut Vec<u8>) {
+    output.extend_from_slice(&[2, facts.flags]);
+    output.extend_from_slice(&facts.dimensions.to_le_bytes());
+}
+
+fn read_vector_facts(bytes: &[u8]) -> Result<(VectorFacts, &[u8]), String> {
+    if bytes.len() < 6 || bytes[0] != 2 {
+        return Err("Invalid separated document metadata prefix".into());
+    }
+    let flags = bytes[1];
+    if flags & !7 != 0 {
+        return Err("Unknown separated document vector flags".into());
+    }
+    let dimensions = u32::from_le_bytes(
+        bytes[2..6]
+            .try_into()
+            .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
+    );
+    if flags & 1 == 0 && (flags != 0 || dimensions != 0) {
+        return Err("Absent vector metadata must have zero flags and dimensions".into());
+    }
+    Ok((VectorFacts { flags, dimensions }, &bytes[6..]))
+}
+
+impl<'a> QueryDocument<'a> {
+    fn with_facts(document: &'a Document, facts: VectorFacts) -> Self {
+        Self {
+            document,
+            vector_summary: (facts.flags & 1 != 0).then_some((
+                facts.dimensions as usize,
+                facts.flags & 2 != 0,
+                facts.flags & 4 != 0,
+            )),
+        }
+    }
+}
+
+fn serialize_query_document_with_facts(
+    document: &Document,
+    facts: VectorFacts,
+) -> Result<String, String> {
+    serde_json::to_string(&QueryDocument::with_facts(document, facts))
+        .map_err(|cause| cause.to_string())
+}
+
+#[cfg(test)]
+fn serialize_query_document(document: &mut Document) -> Result<String, String> {
+    let facts = vector_facts(document.vector.as_deref())?;
+    drop(document.vector.take());
+    serialize_query_document_with_facts(document, facts)
+}
+
+struct SeparatedDocumentFrameBytes {
+    metadata: Vec<u8>,
+    vector: Option<Vec<u8>>,
+}
+
+fn split_document_frame_parts(
+    bytes: &[u8],
+    decoded: &[u8],
+    mut document: Document,
+) -> Result<SeparatedDocumentFrameBytes, String> {
+    if document.vector.is_none() {
+        drop(document);
+        return Ok(SeparatedDocumentFrameBytes {
+            metadata: bytes.to_vec(),
+            vector: None,
+        });
+    }
+    let vector_frame = document
+        .vector
+        .as_ref()
+        .map(|vector| -> Result<Vec<u8>, String> {
+            let capacity = vector
+                .len()
+                .checked_mul(size_of::<f32>())
+                .ok_or_else(|| "Vector frame size overflow".to_owned())?;
+            let mut raw = Vec::with_capacity(capacity);
+            for value in vector {
+                raw.extend_from_slice(&value.to_le_bytes());
+            }
+            let mut frame = Vec::new();
+            append(&mut frame, &raw)?;
+            Ok(frame)
+        })
+        .transpose()?;
+    let vector = document.vector.take();
+    let facts = vector_facts(vector.as_deref())?;
+    drop(vector);
+    drop(document);
+    let mut fields: BTreeMap<String, &serde_json::value::RawValue> =
+        serde_json::from_slice(decoded).map_err(|cause| cause.to_string())?;
+    if fields.remove("vector").is_none() {
+        return Err("Vector field disappeared after document validation".into());
+    }
+    let document_json = serde_json::to_vec(&fields).map_err(|cause| cause.to_string())?;
+    let mut metadata_bytes = Vec::with_capacity(6 + document_json.len());
+    write_vector_facts(facts, &mut metadata_bytes);
+    metadata_bytes.extend_from_slice(&document_json);
+    let mut metadata_frame = Vec::new();
+    append(&mut metadata_frame, &metadata_bytes)?;
+    Ok(SeparatedDocumentFrameBytes {
+        metadata: metadata_frame,
+        vector: vector_frame,
+    })
+}
+
+fn parse_document_metadata(decoded: &[u8]) -> Result<(VectorFacts, Document), String> {
+    let (facts, document_bytes) = if decoded.first() == Some(&b'{') {
+        (
+            VectorFacts {
+                flags: 0,
+                dimensions: 0,
+            },
+            decoded,
+        )
+    } else {
+        read_vector_facts(decoded)?
+    };
+    let document: Document =
+        serde_json::from_slice(document_bytes).map_err(|cause| cause.to_string())?;
+    if document.vector.is_some() {
+        return Err("Separated document metadata contains a vector".into());
+    }
+    Ok((facts, document))
+}
+
+#[doc = "# Errors\nRejects invalid metadata framing, vector summaries, or document JSON."]
+pub fn query_document_from_metadata(bytes: &[u8]) -> Result<String, String> {
+    let decoded = decode_page(bytes)?;
+    let (facts, document) = parse_document_metadata(&decoded)?;
+    drop(decoded);
+    serialize_query_document_with_facts(&document, facts)
+}
+
+#[doc = "# Errors\nRejects invalid metadata ranges, corrupt frames, or document JSON. Returns None above sixty-four KiB declared decoded bytes for scalar fallback."]
+pub fn query_documents_from_metadata(
+    bytes: &[u8],
+    ranges: &[u32],
+) -> Result<Option<String>, String> {
+    use serde::Serializer as _;
+    use serde::ser::SerializeSeq;
+
+    if ranges.is_empty() || !ranges.len().is_multiple_of(2) || ranges.len() > 32 {
+        return Err("Invalid metadata batch framing".into());
+    }
+    let frames = ranges
+        .chunks_exact(2)
+        .map(|range| {
+            let offset = usize::try_from(range[0]).map_err(|cause| cause.to_string())?;
+            let length = usize::try_from(range[1]).map_err(|cause| cause.to_string())?;
+            let end = offset
+                .checked_add(length)
+                .ok_or("Metadata range overflow")?;
+            let frame = bytes
+                .get(offset..end)
+                .ok_or("Metadata range exceeds body")?;
+            if !(8..=MAX_BYTES).contains(&frame.len()) {
+                return Err("Invalid metadata page size".into());
+            }
+            let decoded = u32::from_le_bytes(
+                frame[..4]
+                    .try_into()
+                    .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
+            ) as usize;
+            if decoded > MAX_BYTES {
+                return Err("Metadata page exceeds decoded size budget".into());
+            }
+            Ok((frame, decoded))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let decoded_bytes = frames.iter().map(|(_, decoded)| decoded).sum::<usize>();
+    if decoded_bytes > 64 * 1024 {
+        return Ok(None);
+    }
+    let mut output = Vec::with_capacity(decoded_bytes + frames.len() * 64 + 2);
+    let mut serializer = serde_json::Serializer::new(&mut output);
+    let mut sequence = (&mut serializer)
+        .serialize_seq(Some(ranges.len() / 2))
+        .map_err(|cause| cause.to_string())?;
+    let mut inflater = zlib_rs::Inflate::new(true, 15);
+    let mut decoded =
+        Vec::with_capacity(frames.iter().map(|(_, length)| *length).max().unwrap_or(0));
+    for (frame, length) in frames {
+        decoded.resize(length.max(1), 0);
+        inflater.reset(true);
+        let status = inflater.decompress(&frame[8..], &mut decoded, zlib_rs::InflateFlush::Finish);
+        if status != Ok(zlib_rs::Status::StreamEnd) || inflater.total_out() != length as u64 {
+            return Err(format!("Invalid compressed page: {status:?}"));
+        }
+        let crc = u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]);
+        if crc32fast::hash(&decoded[..length]) != crc {
+            return Err("Page integrity check failed".into());
+        }
+        let (facts, document) = parse_document_metadata(&decoded[..length])?;
+        sequence
+            .serialize_element(&QueryDocument::with_facts(&document, facts))
+            .map_err(|cause| cause.to_string())?;
+    }
+    sequence.end().map_err(|cause| cause.to_string())?;
+    String::from_utf8(output)
+        .map(Some)
+        .map_err(|cause| cause.to_string())
+}
+
+#[doc = "# Errors\nRejects mismatched or corrupt metadata and vector frames."]
+pub fn full_document_from_frames(
+    metadata_bytes: &[u8],
+    vector_bytes: &[u8],
+) -> Result<String, String> {
+    let decoded = decode_page(metadata_bytes)?;
+    let (facts, mut document) = parse_document_metadata(&decoded)?;
+    drop(decoded);
+    let vector = if vector_bytes.is_empty() {
+        None
+    } else {
+        let decoded = decode_page(vector_bytes)?;
+        let (chunks, remainder) = decoded.as_chunks::<4>();
+        if !remainder.is_empty() {
+            return Err("Vector frame length is not divisible by four".into());
+        }
+        if chunks.len() != facts.dimensions as usize {
+            return Err("Vector frame dimension mismatch".into());
+        }
+        Some(
+            chunks
+                .iter()
+                .map(|chunk| f32::from_le_bytes(*chunk))
+                .collect(),
+        )
+    };
+    let actual_facts = vector_facts(vector.as_deref())?;
+    if actual_facts != facts {
+        return Err("Vector frame does not match metadata vector summary".into());
+    }
+    document.vector = vector;
+    serde_json::to_string(&document).map_err(|cause| cause.to_string())
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Range {
     pub offset: u32,
     pub length: u32,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(untagged)]
+pub enum DocumentAttributes {
+    Owned(Box<serde_json::value::RawValue>),
+    Shared(Rc<serde_json::value::RawValue>),
+}
+
+impl<'de> Deserialize<'de> for DocumentAttributes {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Box::<serde_json::value::RawValue>::deserialize(deserializer).map(Self::Owned)
+    }
+}
+
+impl DocumentAttributes {
+    fn shared_identity(&self) -> Option<*const ()> {
+        match self {
+            Self::Shared(value) => Some(Rc::as_ptr(value).cast::<()>()),
+            Self::Owned(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn get(&self) -> &str {
+        self.as_ref().get()
+    }
+}
+
+impl AsRef<serde_json::value::RawValue> for DocumentAttributes {
+    fn as_ref(&self) -> &serde_json::value::RawValue {
+        match self {
+            Self::Owned(value) => value,
+            Self::Shared(value) => value,
+        }
+    }
+}
+
+impl From<Box<serde_json::value::RawValue>> for DocumentAttributes {
+    fn from(value: Box<serde_json::value::RawValue>) -> Self {
+        Self::Owned(value)
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
-pub struct DocumentMeta {
-    pub id: String,
+pub struct DocumentMeta<Id = Box<str>, Attributes = DocumentAttributes, Length = u32, Vector = bool>
+{
+    pub id: Id,
     pub revision: u64,
-    pub title_length: u32,
-    pub body_length: u32,
-    pub attributes: Box<serde_json::value::RawValue>,
+    pub title_length: Length,
+    pub body_length: Length,
+    pub attributes: Attributes,
     pub data: Range,
-    pub vector: bool,
+    pub vector: Vector,
+}
+
+#[derive(Clone)]
+enum ScalarColumn<T> {
+    Constant { value: T, len: usize },
+    Dense(Vec<T>),
+}
+
+impl<T: Copy + PartialEq> ScalarColumn<T> {
+    const fn new() -> Self {
+        Self::Dense(Vec::new())
+    }
+
+    fn push(&mut self, value: T, capacity: usize) {
+        self.push_charged(value, capacity, |_| Ok::<(), std::convert::Infallible>(()))
+            .unwrap_or_else(|never| match never {});
+    }
+
+    fn push_charged<E>(
+        &mut self,
+        value: T,
+        capacity: usize,
+        charge: impl FnOnce(usize) -> Result<(), E>,
+    ) -> Result<(), E> {
+        match self {
+            Self::Constant { value: first, len } if *first == value => *len += 1,
+            Self::Constant { value: first, len } => {
+                charge(capacity * size_of::<T>())?;
+                let mut values = Vec::with_capacity(capacity);
+                values.resize(*len, *first);
+                values.push(value);
+                *self = Self::Dense(values);
+            }
+            Self::Dense(values) if values.is_empty() => *self = Self::Constant { value, len: 1 },
+            Self::Dense(values) => values.push(value),
+        }
+        Ok(())
+    }
+
+    const fn len(&self) -> usize {
+        match self {
+            Self::Constant { len, .. } => *len,
+            Self::Dense(values) => values.len(),
+        }
+    }
+
+    #[inline]
+    fn get(&self, index: usize) -> T {
+        match self {
+            Self::Constant { value, len } => {
+                assert!(index < *len);
+                *value
+            }
+            Self::Dense(values) => values[index],
+        }
+    }
+
+    fn iter(&self) -> impl ExactSizeIterator<Item = T> + DoubleEndedIterator {
+        (0..self.len()).map(|index| self.get(index))
+    }
+
+    const fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Constant { .. } => 0,
+            Self::Dense(values) => values.capacity() * size_of::<T>(),
+        }
+    }
+
+    fn shrink_to_fit(&mut self) {
+        if let Self::Dense(values) = self {
+            values.shrink_to_fit();
+        }
+    }
+
+    #[cfg(test)]
+    fn set(&mut self, index: usize, value: T) {
+        if let Self::Constant { value: first, len } = self {
+            *self = Self::Dense(vec![*first; *len]);
+        }
+        if let Self::Dense(values) = self {
+            values[index] = value;
+        }
+    }
+}
+
+#[derive(Clone)]
+enum AttributeColumn {
+    Dense(Vec<DocumentAttributes>),
+    Dictionary {
+        values: Vec<DocumentAttributes>,
+        indexes: Vec<u16>,
+        counts: Vec<u16>,
+    },
+}
+
+impl AttributeColumn {
+    fn validate_expansion(&self, maximum: usize) -> Result<(), String> {
+        let failure = "Directory attributes exceed canonical size budget";
+        let mut remaining = maximum;
+        match self {
+            Self::Dense(values) => {
+                for value in values {
+                    remaining = remaining.checked_sub(value.get().len()).ok_or(failure)?;
+                }
+            }
+            Self::Dictionary { values, counts, .. } => {
+                for (value, count) in values.iter().zip(counts) {
+                    let bytes = value
+                        .get()
+                        .len()
+                        .checked_mul(usize::from(*count))
+                        .ok_or(failure)?;
+                    remaining = remaining.checked_sub(bytes).ok_or(failure)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn dense_mut(&mut self) -> &mut Vec<DocumentAttributes> {
+        match self {
+            Self::Dense(values) => values,
+            Self::Dictionary {
+                values, indexes, ..
+            } => {
+                let dense = indexes
+                    .iter()
+                    .map(|index| values[usize::from(*index)].clone())
+                    .collect();
+                *self = Self::Dense(dense);
+                self.dense_mut()
+            }
+        }
+    }
+
+    fn get(&self, row: usize) -> &DocumentAttributes {
+        match self {
+            Self::Dense(values) => &values[row],
+            Self::Dictionary {
+                values, indexes, ..
+            } => &values[usize::from(indexes[row])],
+        }
+    }
+    fn heap_bytes(&self) -> usize {
+        let (values, indexes) = match self {
+            Self::Dense(values) => (values, 0),
+            Self::Dictionary {
+                values,
+                indexes,
+                counts,
+            } => (
+                values,
+                (indexes.capacity() + counts.capacity()) * size_of::<u16>(),
+            ),
+        };
+        values.capacity() * size_of::<DocumentAttributes>()
+            + values
+                .iter()
+                .map(|value| value.get().len() + 16)
+                .sum::<usize>()
+            + indexes
+    }
+    fn shrink_to_fit(&mut self) {
+        match self {
+            Self::Dense(values) => values.shrink_to_fit(),
+            Self::Dictionary {
+                values,
+                indexes,
+                counts,
+            } => {
+                values.shrink_to_fit();
+                indexes.shrink_to_fit();
+                counts.shrink_to_fit();
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct DocumentTable {
+    ids: String,
+    rows: Vec<DocumentMeta<std::ops::Range<usize>, (), (), ()>>,
+    title_lengths: ScalarColumn<u32>,
+    body_lengths: ScalarColumn<u32>,
+    vectors: ScalarColumn<bool>,
+    attributes: AttributeColumn,
+}
+
+impl DocumentTable {
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.rows.len()
+    }
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        self.rows.capacity()
+    }
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+    #[must_use]
+    pub fn row(&self, index: usize) -> DocumentMeta<&str, &DocumentAttributes> {
+        let row = &self.rows[index];
+        DocumentMeta {
+            id: &self.ids[row.id.clone()],
+            revision: row.revision,
+            title_length: self.title_lengths.get(index),
+            body_length: self.body_lengths.get(index),
+            attributes: self.attributes.get(index),
+            data: row.data.clone(),
+            vector: self.vectors.get(index),
+        }
+    }
+    #[must_use]
+    fn get(&self, index: usize) -> Option<DocumentMeta<&str, &DocumentAttributes>> {
+        self.rows.get(index).map(|_| self.row(index))
+    }
+    #[cfg(any(test, target_arch = "wasm32"))]
+    fn first(&self) -> Option<DocumentMeta<&str, &DocumentAttributes>> {
+        self.get(0)
+    }
+    #[must_use]
+    pub fn iter(
+        &self,
+    ) -> impl ExactSizeIterator<Item = DocumentMeta<&str, &DocumentAttributes>> + DoubleEndedIterator
+    {
+        (0..self.len()).map(|index| self.row(index))
+    }
+    #[cfg(target_arch = "wasm32")]
+    fn find_id(&self, id: &str) -> Result<usize, usize> {
+        self.rows
+            .binary_search_by(|row| compare_document_ids(&self.ids[row.id.clone()], id))
+    }
+    fn metadata(
+        &self,
+    ) -> impl ExactSizeIterator<Item = DocumentMeta<std::ops::Range<usize>, &DocumentAttributes>>
+    + DoubleEndedIterator {
+        self.rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| DocumentMeta {
+                id: row.id.clone(),
+                revision: row.revision,
+                title_length: self.title_lengths.get(index),
+                body_length: self.body_lengths.get(index),
+                attributes: self.attributes.get(index),
+                data: row.data.clone(),
+                vector: self.vectors.get(index),
+            })
+    }
+    fn lengths(&self) -> impl ExactSizeIterator<Item = (u32, u32)> + DoubleEndedIterator {
+        self.title_lengths.iter().zip(self.body_lengths.iter())
+    }
+    fn shrink_to_fit(&mut self) {
+        self.ids.shrink_to_fit();
+        self.rows.shrink_to_fit();
+        self.attributes.shrink_to_fit();
+        self.title_lengths.shrink_to_fit();
+        self.body_lengths.shrink_to_fit();
+        self.vectors.shrink_to_fit();
+    }
+}
+
+impl From<Vec<DocumentMeta>> for DocumentTable {
+    fn from(documents: Vec<DocumentMeta>) -> Self {
+        let mut ids =
+            String::with_capacity(documents.iter().map(|document| document.id.len()).sum());
+        let mut attributes = Vec::with_capacity(documents.len());
+        let count = documents.len();
+        let mut title_lengths = ScalarColumn::new();
+        let mut body_lengths = ScalarColumn::new();
+        let mut vectors = ScalarColumn::new();
+        let rows = documents
+            .into_iter()
+            .map(|document| {
+                let start = ids.len();
+                ids.push_str(&document.id);
+                let end = ids.len();
+                attributes.push(document.attributes);
+                title_lengths.push(document.title_length, count);
+                body_lengths.push(document.body_length, count);
+                vectors.push(document.vector, count);
+                DocumentMeta {
+                    id: start..end,
+                    revision: document.revision,
+                    title_length: (),
+                    body_length: (),
+                    attributes: (),
+                    data: document.data,
+                    vector: (),
+                }
+            })
+            .collect();
+        Self {
+            ids,
+            rows,
+            attributes: AttributeColumn::Dense(attributes),
+            title_lengths,
+            body_lengths,
+            vectors,
+        }
+    }
+}
+
+impl Serialize for DocumentTable {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.iter())
+    }
+}
+
+impl<'de> Deserialize<'de> for DocumentTable {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Vec::<DocumentMeta>::deserialize(deserializer).map(Self::from)
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -305,10 +984,15 @@ pub struct Header {
     #[serde(skip)]
     filter_masks: RefCell<FilterMasks>,
     pub version: u32,
-    pub documents: Vec<DocumentMeta>,
+    pub documents: DocumentTable,
     pub terms: TermDictionary,
     pub total_title_length: u64,
     pub total_body_length: u64,
+    pub metadata_end: u32,
+    pub vector_end: u32,
+    pub vector_ranges: Vec<Range>,
+    #[serde(skip)]
+    vector_prefix: Vec<u32>,
 }
 
 impl<'de> Deserialize<'de> for TermDictionary {
@@ -508,15 +1192,114 @@ impl<'de> serde::de::Visitor<'de> for FilterAttributes<'_, '_> {
     }
 }
 
+fn vector_prefix(documents: &DocumentTable) -> Result<Vec<u32>, String> {
+    let mut prefix = Vec::with_capacity(documents.len().div_ceil(64));
+    let mut count = 0_u32;
+    for (index, vector) in documents.vectors.iter().enumerate() {
+        if index % 64 == 0 {
+            prefix.push(count);
+        }
+        count = count
+            .checked_add(u32::from(vector))
+            .ok_or("Vector count overflow")?;
+    }
+    Ok(prefix)
+}
+
+fn validate_columns(header: &Header) -> Result<(), String> {
+    if header.metadata_end > header.vector_end || header.vector_end as usize > MAX_BYTES {
+        return Err("Invalid segment column boundaries".into());
+    }
+    let mut cursor = 0_u32;
+    for document in &header.documents.rows {
+        if document.data.offset != cursor || document.data.length < 8 {
+            return Err("Document frames do not partition the metadata column".into());
+        }
+        cursor = cursor
+            .checked_add(document.data.length)
+            .ok_or("Metadata range overflow")?;
+    }
+    if cursor != header.metadata_end {
+        return Err("Metadata column does not match document ranges".into());
+    }
+    if header.vector_ranges.len()
+        != header
+            .documents
+            .vectors
+            .iter()
+            .filter(|vector| *vector)
+            .count()
+    {
+        return Err("Vector column count does not match document presence".into());
+    }
+    for range in &header.vector_ranges {
+        if range.offset != cursor || range.length < 8 {
+            return Err("Vector frames do not partition the vector column".into());
+        }
+        cursor = cursor
+            .checked_add(range.length)
+            .ok_or("Vector range overflow")?;
+    }
+    if cursor != header.vector_end {
+        return Err("Vector column does not match vector ranges".into());
+    }
+    for term in header.terms.values() {
+        for block in &term.blocks {
+            let end = block
+                .data
+                .offset
+                .checked_add(block.data.length)
+                .ok_or("Posting range overflow")?;
+            if block.data.offset < header.vector_end
+                || block.data.length < 8
+                || end as usize > MAX_BYTES
+            {
+                return Err(
+                    "Posting block overlaps document columns or exceeds segment budget".into(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Header {
-    #[must_use]
-    pub fn heap_bytes(&self) -> usize {
-        let documents = self.documents.capacity() * size_of::<DocumentMeta>()
+    #[doc = "# Errors\nRejects missing rows or inconsistent vector references."]
+    pub fn vector_range(&self, row: usize) -> Result<Option<&Range>, String> {
+        self.documents.rows.get(row).ok_or("Invalid row")?;
+        if !self.documents.vectors.get(row) {
+            return Ok(None);
+        }
+        let start = row / 64 * 64;
+        let base = self
+            .vector_prefix
+            .get(row / 64)
+            .copied()
+            .ok_or("Missing vector prefix")? as usize;
+        let index = base
             + self
                 .documents
+                .vectors
                 .iter()
-                .map(|doc| doc.id.capacity() + doc.attributes.get().len() + 32)
-                .sum::<usize>();
+                .skip(start)
+                .take(row - start)
+                .filter(|vector| *vector)
+                .count();
+        self.vector_ranges
+            .get(index)
+            .map(Some)
+            .ok_or_else(|| "Missing vector range".into())
+    }
+
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        let documents = self.documents.rows.capacity()
+            * size_of::<DocumentMeta<std::ops::Range<usize>, (), (), ()>>()
+            + self.documents.ids.capacity()
+            + self.documents.attributes.heap_bytes()
+            + self.documents.title_lengths.heap_bytes()
+            + self.documents.body_lengths.heap_bytes()
+            + self.documents.vectors.heap_bytes();
         let terms = self.terms.entries.len() * size_of::<(std::ops::Range<usize>, TermMeta)>()
             + self.terms.text.len()
             + 16
@@ -525,7 +1308,13 @@ impl Header {
                 .values()
                 .map(|meta| meta.blocks.len() * size_of::<BlockMeta>())
                 .sum::<usize>();
-        documents + terms + size_of::<Self>() + 32 + FILTER_CACHE_BYTES
+        documents
+            + terms
+            + self.vector_ranges.capacity() * size_of::<Range>()
+            + self.vector_prefix.capacity() * size_of::<u32>()
+            + size_of::<Self>()
+            + 32
+            + FILTER_CACHE_BYTES
     }
 
     fn compact_json(&self) -> Result<Vec<u8>, String> {
@@ -535,6 +1324,9 @@ impl Header {
             DirectoryTerms(&self.terms),
             self.total_title_length,
             self.total_body_length,
+            self.metadata_end,
+            self.vector_end,
+            DirectoryRanges(&self.vector_ranges),
         ))
         .map_err(|cause| cause.to_string())
     }
@@ -563,21 +1355,23 @@ impl Header {
         let allowed = self.allowed(filters, &[])?;
         Ok(self
             .documents
-            .iter()
-            .zip(&allowed)
-            .filter(|(_, allowed)| **allowed)
-            .fold(None, |minimum, (document, _)| match minimum {
-                Some((title, body)) => Some((
-                    u32::min(title, document.title_length),
-                    u32::min(body, document.body_length),
-                )),
-                None => Some((document.title_length, document.body_length)),
-            }))
+            .lengths()
+            .zip(allowed.iter())
+            .filter(|(_, allowed)| *allowed)
+            .fold(
+                None,
+                |minimum, ((title_length, body_length), _)| match minimum {
+                    Some((title, body)) => {
+                        Some((u32::min(title, title_length), u32::min(body, body_length)))
+                    }
+                    None => Some((title_length, body_length)),
+                },
+            ))
     }
 
-    fn allowed(&self, filters: &[Filter], dead: &[u32]) -> Result<Vec<bool>, String> {
+    fn allowed(&self, filters: &[Filter], dead: &[u32]) -> Result<BitVec, String> {
         let mut allowed = if filters.is_empty() {
-            vec![true; self.documents.len()]
+            BitVec::from_elem(self.documents.len(), true)
         } else {
             let key = serde_json::to_string(filters).map_err(|cause| cause.to_string())?;
             let cached = self
@@ -590,7 +1384,7 @@ impl Header {
             if let Some(mask) = cached {
                 mask
             } else {
-                let mut allowed = vec![true; self.documents.len()];
+                let mut allowed = BitVec::from_elem(self.documents.len(), true);
                 let fields: BTreeSet<_> =
                     filters.iter().map(|filter| filter.field.as_str()).collect();
                 let mut values: BTreeMap<_, Option<serde_json::Value>> =
@@ -599,11 +1393,12 @@ impl Header {
                     .borrow_mut()
                     .prepare_representatives(&self.documents, &fields)?;
                 let cache = self.filter_masks.borrow();
-                for (index, doc) in self.documents.iter().enumerate() {
+                for (index, doc) in self.documents.metadata().enumerate() {
                     if let Some((_, representatives)) = &cache.representatives {
                         let representative = usize::from(representatives[index]);
                         if representative != index {
-                            allowed[index] = allowed[representative];
+                            let representative_allowed = allowed[representative];
+                            allowed.set(index, representative_allowed);
                             continue;
                         }
                     }
@@ -624,13 +1419,13 @@ impl Header {
                         if !filter
                             .matches(values.get(filter.field.as_str()).and_then(Option::as_ref))?
                         {
-                            allowed[index] = false;
+                            allowed.set(index, false);
                             break;
                         }
                     }
                 }
                 drop(cache);
-                let bytes = key.capacity() + allowed.capacity() + 128;
+                let bytes = key.capacity() + allowed.capacity().div_ceil(8) + 128;
                 let mut cache = self.filter_masks.borrow_mut();
                 if cache.reserve(bytes) {
                     cache.bytes += bytes;
@@ -640,9 +1435,10 @@ impl Header {
             }
         };
         for row in dead {
-            *allowed
-                .get_mut(*row as usize)
-                .ok_or("Invalid deleted row")? = false;
+            if *row as usize >= allowed.len() {
+                return Err("Invalid deleted row".into());
+            }
+            allowed.set(*row as usize, false);
         }
         Ok(allowed)
     }
@@ -651,6 +1447,135 @@ impl Header {
 pub struct BuiltSegment {
     pub header: Header,
     pub bytes: Vec<u8>,
+    pub common_projection: Option<String>,
+}
+
+type TermBound = (u32, u32, u32, u32);
+
+fn summary_bounds(blocks: &[BlockMeta]) -> Vec<TermBound> {
+    let mut bounds: Vec<_> = blocks
+        .iter()
+        .map(|block| {
+            (
+                block.max_title_tf,
+                block.max_body_tf,
+                block.min_title_length,
+                block.min_body_length,
+            )
+        })
+        .collect();
+    bounds.sort_unstable();
+    bounds.dedup();
+    bounds
+}
+
+#[derive(Deserialize, Serialize)]
+struct CommonTermProjection {
+    terms: Vec<String>,
+    partitions: Vec<Vec<Option<TermBound>>>,
+    independent: Vec<Vec<TermBound>>,
+}
+
+impl CommonTermProjection {
+    fn encode(mut self, header: &Header) -> Result<Option<String>, String> {
+        self.independent = self
+            .terms
+            .iter()
+            .map(|term| {
+                header
+                    .terms
+                    .get(term)
+                    .map(|metadata| summary_bounds(&metadata.blocks))
+                    .ok_or_else(|| "Missing common-term metadata".to_owned())
+            })
+            .collect::<Result<_, _>>()?;
+        let encoded = serde_json::to_string(&self).map_err(|cause| cause.to_string())?;
+        if encoded.len() > 4096 {
+            return Ok(None);
+        }
+        Ok(Some(encoded))
+    }
+}
+
+fn common_term_names<'a>(terms: impl Iterator<Item = (&'a str, usize)>) -> Vec<&'a str> {
+    let mut entries: Vec<_> = terms
+        .filter(|(term, df)| *df > 1 && term.len() <= 64)
+        .collect();
+    if entries.len() > 16 {
+        entries.select_nth_unstable_by(16, |left, right| {
+            right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0))
+        });
+        entries.truncate(16);
+    }
+    let mut names: Vec<_> = entries.into_iter().map(|(term, _)| term).collect();
+    names.sort_unstable();
+    names
+}
+
+fn common_term_projection(
+    metadata: &DocumentTable,
+    lists: &BTreeMap<String, Vec<Posting>>,
+) -> Result<Option<CommonTermProjection>, String> {
+    let terms = common_term_names(
+        lists
+            .iter()
+            .map(|(term, postings)| (term.as_str(), postings.len())),
+    );
+    if terms.is_empty() {
+        return Ok(None);
+    }
+    let lengths: BTreeSet<_> = metadata.lengths().collect();
+    let partition_count = lengths.len().min(32);
+    let groups: BTreeMap<_, _> = lengths
+        .iter()
+        .enumerate()
+        .map(|(index, pair)| (*pair, index * partition_count / lengths.len()))
+        .collect();
+    let row_groups: Vec<_> = metadata
+        .lengths()
+        .map(|pair| {
+            groups
+                .get(&pair)
+                .copied()
+                .ok_or_else(|| "Missing common-term projection group".to_owned())
+        })
+        .collect::<Result<_, _>>()?;
+    let mut partitions = vec![vec![None; terms.len()]; partition_count];
+    for (column, term) in terms.iter().enumerate() {
+        let postings = lists
+            .get(*term)
+            .ok_or_else(|| "Missing common-term postings".to_owned())?;
+        for posting in postings {
+            let row = usize::try_from(posting.row).map_err(|cause| cause.to_string())?;
+            let document = metadata
+                .get(row)
+                .ok_or_else(|| "Invalid common-term posting row".to_owned())?;
+            let group = *row_groups
+                .get(row)
+                .ok_or_else(|| "Missing common-term posting group".to_owned())?;
+            let title_tf = u32::try_from(posting.title.len()).map_err(|cause| cause.to_string())?;
+            let body_tf = u32::try_from(posting.body.len()).map_err(|cause| cause.to_string())?;
+            let bound = partitions
+                .get_mut(group)
+                .and_then(|partition| partition.get_mut(column))
+                .ok_or_else(|| "Invalid common-term projection cell".to_owned())?;
+            let value = bound.get_or_insert((
+                title_tf,
+                body_tf,
+                document.title_length,
+                document.body_length,
+            ));
+            value.0 = value.0.max(title_tf);
+            value.1 = value.1.max(body_tf);
+            value.2 = value.2.min(document.title_length);
+            value.3 = value.3.min(document.body_length);
+        }
+    }
+    Ok(Some(CommonTermProjection {
+        terms: terms.iter().map(|term| (*term).to_owned()).collect(),
+        partitions,
+        independent: Vec::new(),
+    }))
 }
 
 fn append(payload: &mut Vec<u8>, data: &[u8]) -> Result<Range, String> {
@@ -876,6 +1801,23 @@ impl PostingRow for FrequencyPosting {
     }
 }
 
+fn merge_hot_rows<T: PostingRow>(
+    list: &mut Vec<T>,
+    rows: impl Iterator<Item = T>,
+) -> Result<(), String> {
+    list.extend(rows);
+    list.sort_unstable_by_key(PostingRow::row);
+    for pair in list.windows(2) {
+        if pair[0].row() == pair[1].row()
+            && (pair[0].counts() != pair[1].counts() || pair[0].positions() != pair[1].positions())
+        {
+            return Err("Conflicting common posting row".into());
+        }
+    }
+    list.dedup_by_key(|row| row.row());
+    Ok(())
+}
+
 fn validate_posting(
     header: &Header,
     row: u32,
@@ -900,7 +1842,7 @@ fn validate_posting(
 
 fn encode_terms(
     payload: &mut Vec<u8>,
-    metadata: &[DocumentMeta],
+    metadata: &DocumentTable,
     lists: BTreeMap<String, Vec<Posting>>,
 ) -> Result<TermDictionary, String> {
     let mut terms = Vec::with_capacity(lists.len());
@@ -930,12 +1872,12 @@ fn encode_terms(
                 .map_err(|cause| cause.to_string())?,
                 min_title_length: chunk
                     .iter()
-                    .map(|p| metadata[p.row as usize].title_length)
+                    .map(|p| metadata.title_lengths.get(p.row as usize))
                     .min()
                     .ok_or("Empty posting block")?,
                 min_body_length: chunk
                     .iter()
-                    .map(|p| metadata[p.row as usize].body_length)
+                    .map(|p| metadata.body_lengths.get(p.row as usize))
                     .min()
                     .ok_or("Empty posting block")?,
                 data,
@@ -972,6 +1914,99 @@ fn filterable_fields(names: &[String]) -> Result<BTreeSet<&str>, String> {
     Ok(selected)
 }
 
+fn finish_document_columns(
+    payload: &mut Vec<u8>,
+    vectors: &[u8],
+    vector_ranges: &mut [Range],
+) -> Result<(u32, u32), String> {
+    let metadata_end = u32::try_from(payload.len()).map_err(|cause| cause.to_string())?;
+    if payload
+        .len()
+        .checked_add(vectors.len())
+        .is_none_or(|length| length > MAX_BYTES)
+    {
+        return Err("Document columns exceed segment budget".into());
+    }
+    for range in vector_ranges {
+        range.offset = range
+            .offset
+            .checked_add(metadata_end)
+            .ok_or("Vector offset overflow")?;
+    }
+    payload.extend_from_slice(vectors);
+    Ok((
+        metadata_end,
+        u32::try_from(payload.len()).map_err(|cause| cause.to_string())?,
+    ))
+}
+
+fn append_document_columns(
+    document: &mut Document,
+    payload: &mut Vec<u8>,
+    vector_payload: &mut Vec<u8>,
+    vector_ranges: &mut Vec<Range>,
+) -> Result<Range, String> {
+    let vector = document.vector.take();
+    let facts = vector_facts(vector.as_deref())?;
+    let json = serde_json::to_vec(&document).map_err(|cause| cause.to_string())?;
+    let data = if let Some(values) = &vector {
+        let mut metadata_bytes = Vec::with_capacity(6 + json.len());
+        write_vector_facts(facts, &mut metadata_bytes);
+        metadata_bytes.extend_from_slice(&json);
+        let data = append(payload, &metadata_bytes)?;
+        let mut raw = Vec::with_capacity(values.len() * size_of::<f32>());
+        for value in values {
+            raw.extend_from_slice(&value.to_le_bytes());
+        }
+        vector_ranges.push(append(vector_payload, &raw)?);
+        data
+    } else {
+        append(payload, &json)?
+    };
+    document.vector = vector;
+    Ok(data)
+}
+
+fn index_document_postings(
+    document: &Document,
+    row: u32,
+    lists: &mut BTreeMap<String, Vec<Posting>>,
+) -> Result<(u32, u32), String> {
+    let title = normalize_text(&document.title);
+    let body = normalize_text(&document.text);
+    let title_tokens: Vec<_> = title.split_whitespace().collect();
+    let body_tokens: Vec<_> = body.split_whitespace().collect();
+    let mut frequencies: BTreeMap<&str, Posting> = BTreeMap::new();
+    for (field, tokens) in [title_tokens.as_slice(), body_tokens.as_slice()]
+        .iter()
+        .enumerate()
+    {
+        for (position, token) in tokens.iter().enumerate() {
+            let posting = frequencies.entry(token).or_insert_with(|| Posting {
+                row,
+                title: Vec::new(),
+                body: Vec::new(),
+            });
+            if field == 0 {
+                posting
+                    .title
+                    .push(u32::try_from(position).map_err(|cause| cause.to_string())?);
+            } else {
+                posting
+                    .body
+                    .push(u32::try_from(position).map_err(|cause| cause.to_string())?);
+            }
+        }
+    }
+    for (term, posting) in frequencies {
+        lists.entry(term.into()).or_default().push(posting);
+    }
+    Ok((
+        u32::try_from(title_tokens.len()).map_err(|cause| cause.to_string())?,
+        u32::try_from(body_tokens.len()).map_err(|cause| cause.to_string())?,
+    ))
+}
+
 #[doc = "# Errors\nRejects empty or duplicate documents, invalid field declarations, wire-size overflow, serialization errors, and segments beyond the size budget."]
 pub fn build(
     mut documents: Vec<Document>,
@@ -990,44 +2025,22 @@ pub fn build(
     }
     let mut payload = Vec::new();
     let mut metadata = Vec::with_capacity(documents.len());
+    let mut vector_payload = Vec::new();
+    let mut vector_ranges = Vec::new();
     let mut lists: BTreeMap<String, Vec<Posting>> = BTreeMap::new();
     let mut total_title_length = 0;
     let mut total_body_length = 0;
-    for (index, document) in documents.iter().enumerate() {
+    for (index, document) in documents.iter_mut().enumerate() {
         let row = u32::try_from(index).map_err(|cause| cause.to_string())?;
-        let title = normalize_text(&document.title);
-        let body = normalize_text(&document.text);
-        let title_tokens: Vec<_> = title.split_whitespace().collect();
-        let body_tokens: Vec<_> = body.split_whitespace().collect();
-        total_title_length += title_tokens.len() as u64;
-        total_body_length += body_tokens.len() as u64;
-        let mut frequencies: BTreeMap<&str, Posting> = BTreeMap::new();
-        for (field, tokens) in [title_tokens.as_slice(), body_tokens.as_slice()]
-            .iter()
-            .enumerate()
-        {
-            for (position, token) in tokens.iter().enumerate() {
-                let posting = frequencies.entry(token).or_insert_with(|| Posting {
-                    row,
-                    title: Vec::new(),
-                    body: Vec::new(),
-                });
-                if field == 0 {
-                    posting
-                        .title
-                        .push(u32::try_from(position).map_err(|cause| cause.to_string())?);
-                } else {
-                    posting
-                        .body
-                        .push(u32::try_from(position).map_err(|cause| cause.to_string())?);
-                }
-            }
-        }
-        for (term, posting) in frequencies {
-            lists.entry(term.into()).or_default().push(posting);
-        }
-        let json = serde_json::to_vec(document).map_err(|e| e.to_string())?;
-        let data = append(&mut payload, &json)?;
+        let (title_length, body_length) = index_document_postings(document, row, &mut lists)?;
+        total_title_length += u64::from(title_length);
+        total_body_length += u64::from(body_length);
+        let data = append_document_columns(
+            document,
+            &mut payload,
+            &mut vector_payload,
+            &mut vector_ranges,
+        )?;
         let attributes = filterable
             .as_ref()
             .map_or_else(
@@ -1044,26 +2057,180 @@ pub fn build(
             )
             .map_err(|cause| cause.to_string())?;
         metadata.push(DocumentMeta {
-            id: document.id.clone(),
+            id: document.id.clone().into_boxed_str(),
             revision: document.revision,
-            title_length: u32::try_from(title_tokens.len()).map_err(|cause| cause.to_string())?,
-            body_length: u32::try_from(body_tokens.len()).map_err(|cause| cause.to_string())?,
-            attributes,
+            title_length,
+            body_length,
+            attributes: attributes.into(),
             data,
             vector: document.vector.is_some(),
         });
     }
+    let metadata = DocumentTable::from(metadata);
+    let common_projection = common_term_projection(&metadata, &lists)?;
+    let (metadata_end, vector_end) =
+        finish_document_columns(&mut payload, &vector_payload, &mut vector_ranges)?;
+    drop(vector_payload);
     let terms = encode_terms(&mut payload, &metadata, lists)?;
+    let vector_prefix = vector_prefix(&metadata)?;
     let header = Header {
         filter_masks: RefCell::default(),
-        version: 1,
+        version: 2,
         documents: metadata,
         terms,
         total_title_length,
         total_body_length,
+        metadata_end,
+        vector_end,
+        vector_ranges,
+        vector_prefix,
     };
+    let common_projection = common_projection
+        .map(|projection| projection.encode(&header))
+        .transpose()?
+        .flatten();
     let bytes = header.encode(&payload)?;
-    Ok(BuiltSegment { header, bytes })
+    Ok(BuiltSegment {
+        header,
+        bytes,
+        common_projection,
+    })
+}
+
+#[derive(Serialize, Deserialize)]
+struct LegacySegmentHeader {
+    version: u32,
+    documents: Vec<DocumentMeta>,
+    terms: TermDictionary,
+    total_title_length: u64,
+    total_body_length: u64,
+}
+
+fn parse_legacy_segment(bytes: &[u8]) -> Result<(LegacySegmentHeader, usize), String> {
+    if bytes.len() < 16 || bytes.len() > MAX_BYTES || &bytes[..8] != b"RAIOSEG1" {
+        return Err("Migration requires one bounded v1 segment".into());
+    }
+    let length = u32::from_le_bytes(
+        bytes[8..12]
+            .try_into()
+            .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
+    ) as usize;
+    let expected_crc = u32::from_le_bytes(
+        bytes[12..16]
+            .try_into()
+            .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
+    );
+    let json = bytes
+        .get(16..16 + length)
+        .ok_or("Truncated legacy header")?;
+    if crc32fast::hash(json) != expected_crc {
+        return Err("Legacy header checksum mismatch".into());
+    }
+    let legacy: LegacySegmentHeader =
+        serde_json::from_slice(json).map_err(|cause| cause.to_string())?;
+    if legacy.version != 1 || legacy.documents.is_empty() || legacy.documents.len() > 10000 {
+        return Err("Invalid legacy segment version or document count".into());
+    }
+    Ok((legacy, 16 + length))
+}
+
+#[doc = "# Errors\nRejects invalid legacy segments, corrupt documents or postings, and converted segments above sixteen MiB."]
+pub fn migrate_segment(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let (legacy, base) = parse_legacy_segment(bytes)?;
+    let source = bytes.get(base..).ok_or("Truncated legacy payload")?;
+    let mut metadata = Vec::with_capacity(legacy.documents.len());
+    let mut payload = Vec::new();
+    let mut vectors = Vec::new();
+    let mut vector_ranges = Vec::new();
+    let mut source_end = 0_u32;
+    for mut row in legacy.documents {
+        if row.data.offset != source_end || row.data.length < 8 {
+            return Err("Legacy document frames do not partition their prefix".into());
+        }
+        source_end = source_end
+            .checked_add(row.data.length)
+            .ok_or("Legacy document range overflow")?;
+        let frame = source
+            .get(row.data.offset as usize..source_end as usize)
+            .ok_or("Truncated legacy document")?;
+        let decoded = decode_page(frame)?;
+        let document: Document =
+            serde_json::from_slice(&decoded).map_err(|cause| cause.to_string())?;
+        if document.id.as_bytes() != row.id.as_bytes()
+            || document.revision != row.revision
+            || document.vector.is_some() != row.vector
+        {
+            return Err("Legacy document does not match its directory".into());
+        }
+        let separated = split_document_frame_parts(frame, &decoded, document)?;
+        row.data = append_existing_frame(&mut payload, &separated.metadata)?;
+        if let Some(vector) = separated.vector {
+            vector_ranges.push(append_existing_frame(&mut vectors, &vector)?);
+        }
+        metadata.push(row);
+    }
+    let (metadata_end, vector_end) =
+        finish_document_columns(&mut payload, &vectors, &mut vector_ranges)?;
+    drop(vectors);
+    let tail = source
+        .get(source_end as usize..)
+        .ok_or("Missing legacy posting tail")?;
+    if payload
+        .len()
+        .checked_add(tail.len())
+        .is_none_or(|length| length > MAX_BYTES)
+    {
+        return Err("Converted segment exceeds sixteen MiB before its header".into());
+    }
+    payload.extend_from_slice(tail);
+    let mut terms = legacy.terms;
+    for (_, term) in &mut terms.entries {
+        for block in &mut term.blocks {
+            let end = block
+                .data
+                .offset
+                .checked_add(block.data.length)
+                .ok_or("Legacy posting overflow")?;
+            if block.data.offset < source_end || end as usize > source.len() {
+                return Err("Legacy posting range outside its payload".into());
+            }
+            block.data.offset = vector_end
+                .checked_add(block.data.offset - source_end)
+                .ok_or("Migrated posting offset overflow")?;
+        }
+    }
+    let metadata = DocumentTable::from(metadata);
+    let header = Header {
+        filter_masks: RefCell::default(),
+        version: 2,
+        vector_prefix: vector_prefix(&metadata)?,
+        documents: metadata,
+        terms,
+        total_title_length: legacy.total_title_length,
+        total_body_length: legacy.total_body_length,
+        metadata_end,
+        vector_end,
+        vector_ranges,
+    };
+    validate_header(&header)?;
+    header.encode(&payload)
+}
+
+fn append_existing_frame(payload: &mut Vec<u8>, frame: &[u8]) -> Result<Range, String> {
+    if frame.len() < 8
+        || payload
+            .len()
+            .checked_add(frame.len())
+            .is_none_or(|length| length > MAX_BYTES)
+    {
+        return Err("Converted document columns exceed segment budget".into());
+    }
+    let range = Range {
+        offset: u32::try_from(payload.len()).map_err(|cause| cause.to_string())?,
+        length: u32::try_from(frame.len()).map_err(|cause| cause.to_string())?,
+    };
+    payload.extend_from_slice(frame);
+    Ok(range)
 }
 
 #[doc = "# Errors\nRejects invalid framing, checksums, versions, ordering, frequencies, and posting directories."]
@@ -1093,21 +2260,25 @@ pub fn parse_header(bytes: &[u8]) -> Result<(Header, usize), String> {
     let text = std::str::from_utf8(json).map_err(|cause| cause.to_string())?;
     let mut header: Header = serde_json::from_str(text).map_err(|e| e.to_string())?;
     validate_header(&header)?;
+    header.vector_prefix = vector_prefix(&header.documents)?;
     header.documents.shrink_to_fit();
     Ok((header, 16 + length))
 }
 
 fn validate_header(header: &Header) -> Result<(), String> {
-    if header.version != 1 || header.documents.len() > 10000 {
+    if header.version != 2 || header.documents.is_empty() || header.documents.len() > 10000 {
         return Err("Invalid segment version or document count".into());
     }
-    if header
-        .documents
-        .windows(2)
-        .any(|p| compare_document_ids(&p[0].id, &p[1].id) != Ordering::Less)
-    {
+    let documents = &header.documents;
+    if documents.rows.windows(2).any(|pair| {
+        compare_document_ids(
+            &documents.ids[pair[0].id.clone()],
+            &documents.ids[pair[1].id.clone()],
+        ) != Ordering::Less
+    }) {
         return Err("Segment ids are not strictly sorted".into());
     }
+    validate_columns(header)?;
     for term in header.terms.values() {
         if term.df > u32::try_from(header.documents.len()).map_err(|cause| cause.to_string())? {
             return Err("Invalid term document frequency".into());
@@ -1132,7 +2303,38 @@ fn validate_header(header: &Header) -> Result<(), String> {
     Ok(())
 }
 
-const DIRECTORY_MAGIC: &[u8; 8] = b"RAIODIR3";
+const DIRECTORY_MAGIC: &[u8; 8] = b"RAIODIR5";
+const COMMON_DIRECTORY_MAGIC: &[u8; 8] = b"RAIOCOM3";
+const MAX_COMMON_POSTING_BYTES: usize = 32 * 1024;
+const MAX_COMMON_FRAME_BYTES: usize = 64 * 1024;
+const MAX_COMMON_DECODED_POSTING_BYTES: usize = 64 * 1024;
+
+#[derive(Default)]
+struct HotPostings {
+    terms: BTreeMap<String, Vec<Box<[u8]>>>,
+    bytes: usize,
+}
+
+impl HotPostings {
+    fn heap_bytes(&self) -> usize {
+        self.bytes
+            + self
+                .terms
+                .iter()
+                .map(|(term, blocks)| {
+                    term.capacity() + 128 + blocks.capacity() * (size_of::<Box<[u8]>>() + 16)
+                })
+                .sum::<usize>()
+            + size_of::<Self>()
+            + 1024
+            + 32
+    }
+}
+
+struct DecodedDirectory {
+    header: Header,
+    hot: Option<Rc<HotPostings>>,
+}
 
 #[doc = "# Errors\nRejects invalid canonical headers, mismatched lengths, trailing bytes and directory size limits."]
 pub fn parse_directory(bytes: &[u8], expected: usize) -> Result<Header, String> {
@@ -1146,17 +2348,25 @@ pub fn parse_directory(bytes: &[u8], expected: usize) -> Result<Header, String> 
     Ok(header)
 }
 
-struct DirectoryDocuments<'a>(&'a [DocumentMeta]);
+struct DirectoryRanges<'a>(&'a [Range]);
+
+impl Serialize for DirectoryRanges<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(|range| (range.offset, range.length)))
+    }
+}
+
+struct DirectoryDocuments<'a>(&'a DocumentTable);
 
 impl Serialize for DirectoryDocuments<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_seq(self.0.iter().map(|document| {
             (
-                &document.id,
+                document.id,
                 document.revision,
                 document.title_length,
                 document.body_length,
-                &document.attributes,
+                document.attributes,
                 (document.data.offset, document.data.length),
                 document.vector,
             )
@@ -1198,13 +2408,33 @@ impl Serialize for DirectoryTerms<'_> {
 #[doc = "# Errors\nRejects invalid or incomplete canonical headers and directory size limits."]
 pub fn compress_directory(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let header = parse_directory(bytes, bytes.len())?;
-    let length = bytes.len();
-    let compact = binary_directory::encode(&header)?;
-    if compact.len() > MAX_BYTES || compact.len() > length {
+    compress_directory_header(&header, bytes.len())
+}
+
+fn compress_directory_header(header: &Header, length: usize) -> Result<Vec<u8>, String> {
+    if !(16..=MAX_BYTES).contains(&length) {
+        return Err("Invalid directory length".into());
+    }
+    let compact = binary_directory::encode(header)?;
+    compress_directory_payload(&compact, length, *DIRECTORY_MAGIC)
+}
+
+fn compress_directory_payload(
+    compact: &[u8],
+    length: usize,
+    magic: [u8; 8],
+) -> Result<Vec<u8>, String> {
+    let maximum_compact = length
+        + (if magic == *COMMON_DIRECTORY_MAGIC {
+            MAX_COMMON_FRAME_BYTES + 4
+        } else {
+            0
+        });
+    if compact.len() > MAX_BYTES || compact.len() > maximum_compact {
         return Err("Compact directory exceeds size budget".into());
     }
     let mut encoded = Vec::with_capacity(20);
-    encoded.extend_from_slice(DIRECTORY_MAGIC);
+    encoded.extend_from_slice(&magic);
     encoded.extend_from_slice(
         &u32::try_from(length)
             .map_err(|cause| cause.to_string())?
@@ -1217,13 +2447,13 @@ pub fn compress_directory(bytes: &[u8]) -> Result<Vec<u8>, String> {
     );
     let mut checksum = crc32fast::Hasher::new();
     checksum.update(&encoded);
-    checksum.update(&compact);
+    checksum.update(compact);
     encoded.extend_from_slice(&checksum.finalize().to_le_bytes());
     let flags = miniz_oxide::deflate::core::create_comp_flags_from_zip_params(3, 1, 0);
     let mut compressor = miniz_oxide::deflate::core::CompressorOxide::new(flags);
     let (status, consumed) = miniz_oxide::deflate::core::compress_to_output(
         &mut compressor,
-        &compact,
+        compact,
         miniz_oxide::deflate::core::TDEFLFlush::Finish,
         |chunk| {
             encoded.extend_from_slice(chunk);
@@ -1242,16 +2472,29 @@ pub fn parse_compressed_directory(
     expected: usize,
     max_heap_bytes: usize,
 ) -> Result<Header, String> {
-    decode_directory_frame(bytes, expected, max_heap_bytes, None)
+    decode_directory_payload(bytes, expected, max_heap_bytes, None, *DIRECTORY_MAGIC)
 }
 
-fn decode_directory_frame(
+fn decode_directory_payload(
     bytes: &[u8],
     expected: usize,
     max_heap_bytes: usize,
     validated: Option<&std::cell::Cell<bool>>,
+    magic: [u8; 8],
 ) -> Result<Header, String> {
-    if bytes.len() < 20 || &bytes[..8] != DIRECTORY_MAGIC || bytes.len() > MAX_BYTES + 8192 {
+    decode_directory_contents(bytes, expected, max_heap_bytes, validated, magic)
+        .map(|contents| contents.header)
+}
+
+fn decode_directory_contents(
+    bytes: &[u8],
+    expected: usize,
+    max_heap_bytes: usize,
+    validated: Option<&std::cell::Cell<bool>>,
+    magic: [u8; 8],
+) -> Result<DecodedDirectory, String> {
+    let maximum_frame = MAX_BYTES + 8192;
+    if bytes.len() < 20 || bytes[..8] != magic || bytes.len() > maximum_frame {
         return Err("Invalid compressed directory frame".into());
     }
     let length = u32::from_le_bytes(
@@ -1267,7 +2510,13 @@ fn decode_directory_frame(
             .try_into()
             .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
     ) as usize;
-    if compact_length > MAX_BYTES || compact_length > expected {
+    let maximum_compact = expected
+        + (if magic == *COMMON_DIRECTORY_MAGIC {
+            MAX_COMMON_FRAME_BYTES + 4
+        } else {
+            0
+        });
+    if compact_length > MAX_BYTES || compact_length > maximum_compact {
         return Err("Compact directory exceeds size budget".into());
     }
     let checksum = u32::from_le_bytes(
@@ -1295,14 +2544,494 @@ fn decode_directory_frame(
             return Err("Compressed directory integrity check failed".into());
         }
     }
-    let header = binary_directory::decode(&decoded, max_heap_bytes)?;
+    let (header_bytes, hot_bytes) = if magic == *COMMON_DIRECTORY_MAGIC {
+        let (header, hot) = common_directory_parts(&decoded, expected)?;
+        (header, Some(hot))
+    } else {
+        (decoded.as_slice(), None)
+    };
+    let reserved = match hot_bytes {
+        Some(bytes) => hot_postings_heap_reservation(bytes)?,
+        None => 0,
+    };
+    if reserved > MAX_COMMON_FRAME_BYTES + 4096 || reserved > max_heap_bytes {
+        return Err("Common posting payload exceeds memory budget".into());
+    }
+    let header = binary_directory::decode(header_bytes, max_heap_bytes.saturating_sub(reserved))?;
+    header.documents.attributes.validate_expansion(expected)?;
     if !previously_validated {
         validate_header(&header)?;
-        if let Some(verified) = validated {
-            verified.set(true);
+        if magic == *COMMON_DIRECTORY_MAGIC
+            && (header.terms.len() > 16
+                || header
+                    .terms
+                    .iter()
+                    .any(|(term, metadata)| term.len() > 64 || metadata.df <= 1))
+        {
+            return Err("Invalid common-directory term selection".into());
         }
     }
-    Ok(header)
+    let hot = match hot_bytes {
+        Some(bytes) => {
+            let hot = decode_hot_postings(bytes, &header)?;
+            if hot.terms.is_empty() {
+                None
+            } else {
+                Some(Rc::new(hot))
+            }
+        }
+        None => None,
+    };
+    let charged = header.heap_bytes() + hot.as_ref().map_or(0, |hot| hot.heap_bytes());
+    if charged > max_heap_bytes {
+        return Err("Decoded directory exceeds memory budget".into());
+    }
+    if let Some(verified) = validated {
+        verified.set(true);
+    }
+    Ok(DecodedDirectory { header, hot })
+}
+
+fn common_directory_parts(decoded: &[u8], expected: usize) -> Result<(&[u8], &[u8]), String> {
+    let header_length = u32::from_le_bytes(
+        decoded
+            .get(..4)
+            .ok_or("Truncated common-directory length")?
+            .try_into()
+            .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
+    ) as usize;
+    let header_end = 4_usize
+        .checked_add(header_length)
+        .ok_or("Common-directory length overflow")?;
+    if header_length == 0
+        || header_length > expected
+        || header_end > decoded.len()
+        || decoded.len() - header_end > MAX_COMMON_FRAME_BYTES
+    {
+        return Err("Invalid common-directory payload length".into());
+    }
+    Ok((&decoded[4..header_end], &decoded[header_end..]))
+}
+
+#[doc = "# Errors\nRejects invalid canonical headers and common-directory size budgets."]
+pub fn compress_common_directory(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let header = parse_directory(bytes, bytes.len())?;
+    compress_common_directory_header(&header, bytes.len(), None)
+}
+
+#[doc = "# Errors\nRejects invalid canonical segments, source ranges and common-posting budgets."]
+pub fn compress_common_directory_segment(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let (header, header_length) = parse_header(bytes)?;
+    compress_common_directory_header(&header, header_length, Some(bytes))
+}
+
+fn compress_common_directory_header(
+    header: &Header,
+    expected: usize,
+    source: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
+    if !(16..=MAX_BYTES).contains(&expected) {
+        return Err("Invalid directory length".into());
+    }
+    let names = common_term_names(
+        header
+            .terms
+            .iter()
+            .map(|(term, meta)| (term, meta.df as usize)),
+    );
+    let terms = TermDictionary::from_entries(
+        names
+            .into_iter()
+            .filter_map(|term| header.terms.get(term).map(|meta| (term, meta.clone())))
+            .collect(),
+    );
+    let compact_header = binary_directory::encode_terms(header, &terms)?;
+    let hot = match source {
+        Some(bytes) => encode_hot_postings(header, &terms, bytes, expected)?,
+        None => vec![0, 0],
+    };
+    let mut compact = Vec::with_capacity(4 + compact_header.len() + hot.len());
+    compact.extend_from_slice(
+        &u32::try_from(compact_header.len())
+            .map_err(|cause| cause.to_string())?
+            .to_le_bytes(),
+    );
+    compact.extend_from_slice(&compact_header);
+    compact.extend_from_slice(&hot);
+    if compact_header.len() > expected
+        || hot.len() > MAX_COMMON_FRAME_BYTES
+        || compact.len() > expected + MAX_COMMON_FRAME_BYTES + 4
+    {
+        return Err("Common-directory payload exceeds size budget".into());
+    }
+    compress_directory_payload(&compact, expected, *COMMON_DIRECTORY_MAGIC)
+}
+
+fn encode_hot_postings(
+    header: &Header,
+    terms: &TermDictionary,
+    source: &[u8],
+    expected: usize,
+) -> Result<Vec<u8>, String> {
+    let (source_header, header_length) = parse_header(source)?;
+    if header_length != expected
+        || source_header.version != header.version
+        || source.len() < expected
+        || binary_directory::encode(&source_header)? != binary_directory::encode(header)?
+    {
+        return Err("Common posting source does not match directory".into());
+    }
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(&0_u16.to_le_bytes());
+    let mut selected = 0_u16;
+    let mut posting_bytes = 0_usize;
+    let mut decoded_bytes = 0_usize;
+    let mut retained_bytes = size_of::<HotPostings>() + 1024 + 32;
+    for (term, metadata) in terms {
+        let term_bytes = term.as_bytes();
+        if term_bytes.len() > 64
+            || metadata.blocks.is_empty()
+            || metadata.blocks.len() > u16::MAX as usize
+        {
+            continue;
+        }
+        let required = metadata.blocks.iter().try_fold(0_usize, |total, block| {
+            total
+                .checked_add(block.data.length as usize)
+                .ok_or("Posting byte count overflow")
+        })?;
+        let overhead = 2 + term_bytes.len() + 2 + metadata.blocks.len() * 8;
+        if posting_bytes + required > MAX_COMMON_POSTING_BYTES
+            || encoded.len() + overhead + required > MAX_COMMON_FRAME_BYTES
+        {
+            continue;
+        }
+        let frames = metadata
+            .blocks
+            .iter()
+            .map(|block| {
+                let absolute = expected
+                    .checked_add(block.data.offset as usize)
+                    .ok_or("Posting offset overflow")?;
+                let end = absolute
+                    .checked_add(block.data.length as usize)
+                    .ok_or("Posting length overflow")?;
+                let page = source
+                    .get(absolute..end)
+                    .ok_or("Common posting source range is invalid")?;
+                if page.len() < 8 {
+                    return Err("Invalid common posting page".into());
+                }
+                let decoded = u32::from_le_bytes(
+                    page[..4]
+                        .try_into()
+                        .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
+                ) as usize;
+                Ok((page, decoded))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let required_decoded = frames.iter().try_fold(0_usize, |sum, (_, decoded)| {
+            sum.checked_add(*decoded)
+                .ok_or("Common posting decoded byte overflow")
+        })?;
+        let required_retained = required
+            + term_bytes.len()
+            + 128
+            + metadata.blocks.len() * (size_of::<Box<[u8]>>() + 16);
+        if decoded_bytes + required_decoded > MAX_COMMON_DECODED_POSTING_BYTES
+            || retained_bytes + required_retained > MAX_COMMON_FRAME_BYTES + 4096
+        {
+            continue;
+        }
+        encoded.extend_from_slice(
+            &u16::try_from(term_bytes.len())
+                .map_err(|cause| cause.to_string())?
+                .to_le_bytes(),
+        );
+        encoded.extend_from_slice(term_bytes);
+        encoded.extend_from_slice(
+            &u16::try_from(metadata.blocks.len())
+                .map_err(|cause| cause.to_string())?
+                .to_le_bytes(),
+        );
+        for (block, (page, _)) in metadata.blocks.iter().zip(&frames) {
+            validate_hot_block(header, block, page)?;
+            encoded.extend_from_slice(&block.data.offset.to_le_bytes());
+            encoded.extend_from_slice(&block.data.length.to_le_bytes());
+            encoded.extend_from_slice(page);
+        }
+        posting_bytes += required;
+        decoded_bytes += required_decoded;
+        retained_bytes += required_retained;
+        selected += 1;
+    }
+    encoded[..2].copy_from_slice(&selected.to_le_bytes());
+    Ok(encoded)
+}
+
+fn validate_hot_block(header: &Header, metadata: &BlockMeta, bytes: &[u8]) -> Result<(), String> {
+    let postings =
+        decode_posting_rows::<false, _>(bytes, |row, title, body| (row, title.last, body.last))?;
+    if postings.len() != metadata.count as usize
+        || postings.first().map(|posting| posting.0) != Some(metadata.first)
+        || postings.last().map(|posting| posting.0) != Some(metadata.last)
+    {
+        return Err("Common posting block does not match directory".into());
+    }
+    let mut previous = None;
+    for (row, title, body) in postings {
+        validate_posting(header, row, title, body, previous)?;
+        previous = Some(row);
+    }
+
+    Ok(())
+}
+
+fn decode_hot_postings(bytes: &[u8], header: &Header) -> Result<HotPostings, String> {
+    if bytes.len() > MAX_COMMON_FRAME_BYTES || bytes.len() < 2 {
+        return Err("Invalid common posting payload size".into());
+    }
+    let mut cursor = 0_usize;
+    let read_u16 = |cursor: &mut usize| -> Result<u16, String> {
+        let end = cursor
+            .checked_add(2)
+            .ok_or("Common posting offset overflow")?;
+        let value = u16::from_le_bytes(
+            bytes
+                .get(*cursor..end)
+                .ok_or("Truncated common posting payload")?
+                .try_into()
+                .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
+        );
+        *cursor = end;
+        Ok(value)
+    };
+    let read_u32 = |cursor: &mut usize| -> Result<u32, String> {
+        let end = cursor
+            .checked_add(4)
+            .ok_or("Common posting offset overflow")?;
+        let value = u32::from_le_bytes(
+            bytes
+                .get(*cursor..end)
+                .ok_or("Truncated common posting payload")?
+                .try_into()
+                .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
+        );
+        *cursor = end;
+        Ok(value)
+    };
+    let count = read_u16(&mut cursor)? as usize;
+    if count > 16 {
+        return Err("Too many common posting terms".into());
+    }
+    let mut hot = HotPostings::default();
+    for _ in 0..count {
+        let length = read_u16(&mut cursor)? as usize;
+        if length == 0 || length > 64 {
+            return Err("Invalid common posting term length".into());
+        }
+        let end = cursor
+            .checked_add(length)
+            .ok_or("Common posting offset overflow")?;
+        let term = std::str::from_utf8(
+            bytes
+                .get(cursor..end)
+                .ok_or("Truncated common posting term")?,
+        )
+        .map_err(|cause| cause.to_string())?
+        .to_owned();
+        cursor = end;
+        if hot
+            .terms
+            .last_key_value()
+            .is_some_and(|(prior, _)| prior >= &term)
+            || header.terms.get(&term).is_none()
+        {
+            return Err("Invalid common posting term".into());
+        }
+        let block_count = read_u16(&mut cursor)? as usize;
+        let metadata = header
+            .terms
+            .get(&term)
+            .ok_or("Missing common posting term")?;
+        if block_count == 0 || block_count != metadata.blocks.len() {
+            return Err("Incomplete common posting term".into());
+        }
+        let mut blocks = Vec::with_capacity(block_count);
+        for meta in &metadata.blocks {
+            let offset = read_u32(&mut cursor)?;
+            let length = read_u32(&mut cursor)? as usize;
+            let end = cursor
+                .checked_add(length)
+                .ok_or("Common posting length overflow")?;
+            if offset != meta.data.offset || length != meta.data.length as usize || length == 0 {
+                return Err("Common posting block metadata mismatch".into());
+            }
+            let page = bytes
+                .get(cursor..end)
+                .ok_or("Truncated common posting block")?;
+            validate_hot_block(header, meta, page)?;
+            blocks.push(page.into());
+            hot.bytes += length;
+            cursor = end;
+        }
+        hot.terms.insert(term, blocks);
+    }
+    if cursor != bytes.len() || hot.bytes > MAX_COMMON_POSTING_BYTES {
+        return Err("Invalid common posting payload framing".into());
+    }
+    Ok(hot)
+}
+
+fn hot_postings_heap_reservation(bytes: &[u8]) -> Result<usize, String> {
+    if bytes.len() > MAX_COMMON_FRAME_BYTES || bytes.len() < 2 {
+        return Err("Invalid common posting payload size".into());
+    }
+    let mut cursor = 0_usize;
+    let read_u16 = |cursor: &mut usize| -> Result<usize, String> {
+        let end = cursor
+            .checked_add(2)
+            .ok_or("Common posting offset overflow")?;
+        let value = u16::from_le_bytes(
+            bytes
+                .get(*cursor..end)
+                .ok_or("Truncated common posting payload")?
+                .try_into()
+                .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
+        ) as usize;
+        *cursor = end;
+        Ok(value)
+    };
+    let read_u32 = |cursor: &mut usize| -> Result<usize, String> {
+        let end = cursor
+            .checked_add(4)
+            .ok_or("Common posting offset overflow")?;
+        let value = u32::from_le_bytes(
+            bytes
+                .get(*cursor..end)
+                .ok_or("Truncated common posting payload")?
+                .try_into()
+                .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
+        ) as usize;
+        *cursor = end;
+        Ok(value)
+    };
+    let count = read_u16(&mut cursor)?;
+    if count > 16 {
+        return Err("Too many common posting terms".into());
+    }
+    if count == 0 {
+        if cursor != bytes.len() {
+            return Err("Invalid empty common posting payload".into());
+        }
+        return Ok(0);
+    }
+    let mut charge = size_of::<HotPostings>() + 1024 + 32;
+    let mut posting_bytes = 0_usize;
+    let mut decoded_bytes = 0_usize;
+    for _ in 0..count {
+        let term_length = read_u16(&mut cursor)?;
+        let term_end = cursor
+            .checked_add(term_length)
+            .ok_or("Common posting offset overflow")?;
+        if bytes.get(cursor..term_end).is_none() {
+            return Err("Truncated common posting term".into());
+        }
+        cursor = term_end;
+        let blocks = read_u16(&mut cursor)?;
+        charge = charge
+            .checked_add(term_length + 128)
+            .and_then(|value| value.checked_add(blocks * (size_of::<Box<[u8]>>() + 16)))
+            .ok_or("Common posting heap size overflow")?;
+        for _ in 0..blocks {
+            let _offset = read_u32(&mut cursor)?;
+            let length = read_u32(&mut cursor)?;
+            let end = cursor
+                .checked_add(length)
+                .ok_or("Common posting length overflow")?;
+            if bytes.get(cursor..end).is_none() {
+                return Err("Truncated common posting block".into());
+            }
+            let page = &bytes[cursor..end];
+            if page.len() < 8 {
+                return Err("Invalid common posting page".into());
+            }
+            let decoded = u32::from_le_bytes(
+                page[..4]
+                    .try_into()
+                    .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
+            ) as usize;
+            posting_bytes += length;
+            decoded_bytes = decoded_bytes
+                .checked_add(decoded)
+                .ok_or("Common posting decoded byte overflow")?;
+            if posting_bytes > MAX_COMMON_POSTING_BYTES
+                || decoded_bytes > MAX_COMMON_DECODED_POSTING_BYTES
+            {
+                return Err("Common postings exceed byte budgets".into());
+            }
+            charge = charge
+                .checked_add(length)
+                .ok_or("Common posting heap size overflow")?;
+            cursor = end;
+        }
+    }
+    if cursor != bytes.len() {
+        return Err("Invalid common posting payload framing".into());
+    }
+    Ok(charge)
+}
+
+pub struct CommonDirectory {
+    header: Rc<Header>,
+    hot: Option<Rc<HotPostings>>,
+}
+
+impl CommonDirectory {
+    #[doc = "# Errors\nRejects invalid common-directory framing, integrity and allocation budgets."]
+    pub fn compressed(
+        bytes: &[u8],
+        expected: usize,
+        max_heap_bytes: usize,
+    ) -> Result<Self, String> {
+        let contents = decode_directory_contents(
+            bytes,
+            expected,
+            max_heap_bytes,
+            None,
+            *COMMON_DIRECTORY_MAGIC,
+        )?;
+        Ok(Self {
+            header: Rc::new(contents.header),
+            hot: contents.hot,
+        })
+    }
+
+    #[must_use]
+    pub fn covers(&self, query: &PreparedQuery) -> bool {
+        query
+            .terms
+            .words
+            .iter()
+            .all(|term| self.header.terms.get(term).is_some())
+    }
+
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        self.header.heap_bytes() + self.hot.as_ref().map_or(0, |hot| hot.heap_bytes())
+    }
+
+    #[doc = "Creates a search whose remaining posting spans must still be supplied.\n\n# Errors\nRejects uncovered terms, invalid filters and deleted rows before creating a search."]
+    pub fn ranker(&self, query: &PreparedQuery, dead: &[u32]) -> Result<Search, String> {
+        if !self.covers(query) {
+            return Err("Common directory does not cover query".into());
+        }
+        let mut search = query.ranker(Rc::clone(&self.header), dead)?;
+        search.pending_hot.clone_from(&self.hot);
+        let selection = search.all_hot_selection()?;
+        let _remaining = search.satisfy_hot_selection(selection)?;
+        Ok(search)
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -1416,6 +3145,13 @@ struct QueryTerms {
 }
 
 impl QueryTerms {
+    fn word(&self, term: &str) -> Option<&str> {
+        self.order
+            .binary_search_by(|index| self.words[*index].as_str().cmp(term))
+            .ok()
+            .map(|position| self.words[self.order[position]].as_str())
+    }
+
     fn new(statistics: Statistics, text: &str, mode: &str, top_k: usize) -> Result<Self, String> {
         let words = normalize_text(text)
             .split_whitespace()
@@ -1548,10 +3284,20 @@ impl Ord for Hit {
     }
 }
 
+fn offer_hit(heap: &mut BinaryHeap<Hit>, top_k: usize, hit: Hit) {
+    if heap.len() < top_k {
+        heap.push(hit);
+    } else if let Some(mut cutoff) = heap.peek_mut()
+        && hit < *cutoff
+    {
+        *cutoff = hit;
+    }
+}
+
 struct PostingCursors<'a, T: PostingRow> {
     lists: Vec<&'a [T]>,
     cursors: Vec<usize>,
-    allowed: &'a [bool],
+    allowed: &'a BitVec,
     driver: Option<usize>,
     required: Option<usize>,
     requirement: Option<(usize, f64)>,
@@ -1559,7 +3305,7 @@ struct PostingCursors<'a, T: PostingRow> {
 }
 
 impl<'a, T: PostingRow> PostingCursors<'a, T> {
-    fn new(lists: Vec<&'a [T]>, allowed: &'a [bool], intersect: bool) -> Self {
+    fn new(lists: Vec<&'a [T]>, allowed: &'a BitVec, intersect: bool) -> Self {
         let driver = if intersect {
             lists
                 .iter()
@@ -1681,10 +3427,17 @@ pub struct Search {
     pub words: Rc<Vec<String>>,
     pub mode: String,
     pub top_k: usize,
-    pub allowed: Vec<bool>,
+    pub allowed: BitVec,
     terms: Rc<QueryTerms>,
     lists: PostingLists,
     last_decoded_rows: BTreeMap<String, Option<u32>>,
+    pending_hot: Option<Rc<HotPostings>>,
+    loaded_hot_blocks: BTreeMap<String, BTreeSet<u32>>,
+}
+
+struct SelectedPostingBlocks {
+    term: String,
+    indices: Vec<usize>,
 }
 
 #[derive(Serialize)]
@@ -1732,6 +3485,99 @@ impl PreparedQuery {
 
 impl Search {
     #[must_use]
+    pub fn uniform_hits(&self) -> Option<Vec<Hit>> {
+        if self.header.documents.is_empty()
+            || self.header.documents.len() > 10000
+            || self.terms.order.is_empty()
+            || self.mode == "phrase" && self.words.len() != 1
+        {
+            return None;
+        }
+        let count = u32::try_from(self.header.documents.len()).ok()?;
+        let maximum_bytes = u32::try_from(MAX_BYTES).ok()?;
+        let mut frequencies = Vec::with_capacity(self.terms.order.len());
+        for term in &self.terms.order {
+            let metadata = self.header.terms.get(self.words[*term].as_str())?;
+            if metadata.df != count || metadata.blocks.is_empty() {
+                return None;
+            }
+            let first = metadata.blocks.first()?;
+            let frequency = (first.max_title_tf, first.max_body_tf);
+            if frequency != (0, 1) && frequency != (1, 0) {
+                return None;
+            }
+            let mut next_row = 0;
+            let mut previous_end = 0;
+            for block in &metadata.blocks {
+                let end = block.data.offset.checked_add(block.data.length)?;
+                if block.first != next_row
+                    || block.count == 0
+                    || block.count > u32::try_from(BLOCK_SIZE).ok()?
+                    || block.last.checked_sub(block.first)?.checked_add(1)? != block.count
+                    || (block.max_title_tf, block.max_body_tf) != frequency
+                    || block.data.length == 0
+                    || block.data.offset < previous_end
+                    || end > maximum_bytes
+                {
+                    return None;
+                }
+                next_row = block.last.checked_add(1)?;
+                previous_end = end;
+            }
+            if next_row != count {
+                return None;
+            }
+            frequencies.push(frequency);
+        }
+        let normalization = self.terms.scorers.first()?;
+        let title = frequencies.iter().any(|frequency| frequency.0 > 0);
+        let body = frequencies.iter().any(|frequency| frequency.1 > 0);
+        let mut heap = BinaryHeap::with_capacity(self.top_k);
+        let mut score_cache = [None; 64];
+        for (row, (title_length, body_length)) in self.header.documents.lengths().enumerate() {
+            if title && title_length == 0 || body && body_length == 0 {
+                return None;
+            }
+            if !self.allowed[row] {
+                continue;
+            }
+            let identity = (u64::from(title_length) << 32) | u64::from(body_length);
+            let index = (identity.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 58) as usize;
+            let cached = &mut score_cache[index];
+            let score = match *cached {
+                Some((key, score)) if key == identity => score,
+                _ => {
+                    let denominators = normalization.denominators(title_length, body_length);
+                    let mut score = 0.0;
+                    for (index, frequency) in frequencies.iter().enumerate() {
+                        score += self.terms.scorers[index].score_normalized(
+                            frequency.0,
+                            frequency.1,
+                            denominators,
+                        );
+                    }
+                    *cached = Some((identity, score));
+                    score
+                }
+            };
+            if score <= 0.0 {
+                continue;
+            }
+            offer_hit(
+                &mut heap,
+                self.top_k,
+                Hit {
+                    row: u32::try_from(row).ok()?,
+                    score,
+                },
+            );
+        }
+        let mut hits = heap.into_vec();
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.row.cmp(&b.row)));
+        Some(hits)
+    }
+
+    #[must_use]
     pub fn posting_spans(&self) -> Vec<PostingSpan<'_>> {
         self.posting_spans_matching(|_| true)
     }
@@ -1769,8 +3615,7 @@ impl Search {
         }
         let mut lengths = [None; 16];
         let mut distinct = 0;
-        for document in self.header.documents.iter().take(lengths.len()) {
-            let pair = (document.title_length, document.body_length);
+        for pair in self.header.documents.lengths().take(lengths.len()) {
             if !lengths[..distinct].contains(&Some(pair)) {
                 lengths[distinct] = Some(pair);
                 distinct += 1;
@@ -1787,18 +3632,17 @@ impl Search {
     fn dense_cutoff_scores<const REUSE_LENGTHS: bool>(&self, dense: &[&TermScorer]) -> Option<Hit> {
         let mut heap: BinaryHeap<Hit> = BinaryHeap::with_capacity(self.top_k);
         let mut minimum_scores = [None; 64];
-        for (row, document) in self.header.documents.iter().enumerate() {
+        for (row, (title_length, body_length)) in self.header.documents.lengths().enumerate() {
             if !self.allowed[row] {
                 continue;
             }
             let compute = || {
                 dense.iter().fold(0.0, |score, scorer| {
-                    score + scorer.minimum_score(document.title_length, document.body_length)
+                    score + scorer.minimum_score(title_length, body_length)
                 })
             };
             let score = if REUSE_LENGTHS {
-                let identity =
-                    (u64::from(document.title_length) << 32) | u64::from(document.body_length);
+                let identity = (u64::from(title_length) << 32) | u64::from(body_length);
                 let index = (identity.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 58) as usize;
                 let cached = &mut minimum_scores[index];
                 match *cached {
@@ -1841,7 +3685,7 @@ impl Search {
             |cutoff| {
                 self.posting_spans_cutoff(
                     cutoff.score,
-                    &self.header.documents[cutoff.row as usize].id,
+                    self.header.documents.row(cutoff.row as usize).id,
                     true,
                 )
             },
@@ -1873,14 +3717,10 @@ impl Search {
             if bound.total_cmp(&score) != Ordering::Equal {
                 return true;
             }
-            self.allowed[candidate.first as usize..=candidate.last as usize]
-                .iter()
-                .position(|allowed| *allowed)
-                .is_some_and(|offset| {
-                    let order = compare_document_ids(
-                        &self.header.documents[candidate.first as usize + offset].id,
-                        id,
-                    );
+            (candidate.first as usize..=candidate.last as usize)
+                .find(|row| self.allowed[*row])
+                .is_some_and(|row| {
+                    let order = compare_document_ids(self.header.documents.row(row).id, id);
                     order == Ordering::Less || (inclusive && order == Ordering::Equal)
                 })
         }))
@@ -1890,7 +3730,7 @@ impl Search {
         &self,
         competitive: impl Fn(&BlockMeta) -> bool,
     ) -> Vec<PostingSpan<'_>> {
-        let unrestricted = self.allowed.iter().all(|allowed| *allowed);
+        let unrestricted = self.allowed.all();
         let mut spans: Vec<PostingSpan<'_>> = Vec::new();
         for index in &self.terms.order {
             let term = &self.words[*index];
@@ -1899,10 +3739,15 @@ impl Search {
             };
             let mut blocks: Vec<&BlockMeta> = Vec::new();
             for block in &metadata.blocks {
+                if self
+                    .loaded_hot_blocks
+                    .get(term)
+                    .is_some_and(|loaded| loaded.contains(&block.data.offset))
+                {
+                    continue;
+                }
                 if (unrestricted
-                    || self.allowed[block.first as usize..=block.last as usize]
-                        .iter()
-                        .any(|allowed| *allowed))
+                    || (block.first as usize..=block.last as usize).any(|row| self.allowed[row]))
                     && competitive(block)
                 {
                     if blocks.last().is_some_and(|previous| {
@@ -1969,12 +3814,188 @@ impl Search {
             } else {
                 PostingLists::Frequencies(BTreeMap::new())
             },
+            pending_hot: None,
+            loaded_hot_blocks: BTreeMap::new(),
         })
+    }
+
+    #[cfg(any(test, target_arch = "wasm32"))]
+    fn own_posting_selection(
+        &self,
+        spans: &[PostingSpan<'_>],
+    ) -> Result<Vec<SelectedPostingBlocks>, String> {
+        spans
+            .iter()
+            .map(|span| {
+                let metadata = self
+                    .header
+                    .terms
+                    .get(span.term)
+                    .ok_or("Missing selected term")?;
+                let indices = span
+                    .blocks
+                    .iter()
+                    .map(|block| {
+                        metadata
+                            .blocks
+                            .binary_search_by_key(&block.data.offset, |candidate| {
+                                candidate.data.offset
+                            })
+                            .map_err(|index| {
+                                format!("Missing selected posting block near index {index}")
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(SelectedPostingBlocks {
+                    term: span.term.to_owned(),
+                    indices,
+                })
+            })
+            .collect()
+    }
+
+    fn satisfy_hot_selection(
+        &mut self,
+        selection: Vec<SelectedPostingBlocks>,
+    ) -> Result<Vec<SelectedPostingBlocks>, String> {
+        let Some(hot) = self.pending_hot.clone() else {
+            return Ok(selection);
+        };
+        let header = Rc::clone(&self.header);
+        let mut missing = Vec::with_capacity(selection.len());
+        for selected in selection {
+            let Some(cached) = hot.terms.get(&selected.term) else {
+                missing.push(selected);
+                continue;
+            };
+            let metadata = header
+                .terms
+                .get(&selected.term)
+                .ok_or("Missing selected term")?;
+            for index in &selected.indices {
+                let block = metadata
+                    .blocks
+                    .get(*index)
+                    .ok_or("Missing selected posting block")?;
+                let already_loaded = self
+                    .loaded_hot_blocks
+                    .get(&selected.term)
+                    .is_some_and(|loaded| loaded.contains(&block.data.offset));
+                if already_loaded {
+                    continue;
+                }
+                let page = cached.get(*index).ok_or("Incomplete common hot term")?;
+                self.add_hot_block(&selected.term, block, page)?;
+                self.loaded_hot_blocks
+                    .entry(selected.term.clone())
+                    .or_default()
+                    .insert(block.data.offset);
+            }
+        }
+        Ok(missing)
+    }
+
+    fn add_hot_block(
+        &mut self,
+        term: &str,
+        metadata: &BlockMeta,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let previous = self.last_decoded_rows.get(term).copied().flatten();
+        if previous.is_none_or(|row| row < metadata.first) {
+            return self.add(term, bytes);
+        }
+        validate_hot_block(&self.header, metadata, bytes)?;
+        match &mut self.lists {
+            PostingLists::Positions(lists) => {
+                let rows = decode_postings(bytes)?;
+                let list = lists.entry(term.into()).or_default();
+                merge_hot_rows(
+                    list,
+                    rows.into_iter()
+                        .filter(|row| self.allowed[row.row as usize]),
+                )?;
+            }
+            PostingLists::Frequencies(lists) => {
+                let rows =
+                    decode_posting_rows::<false, _>(bytes, |row, title, body| FrequencyPosting {
+                        row,
+                        title: title.count,
+                        body: body.count,
+                    })?;
+                let list = lists.entry(term.into()).or_default();
+                merge_hot_rows(
+                    list,
+                    rows.into_iter()
+                        .filter(|row| self.allowed[row.row as usize]),
+                )?;
+            }
+        }
+        self.last_decoded_rows.insert(
+            term.into(),
+            Some(previous.unwrap_or_default().max(metadata.last)),
+        );
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn has_hot_selection(&self, spans: &[PostingSpan<'_>]) -> bool {
+        self.pending_hot
+            .as_ref()
+            .is_some_and(|hot| spans.iter().any(|span| hot.terms.contains_key(span.term)))
+    }
+
+    fn all_hot_selection(&self) -> Result<Vec<SelectedPostingBlocks>, String> {
+        let Some(hot) = self.pending_hot.as_ref() else {
+            return Ok(Vec::new());
+        };
+        self.words
+            .iter()
+            .filter(|term| hot.terms.contains_key(term.as_str()))
+            .map(|term| {
+                let metadata = self
+                    .header
+                    .terms
+                    .get(term)
+                    .ok_or("Missing hot posting term")?;
+                Ok(SelectedPostingBlocks {
+                    term: term.clone(),
+                    indices: (0..metadata.blocks.len()).collect(),
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn encode_posting_selection(
+        &self,
+        selection: &[SelectedPostingBlocks],
+    ) -> Result<String, String> {
+        let mut spans = Vec::with_capacity(selection.len());
+        for selected in selection {
+            let term = self
+                .terms
+                .word(&selected.term)
+                .ok_or("Missing selected query term")?;
+            let metadata = self.header.terms.get(term).ok_or("Missing selected term")?;
+            let blocks = selected
+                .indices
+                .iter()
+                .map(|index| {
+                    metadata
+                        .blocks
+                        .get(*index)
+                        .ok_or("Missing selected posting block")
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            spans.push(PostingSpan { term, blocks });
+        }
+        serde_json::to_string(&spans).map_err(|cause| cause.to_string())
     }
 
     #[doc = "# Errors\nRejects unrequested terms, corrupt pages, invalid rows or positions, and unordered posting blocks."]
     pub fn add(&mut self, term: &str, bytes: &[u8]) -> Result<(), String> {
-        if !self.words.iter().any(|word| word == term) {
+        if self.terms.word(term).is_none() {
             return Err("Unrequested posting term".into());
         }
         match &mut self.lists {
@@ -2019,7 +4040,7 @@ impl Search {
         term: &str,
         rows: &[DecodedFrequencyPosting],
     ) -> Result<(), String> {
-        if !self.words.iter().any(|word| word == term) {
+        if self.terms.word(term).is_none() {
             return Err("Unrequested posting term".into());
         }
         let PostingLists::Frequencies(lists) = &mut self.lists else {
@@ -2049,7 +4070,7 @@ impl Search {
         term: &str,
         rows: &[DecodedFrequencyPosting],
     ) -> Result<(), String> {
-        if !self.words.iter().any(|word| word == term) {
+        if self.terms.word(term).is_none() {
             return Err("Unrequested posting term".into());
         }
         let PostingLists::Frequencies(lists) = &mut self.lists else {
@@ -2095,7 +4116,7 @@ impl Search {
     }
 
     fn block_bounds(&self) -> Vec<Vec<(&BlockMeta, f64)>> {
-        let unrestricted = self.allowed.iter().all(|allowed| *allowed);
+        let unrestricted = self.allowed.all();
         self.terms
             .order
             .iter()
@@ -2111,11 +4132,9 @@ impl Search {
                             Some((block.min_title_length, block.min_body_length))
                         } else {
                             let rows = block.first as usize..=block.last as usize;
-                            self.header.documents[rows.clone()]
-                                .iter()
-                                .zip(&self.allowed[rows])
-                                .filter(|(_, allowed)| **allowed)
-                                .fold(None, |minimum, (document, _)| match minimum {
+                            rows.filter(|row| self.allowed[*row])
+                                .map(|row| self.header.documents.row(row))
+                                .fold(None, |minimum, document| match minimum {
                                     Some((title, body)) => Some((
                                         u32::min(title, document.title_length),
                                         u32::min(body, document.body_length),
@@ -2251,7 +4270,7 @@ impl Search {
             selected.fill(None);
             let mut matched = 0;
             let mut score = 0.0;
-            let meta = &self.header.documents[row as usize];
+            let meta = self.header.documents.row(row as usize);
             let denominators = normalization.denominators(meta.title_length, meta.body_length);
             for (index, list) in positions.lists.iter().enumerate() {
                 if let Some(posting) = list
@@ -2278,13 +4297,7 @@ impl Search {
                 continue;
             }
             let hit = Hit { row, score };
-            if heap.len() < self.top_k {
-                heap.push(hit);
-            } else if let Some(mut cutoff) = heap.peek_mut()
-                && hit < *cutoff
-            {
-                *cutoff = hit;
-            }
+            offer_hit(&mut heap, self.top_k, hit);
         }
         let mut hits = heap.into_vec();
         hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.row.cmp(&b.row)));
@@ -2454,7 +4467,7 @@ pub fn bloom_filter_many<'a>(
 #[cfg(target_arch = "wasm32")]
 pub mod wasm {
     use super::{
-        BlockMeta, BuiltSegment, Document, DocumentMeta, Filter, Header, MAX_BYTES,
+        BuiltSegment, Document, DocumentAttributes, DocumentMeta, Filter, Header, MAX_BYTES,
         MAX_QUERY_TERMS, Range, Search, SelectedAttributes, Statistics, TermDictionary, TermMeta,
         TermScorer, append, bloom_build, bloom_filter_many, build, compare_document_ids,
         decode_page, document_terms, matches, parse_header,
@@ -2465,44 +4478,44 @@ pub mod wasm {
     use std::rc::{Rc, Weak};
     use wasm_bindgen::prelude::*;
 
-    fn summary_bounds(blocks: &[BlockMeta]) -> Vec<(u32, u32, u32, u32)> {
-        let mut bounds: Vec<_> = blocks
-            .iter()
-            .map(|block| {
-                (
-                    block.max_title_tf,
-                    block.max_body_tf,
-                    block.min_title_length,
-                    block.min_body_length,
-                )
-            })
-            .collect();
-        bounds.sort_unstable();
-        bounds.dedup();
-        bounds
-    }
-
     #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
     struct TermSummary {
         df: u32,
-        bounds: Vec<(u32, u32, u32, u32)>,
+        bounds: Vec<super::TermBound>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        single: Option<TermDocument>,
     }
 
     impl From<&TermMeta> for TermSummary {
         fn from(meta: &TermMeta) -> Self {
             Self {
                 df: meta.df,
-                bounds: summary_bounds(&meta.blocks),
+                bounds: super::summary_bounds(&meta.blocks),
+                single: None,
             }
         }
     }
 
-    #[derive(Serialize, Deserialize)]
+    #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct LeaderDocument {
+    struct TermDocument {
         row: u32,
         id: String,
         data: Range,
+    }
+
+    impl TermDocument {
+        fn is_bounded(&self, count: u32) -> bool {
+            self.row < count
+                && !self.id.is_empty()
+                && self.id.encode_utf16().count() <= 128
+                && self.data.length >= 8
+                && self
+                    .data
+                    .offset
+                    .checked_add(self.data.length)
+                    .is_some_and(|end| end as usize <= MAX_BYTES)
+        }
     }
 
     #[derive(Serialize, Deserialize)]
@@ -2512,7 +4525,7 @@ pub mod wasm {
         terms: Vec<String>,
         length: u32,
         longer: bool,
-        documents: Vec<LeaderDocument>,
+        documents: Vec<TermDocument>,
     }
 
     impl CommonLeader {
@@ -2572,7 +4585,7 @@ pub mod wasm {
                     row: document.row,
                     id: &document.id,
                     score,
-                    data: &document.data,
+                    data: document.data.clone(),
                 })
                 .collect();
             if ranked.len() != required {
@@ -2603,20 +4616,25 @@ pub mod wasm {
             if terms.is_empty() {
                 continue;
             }
-            let length = |document: &DocumentMeta| {
+            let length = |document: &DocumentMeta<&str, &DocumentAttributes>| {
                 if title {
                     document.title_length
                 } else {
                     document.body_length
                 }
             };
-            let Some(minimum) = header.documents.iter().map(length).min() else {
+            let Some(minimum) = header
+                .documents
+                .iter()
+                .map(|document| length(&document))
+                .min()
+            else {
                 continue;
             };
             let mut documents = Vec::new();
             let mut bytes = 0;
             for (row, document) in header.documents.iter().enumerate() {
-                if length(document) != minimum {
+                if length(&document) != minimum {
                     continue;
                 }
                 let charge = document.id.len() * 6 + 128;
@@ -2624,9 +4642,9 @@ pub mod wasm {
                     break;
                 }
                 bytes += charge;
-                documents.push(LeaderDocument {
+                documents.push(TermDocument {
                     row: u32::try_from(row).map_err(|cause| cause.to_string())?,
-                    id: document.id.clone(),
+                    id: document.id.to_string(),
                     data: document.data.clone(),
                 });
             }
@@ -2637,7 +4655,7 @@ pub mod wasm {
                 longer: header
                     .documents
                     .iter()
-                    .any(|document| length(document) > minimum),
+                    .any(|document| length(&document) > minimum),
                 documents,
             });
         }
@@ -2726,49 +4744,48 @@ pub mod wasm {
     }
 
     fn common_terms(header: &Header) -> Result<String, String> {
-        let mut entries: Vec<_> = header
-            .terms
-            .iter()
-            .filter(|(term, metadata)| metadata.df > 1 && term.len() <= 64)
-            .collect();
-        if entries.len() > 16 {
-            entries.select_nth_unstable_by(16, |left, right| {
-                right.1.df.cmp(&left.1.df).then_with(|| left.0.cmp(right.0))
-            });
-            entries.truncate(16);
-        }
-        let dictionary: BTreeMap<_, _> = entries
-            .into_iter()
-            .map(|(term, metadata)| {
-                let first = metadata
-                    .blocks
-                    .first()
-                    .ok_or("Common term has no posting blocks")?;
-                let bounds = metadata.blocks.iter().skip(1).fold(
+        let dictionary: BTreeMap<_, _> = super::common_term_names(
+            header
+                .terms
+                .iter()
+                .map(|(term, metadata)| (term, metadata.df as usize)),
+        )
+        .into_iter()
+        .map(|term| {
+            let metadata = header
+                .terms
+                .get(term)
+                .ok_or("Common term metadata disappeared")?;
+            let first = metadata
+                .blocks
+                .first()
+                .ok_or("Common term has no posting blocks")?;
+            let bounds = metadata.blocks.iter().skip(1).fold(
+                (
+                    first.max_title_tf,
+                    first.max_body_tf,
+                    first.min_title_length,
+                    first.min_body_length,
+                ),
+                |(title, body, title_length, body_length), block| {
                     (
-                        first.max_title_tf,
-                        first.max_body_tf,
-                        first.min_title_length,
-                        first.min_body_length,
-                    ),
-                    |(title, body, title_length, body_length), block| {
-                        (
-                            title.max(block.max_title_tf),
-                            body.max(block.max_body_tf),
-                            title_length.min(block.min_title_length),
-                            body_length.min(block.min_body_length),
-                        )
-                    },
-                );
-                Ok::<_, String>((
-                    term,
-                    TermSummary {
-                        df: metadata.df,
-                        bounds: vec![bounds],
-                    },
-                ))
-            })
-            .collect::<Result<_, _>>()?;
+                        title.max(block.max_title_tf),
+                        body.max(block.max_body_tf),
+                        title_length.min(block.min_title_length),
+                        body_length.min(block.min_body_length),
+                    )
+                },
+            );
+            Ok::<_, String>((
+                term,
+                TermSummary {
+                    df: metadata.df,
+                    bounds: vec![bounds],
+                    single: None,
+                },
+            ))
+        })
+        .collect::<Result<_, _>>()?;
         serde_json::to_string(&dictionary).map_err(|cause| cause.to_string())
     }
 
@@ -2790,6 +4807,41 @@ pub mod wasm {
         },
     }
 
+    struct EligibilityKey<'a>(&'a [Option<&'a serde_json::Value>]);
+
+    impl Serialize for EligibilityKey<'_> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            use serde::ser::SerializeSeq as _;
+
+            let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+            for value in self.0 {
+                sequence.serialize_element(&EligibilityValues(*value))?;
+            }
+            sequence.end()
+        }
+    }
+
+    struct EligibilityValues<'a>(Option<&'a serde_json::Value>);
+
+    impl Serialize for EligibilityValues<'_> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            use serde::ser::{Error as _, SerializeSeq as _};
+
+            let mut sequence = serializer.serialize_seq(Some(usize::from(self.0.is_some())))?;
+            if let Some(value) = self.0 {
+                let value = serde_json::to_string(value).map_err(S::Error::custom)?;
+                sequence.serialize_element(&value)?;
+            }
+            sequence.end()
+        }
+    }
+
     struct EligibilityProjectionBuilder {
         fields: Vec<String>,
         groups: Option<BTreeMap<String, (u32, u32)>>,
@@ -2800,8 +4852,8 @@ pub mod wasm {
 
     impl EligibilityProjectionBuilder {
         fn new(fields: Vec<String>) -> Result<Self, String> {
-            if fields.len() > 16 {
-                return Err("Eligibility exceeds sixteen fields".into());
+            if fields.len() > 64 {
+                return Err("Eligibility exceeds sixty-four fields".into());
             }
             let bytes = serde_json::to_vec(&fields)
                 .map_err(|cause| cause.to_string())?
@@ -2853,7 +4905,7 @@ pub mod wasm {
             if self.groups.is_none() && self.columns.is_none() {
                 return Ok(());
             }
-            let mut values = [None; 16];
+            let mut values = [None; 64];
             for (value, field) in values.iter_mut().zip(&self.fields) {
                 *value = attributes(field);
             }
@@ -2912,27 +4964,21 @@ pub mod wasm {
                 }
                 return Ok(());
             }
-            let values: Vec<Vec<_>> = attributes
-                .iter()
-                .map(|value| {
-                    value
-                        .map(serde_json::to_string)
-                        .transpose()
-                        .map(|value| value.into_iter().collect())
-                })
-                .collect::<Result<_, _>>()
+            self.scalar.clear();
+            serde_json::to_writer(&mut self.scalar, &EligibilityKey(attributes))
                 .map_err(|cause| cause.to_string())?;
+            let key = std::str::from_utf8(&self.scalar).map_err(|cause| cause.to_string())?;
             let Some(groups) = &mut self.groups else {
-                self.push_columns(&values, title, body);
                 return Ok(());
             };
-            let key = serde_json::to_string(&values).map_err(|cause| cause.to_string())?;
-            if let Some((minimum_title, minimum_body)) = groups.get_mut(&key) {
+            if let Some((minimum_title, minimum_body)) = groups.get_mut(key) {
                 *minimum_title = (*minimum_title).min(title);
                 *minimum_body = (*minimum_body).min(body);
             } else {
                 self.bytes += key.len() + 32;
                 if groups.len() >= 256 || self.bytes > 4096 {
+                    let values: Vec<Vec<String>> =
+                        serde_json::from_str(key).map_err(|cause| cause.to_string())?;
                     let previous = self.groups.take().unwrap_or_default();
                     self.columns = Some(self.fields.iter().map(|_| BTreeMap::new()).collect());
                     self.bytes = serde_json::to_vec(&self.fields)
@@ -2947,7 +4993,7 @@ pub mod wasm {
                     self.push_columns(&values, title, body);
                     return Ok(());
                 }
-                groups.insert(key, (title, body));
+                groups.insert(key.to_owned(), (title, body));
             }
             Ok(())
         }
@@ -2995,12 +5041,35 @@ pub mod wasm {
     }
 
     impl EligibilityQuery {
+        fn projection_indices<'a>(
+            &'a self,
+            fields: &[String],
+        ) -> Result<std::borrow::Cow<'a, [usize]>, String> {
+            if fields == self.fields {
+                return Ok(std::borrow::Cow::Borrowed(&self.field_indices));
+            }
+            if fields.len() > 64 || fields.windows(2).any(|pair| pair[0] >= pair[1]) {
+                return Err("Eligibility projection scope mismatch".to_owned());
+            }
+            self.filters
+                .iter()
+                .map(|filter| {
+                    fields.binary_search(&filter.field).map_err(|index| {
+                        format!("Eligibility projection omitted filter field at {index}")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(std::borrow::Cow::Owned)
+        }
+
         fn marginal_minimum(
             &self,
             columns: Vec<Vec<(Option<String>, u32, u32)>>,
+            field_count: usize,
+            field_indices: &[usize],
         ) -> Result<Option<(u32, u32)>, String> {
             if columns.is_empty()
-                || columns.len() != self.fields.len()
+                || columns.len() != field_count
                 || columns.iter().any(Vec::is_empty)
                 || columns.iter().map(Vec::len).sum::<usize>() > 256
             {
@@ -3021,7 +5090,7 @@ pub mod wasm {
                         return Err("Eligibility value must be scalar".to_owned());
                     }
                     let mut matched = true;
-                    for (filter, field) in self.filters.iter().zip(&self.field_indices) {
+                    for (filter, field) in self.filters.iter().zip(field_indices) {
                         if *field == index && !filter.matches(value.as_ref())? {
                             matched = false;
                             break;
@@ -3034,9 +5103,11 @@ pub mod wasm {
                         });
                     }
                 }
-                lower = lower
-                    .zip(minimum)
-                    .map(|((a, b), (c, d))| (a.max(c), b.max(d)));
+                if field_indices.contains(&index) {
+                    lower = lower
+                        .zip(minimum)
+                        .map(|((a, b), (c, d))| (a.max(c), b.max(d)));
+                }
             }
             Ok(lower)
         }
@@ -3073,6 +5144,13 @@ pub mod wasm {
             })
         }
 
+        #[doc = "# Errors\nRejects invalid attributes or filter operators."]
+        pub fn matches(&self, attributes: &str) -> Result<bool, JsValue> {
+            let attributes: BTreeMap<String, serde_json::Value> = serde_json::from_str(attributes)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            matches(&attributes, &self.filters).map_err(|cause| JsValue::from_str(&cause))
+        }
+
         #[doc = "# Errors\nRejects oversized, malformed or differently scoped eligibility projections."]
         pub fn minimum(&self, projection: &str) -> Result<String, JsValue> {
             if projection.len() > 4096 {
@@ -3080,14 +5158,15 @@ pub mod wasm {
             }
             let projection: EligibilityProjection = serde_json::from_str(projection)
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
-            if projection.fields != self.fields {
-                return Err(JsValue::from_str("Eligibility projection scope mismatch"));
-            }
+            let field_indices = self
+                .projection_indices(&projection.fields)
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            let field_count = projection.fields.len();
             let groups = match projection.data {
                 EligibilityData::Joint { groups } => groups,
                 EligibilityData::Marginal { columns } => {
                     let minimum = self
-                        .marginal_minimum(columns)
+                        .marginal_minimum(columns, field_count, &field_indices)
                         .map_err(|cause| JsValue::from_str(&cause))?;
                     return serde_json::to_string(&minimum)
                         .map_err(|cause| JsValue::from_str(&cause.to_string()));
@@ -3098,7 +5177,7 @@ pub mod wasm {
             }
             let mut minimum = None;
             for (values, title, body) in groups {
-                if values.len() != self.fields.len() || values.iter().any(|value| value.len() > 1) {
+                if values.len() != field_count || values.iter().any(|value| value.len() > 1) {
                     return Err(JsValue::from_str("Eligibility projection omitted a field"));
                 }
                 let attributes = values
@@ -3121,7 +5200,7 @@ pub mod wasm {
                     })
                     .collect::<Result<Vec<_>, JsValue>>()?;
                 let mut matched = true;
-                for (filter, index) in self.filters.iter().zip(&self.field_indices) {
+                for (filter, index) in self.filters.iter().zip(field_indices.iter()) {
                     if !filter
                         .matches(attributes[*index].as_ref())
                         .map_err(|cause| JsValue::from_str(&cause))?
@@ -3136,6 +5215,9 @@ pub mod wasm {
                         None => (title, body),
                     });
                 }
+            }
+            if self.filters.is_empty() {
+                minimum = Some((0, 0));
             }
             serde_json::to_string(&minimum).map_err(|cause| JsValue::from_str(&cause.to_string()))
         }
@@ -3164,7 +5246,11 @@ pub mod wasm {
                 return Some(*index);
             }
             let charge = size_of::<TermSummary>()
-                + summary.bounds.capacity() * size_of::<(u32, u32, u32, u32)>()
+                + summary.bounds.capacity() * size_of::<super::TermBound>()
+                + summary
+                    .single
+                    .as_ref()
+                    .map_or(0, |document| document.id.capacity())
                 + 192;
             if charge > SUMMARY_POOL_BYTES.saturating_sub(self.bytes) {
                 return None;
@@ -3197,12 +5283,12 @@ pub mod wasm {
     }
 
     struct OverviewPartitions<'a> {
-        partitions: &'a [BTreeMap<String, TermSummary>],
+        partitions: &'a [BTreeMap<&'a str, TermSummary>],
         pool: &'a RefCell<SummaryPool>,
     }
 
     struct OverviewPartition<'a> {
-        terms: &'a BTreeMap<String, TermSummary>,
+        terms: &'a BTreeMap<&'a str, TermSummary>,
         pool: &'a RefCell<SummaryPool>,
     }
 
@@ -3229,17 +5315,39 @@ pub mod wasm {
         }
     }
 
+    struct SingletonDictionary<'a>(&'a BTreeMap<&'a str, TermDocument>);
+
+    impl Serialize for SingletonDictionary<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::SerializeMap;
+            let mut map = serializer.serialize_map(Some(self.0.len()))?;
+            for (term, document) in self.0 {
+                map.serialize_entry(
+                    term,
+                    &(
+                        document.row,
+                        &document.id,
+                        document.data.offset,
+                        document.data.length,
+                    ),
+                )?;
+            }
+            map.end()
+        }
+    }
+
     struct DirectoryOverview<'a> {
         header: &'a Header,
+        singletons: &'a BTreeMap<&'a str, TermDocument>,
         eligibility: OverviewEligibility<'a>,
-        partitions: Option<&'a [BTreeMap<String, TermSummary>]>,
+        partitions: Option<&'a [BTreeMap<&'a str, TermSummary>]>,
     }
 
     impl Serialize for DirectoryOverview<'_> {
         fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
             use serde::ser::SerializeTuple;
             let pool = RefCell::new(SummaryPool::default());
-            let mut tuple = serializer.serialize_tuple(4)?;
+            let mut tuple = serializer.serialize_tuple(5)?;
             tuple.serialize_element(&OverviewDictionary {
                 terms: &self.header.terms,
                 pool: &pool,
@@ -3262,6 +5370,7 @@ pub mod wasm {
                     .map(|(_, summary)| summary)
                     .collect::<Vec<_>>(),
             )?;
+            tuple.serialize_element(&SingletonDictionary(self.singletons))?;
             tuple.end()
         }
     }
@@ -3281,7 +5390,7 @@ pub mod wasm {
         fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
             serializer.collect_seq(self.groups.iter().map(|group| {
                 (
-                    self.header.documents[group.row].attributes.as_ref(),
+                    self.header.documents.row(group.row).attributes.as_ref(),
                     group.title,
                     group.body,
                 )
@@ -3333,7 +5442,7 @@ pub mod wasm {
         }
 
         fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut sequence: A) -> Result<(), A::Error> {
-            while sequence.next_element::<(u32, u32, u32, u32)>()?.is_some() {}
+            while sequence.next_element::<super::TermBound>()?.is_some() {}
             Ok(())
         }
     }
@@ -3729,6 +5838,53 @@ pub mod wasm {
         }
     }
 
+    struct SelectedSingletons<'a>(&'a BTreeSet<String>);
+
+    impl<'de> serde::de::DeserializeSeed<'de> for SelectedSingletons<'_> {
+        type Value = BTreeMap<String, TermDocument>;
+
+        fn deserialize<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_map(self)
+        }
+    }
+
+    impl<'de> serde::de::Visitor<'de> for SelectedSingletons<'_> {
+        type Value = BTreeMap<String, TermDocument>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a singleton proof dictionary")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut selected = BTreeMap::new();
+            while let Some(term) = map.next_key_seed(SelectedTerm(self.0))? {
+                if let Some(term) = term {
+                    let (row, id, offset, length) = map.next_value::<(u32, String, u32, u32)>()?;
+                    let document = TermDocument {
+                        row,
+                        id,
+                        data: Range { offset, length },
+                    };
+                    if !document.is_bounded(10000) {
+                        return Err(serde::de::Error::custom("Invalid singleton reference"));
+                    }
+                    if selected.insert(term, document).is_some() {
+                        return Err(serde::de::Error::custom("Duplicate singleton proof"));
+                    }
+                } else {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+            Ok(selected)
+        }
+    }
+
     impl<'de> serde::de::DeserializeSeed<'de> for SelectedOverview<'_> {
         type Value = Overview;
 
@@ -3736,7 +5892,7 @@ pub mod wasm {
             self,
             deserializer: D,
         ) -> Result<Self::Value, D::Error> {
-            deserializer.deserialize_tuple(4, self)
+            deserializer.deserialize_tuple(5, self)
         }
     }
 
@@ -3744,7 +5900,9 @@ pub mod wasm {
         type Value = Overview;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("term indices, eligibility, partitions and summary pool")
+            formatter.write_str(
+                "term indices, eligibility, partitions, summary pool and singleton proofs",
+            )
         }
 
         fn visit_seq<A: serde::de::SeqAccess<'de>>(
@@ -3779,8 +5937,11 @@ pub mod wasm {
             let (summaries, count) = sequence
                 .next_element_seed(SelectedSummaries(&requested))?
                 .ok_or_else(|| serde::de::Error::invalid_length(3, &self))?;
+            let singletons = sequence
+                .next_element_seed(SelectedSingletons(self.requested))?
+                .ok_or_else(|| serde::de::Error::invalid_length(4, &self))?;
             if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
-                return Err(serde::de::Error::invalid_length(5, &self));
+                return Err(serde::de::Error::invalid_length(6, &self));
             }
             let maximum = dictionary
                 .maximum
@@ -3812,8 +5973,15 @@ pub mod wasm {
                         })
                         .collect()
                 };
+            let mut dictionary = resolve(dictionary)?;
+            for (term, document) in singletons {
+                let summary = dictionary
+                    .get_mut(&term)
+                    .ok_or_else(|| serde::de::Error::custom("Missing singleton summary"))?;
+                summary.single = Some(document);
+            }
             Ok(Overview {
-                dictionary: resolve(dictionary)?,
+                dictionary,
                 minimum: eligibility.minimum,
                 eligibility: eligibility.projection,
                 partitions: partitions
@@ -3823,8 +5991,8 @@ pub mod wasm {
         }
     }
 
-    fn term_bound(meta: &TermSummary, scorer: &TermScorer, minimum: (u32, u32)) -> f64 {
-        meta.bounds
+    fn term_bound(bounds: &[super::TermBound], scorer: &TermScorer, minimum: (u32, u32)) -> f64 {
+        bounds
             .iter()
             .map(|&(title_tf, body_tf, title_length, body_length)| {
                 scorer.score(
@@ -3842,6 +6010,100 @@ pub mod wasm {
         dictionary: BTreeMap<String, TermSummary>,
         minimum: Option<(u32, u32)>,
         partitions: Option<Vec<BTreeMap<String, TermSummary>>>,
+    }
+
+    #[derive(Deserialize)]
+    struct CompactMinimumCatalog(super::CommonTermProjection, Vec<u32>, Option<(u32, u32)>);
+
+    struct CompactActiveTerm<'a> {
+        index: usize,
+        df: u32,
+        scorer: &'a TermScorer,
+        independent_score: f64,
+    }
+
+    impl CompactMinimumCatalog {
+        fn active_terms<'a>(
+            &self,
+            scorers: &'a BTreeMap<&str, TermScorer>,
+        ) -> Result<Vec<CompactActiveTerm<'a>>, String> {
+            let projection = &self.0;
+            let dfs = &self.1;
+            let term_count = projection.terms.len();
+            if !(1..=16).contains(&term_count) || dfs.len() != term_count {
+                return Err("Invalid compact term projection dimensions".to_owned());
+            }
+            let mut order: Vec<_> = (0..term_count).collect();
+            order.sort_unstable_by(|left, right| {
+                projection.terms[*left].cmp(&projection.terms[*right])
+            });
+            if order
+                .windows(2)
+                .any(|pair| projection.terms[pair[0]] == projection.terms[pair[1]])
+                || projection
+                    .terms
+                    .iter()
+                    .any(|term| term.encode_utf16().count() > 64)
+            {
+                return Err("Invalid compact term projection terms".to_owned());
+            }
+            for df in dfs {
+                if *df > 10_000 {
+                    return Err("Invalid compact term frequency".to_owned());
+                }
+            }
+            if projection.independent.len() != term_count
+                || projection.independent.iter().any(|summary| {
+                    !(1..=128).contains(&summary.len())
+                        || summary
+                            .iter()
+                            .any(|(title_tf, body_tf, _, _)| *title_tf == 0 && *body_tf == 0)
+                })
+                || !(1..=32).contains(&projection.partitions.len())
+                || projection.partitions.iter().any(|partition| {
+                    partition.len() != term_count
+                        || partition.iter().any(|bound| {
+                            bound.is_some_and(|(title_tf, body_tf, _, _)| {
+                                title_tf == 0 && body_tf == 0
+                            })
+                        })
+                })
+                || (0..term_count).any(|index| {
+                    !projection
+                        .partitions
+                        .iter()
+                        .any(|partition| partition[index].is_some())
+                })
+            {
+                return Err("Invalid compact term projection bounds".to_owned());
+            }
+            let mut active = Vec::new();
+            for index in order {
+                let df = dfs[index];
+                if df == 0 {
+                    continue;
+                }
+                let term = projection.terms[index].as_str();
+                let scorer = scorers
+                    .get(term)
+                    .ok_or_else(|| "Missing compact term scorer".to_owned())?;
+                let independent_score = term_bound(
+                    &projection.independent[index],
+                    scorer,
+                    self.2.unwrap_or((0, 0)),
+                );
+                active.push(CompactActiveTerm {
+                    index,
+                    df,
+                    scorer,
+                    independent_score,
+                });
+            }
+            if active.is_empty() {
+                return Err("Invalid compact term projection bounds".to_owned());
+            }
+            Ok(active)
+        }
     }
 
     #[wasm_bindgen]
@@ -3868,7 +6130,7 @@ pub mod wasm {
                 let upper = |term: &str, meta: &TermSummary| {
                     scorers
                         .get(term)
-                        .map_or(0.0, |scorer| term_bound(meta, scorer, minimum))
+                        .map_or(0.0, |scorer| term_bound(&meta.bounds, scorer, minimum))
                 };
                 let independent = catalog
                     .dictionary
@@ -3901,9 +6163,93 @@ pub mod wasm {
     }
 
     #[wasm_bindgen]
+    #[doc = "# Errors\nRejects invalid statistics, compact projections or batches beyond 64 segments."]
+    pub fn segment_term_bounds_compact(
+        statistics: &str,
+        catalogs: &str,
+    ) -> Result<Vec<f64>, JsValue> {
+        let statistics: Statistics = serde_json::from_str(statistics)
+            .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        let catalogs: Vec<(super::CommonTermProjection, Vec<u32>)> = serde_json::from_str(catalogs)
+            .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        compact_term_bounds(
+            &statistics,
+            catalogs
+                .into_iter()
+                .map(|(projection, dfs)| CompactMinimumCatalog(projection, dfs, Some((0, 0)))),
+        )
+        .map_err(|cause| JsValue::from_str(&cause))
+    }
+
+    #[wasm_bindgen]
+    #[doc = "# Errors\nRejects invalid statistics, compact projections, minima or batches beyond 64 segments."]
+    pub fn segment_term_bounds_compact_minimum(
+        statistics: &str,
+        catalogs: &str,
+    ) -> Result<Vec<f64>, JsValue> {
+        let statistics: Statistics = serde_json::from_str(statistics)
+            .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        let catalogs: Vec<CompactMinimumCatalog> = serde_json::from_str(catalogs)
+            .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        compact_term_bounds(&statistics, catalogs.into_iter())
+            .map_err(|cause| JsValue::from_str(&cause))
+    }
+
+    fn compact_term_bounds(
+        statistics: &Statistics,
+        catalogs: impl ExactSizeIterator<Item = CompactMinimumCatalog>,
+    ) -> Result<Vec<f64>, String> {
+        if catalogs.len() > 64 {
+            return Err("Term bound batch exceeds segment budget".to_owned());
+        }
+        let scorers: BTreeMap<_, _> = statistics
+            .frequencies
+            .iter()
+            .map(|(term, df)| (term.as_str(), TermScorer::new(statistics, *df)))
+            .collect();
+        let mut bounds = Vec::with_capacity(catalogs.len());
+        for catalog in catalogs {
+            let active = catalog.active_terms(&scorers)?;
+            if catalog.2.is_none() {
+                bounds.push(0.0);
+                continue;
+            }
+            let minimum = catalog.2.unwrap_or((0, 0));
+            let independent = active
+                .iter()
+                .map(|term| term.independent_score)
+                .sum::<f64>();
+            let correlated = catalog
+                .0
+                .partitions
+                .iter()
+                .map(|partition| {
+                    let mut score = 0.0;
+                    for term in &active {
+                        if term.df == 1 {
+                            score += term.independent_score;
+                        } else if let Some(bound) = partition[term.index] {
+                            score += term_bound(std::slice::from_ref(&bound), term.scorer, minimum);
+                        }
+                    }
+                    score
+                })
+                .fold(0.0, f64::max);
+            bounds.push(independent.min(correlated));
+        }
+        Ok(bounds)
+    }
+
+    #[wasm_bindgen]
     #[doc = "# Errors\nRejects invalid canonical headers or size limits."]
     pub fn directory_compress(bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
         super::compress_directory(bytes).map_err(|cause| JsValue::from_str(&cause))
+    }
+
+    #[wasm_bindgen]
+    #[doc = "# Errors\nRejects invalid canonical headers or common-directory size limits."]
+    pub fn common_directory_compress(bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
+        super::compress_common_directory(bytes).map_err(|cause| JsValue::from_str(&cause))
     }
 
     fn overview_eligibility(header: &Header) -> Box<[EligibilityGroup]> {
@@ -3923,11 +6269,13 @@ pub mod wasm {
 
     fn encode_overview(
         header: &Header,
-        partitions: Option<&[BTreeMap<String, TermSummary>]>,
+        partitions: Option<&[BTreeMap<&str, TermSummary>]>,
         groups: &[EligibilityGroup],
+        singletons: &BTreeMap<&str, TermDocument>,
     ) -> Result<Vec<u8>, String> {
         let json = serde_json::to_vec(&DirectoryOverview {
             header,
+            singletons,
             eligibility: OverviewEligibility { header, groups },
             partitions,
         })
@@ -3938,6 +6286,64 @@ pub mod wasm {
         let mut bytes = Vec::new();
         append(&mut bytes, &json)?;
         Ok(bytes)
+    }
+
+    fn singleton_document(
+        bytes: &[u8],
+        base: usize,
+        header: &Header,
+        term: &str,
+        metadata: &TermMeta,
+        remaining: &mut usize,
+    ) -> Result<Option<TermDocument>, String> {
+        let [block] = metadata.blocks.as_ref() else {
+            return Ok(None);
+        };
+        if block.count != 1 || block.first != block.last {
+            return Ok(None);
+        }
+        let document = header.documents.row(block.first as usize);
+        let charge = term.len() + document.id.len() + size_of::<TermDocument>() + 256;
+        if charge > *remaining {
+            return Ok(None);
+        }
+        let start = base
+            .checked_add(block.data.offset as usize)
+            .ok_or("Invalid singleton posting range")?;
+        let end = start
+            .checked_add(block.data.length as usize)
+            .ok_or("Invalid singleton posting range")?;
+        let page = bytes
+            .get(start..end)
+            .ok_or("Invalid singleton posting range")?;
+        let rows = super::decode_posting_rows::<false, _>(page, |row, title, body| {
+            super::DecodedFrequencyPosting {
+                posting: super::FrequencyPosting {
+                    row,
+                    title: title.count,
+                    body: body.count,
+                },
+                title_last: title.last,
+                body_last: body.last,
+            }
+        })?;
+        let [row] = rows.as_slice() else {
+            return Ok(None);
+        };
+        super::validate_posting(header, row.posting.row, row.title_last, row.body_last, None)?;
+        if row.posting.row != block.first
+            || (row.posting.title, row.posting.body) != (block.max_title_tf, block.max_body_tf)
+            || (document.title_length, document.body_length)
+                != (block.min_title_length, block.min_body_length)
+        {
+            return Ok(None);
+        }
+        *remaining -= charge;
+        Ok(Some(TermDocument {
+            row: block.first,
+            id: document.id.to_owned(),
+            data: document.data,
+        }))
     }
 
     fn correlated_overview(bytes: &[u8]) -> Result<Option<Vec<u8>>, String> {
@@ -3955,13 +6361,20 @@ pub mod wasm {
             .enumerate()
             .map(|(index, pair)| (*pair, index * lengths.len().min(32) / lengths.len()))
             .collect();
-        let mut partitions: Vec<BTreeMap<String, TermSummary>> = (0..lengths.len().min(32))
+        let mut partitions: Vec<BTreeMap<&str, TermSummary>> = (0..lengths.len().min(32))
             .map(|_| BTreeMap::new())
             .collect();
         let mut entries = 0;
+        let mut singletons = BTreeMap::new();
+        let mut singleton_budget = 4 * 1024 * 1024;
         let entry_budget = (header.terms.len() / 4).clamp(512, 65536);
         for (term, metadata) in &header.terms {
             if metadata.df == 1 {
+                if let Some(document) =
+                    singleton_document(bytes, base, &header, term, metadata, &mut singleton_budget)?
+                {
+                    singletons.insert(term, document);
+                }
                 continue;
             }
             let mut previous = None;
@@ -3993,7 +6406,7 @@ pub mod wasm {
                         previous,
                     )?;
                     previous = Some(row.posting.row);
-                    let document = &header.documents[row.posting.row as usize];
+                    let document = header.documents.row(row.posting.row as usize);
                     let group = groups[&(document.title_length, document.body_length)];
                     let partition = &mut partitions[group];
                     if !partition.contains_key(term) {
@@ -4002,12 +6415,11 @@ pub mod wasm {
                             return Ok(None);
                         }
                     }
-                    let summary = partition
-                        .entry(term.to_owned())
-                        .or_insert_with(|| TermSummary {
-                            df: 0,
-                            bounds: vec![(0, 0, document.title_length, document.body_length)],
-                        });
+                    let summary = partition.entry(term).or_insert_with(|| TermSummary {
+                        df: 0,
+                        bounds: vec![(0, 0, document.title_length, document.body_length)],
+                        single: None,
+                    });
                     summary.df += 1;
                     let bound = &mut summary.bounds[0];
                     bound.0 = bound.0.max(row.posting.title);
@@ -4017,7 +6429,12 @@ pub mod wasm {
                 }
             }
         }
-        let encoded = encode_overview(&header, Some(&partitions), &overview_eligibility(&header))?;
+        let encoded = encode_overview(
+            &header,
+            Some(&partitions),
+            &overview_eligibility(&header),
+            &singletons,
+        )?;
         if encoded.len() > 1024 * 1024 {
             return Ok(None);
         }
@@ -4055,6 +6472,16 @@ pub mod wasm {
         pub fn bytes(&self) -> Vec<u8> {
             self.built.bytes.clone()
         }
+        pub fn common_projection(&self) -> Option<String> {
+            self.built.common_projection.clone()
+        }
+        #[doc = "# Errors\nRejects malformed field lists, more than sixty-four fields, invalid attributes or model serialization."]
+        pub fn eligibility(&self, fields: &str) -> Result<Option<String>, JsValue> {
+            let fields = eligibility_fields(fields).map_err(|cause| JsValue::from_str(&cause))?;
+            encoded_eligibility(&self.built.header, None, &fields)
+                .map_err(|cause| JsValue::from_str(&cause))
+        }
+
         #[doc = "# Errors\nRejects common-term metadata or serialization failures."]
         pub fn common_terms(&self) -> Result<String, JsValue> {
             common_terms(&self.built.header).map_err(|cause| JsValue::from_str(&cause))
@@ -4079,7 +6506,38 @@ pub mod wasm {
     struct CachedDirectoryFrame {
         bytes: Box<[u8]>,
         expected: usize,
+        partial: bool,
         validated: std::cell::Cell<bool>,
+    }
+
+    impl CachedDirectoryFrame {
+        fn new(bytes: Vec<u8>, expected: usize, partial: bool) -> Result<Self, String> {
+            let magic = if partial {
+                super::COMMON_DIRECTORY_MAGIC
+            } else {
+                super::DIRECTORY_MAGIC
+            };
+            let maximum = MAX_BYTES
+                + (if partial {
+                    super::MAX_COMMON_FRAME_BYTES
+                } else {
+                    0
+                })
+                + 8192;
+            if bytes.len() < 20
+                || bytes.len() > maximum
+                || &bytes[..8] != magic
+                || !(16..=MAX_BYTES).contains(&expected)
+            {
+                return Err("Invalid compressed directory frame".into());
+            }
+            Ok(Self {
+                bytes: bytes.into_boxed_slice(),
+                expected,
+                partial,
+                validated: std::cell::Cell::new(false),
+            })
+        }
     }
 
     #[wasm_bindgen]
@@ -4092,20 +6550,19 @@ pub mod wasm {
         #[wasm_bindgen(constructor)]
         #[doc = "# Errors\nRejects invalid frame envelopes and expected header sizes."]
         pub fn new(bytes: Vec<u8>, expected: u32) -> Result<Self, JsValue> {
-            let expected = expected as usize;
-            if bytes.len() < 20
-                || bytes.len() > MAX_BYTES + 8192
-                || &bytes[..8] != super::DIRECTORY_MAGIC
-                || !(16..=MAX_BYTES).contains(&expected)
-            {
-                return Err(JsValue::from_str("Invalid compressed directory frame"));
-            }
+            let frame = CachedDirectoryFrame::new(bytes, expected as usize, false)
+                .map_err(|cause| JsValue::from_str(&cause))?;
             Ok(Self {
-                frame: Rc::new(CachedDirectoryFrame {
-                    bytes: bytes.into_boxed_slice(),
-                    expected,
-                    validated: std::cell::Cell::new(false),
-                }),
+                frame: Rc::new(frame),
+            })
+        }
+
+        #[doc = "# Errors\nRejects invalid common frame envelopes and expected header sizes."]
+        pub fn common(bytes: Vec<u8>, expected: u32) -> Result<Self, JsValue> {
+            let frame = CachedDirectoryFrame::new(bytes, expected as usize, true)
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            Ok(Self {
+                frame: Rc::new(frame),
             })
         }
 
@@ -4128,15 +6585,23 @@ pub mod wasm {
 
         #[doc = "# Errors\nRejects corruption, invalid headers and decoded-memory budget violations."]
         pub fn directory(&self, max_heap_bytes: u32) -> Result<Directory, JsValue> {
-            let header = super::decode_directory_frame(
+            let magic = if self.frame.partial {
+                *super::COMMON_DIRECTORY_MAGIC
+            } else {
+                *super::DIRECTORY_MAGIC
+            };
+            let contents = super::decode_directory_contents(
                 &self.frame.bytes,
                 self.frame.expected,
                 max_heap_bytes as usize,
                 Some(&self.frame.validated),
+                magic,
             )
             .map_err(|cause| JsValue::from_str(&cause))?;
             Ok(Directory {
-                header: Rc::new(header),
+                header: Rc::new(contents.header),
+                partial: self.frame.partial,
+                hot: contents.hot,
                 overview_groups: RefCell::default(),
             })
         }
@@ -4145,7 +6610,106 @@ pub mod wasm {
     #[wasm_bindgen]
     pub struct Directory {
         header: Rc<Header>,
+        partial: bool,
+        hot: Option<Rc<super::HotPostings>>,
         overview_groups: RefCell<Option<Box<[EligibilityGroup]>>>,
+    }
+
+    struct EligibleCatalog {
+        minimum: Option<(u32, u32)>,
+        eligibility: Option<EligibilityProjection>,
+    }
+
+    fn projected_eligibility(
+        header: &Header,
+        retained: Option<Box<[EligibilityGroup]>>,
+        fields: &BTreeSet<&str>,
+        filters: &[Filter],
+    ) -> Result<EligibleCatalog, String> {
+        let mut groups = EligibilityProjectionBuilder::new(
+            fields.iter().map(|field| (*field).to_owned()).collect(),
+        )?;
+        let mut minimum = None;
+        if !fields.is_empty() {
+            let physical = retained.unwrap_or_else(|| overview_eligibility(header));
+            let mut values: BTreeMap<_, Option<serde_json::Value>> =
+                fields.iter().map(|field| (*field, None)).collect();
+            for group in &physical {
+                let attributes = header.documents.row(group.row).attributes;
+                let title = group.title;
+                let body = group.body;
+                for value in values.values_mut() {
+                    *value = None;
+                }
+                let mut deserializer = serde_json::Deserializer::from_str(attributes.get());
+                serde::de::DeserializeSeed::deserialize(
+                    super::FilterAttributes {
+                        fields,
+                        values: &mut values,
+                    },
+                    &mut deserializer,
+                )
+                .map_err(|cause| cause.to_string())?;
+                deserializer.end().map_err(|cause| cause.to_string())?;
+                groups.push(
+                    |field| values.get(field).and_then(Option::as_ref),
+                    title,
+                    body,
+                )?;
+                let mut matched = true;
+                for filter in filters {
+                    if !filter
+                        .matches(values.get(filter.field.as_str()).and_then(Option::as_ref))?
+                    {
+                        matched = false;
+                        break;
+                    }
+                }
+                if matched {
+                    minimum = Some(match minimum {
+                        Some((minimum_title, minimum_body)) => {
+                            (title.min(minimum_title), body.min(minimum_body))
+                        }
+                        None => (title, body),
+                    });
+                }
+            }
+        }
+        if filters.is_empty() {
+            minimum = Some((0, 0));
+        }
+        Ok(EligibleCatalog {
+            minimum,
+            eligibility: groups.finish()?,
+        })
+    }
+
+    fn eligibility_fields(fields: &str) -> Result<Vec<String>, String> {
+        let mut fields: Vec<String> =
+            serde_json::from_str(fields).map_err(|cause| cause.to_string())?;
+        if fields.len() > 64 {
+            return Err("Eligibility exceeds sixty-four fields".to_owned());
+        }
+        fields.sort_unstable();
+        fields.dedup();
+        Ok(fields)
+    }
+
+    fn encoded_eligibility(
+        header: &Header,
+        retained: Option<Box<[EligibilityGroup]>>,
+        fields: &[String],
+    ) -> Result<Option<String>, String> {
+        let fields = fields.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        let projection = projected_eligibility(header, retained, &fields, &[])?;
+        let Some(projection) = projection.eligibility else {
+            return Ok(None);
+        };
+        let encoded = serde_json::to_string(&projection).map_err(|cause| cause.to_string())?;
+        if encoded.len() > 4096 {
+            return Ok(None);
+        }
+        Ok(Some(encoded))
     }
 
     #[wasm_bindgen]
@@ -4156,6 +6720,8 @@ pub mod wasm {
             let (header, _) = parse_header(bytes).map_err(|cause| JsValue::from_str(&cause))?;
             Ok(Self {
                 header: Rc::new(header),
+                partial: false,
+                hot: None,
                 overview_groups: RefCell::default(),
             })
         }
@@ -4174,6 +6740,8 @@ pub mod wasm {
             .map_err(|cause| JsValue::from_str(&cause))?;
             Ok(Self {
                 header: Rc::new(header),
+                partial: false,
+                hot: None,
                 overview_groups: RefCell::default(),
             })
         }
@@ -4184,14 +6752,83 @@ pub mod wasm {
                 .map_err(|cause| JsValue::from_str(&cause))?;
             Ok(Self {
                 header: Rc::new(header),
+                partial: false,
+                hot: None,
                 overview_groups: RefCell::default(),
             })
+        }
+
+        #[doc = "# Errors\nRejects invalid common-directory frames, selected terms and allocation budgets."]
+        pub fn common(bytes: &[u8], expected: u32, max_heap_bytes: u32) -> Result<Self, JsValue> {
+            let directory = super::CommonDirectory::compressed(
+                bytes,
+                expected as usize,
+                max_heap_bytes as usize,
+            )
+            .map_err(|cause| JsValue::from_str(&cause))?;
+            Ok(Self {
+                header: directory.header,
+                partial: true,
+                hot: directory.hot,
+                overview_groups: RefCell::default(),
+            })
+        }
+
+        #[must_use]
+        pub fn covers_query(&self, query: &PreparedQuery) -> bool {
+            !self.partial
+                || query
+                    .query
+                    .terms
+                    .words
+                    .iter()
+                    .all(|term| self.header.terms.get(term).is_some())
+        }
+
+        #[doc = "# Errors\nRejects invalid expected lengths and compact directory size limits."]
+        pub fn compressed_frame(&self, expected: u32) -> Result<Vec<u8>, JsValue> {
+            if self.partial {
+                return Err(JsValue::from_str("Operation requires a complete directory"));
+            }
+            super::compress_directory_header(&self.header, expected as usize)
+                .map_err(|cause| JsValue::from_str(&cause))
+        }
+
+        #[doc = "# Errors\nRejects partial directories, invalid expected lengths and common-directory size limits."]
+        pub fn common_frame(
+            &self,
+            expected: u32,
+            source: Option<Vec<u8>>,
+        ) -> Result<Vec<u8>, JsValue> {
+            if self.partial {
+                return Err(JsValue::from_str("Operation requires a complete directory"));
+            }
+            source
+                .map_or_else(
+                    || {
+                        super::compress_common_directory_header(
+                            &self.header,
+                            expected as usize,
+                            None,
+                        )
+                    },
+                    |bytes| {
+                        super::compress_common_directory_header(
+                            &self.header,
+                            expected as usize,
+                            Some(&bytes),
+                        )
+                    },
+                )
+                .map_err(|cause| JsValue::from_str(&cause))
         }
 
         #[must_use]
         pub fn retain(&self) -> Self {
             Self {
                 header: self.header.clone(),
+                partial: self.partial,
+                hot: self.hot.clone(),
                 overview_groups: RefCell::default(),
             }
         }
@@ -4199,6 +6836,7 @@ pub mod wasm {
         #[must_use]
         pub fn heap_bytes(&self) -> usize {
             self.header.heap_bytes()
+                + self.hot.as_ref().map_or(0, |hot| hot.heap_bytes())
                 + self
                     .overview_groups
                     .borrow()
@@ -4208,6 +6846,9 @@ pub mod wasm {
 
         #[doc = "# Errors\nRejects invalid term JSON or directory serialization errors."]
         pub fn terms(&self, terms: &str) -> Result<String, JsValue> {
+            if self.partial {
+                return Err(JsValue::from_str("Operation requires a complete directory"));
+            }
             let terms: Vec<String> =
                 serde_json::from_str(terms).map_err(|e| JsValue::from_str(&e.to_string()))?;
             let selected: BTreeMap<_, _> = terms
@@ -4219,6 +6860,9 @@ pub mod wasm {
 
         #[doc = "# Errors\nRejects invalid term JSON or summary serialization."]
         pub fn summary(&self, terms: &str) -> Result<String, JsValue> {
+            if self.partial {
+                return Err(JsValue::from_str("Operation requires a complete directory"));
+            }
             let terms: Vec<String> = serde_json::from_str(terms)
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
             let selected: BTreeMap<_, _> = terms
@@ -4235,8 +6879,9 @@ pub mod wasm {
 
         #[doc = "# Errors\nRejects invalid terms, filters, attributes, or catalog serialization."]
         pub fn catalog(&self, terms: &str, filters: &str) -> Result<String, JsValue> {
-            use serde::de::DeserializeSeed;
-
+            if self.partial {
+                return Err(JsValue::from_str("Operation requires a complete directory"));
+            }
             let terms: Vec<String> = serde_json::from_str(terms)
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
             let filters: Vec<Filter> = serde_json::from_str(filters)
@@ -4245,41 +6890,13 @@ pub mod wasm {
                 return Err(JsValue::from_str("Catalog projection exceeds query limits"));
             }
             let fields: BTreeSet<_> = filters.iter().map(|filter| filter.field.as_str()).collect();
-            let mut groups = EligibilityProjectionBuilder::new(
-                fields.iter().map(|field| (*field).to_owned()).collect(),
+            let eligible = projected_eligibility(
+                &self.header,
+                self.overview_groups.borrow_mut().take(),
+                &fields,
+                &filters,
             )
             .map_err(|cause| JsValue::from_str(&cause))?;
-            let mut minimum = None;
-            let retained = self.overview_groups.borrow_mut().take();
-            if !filters.is_empty() {
-                let physical = retained.unwrap_or_else(|| overview_eligibility(&self.header));
-                for group in &physical {
-                    let attributes = &self.header.documents[group.row].attributes;
-                    let title = group.title;
-                    let body = group.body;
-                    let mut deserializer = serde_json::Deserializer::from_str(attributes.get());
-                    let attributes = SelectedAttributes(&fields)
-                        .deserialize(&mut deserializer)
-                        .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
-                    deserializer
-                        .end()
-                        .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
-                    groups
-                        .push(|field| attributes.get(field), title, body)
-                        .map_err(|cause| JsValue::from_str(&cause))?;
-                    if matches(&attributes, &filters).map_err(|cause| JsValue::from_str(&cause))? {
-                        minimum = Some(match minimum {
-                            Some((minimum_title, minimum_body)) => {
-                                (title.min(minimum_title), body.min(minimum_body))
-                            }
-                            None => (title, body),
-                        });
-                    }
-                }
-            }
-            if filters.is_empty() {
-                minimum = Some((0, 0));
-            }
             let projection = Overview {
                 dictionary: terms
                     .iter()
@@ -4290,21 +6907,38 @@ pub mod wasm {
                             .map(|meta| (term.clone(), TermSummary::from(meta)))
                     })
                     .collect(),
-                minimum,
-                eligibility: groups.finish().map_err(|cause| JsValue::from_str(&cause))?,
+                minimum: eligible.minimum,
+                eligibility: eligible.eligibility,
                 partitions: None,
             };
             serde_json::to_string(&projection)
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))
         }
 
+        #[doc = "# Errors\nRejects malformed field lists, more than sixty-four fields, invalid attributes or model serialization."]
+        pub fn eligibility(&self, fields: &str) -> Result<Option<String>, JsValue> {
+            let fields = eligibility_fields(fields).map_err(|cause| JsValue::from_str(&cause))?;
+            encoded_eligibility(
+                &self.header,
+                self.overview_groups.borrow_mut().take(),
+                &fields,
+            )
+            .map_err(|cause| JsValue::from_str(&cause))
+        }
+
         #[doc = "# Errors\nRejects common-term metadata or serialization failures."]
         pub fn common_terms(&self) -> Result<String, JsValue> {
+            if self.partial {
+                return Err(JsValue::from_str("Operation requires a complete directory"));
+            }
             common_terms(&self.header).map_err(|cause| JsValue::from_str(&cause))
         }
 
         #[doc = "# Errors\nRejects common-leader serialization errors."]
         pub fn common_leaders(&self) -> Result<String, JsValue> {
+            if self.partial {
+                return Err(JsValue::from_str("Operation requires a complete directory"));
+            }
             common_leaders(&self.header).map_err(|cause| JsValue::from_str(&cause))
         }
         #[doc = "# Errors\nRejects invalid document metadata or serialization."]
@@ -4325,12 +6959,15 @@ pub mod wasm {
 
         #[doc = "# Errors\nRejects summary serialization or size budgets."]
         pub fn overview(&self) -> Result<Vec<u8>, JsValue> {
+            if self.partial {
+                return Err(JsValue::from_str("Operation requires a complete directory"));
+            }
             let groups = self
                 .overview_groups
                 .borrow_mut()
                 .take()
                 .unwrap_or_else(|| overview_eligibility(&self.header));
-            let bytes = encode_overview(&self.header, None, &groups)
+            let bytes = encode_overview(&self.header, None, &groups, &BTreeMap::new())
                 .map_err(|cause| JsValue::from_str(&cause))?;
             *self.overview_groups.borrow_mut() = Some(groups);
             Ok(bytes)
@@ -4345,16 +6982,16 @@ pub mod wasm {
                 serde_json::from_str(dead).map_err(|e| JsValue::from_str(&e.to_string()))?;
             let mut found = Vec::new();
             for id in &ids {
-                if let Ok(index) = header
-                    .documents
-                    .binary_search_by(|doc| compare_document_ids(&doc.id, id))
-                {
+                if let Ok(index) = header.documents.find_id(id) {
                     let row = u32::try_from(index)
                         .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
                     if !dead.contains(&row) {
                         found.push(Located {
                             row,
-                            document: &header.documents[index],
+                            document: header.documents.row(index),
+                            vector_data: header
+                                .vector_range(index)
+                                .map_err(|cause| JsValue::from_str(&cause))?,
                         });
                     }
                 }
@@ -4384,9 +7021,16 @@ pub mod wasm {
                 serde_json::from_str(rows).map_err(|e| JsValue::from_str(&e.to_string()))?;
             let selected = rows
                 .iter()
-                .map(|row| header.documents.get(*row as usize).ok_or("Invalid row"))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(JsValue::from_str)?;
+                .map(|row| {
+                    let index = *row as usize;
+                    Ok(Located {
+                        row: *row,
+                        document: header.documents.get(index).ok_or("Invalid row")?,
+                        vector_data: header.vector_range(index)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()
+                .map_err(|cause| JsValue::from_str(&cause))?;
             serde_json::to_string(&selected).map_err(|e| JsValue::from_str(&e.to_string()))
         }
 
@@ -4397,6 +7041,9 @@ pub mod wasm {
             dead: &str,
             constant_attributes: Option<String>,
         ) -> Result<Ranker, JsValue> {
+            if !self.covers_query(query) {
+                return Err(JsValue::from_str("Common directory does not cover query"));
+            }
             let dead: Vec<u32> = serde_json::from_str(dead)
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
             let filters = if uniform_filters(&query.query.filters, constant_attributes)
@@ -4406,7 +7053,7 @@ pub mod wasm {
             } else {
                 query.query.filters.as_slice()
             };
-            let search = Search::with_terms(
+            let mut search = Search::with_terms(
                 self.header.clone(),
                 query.query.terms.clone(),
                 &query.query.mode,
@@ -4415,11 +7062,15 @@ pub mod wasm {
                 filters,
             )
             .map_err(|cause| JsValue::from_str(&cause))?;
+            search.pending_hot.clone_from(&self.hot);
             Ok(Ranker { search })
         }
 
         #[doc = "# Errors\nRejects invalid query JSON, filters, term budgets, top-k, or match mode."]
         pub fn ranker(&self, query: &str) -> Result<Ranker, JsValue> {
+            if self.partial {
+                return Err(JsValue::from_str("Operation requires a complete directory"));
+            }
             let input: Input =
                 serde_json::from_str(query).map_err(|e| JsValue::from_str(&e.to_string()))?;
             let search = Search::new(
@@ -4439,7 +7090,9 @@ pub mod wasm {
     #[derive(Serialize)]
     struct Located<'a> {
         row: u32,
-        document: &'a DocumentMeta,
+        document: DocumentMeta<&'a str, &'a DocumentAttributes>,
+        #[serde(rename = "vectorData")]
+        vector_data: Option<&'a Range>,
     }
 
     #[wasm_bindgen]
@@ -4477,12 +7130,38 @@ pub mod wasm {
     }
 
     #[wasm_bindgen]
+    #[doc = "# Errors\nRejects invalid v2 canonical header framing or serialization."]
+    pub fn segment_header(bytes: &[u8]) -> Result<String, JsValue> {
+        let (header, _) = parse_header(bytes).map_err(|cause| JsValue::from_str(&cause))?;
+        serde_json::to_string(&header).map_err(|cause| JsValue::from_str(&cause.to_string()))
+    }
+
+    #[wasm_bindgen]
+    #[doc = "# Errors\nRejects invalid v1 sources or migration output above sixteen MiB."]
+    pub fn segment_migrate(bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
+        super::migrate_segment(bytes).map_err(|cause| JsValue::from_str(&cause))
+    }
+
+    #[wasm_bindgen]
     #[doc = "# Errors\nRejects corrupt pages or invalid document serialization."]
-    pub fn segment_document(bytes: &[u8]) -> Result<String, JsValue> {
-        let decoded = decode_page(bytes).map_err(|cause| JsValue::from_str(&cause))?;
-        let document: Document =
-            serde_json::from_slice(&decoded).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        serde_json::to_string(&document).map_err(|e| JsValue::from_str(&e.to_string()))
+    pub fn segment_document(bytes: &[u8], vector: &[u8]) -> Result<String, JsValue> {
+        super::full_document_from_frames(bytes, vector).map_err(|cause| JsValue::from_str(&cause))
+    }
+
+    #[wasm_bindgen]
+    #[doc = "# Errors\nRejects corrupt pages, invalid document serialization, or query projection errors."]
+    pub fn segment_query_document(bytes: &[u8]) -> Result<String, JsValue> {
+        super::query_document_from_metadata(bytes).map_err(|cause| JsValue::from_str(&cause))
+    }
+
+    #[wasm_bindgen]
+    #[doc = "# Errors\nRejects invalid metadata batches or query projections. Returns None above the decoded batch budget for scalar validation and projection."]
+    pub fn segment_query_documents(
+        bytes: &[u8],
+        ranges: &[u32],
+    ) -> Result<Option<String>, JsValue> {
+        super::query_documents_from_metadata(bytes, ranges)
+            .map_err(|cause| JsValue::from_str(&cause))
     }
 
     #[wasm_bindgen]
@@ -4624,6 +7303,106 @@ pub mod wasm {
 
     #[wasm_bindgen]
     impl PreparedQuery {
+        #[doc = "# Errors\nRejects malformed singleton catalogs or tombstones."]
+        pub fn singleton_hits(
+            &self,
+            catalog: &str,
+            count: u32,
+            dead: &str,
+            constant_attributes: Option<String>,
+        ) -> Result<Option<String>, JsValue> {
+            if self.query.mode == "phrase" && self.query.terms.words.len() != 1
+                || !uniform_filters(&self.query.filters, constant_attributes)
+                    .map_err(|cause| JsValue::from_str(&cause))?
+            {
+                return Ok(None);
+            }
+            if catalog.len() > 1024 * 1024 || dead.len() > 64 * 1024 {
+                return Err(JsValue::from_str("Singleton query exceeds byte budget"));
+            }
+            let dictionary: BTreeMap<String, TermSummary> = serde_json::from_str(catalog)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            let dead: Vec<u32> = serde_json::from_str(dead)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            let excluded: BTreeSet<_> = dead.iter().copied().collect();
+            if count == 0
+                || count > 10000
+                || dictionary.len() > MAX_QUERY_TERMS
+                || excluded.len() != dead.len()
+                || dead.iter().any(|row| *row >= count)
+            {
+                return Err(JsValue::from_str("Invalid singleton query budget"));
+            }
+            let mut candidates = BTreeMap::new();
+            for (index, word) in self.query.terms.order.iter().enumerate() {
+                let Some(metadata) = dictionary.get(&self.query.terms.words[*word]) else {
+                    if self.query.mode != "any" {
+                        return Ok(Some("[]".into()));
+                    }
+                    continue;
+                };
+                let Some(document) = metadata.single.as_ref() else {
+                    return Ok(None);
+                };
+                let [bound] = metadata.bounds.as_slice() else {
+                    return Ok(None);
+                };
+                let &(title, body, title_length, body_length) = bound;
+                if metadata.df != 1
+                    || !document.is_bounded(count)
+                    || (title == 0 && body == 0)
+                    || title > title_length
+                    || body > body_length
+                {
+                    return Ok(None);
+                }
+                if excluded.contains(&document.row) {
+                    continue;
+                }
+                let candidate = candidates.entry(document.row).or_insert((
+                    document,
+                    0.0,
+                    0,
+                    (title_length, body_length),
+                ));
+                if candidate.0.id != document.id
+                    || candidate.0.data != document.data
+                    || candidate.3 != (title_length, body_length)
+                {
+                    return Ok(None);
+                }
+                candidate.1 +=
+                    self.query.terms.scorers[index].score(title, body, title_length, body_length);
+                candidate.2 += 1;
+            }
+            let mut ranked = Vec::new();
+            for (document, score, matched, _) in candidates.into_values() {
+                if !score.is_finite() {
+                    return Ok(None);
+                }
+                if score <= 0.0
+                    || self.query.mode != "any" && matched != self.query.terms.order.len()
+                {
+                    continue;
+                }
+                ranked.push(Ranked {
+                    row: document.row,
+                    id: &document.id,
+                    score,
+                    data: document.data.clone(),
+                });
+            }
+            ranked.sort_by(|a, b| {
+                b.score
+                    .total_cmp(&a.score)
+                    .then_with(|| compare_document_ids(a.id, b.id))
+            });
+            ranked.truncate(self.query.top_k);
+            serde_json::to_string(&ranked)
+                .map(Some)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))
+        }
+
         #[doc = "# Errors\nRejects invalid common-leader metadata or tombstones."]
         pub fn common_hits(
             &self,
@@ -4633,7 +7412,7 @@ pub mod wasm {
             dead: &str,
             constant_attributes: Option<String>,
         ) -> Result<Option<String>, JsValue> {
-            if self.query.mode == "phrase"
+            if self.query.mode == "phrase" && self.query.terms.words.len() != 1
                 || !uniform_filters(&self.query.filters, constant_attributes)
                     .map_err(|cause| JsValue::from_str(&cause))?
             {
@@ -4716,26 +7495,71 @@ pub mod wasm {
     #[wasm_bindgen]
     impl Ranker {
         #[doc = "# Errors\nRejects posting span serialization errors."]
-        pub fn posting_spans(&self) -> Result<String, JsValue> {
-            serde_json::to_string(&self.search.posting_spans())
-                .map_err(|cause| JsValue::from_str(&cause.to_string()))
+        pub fn posting_spans(&mut self) -> Result<String, JsValue> {
+            let spans = self.search.posting_spans();
+            if !self.search.has_hot_selection(&spans) {
+                return serde_json::to_string(&spans)
+                    .map_err(|cause| JsValue::from_str(&cause.to_string()));
+            }
+            let selection = self
+                .search
+                .own_posting_selection(&spans)
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            drop(spans);
+            let remaining = self
+                .search
+                .satisfy_hot_selection(selection)
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            self.search
+                .encode_posting_selection(&remaining)
+                .map_err(|cause| JsValue::from_str(&cause))
         }
         #[doc = "# Errors\nRejects invalid derived cutoffs or posting span serialization errors."]
-        pub fn posting_spans_seeded(&self) -> Result<String, JsValue> {
+        pub fn posting_spans_seeded(&mut self) -> Result<String, JsValue> {
             let spans = self
                 .search
                 .posting_spans_seeded()
                 .map_err(|cause| JsValue::from_str(&cause))?;
-            serde_json::to_string(&spans).map_err(|cause| JsValue::from_str(&cause.to_string()))
+            if !self.search.has_hot_selection(&spans) {
+                return serde_json::to_string(&spans)
+                    .map_err(|cause| JsValue::from_str(&cause.to_string()));
+            }
+            let selection = self
+                .search
+                .own_posting_selection(&spans)
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            drop(spans);
+            let remaining = self
+                .search
+                .satisfy_hot_selection(selection)
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            self.search
+                .encode_posting_selection(&remaining)
+                .map_err(|cause| JsValue::from_str(&cause))
         }
 
         #[doc = "# Errors\nRejects invalid cutoffs or posting span serialization errors."]
-        pub fn posting_spans_after(&self, score: f64, id: &str) -> Result<String, JsValue> {
+        pub fn posting_spans_after(&mut self, score: f64, id: &str) -> Result<String, JsValue> {
             let spans = self
                 .search
                 .posting_spans_after(score, id)
                 .map_err(|cause| JsValue::from_str(&cause))?;
-            serde_json::to_string(&spans).map_err(|cause| JsValue::from_str(&cause.to_string()))
+            if !self.search.has_hot_selection(&spans) {
+                return serde_json::to_string(&spans)
+                    .map_err(|cause| JsValue::from_str(&cause.to_string()));
+            }
+            let selection = self
+                .search
+                .own_posting_selection(&spans)
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            drop(spans);
+            let remaining = self
+                .search
+                .satisfy_hot_selection(selection)
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            self.search
+                .encode_posting_selection(&remaining)
+                .map_err(|cause| JsValue::from_str(&cause))
         }
 
         #[doc = "# Errors\nRejects unrequested terms, positional mode, invalid rows/positions, or unordered blocks."]
@@ -4770,21 +7594,36 @@ pub mod wasm {
                 .add(term, bytes)
                 .map_err(|cause| JsValue::from_str(&cause))
         }
+
+        #[doc = "# Errors\nRejects serialization of exact uniform-frequency hits."]
+        pub fn uniform_hits(&self) -> Result<Option<String>, JsValue> {
+            self.search
+                .uniform_hits()
+                .map(|hits| self.encode_hits(&hits))
+                .transpose()
+        }
+
         #[doc = "# Errors\nRejects posting frequency overflow or result serialization errors."]
         pub fn finish(&self) -> Result<String, JsValue> {
             let hits = self
                 .search
                 .finish()
                 .map_err(|cause| JsValue::from_str(&cause))?;
+            self.encode_hits(&hits)
+        }
+    }
+
+    impl Ranker {
+        fn encode_hits(&self, hits: &[super::Hit]) -> Result<String, JsValue> {
             let ranked: Vec<_> = hits
                 .iter()
                 .map(|hit| {
-                    let document = &self.search.header.documents[hit.row as usize];
+                    let document = self.search.header.documents.row(hit.row as usize);
                     Ranked {
                         row: hit.row,
-                        id: &document.id,
+                        id: document.id,
                         score: hit.score,
-                        data: &document.data,
+                        data: document.data.clone(),
                     }
                 })
                 .collect();
@@ -4797,13 +7636,108 @@ pub mod wasm {
         row: u32,
         id: &'a str,
         score: f64,
-        data: &'a Range,
+        data: Range,
+    }
+}
+
+#[cfg(test)]
+mod query_document_projection_tests {
+    use super::{Document, serialize_query_document};
+    use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+
+    fn document(vector: Option<Vec<f32>>) -> Document {
+        Document {
+            id: "row-1".into(),
+            revision: 7,
+            title: "title".into(),
+            text: "body".into(),
+            attributes: BTreeMap::from([("field".into(), json!("value"))]),
+            vector,
+        }
+    }
+
+    fn check_summary(
+        vector: Option<Vec<f32>>,
+        expected_summary: Value,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut document = document(vector);
+        let mut expected = serde_json::to_value(&document)?;
+        let fields = expected
+            .as_object_mut()
+            .ok_or("Document was not an object")?;
+        fields.remove("vector");
+        fields.insert("vectorSummary".into(), expected_summary);
+        let actual = serde_json::from_str::<Value>(&serialize_query_document(&mut document)?)?;
+        assert_eq!(actual, expected);
+        assert!(document.vector.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn vector_json_extrema_stay_in_range_and_preserve_float32_bits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let values = vec![f32::MAX, -f32::MAX, 0.1, -0.0, f32::from_bits(1)];
+        let source = document(Some(values.clone()));
+        let encoded = serde_json::to_vec(&source)?;
+        let fields =
+            serde_json::from_slice::<BTreeMap<String, Box<serde_json::value::RawValue>>>(&encoded)?;
+        let vector = serde_json::from_str::<Vec<Box<serde_json::value::RawValue>>>(
+            fields.get("vector").ok_or("Missing vector")?.get(),
+        )?;
+        assert_eq!(
+            vector
+                .first()
+                .ok_or("Missing positive extremum")?
+                .get()
+                .parse::<f64>()?
+                .to_bits(),
+            f64::from(f32::MAX).to_bits()
+        );
+        assert_eq!(
+            vector
+                .get(1)
+                .ok_or("Missing negative extremum")?
+                .get()
+                .parse::<f64>()?
+                .to_bits(),
+            f64::from(-f32::MAX).to_bits()
+        );
+        let decoded: Document = serde_json::from_slice(&encoded)?;
+        let decoded = decoded.vector.ok_or("Vector disappeared")?;
+        assert_eq!(
+            decoded
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn query_projection_preserves_fields_and_summarizes_vector_facts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        check_summary(None, Value::Null)?;
+        check_summary(Some(vec![0.5, 0.0, -0.25]), json!([3, true, true]))?;
+        let mut vector_768 = vec![0.0; 768];
+        vector_768[767] = 1.0;
+        check_summary(Some(vector_768), json!([768, true, true]))?;
+        check_summary(Some(Vec::new()), json!([0, true, false]))?;
+        check_summary(Some(vec![0.0, -0.0]), json!([2, true, false]))?;
+        check_summary(Some(vec![f32::INFINITY]), json!([1, false, true]))?;
+        check_summary(Some(vec![0.0; 4097]), json!([4097, true, false]))?;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod filter_cache_tests {
     use super::{Document, FILTER_CACHE_BYTES, Filter, SelectedAttributes, build};
+    use bit_vec::BitVec;
     use serde::de::DeserializeSeed;
     use serde_json::json;
     use std::collections::BTreeSet;
@@ -4945,8 +7879,14 @@ mod filter_cache_tests {
             })
             .collect();
         let mut header = build(documents, None)?.header;
-        for (document, input) in header.documents.iter_mut().zip(inputs) {
-            document.attributes = serde_json::value::RawValue::from_string(input.into())?;
+        for (document, input) in header
+            .documents
+            .attributes
+            .dense_mut()
+            .iter_mut()
+            .zip(inputs)
+        {
+            *document = serde_json::value::RawValue::from_string(input.into())?.into();
         }
         for op in ["eq", "ne", "exists", "in", "gt", "gte", "lt", "lte"] {
             for value in [
@@ -4974,7 +7914,12 @@ mod filter_cache_tests {
                             super::matches(&attributes, &filters)
                         })
                         .collect::<Result<Vec<_>, String>>();
-                    assert_eq!(header.allowed(&filters, &[]), expected);
+                    assert_eq!(
+                        header
+                            .allowed(&filters, &[])
+                            .map(|mask| mask.iter().collect::<Vec<_>>()),
+                        expected
+                    );
                 }
             }
         }
@@ -5012,8 +7957,14 @@ mod filter_cache_tests {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut header = build(documents, None)?.header;
-        for (document, input) in header.documents.iter_mut().zip(inputs) {
-            document.attributes = serde_json::value::RawValue::from_string(input.into())?;
+        for (document, input) in header
+            .documents
+            .attributes
+            .dense_mut()
+            .iter_mut()
+            .zip(inputs)
+        {
+            *document = serde_json::value::RawValue::from_string(input.into())?.into();
         }
         for op in ["eq", "ne", "exists", "in", "gt", "gte", "lt", "lte"] {
             for value in [
@@ -5037,14 +7988,28 @@ mod filter_cache_tests {
                         super::matches(&attributes, &filters)
                     })
                     .collect::<Result<Vec<_>, String>>();
-                assert_eq!(header.allowed(&filters, &[]), expected);
+                assert_eq!(
+                    header
+                        .allowed(&filters, &[])
+                        .map(|mask| mask.iter().collect::<Vec<_>>()),
+                    expected
+                );
                 if let Ok(mask) = expected {
                     let mut deleted = mask.clone();
                     deleted[0] = false;
                     deleted[3] = false;
                     deleted[7] = false;
-                    assert_eq!(header.allowed(&filters, &[0, 3, 7])?, deleted);
-                    assert_eq!(header.allowed(&filters, &[])?, mask);
+                    assert_eq!(
+                        header
+                            .allowed(&filters, &[0, 3, 7])?
+                            .iter()
+                            .collect::<Vec<_>>(),
+                        deleted
+                    );
+                    assert_eq!(
+                        header.allowed(&filters, &[])?.iter().collect::<Vec<_>>(),
+                        mask
+                    );
                 }
                 *header.filter_masks.borrow_mut() = super::FilterMasks::default();
             }
@@ -5095,10 +8060,16 @@ mod filter_cache_tests {
                     super::matches(&attributes, &filters)
                 })
                 .collect::<Result<Vec<_>, String>>()?;
-            assert_eq!(header.allowed(&filters, &[])?, expected);
+            assert_eq!(
+                header.allowed(&filters, &[])?.iter().collect::<Vec<_>>(),
+                expected
+            );
             assert!(!header.allowed(&filters, &[17, 2117])?[17]);
             assert!(!header.allowed(&filters, &[17, 2117])?[2117]);
-            assert_eq!(header.allowed(&filters, &[])?, expected);
+            assert_eq!(
+                header.allowed(&filters, &[])?.iter().collect::<Vec<_>>(),
+                expected
+            );
             let cache = header.filter_masks.borrow();
             assert!(cache.representatives.is_some());
             assert!(cache.bytes <= FILTER_CACHE_BYTES);
@@ -5123,7 +8094,10 @@ mod filter_cache_tests {
                 op: "exists".into(),
                 value: json!(false),
             };
-            assert_eq!(header.allowed(&[filter], &[])?, vec![true; 5000]);
+            assert_eq!(
+                header.allowed(&[filter], &[])?.iter().collect::<Vec<_>>(),
+                vec![true; 5000]
+            );
             let cache = header.filter_masks.borrow();
             assert!(cache.bytes <= FILTER_CACHE_BYTES);
             if let Some((scope, _)) = &cache.representatives {
@@ -5137,7 +8111,10 @@ mod filter_cache_tests {
             value: json!(17),
         };
         let expected: Vec<_> = (0..5000).map(|row| row % 2100 == 17).collect();
-        assert_eq!(header.allowed(&[filter], &[])?, expected);
+        assert_eq!(
+            header.allowed(&[filter], &[])?.iter().collect::<Vec<_>>(),
+            expected
+        );
         Ok(())
     }
 
@@ -5152,8 +8129,8 @@ mod filter_cache_tests {
                 "id":"a", "text":"target", "attributes":{}
             }))?;
             let mut header = build(vec![document], None)?.header;
-            header.documents[0].attributes =
-                serde_json::value::RawValue::from_string(input.into())?;
+            header.documents.attributes.dense_mut()[0] =
+                serde_json::value::RawValue::from_string(input.into())?.into();
             assert!(
                 header
                     .allowed(
@@ -5171,6 +8148,59 @@ mod filter_cache_tests {
     }
 
     #[test]
+    fn packed_mask_lengths_and_capacity_charge_are_exact() {
+        for length in [0, 1, 31, 32, 33, 10_000] {
+            let mut mask = BitVec::from_elem(length, true);
+            assert_eq!(mask.len(), length);
+            assert!(mask.iter().all(|bit| bit));
+            assert_eq!(mask.capacity().div_ceil(8), length.div_ceil(32) * 4);
+            if length > 0 {
+                mask.set(length - 1, false);
+                assert!(!mask[length - 1]);
+                assert!(mask.iter().take(length - 1).all(|bit| bit));
+            }
+        }
+    }
+
+    #[test]
+    fn packed_cache_retains_sixteen_fifo_masks_without_tombstones()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let documents = (0..10_000)
+            .map(|index| {
+                serde_json::from_value::<Document>(json!({
+                    "id": format!("{index}"), "text": "target", "attributes": {"group": index}
+                }))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let header = build(documents, None)?.header;
+        let filters = (0..17)
+            .map(|value| Filter {
+                field: "group".into(),
+                op: "eq".into(),
+                value: json!(value),
+            })
+            .collect::<Vec<_>>();
+        for filter in filters.iter().take(16) {
+            header.allowed(std::slice::from_ref(filter), &[])?;
+        }
+        {
+            let cache = header.filter_masks.borrow();
+            assert_eq!(cache.entries.len(), 16);
+            assert!(cache.bytes <= FILTER_CACHE_BYTES);
+        }
+        let first = filters.first().ok_or("missing first filter")?;
+        assert!(!header.allowed(std::slice::from_ref(first), &[0])?[0]);
+        assert!(header.allowed(std::slice::from_ref(first), &[])?[0]);
+        header.allowed(&filters[16..17], &[])?;
+        let cache = header.filter_masks.borrow();
+        assert_eq!(cache.entries.len(), 16);
+        assert!(cache.bytes <= FILTER_CACHE_BYTES);
+        let first_key = serde_json::to_string(std::slice::from_ref(first))?;
+        assert!(cache.entries.iter().all(|(key, _, _)| key != &first_key));
+        Ok(())
+    }
+
+    #[test]
     fn masks_are_bounded_and_tombstones_remain_query_local()
     -> Result<(), Box<dyn std::error::Error>> {
         let document: Document = serde_json::from_value(json!({
@@ -5183,7 +8213,10 @@ mod filter_cache_tests {
                 op: "eq".into(),
                 value: json!(format!("{}{}", "x".repeat(2500), index)),
             };
-            assert_eq!(header.allowed(&[filter], &[])?, vec![false]);
+            assert_eq!(
+                header.allowed(&[filter], &[])?.iter().collect::<Vec<_>>(),
+                vec![false]
+            );
             let cache = header.filter_masks.borrow();
             assert!(cache.bytes <= FILTER_CACHE_BYTES);
             assert!(cache.entries.len() <= 16);
@@ -5193,9 +8226,18 @@ mod filter_cache_tests {
             op: "eq".into(),
             value: json!(0),
         }];
-        assert_eq!(header.allowed(&filters, &[])?, vec![true]);
-        assert_eq!(header.allowed(&filters, &[0])?, vec![false]);
-        assert_eq!(header.allowed(&filters, &[])?, vec![true]);
+        assert_eq!(
+            header.allowed(&filters, &[])?.iter().collect::<Vec<_>>(),
+            vec![true]
+        );
+        assert_eq!(
+            header.allowed(&filters, &[0])?.iter().collect::<Vec<_>>(),
+            vec![false]
+        );
+        assert_eq!(
+            header.allowed(&filters, &[])?.iter().collect::<Vec<_>>(),
+            vec![true]
+        );
         assert!(!serde_json::to_string(&header)?.contains("filter_masks"));
         Ok(())
     }
@@ -5627,6 +8669,133 @@ mod frequency_tests {
 }
 
 #[cfg(test)]
+mod common_term_projection_tests {
+    use super::{Document, build};
+    use serde_json::{Value, json};
+
+    #[test]
+    fn common_term_projection_uses_complete_quantile_groups()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let documents: Vec<Document> = (0..40)
+            .map(|index| {
+                let title = std::iter::repeat_n(format!("filler{index:02}"), index)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                json!({
+                    "id": format!("doc{index:02}"),
+                    "title": title,
+                    "text": "alpha beta",
+                    "attributes": {}
+                })
+            })
+            .map(serde_json::from_value)
+            .collect::<Result<_, _>>()?;
+        let built = build(documents, None)?;
+        let projection: Value = serde_json::from_str(
+            built
+                .common_projection
+                .as_deref()
+                .ok_or("Expected bounded common-term projection")?,
+        )?;
+        assert_eq!(projection["terms"], json!(["alpha", "beta"]));
+        let partitions = projection["partitions"]
+            .as_array()
+            .ok_or("Missing projection partitions")?;
+        assert_eq!(partitions.len(), 32);
+        assert_eq!(
+            projection["independent"],
+            json!([[[0, 1, 0, 2]], [[0, 1, 0, 2]]])
+        );
+        for (group, partition) in partitions.iter().enumerate() {
+            let rows: Vec<_> = (0..40).filter(|row| row * 32 / 40 == group).collect();
+            let minimum_title = *rows.iter().min().ok_or("Empty projection group")?;
+            assert_eq!(
+                partition,
+                &json!([[0, 1, minimum_title, 2], [0, 1, minimum_title, 2]])
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn common_term_projection_is_omitted_when_encoded_budget_is_exceeded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let terms: Vec<_> = (0..16)
+            .map(|index| format!("term{index:02}{}", "x".repeat(58)))
+            .collect();
+        let body = terms.join(" ");
+        let documents: Vec<Document> = (0..32)
+            .map(|index| {
+                let title = std::iter::repeat_n(format!("filler{index:02}"), index)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                json!({
+                    "id": format!("doc{index:02}"),
+                    "title": title,
+                    "text": body,
+                    "attributes": {}
+                })
+            })
+            .map(serde_json::from_value)
+            .collect::<Result<_, _>>()?;
+        let built = build(documents, None)?;
+        assert!(built.common_projection.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn common_term_projection_keeps_independent_block_bounds_when_length_groups_coarsen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let documents: Vec<Document> = (0..287)
+            .map(|index| {
+                let (id, text) = match index {
+                    0..=127 => (format!("a{index:03}"), "alpha low".to_owned()),
+                    128..=255 => (
+                        format!("b{:03}", index - 128),
+                        format!("{}{}", "alpha ".repeat(50), "high ".repeat(50)),
+                    ),
+                    _ => {
+                        let length = 101 + index - 256;
+                        (
+                            format!("c{:02}", index - 256),
+                            std::iter::repeat_n(format!("pad{index}"), length)
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        )
+                    }
+                };
+                json!({ "id": id, "text": text, "attributes": {} })
+            })
+            .map(serde_json::from_value)
+            .collect::<Result<_, _>>()?;
+        let built = build(documents, None)?;
+        let projection: Value = serde_json::from_str(
+            built
+                .common_projection
+                .as_deref()
+                .ok_or("Expected bounded common-term projection")?,
+        )?;
+        let terms = projection["terms"]
+            .as_array()
+            .ok_or("Missing projection terms")?;
+        let alpha = terms
+            .iter()
+            .position(|term| term == "alpha")
+            .ok_or("Missing alpha projection")?;
+        assert_eq!(projection["partitions"][0][alpha], json!([0, 50, 0, 2]));
+        assert_eq!(
+            projection["independent"][alpha],
+            json!([[0, 1, 0, 2], [0, 50, 0, 100]])
+        );
+        assert!(
+            serde_json::to_vec(&projection)?.len() <= 4096,
+            "projection exceeded encoded budget"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod candidate_tests {
     use super::{Document, Search, Statistics, build};
     use serde_json::json;
@@ -5973,16 +9142,15 @@ mod eligible_bound_tests {
                             block.min_body_length,
                         );
                         assert!(*bound <= physical + 1e-12);
-                        if !search.allowed[block.first as usize..=block.last as usize]
-                            .iter()
-                            .any(|allowed| *allowed)
+                        if !(block.first as usize..=block.last as usize)
+                            .any(|row| search.allowed[row])
                         {
                             assert_eq!(bound.to_bits(), 0.0_f64.to_bits());
                         }
                         for posting in lists[*term].iter().filter(|posting| {
                             block.first <= posting.row && posting.row <= block.last
                         }) {
-                            let document = &header.documents[posting.row as usize];
+                            let document = header.documents.row(posting.row as usize);
                             let actual = scorers[index].score(
                                 posting.title,
                                 posting.body,
@@ -6075,7 +9243,7 @@ mod cutoff_certificate_tests {
         id: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let header = &built.header;
-        let best_id = &header.documents[best.row as usize].id;
+        let best_id = header.documents.row(best.row as usize).id;
         let spans: Vec<_> = search
             .posting_spans_after(score, id)?
             .into_iter()
@@ -6099,25 +9267,20 @@ mod cutoff_certificate_tests {
             }
         }
         let mut upper = score;
-        let mut minimum_id = header
-            .documents
-            .first()
-            .ok_or("Missing source minimum")?
-            .id
-            .clone();
+        let mut minimum_id = header.documents.first().ok_or("Missing source minimum")?.id;
         if minimum_id.encode_utf16().cmp(id.encode_utf16()) == Ordering::Less {
-            minimum_id = id.to_owned();
+            minimum_id = id;
         }
         for hit in search.finish()? {
-            let hit_id = &header.documents[hit.row as usize].id;
+            let hit_id = header.documents.row(hit.row as usize).id;
             match hit.score.total_cmp(&upper) {
                 Ordering::Greater => {
                     upper = hit.score;
-                    minimum_id.clone_from(hit_id);
+                    minimum_id = hit_id;
                 }
                 Ordering::Equal => {
                     if hit_id.encode_utf16().cmp(minimum_id.encode_utf16()) == Ordering::Less {
-                        minimum_id.clone_from(hit_id);
+                        minimum_id = hit_id;
                     }
                 }
                 Ordering::Less => {}
@@ -6180,9 +9343,9 @@ mod cutoff_certificate_tests {
                     }
                     let all = complete.finish()?;
                     let best = all.first().ok_or("Missing complete hit")?;
-                    let best_id = &header.documents[best.row as usize].id;
+                    let best_id = header.documents.row(best.row as usize).id;
                     for score in [best.score - 1e-13, best.score, best.score + 1e-13] {
-                        for id in ["", "row-150", "\u{10000}", "\u{e000}", best_id.as_str()] {
+                        for id in ["", "row-150", "\u{10000}", "\u{e000}", best_id] {
                             for top_k in [1, 10, 100] {
                                 let partial = Search::new(
                                     header.clone(),
@@ -6416,6 +9579,1231 @@ mod required_term_tests {
                 }
             }
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod uniform_hits_tests {
+    use super::{BuiltSegment, Document, Filter, Search, Statistics, build};
+    use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::rc::Rc;
+
+    fn fixture(placement: &str) -> Result<BuiltSegment, Box<dyn std::error::Error>> {
+        let documents = (0..260)
+            .map(|index| {
+                let id = match index {
+                    258 => "\u{e000}".to_owned(),
+                    259 => "😀".to_owned(),
+                    _ => format!("{index:03}"),
+                };
+                let (title, text) = match placement {
+                    "title" => (format!("alpha beta {}", "filler ".repeat(index % 5)), "noise".to_owned()),
+                    "mixed" => (format!("alpha {}", "filler ".repeat(index % 5)), format!("beta {}", "noise ".repeat(index % 7))),
+                    "wide" => ("filler ".repeat(index % 5), format!("alpha beta {}", "noise ".repeat(index % 67))),
+                    _ => ("heading".to_owned(), format!("alpha beta {}", "noise ".repeat(index % 7))),
+                };
+                serde_json::from_value::<Document>(json!({"id":id,"title":title,"text":text,"attributes":{"group":index%3,"empty":null}}))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(build(documents, None)?)
+    }
+
+    fn statistics(zero: bool) -> Statistics {
+        if zero {
+            return Statistics {
+                documents: 0,
+                title_length: 0,
+                body_length: 0,
+                frequencies: BTreeMap::from([("alpha".into(), 0), ("beta".into(), 0)]),
+            };
+        }
+        Statistics {
+            documents: 997,
+            title_length: 17123,
+            body_length: 28441,
+            frequencies: BTreeMap::from([("alpha".into(), 421), ("beta".into(), 699)]),
+        }
+    }
+
+    #[test]
+    fn uniform_hits_match_full_postings_exactly() -> Result<(), Box<dyn std::error::Error>> {
+        let filters: Vec<Vec<Filter>> = serde_json::from_value(json!([
+            [],
+            [{"field":"group","op":"eq","value":1}],
+            [{"field":"group","op":"eq","value":999}],
+            [{"field":"absent","op":"exists","value":false}],
+            [{"field":"empty","op":"eq","value":null}]
+        ]))?;
+        for placement in ["body", "title", "mixed", "wide"] {
+            let built = fixture(placement)?;
+            let base = super::parse_header(&built.bytes)?.1;
+            let header = Rc::new(built.header);
+            for (text, mode) in [
+                ("alpha beta", "any"),
+                ("beta alpha alpha", "any"),
+                ("beta alpha", "all"),
+                ("alpha alpha", "all"),
+                ("alpha", "phrase"),
+            ] {
+                for predicates in &filters {
+                    for dead in [vec![], vec![0, 129, 259]] {
+                        for top_k in [1, 10, 100] {
+                            for zero in [false, true] {
+                                let mut search = Search::new(
+                                    header.clone(),
+                                    statistics(zero),
+                                    text,
+                                    mode,
+                                    top_k,
+                                    &dead,
+                                    predicates,
+                                )?;
+                                let uniform =
+                                    search.uniform_hits().ok_or("Expected uniform proof")?;
+                                for (term, metadata) in &header.terms {
+                                    if !search.words.iter().any(|word| word == term) {
+                                        continue;
+                                    }
+                                    for block in &metadata.blocks {
+                                        let start = base + block.data.offset as usize;
+                                        search.add(
+                                            term,
+                                            &built.bytes[start..start + block.data.length as usize],
+                                        )?;
+                                    }
+                                }
+                                assert_eq!(uniform, search.finish()?);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn uniform_hits_reject_incomplete_or_nonuniform_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let built = fixture("body")?;
+        for defect in [
+            "empty-blocks",
+            "sparse-df",
+            "count",
+            "first",
+            "gap",
+            "last",
+            "zero-range",
+            "overflow-range",
+            "range-order",
+            "body-tf",
+            "both-fields",
+            "mixed-field",
+            "zero-body-length",
+            "zero-title-length",
+            "empty-documents",
+        ] {
+            let mut header = if defect == "zero-title-length" {
+                fixture("title")?.header
+            } else {
+                built.header.clone()
+            };
+            if defect == "zero-title-length" {
+                header.documents.title_lengths.set(0, 0);
+            } else if defect == "zero-body-length" {
+                header.documents.body_lengths.set(0, 0);
+            } else if defect == "empty-documents" {
+                header.documents = super::DocumentTable::from(Vec::new());
+            } else {
+                let term = header.terms.get_mut("alpha").ok_or("Missing alpha")?;
+                match defect {
+                    "empty-blocks" => term.blocks = Box::new([]),
+                    "sparse-df" => term.df -= 1,
+                    "count" => term.blocks[0].count -= 1,
+                    "first" => term.blocks[0].first = 1,
+                    "gap" => term.blocks[1].first += 1,
+                    "last" => term.blocks[2].last -= 1,
+                    "zero-range" => term.blocks[0].data.length = 0,
+                    "overflow-range" => term.blocks[0].data.offset = u32::MAX,
+                    "range-order" => term.blocks[1].data.offset = 0,
+                    "body-tf" => term.blocks[0].max_body_tf = 2,
+                    "both-fields" => term.blocks[0].max_title_tf = 1,
+                    "mixed-field" => {
+                        term.blocks[1].max_title_tf = 1;
+                        term.blocks[1].max_body_tf = 0;
+                    }
+                    _ => return Err("Unknown metadata defect".into()),
+                }
+            }
+            let search = Search::new(
+                Rc::new(header),
+                statistics(false),
+                "alpha beta",
+                "any",
+                10,
+                &[],
+                &[],
+            )?;
+            assert!(search.uniform_hits().is_none(), "accepted {defect}");
+        }
+        let header = Rc::new(built.header);
+        for (text, mode) in [
+            ("alpha unknown", "any"),
+            ("alpha beta", "phrase"),
+            ("alpha alpha", "phrase"),
+            ("", "any"),
+        ] {
+            let search = Search::new(header.clone(), statistics(false), text, mode, 10, &[], &[])?;
+            assert!(search.uniform_hits().is_none(), "accepted {text}/{mode}");
+        }
+        assert!(Search::new(header, statistics(false), "alpha", "any", 10, &[260], &[]).is_err());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dictionary_frames_tests {
+    use super::{
+        Document, DocumentAttributes, build, compress_directory, parse_compressed_directory,
+        parse_header,
+    };
+    use std::collections::BTreeMap;
+    use std::rc::Rc;
+    #[test]
+    fn dictionary_selects_reuse_and_preserves_unique_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for count in [1, 128, 2048] {
+            for cardinality in [1, 100, 700, 2048] {
+                let built = build(
+                    (0..count)
+                        .map(|i| Document {
+                            id: format!("ação-{i:06}😀"),
+                            revision: u64::MAX,
+                            title: "cloudflare rust".into(),
+                            text: "cloudflare rust search".into(),
+                            attributes: BTreeMap::from([
+                                ("group".into(), serde_json::json!(i % cardinality)),
+                                ("nested".into(), serde_json::json!([null, true, "😀"])),
+                            ]),
+                            vector: None,
+                        })
+                        .collect(),
+                    None,
+                )?;
+                let (_, prefix) = parse_header(&built.bytes)?;
+                let frame = compress_directory(&built.bytes[..prefix])?;
+                let decoded = parse_compressed_directory(&frame, prefix, 40 * 1024 * 1024)?;
+                assert_eq!(
+                    serde_json::to_string(&decoded)?,
+                    serde_json::to_string(&built.header)?
+                );
+                if count <= cardinality {
+                    assert!(
+                        decoded
+                            .documents
+                            .iter()
+                            .all(|d| matches!(d.attributes, DocumentAttributes::Owned(_)))
+                    );
+                } else {
+                    match (
+                        decoded.documents.row(0).attributes,
+                        decoded.documents.row(cardinality).attributes,
+                    ) {
+                        (DocumentAttributes::Shared(a), DocumentAttributes::Shared(b)) => {
+                            assert!(Rc::ptr_eq(a, b));
+                        }
+                        _ => return Err("Expected shared dictionary values".into()),
+                    }
+                }
+                let mut corrupt = frame.clone();
+                corrupt[16] ^= 1;
+                assert!(parse_compressed_directory(&corrupt, prefix, 40 * 1024 * 1024).is_err());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod shared_attribute_identity_tests {
+    use super::{Document, DocumentAttributes, Filter, build, matches, parse_compressed_directory};
+    use serde_json::json;
+    use std::rc::Rc;
+
+    #[test]
+    fn dictionary_identity_preserves_filter_errors_missing_values_and_tombstones()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let input = (0..512)
+            .map(|index| {
+                serde_json::from_value::<Document>(json!({
+                    "id": format!("{index:04}"),
+                    "text": "cloudflare rust",
+                    "attributes": {
+                        "group": index % 17,
+                        "year": 2020 + index % 4,
+                        "flag": index % 2 == 0,
+                        "nested": [null, "ação", true]
+                    }
+                }))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let built = build(input, None)?;
+        let (_, prefix) = super::parse_header(&built.bytes)?;
+        let frame = super::compress_directory(&built.bytes[..prefix])?;
+        let decoded = parse_compressed_directory(&frame, prefix, 40 * 1024 * 1024)?;
+        assert!(
+            decoded
+                .documents
+                .iter()
+                .all(|document| matches!(document.attributes, DocumentAttributes::Shared(_)))
+        );
+        let mut isolated = built.header.clone();
+        for document in isolated.documents.attributes.dense_mut() {
+            *document = DocumentAttributes::Shared(Rc::from(
+                serde_json::value::RawValue::from_string(document.get().into())?,
+            ));
+        }
+        let mut mixed = decoded.clone();
+        for (index, document) in mixed
+            .documents
+            .attributes
+            .dense_mut()
+            .iter_mut()
+            .enumerate()
+        {
+            if index % 2 == 0 {
+                *document = serde_json::value::RawValue::from_string(document.get().into())?.into();
+            }
+        }
+        for field in ["group", "year", "flag", "missing", "nested"] {
+            for op in [
+                "eq", "ne", "in", "exists", "gt", "gte", "lt", "lte", "invalid",
+            ] {
+                for value in [
+                    json!(3),
+                    json!(true),
+                    json!(null),
+                    json!([3, 5]),
+                    json!({"a":1}),
+                ] {
+                    let filters = [Filter {
+                        field: field.into(),
+                        op: op.into(),
+                        value,
+                    }];
+                    let expected = built
+                        .header
+                        .documents
+                        .iter()
+                        .map(|document| {
+                            let attributes = serde_json::from_str(document.attributes.get())
+                                .map_err(|cause| cause.to_string())?;
+                            matches(&attributes, &filters)
+                        })
+                        .collect::<Result<Vec<_>, String>>();
+                    for header in [&built.header, &decoded, &isolated, &mixed] {
+                        assert_eq!(
+                            header
+                                .allowed(&filters, &[])
+                                .map(|mask| mask.iter().collect::<Vec<_>>()),
+                            expected
+                        );
+                        if let Ok(mask) = &expected {
+                            let mut deleted = mask.clone();
+                            for row in [0, 7, 511] {
+                                deleted[row] = false;
+                            }
+                            assert_eq!(
+                                header
+                                    .allowed(&filters, &[0, 7, 511])?
+                                    .iter()
+                                    .collect::<Vec<_>>(),
+                                deleted
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod common_frame_validation_tests {
+    use super::{
+        COMMON_DIRECTORY_MAGIC, Document, build, compress_common_directory_segment,
+        compress_directory, compress_directory_payload, decode_directory_contents,
+        decode_directory_payload, parse_header,
+    };
+    use std::{cell::Cell, collections::BTreeMap};
+
+    #[test]
+    fn dictionary_expansion_respects_canonical_header_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut compact = Vec::new();
+        let rows = 10_000_u32;
+        let attribute =
+            serde_json::to_string(&BTreeMap::from([("blob", "a".repeat(1024 * 1024))]))?;
+        for value in [2, rows, 1, 1, u32::try_from(attribute.len())?] {
+            super::put_int(value, &mut compact);
+        }
+        compact.extend_from_slice(attribute.as_bytes());
+        for row in 0..rows {
+            let id = format!("{row:05}");
+            super::put_int(u32::try_from(id.len())?, &mut compact);
+            compact.extend_from_slice(id.as_bytes());
+            for value in [0, 0, 0, 0, row * 8, 8, 0] {
+                super::put_int(value, &mut compact);
+            }
+        }
+        for value in [0, 0, 0, rows * 8, rows * 8, 0] {
+            super::put_int(value, &mut compact);
+        }
+        let expected = 16 * 1024 * 1024;
+        let mut common = Vec::new();
+        common.extend_from_slice(&u32::try_from(compact.len())?.to_le_bytes());
+        common.extend_from_slice(&compact);
+        common.extend_from_slice(&[0, 0]);
+        for (magic, bytes) in [
+            (super::DIRECTORY_MAGIC, compact),
+            (COMMON_DIRECTORY_MAGIC, common),
+        ] {
+            let frame = compress_directory_payload(&bytes, expected, *magic)?;
+            for prior in [false, true] {
+                let validated = Cell::new(prior);
+                let result = decode_directory_payload(
+                    &frame,
+                    expected,
+                    40 * 1024 * 1024,
+                    Some(&validated),
+                    *magic,
+                );
+                assert_eq!(
+                    result.err().ok_or("Impossible expansion accepted")?,
+                    "Directory attributes exceed canonical size budget"
+                );
+                assert_eq!(validated.get(), prior);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn failed_common_selection_never_becomes_an_immutable_validation_witness()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let text = (0..17)
+            .map(|value| format!("term{value}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let built = build(
+            (0..2)
+                .map(|value| Document {
+                    id: value.to_string(),
+                    revision: 1,
+                    title: String::new(),
+                    text: text.clone(),
+                    attributes: BTreeMap::new(),
+                    vector: None,
+                })
+                .collect(),
+            None,
+        )?;
+        let (_, length) = parse_header(&built.bytes)?;
+        let frame = compress_directory(&built.bytes[..length])?;
+        let header_compact = miniz_oxide::inflate::decompress_to_vec_zlib(&frame[20..])
+            .map_err(|cause| cause.to_string())?;
+        let mut compact = Vec::new();
+        compact.extend_from_slice(&u32::try_from(header_compact.len())?.to_le_bytes());
+        compact.extend_from_slice(&header_compact);
+        compact.extend_from_slice(&[0, 0]);
+        let frame = compress_directory_payload(&compact, length, *COMMON_DIRECTORY_MAGIC)?;
+        let validated = Cell::new(false);
+        for _ in 0..2 {
+            let result = decode_directory_payload(
+                &frame,
+                length,
+                40 * 1024 * 1024,
+                Some(&validated),
+                *COMMON_DIRECTORY_MAGIC,
+            );
+            assert_eq!(
+                result.err().ok_or("Invalid selection accepted")?,
+                "Invalid common-directory term selection"
+            );
+            assert!(!validated.get());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn truncated_common_compact_prefix_rejects_without_validation() -> Result<(), String> {
+        for length in 0..4 {
+            let frame = compress_directory_payload(&vec![0; length], 64, *COMMON_DIRECTORY_MAGIC)?;
+            let validated = Cell::new(false);
+            assert!(
+                decode_directory_contents(
+                    &frame,
+                    64,
+                    4096,
+                    Some(&validated),
+                    *COMMON_DIRECTORY_MAGIC
+                )
+                .is_err()
+            );
+            assert!(!validated.get());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_hot_block_with_recomputed_frame_crc_is_rejected_before_validation_cache()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let built = build(
+            (0..256)
+                .map(|value| Document {
+                    id: format!("row{value:04}"),
+                    revision: 1,
+                    title: "common term".into(),
+                    text: "common term common".into(),
+                    attributes: BTreeMap::new(),
+                    vector: None,
+                })
+                .collect(),
+            None,
+        )?;
+        let (_, length) = parse_header(&built.bytes)?;
+        let frame = compress_common_directory_segment(&built.bytes)?;
+        let mut compact = miniz_oxide::inflate::decompress_to_vec_zlib(&frame[20..])
+            .map_err(|cause| cause.to_string())?;
+        let header_length = u32::from_le_bytes(compact[..4].try_into()?) as usize;
+        let hot_start = 4 + header_length;
+        if compact.len() <= hot_start + 2 {
+            return Err("Fixture did not select a hot posting block".into());
+        }
+        let term_length =
+            u16::from_le_bytes(compact[hot_start + 2..hot_start + 4].try_into()?) as usize;
+        let inner_crc = hot_start + 18 + term_length;
+        compact[inner_crc] ^= 1;
+        let damaged = compress_directory_payload(&compact, length, *COMMON_DIRECTORY_MAGIC)?;
+        let validated = Cell::new(false);
+        let error = decode_directory_contents(
+            &damaged,
+            length,
+            40 * 1024 * 1024,
+            Some(&validated),
+            *COMMON_DIRECTORY_MAGIC,
+        )
+        .err()
+        .ok_or("Corrupt common posting block was accepted")?;
+        assert_eq!(error, "Page integrity check failed");
+        assert!(!validated.get());
+        Ok(())
+    }
+
+    #[test]
+    fn common_posting_budget_skips_oversized_decoded_terms_whole()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::{CommonDirectory, MAX_COMMON_POSTING_BYTES};
+
+        let text = "dense ".repeat(512);
+        let built = build(
+            (0..256)
+                .map(|value| Document {
+                    id: format!("row{value:04}"),
+                    revision: 1,
+                    title: String::new(),
+                    text: text.clone(),
+                    attributes: BTreeMap::new(),
+                    vector: None,
+                })
+                .collect(),
+            None,
+        )?;
+        let (_, length) = parse_header(&built.bytes)?;
+        let frame = compress_common_directory_segment(&built.bytes)?;
+        let common = CommonDirectory::compressed(&frame, length, 40 * 1024 * 1024)?;
+        assert!(common.hot.as_ref().is_none_or(
+            |hot| hot.bytes <= MAX_COMMON_POSTING_BYTES && !hot.terms.contains_key("dense")
+        ));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod selected_hot_posting_tests {
+    use super::{
+        CommonDirectory, Document, Filter, PreparedQuery, Statistics, build,
+        compress_common_directory_segment, parse_header,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn lower_cutoff_merges_earlier_hot_blocks_and_preserves_manual_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let built = build(
+            (0_u32..256)
+                .map(|index| Document {
+                    id: format!("row{index:04}"),
+                    revision: 1,
+                    title: String::new(),
+                    text: if index < 128 {
+                        format!("common {}", "padding ".repeat(300))
+                    } else {
+                        "common ".repeat(4)
+                    },
+                    attributes: BTreeMap::from([("group".into(), serde_json::json!(index % 2))]),
+                    vector: None,
+                })
+                .collect(),
+            None,
+        )?;
+        let (header, header_length) = parse_header(&built.bytes)?;
+        let frame = compress_common_directory_segment(&built.bytes)?;
+        let common = CommonDirectory::compressed(&frame, header_length, 40 * 1024 * 1024)?;
+        assert!(
+            common
+                .hot
+                .as_ref()
+                .is_some_and(|hot| hot.terms.contains_key("common"))
+        );
+        let metadata = header.terms.get("common").ok_or("Missing common term")?;
+        for mode in ["any", "all", "phrase"] {
+            let query = PreparedQuery::new(
+                Statistics {
+                    documents: 256,
+                    title_length: header.total_title_length,
+                    body_length: header.total_body_length,
+                    frequencies: header
+                        .terms
+                        .iter()
+                        .map(|(term, value)| (term.to_owned(), u64::from(value.df)))
+                        .collect(),
+                },
+                "common",
+                mode.into(),
+                100,
+                vec![Filter {
+                    field: "group".into(),
+                    op: "eq".into(),
+                    value: serde_json::json!(1),
+                }],
+            )?;
+            let mut baseline = query.ranker(header.clone(), &[7, 129])?;
+            for block in &metadata.blocks {
+                let start = header_length + block.data.offset as usize;
+                baseline.add(
+                    "common",
+                    &built.bytes[start..start + block.data.length as usize],
+                )?;
+            }
+            let expected = baseline.finish()?;
+            let cutoff = expected.first().ok_or("Missing expected hits")?.score * 0.9;
+            let mut selected = query.ranker(header.clone(), &[7, 129])?;
+            selected.pending_hot.clone_from(&common.hot);
+            let last = metadata.blocks.last().ok_or("Missing last block")?;
+            let start = header_length + last.data.offset as usize;
+            selected.add(
+                "common",
+                &built.bytes[start..start + last.data.length as usize],
+            )?;
+            let high = selected.posting_spans_after(cutoff, "row9999")?;
+            assert!(!high.is_empty());
+            assert!(
+                high.iter()
+                    .flat_map(|span| &span.blocks)
+                    .all(|block| block.first >= 128)
+            );
+            let high_selection = selected.own_posting_selection(&high)?;
+            drop(high);
+            assert!(selected.satisfy_hot_selection(high_selection)?.is_empty());
+            let low = selected.posting_spans_after(f64::MIN_POSITIVE, "row9999")?;
+            assert!(
+                low.iter()
+                    .flat_map(|span| &span.blocks)
+                    .any(|block| block.first == 0)
+            );
+            let low_selection = selected.own_posting_selection(&low)?;
+            drop(low);
+            assert!(selected.satisfy_hot_selection(low_selection)?.is_empty());
+            assert_eq!(selected.finish()?, expected);
+            assert_eq!(
+                selected.loaded_hot_blocks.get("common").map(BTreeSet::len),
+                Some(metadata.blocks.len())
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_cutoff_loads_only_selected_hot_blocks_and_repeats_without_duplicate_adds()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let built = build(
+            (0_u32..512)
+                .map(|index| Document {
+                    id: format!("row{index:04}"),
+                    revision: 1,
+                    title: "common".into(),
+                    text: "dense ".repeat(512),
+                    attributes: BTreeMap::new(),
+                    vector: None,
+                })
+                .collect(),
+            None,
+        )?;
+        let (header, header_length) = parse_header(&built.bytes)?;
+        let frame = compress_common_directory_segment(&built.bytes)?;
+        let common = CommonDirectory::compressed(&frame, header_length, 40 * 1024 * 1024)?;
+        let query = PreparedQuery::new(
+            Statistics {
+                documents: 512,
+                title_length: header.total_title_length,
+                body_length: header.total_body_length,
+                frequencies: header
+                    .terms
+                    .iter()
+                    .map(|(term, metadata)| (term.to_owned(), u64::from(metadata.df)))
+                    .collect(),
+            },
+            "common",
+            "any".into(),
+            10,
+            Vec::<Filter>::new(),
+        )?;
+        let mut search = query.ranker(header, &[])?;
+        search.pending_hot.clone_from(&common.hot);
+        let cutoff = search
+            .uniform_hits()
+            .and_then(|hits| hits.first().map(|hit| hit.score))
+            .ok_or("Expected uniform common-term score")?;
+        let original = search.posting_spans_after(cutoff, "row0255")?;
+        let selection = search.own_posting_selection(&original)?;
+        drop(original);
+        let selected_count = selection
+            .iter()
+            .map(|span| span.indices.len())
+            .sum::<usize>();
+        let cached_count = common
+            .hot
+            .as_ref()
+            .and_then(|hot| hot.terms.get("common"))
+            .map(Vec::len)
+            .ok_or("Expected cached common-term blocks")?;
+        assert!(selected_count > 0);
+        assert!(selected_count < cached_count);
+        let remaining = search.satisfy_hot_selection(selection)?;
+        assert!(remaining.is_empty());
+        assert_eq!(
+            search.loaded_hot_blocks.get("common").map(BTreeSet::len),
+            Some(selected_count)
+        );
+        let repeated = search.posting_spans_after(cutoff, "row0255")?;
+        assert!(repeated.is_empty());
+        let repeated_selection = search.own_posting_selection(&repeated)?;
+        drop(repeated);
+        let repeated_remaining = search.satisfy_hot_selection(repeated_selection)?;
+        assert!(repeated_remaining.is_empty());
+        assert_eq!(
+            search.loaded_hot_blocks.get("common").map(BTreeSet::len),
+            Some(selected_count)
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod columnar_v2_tests {
+    use super::{
+        Document, Filter, LegacySegmentHeader, MAX_BYTES, Range, append, build, decode_page,
+        full_document_from_frames, matches, migrate_segment, parse_header,
+        query_document_from_metadata,
+    };
+    use std::collections::BTreeMap;
+
+    fn documents() -> Vec<Document> {
+        [
+            None,
+            Some(vec![]),
+            Some(vec![f32::MAX, -f32::MAX, -0.0, f32::from_bits(1)]),
+            Some(vec![0.1, 0.5]),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, vector)| Document {
+            id: format!("row-{index}"),
+            revision: 7,
+            title: "ação 日本語".into(),
+            text: "cloudflare rust cloudflare".into(),
+            attributes: BTreeMap::from([
+                ("tiny".into(), serde_json::json!(1e-307)),
+                ("max".into(), serde_json::json!(3.402_823_466_385_288_6e38)),
+                ("fraction".into(), serde_json::json!(0.1)),
+                ("nested".into(), serde_json::json!({"vector":"preserved"})),
+            ]),
+            vector,
+        })
+        .collect()
+    }
+
+    fn frame<'a>(payload: &'a [u8], range: &Range) -> Result<&'a [u8], String> {
+        payload
+            .get(range.offset as usize..range.offset as usize + range.length as usize)
+            .ok_or_else(|| "Missing test frame".into())
+    }
+
+    fn legacy_segment() -> Result<Vec<u8>, String> {
+        let documents = documents();
+        let built = build(documents.clone(), None)?;
+        let (_, base) = parse_header(&built.bytes)?;
+        let mut payload = Vec::new();
+        let mut metadata = built.header.documents.clone();
+        for (row, document) in metadata.rows.iter_mut().zip(&documents) {
+            row.data = append(
+                &mut payload,
+                &serde_json::to_vec(document).map_err(|cause| cause.to_string())?,
+            )?;
+        }
+        let document_end = u32::try_from(payload.len()).map_err(|cause| cause.to_string())?;
+        let mut terms = built.header.terms;
+        for (_, term) in &mut terms.entries {
+            for block in &mut term.blocks {
+                block.data.offset = document_end + block.data.offset - built.header.vector_end;
+            }
+        }
+        payload.extend_from_slice(&built.bytes[base + built.header.vector_end as usize..]);
+        let header = LegacySegmentHeader {
+            version: 1,
+            documents: serde_json::from_str(
+                &serde_json::to_string(&metadata).map_err(|cause| cause.to_string())?,
+            )
+            .map_err(|cause| cause.to_string())?,
+            terms,
+            total_title_length: built.header.total_title_length,
+            total_body_length: built.header.total_body_length,
+        };
+        let json = serde_json::to_vec(&header).map_err(|cause| cause.to_string())?;
+        let mut bytes = b"RAIOSEG1".to_vec();
+        bytes.extend_from_slice(
+            &u32::try_from(json.len())
+                .map_err(|cause| cause.to_string())?
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(&crc32fast::hash(&json).to_le_bytes());
+        bytes.extend_from_slice(&json);
+        bytes.extend_from_slice(&payload);
+        Ok(bytes)
+    }
+
+    #[test]
+    fn native_v2_columns_preserve_presence_float_bits_and_header_only_reads() -> Result<(), String>
+    {
+        let original = documents();
+        let built = build(original.clone(), None)?;
+        let (header, base) = parse_header(&built.bytes)?;
+        assert_eq!(header.version, 2);
+        assert_eq!(header.vector_ranges.len(), 3);
+        assert!(parse_header(&built.bytes[..base]).is_ok());
+        let payload = &built.bytes[base..];
+        for (index, (metadata, document)) in header.documents.iter().zip(&original).enumerate() {
+            let data = frame(payload, &metadata.data)?;
+            let vector = header
+                .vector_range(index)?
+                .map(|range| frame(payload, range))
+                .transpose()?
+                .unwrap_or_default();
+            let reconstructed = full_document_from_frames(data, vector)?;
+            let actual: Document =
+                serde_json::from_str(&reconstructed).map_err(|cause| cause.to_string())?;
+            assert_eq!(actual.id, document.id);
+            assert_eq!(
+                actual.vector.as_ref().map(|values| values
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()),
+                document.vector.as_ref().map(|values| values
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>())
+            );
+            let query: serde_json::Value =
+                serde_json::from_str(&query_document_from_metadata(data)?)
+                    .map_err(|cause| cause.to_string())?;
+            assert!(query.get("vector").is_none());
+            assert_eq!(query["attributes"]["nested"]["vector"], "preserved");
+            if document.vector.is_none() {
+                assert!(query["vectorSummary"].is_null());
+            } else {
+                assert_eq!(
+                    query["vectorSummary"][0],
+                    document.vector.as_ref().map_or(0, Vec::len)
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn migration_rebases_only_postings_and_preserves_rows_and_statistics() -> Result<(), String> {
+        let source = legacy_segment()?;
+        assert!(parse_header(&source).is_err());
+        let old_length = u32::from_le_bytes(
+            source[8..12]
+                .try_into()
+                .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
+        ) as usize;
+        let old: LegacySegmentHeader = serde_json::from_slice(&source[16..16 + old_length])
+            .map_err(|cause| cause.to_string())?;
+        let old_payload = &source[16 + old_length..];
+        let old_end = old.documents.last().ok_or("Missing row")?.data.offset
+            + old.documents.last().ok_or("Missing row")?.data.length;
+        let migrated = migrate_segment(&source)?;
+        let (header, base) = parse_header(&migrated)?;
+        assert_eq!(header.total_title_length, old.total_title_length);
+        assert_eq!(header.total_body_length, old.total_body_length);
+        assert_eq!(
+            &migrated[base + header.vector_end as usize..],
+            &old_payload[old_end as usize..]
+        );
+        for (row, (before, after)) in old
+            .documents
+            .iter()
+            .zip(header.documents.iter())
+            .enumerate()
+        {
+            assert_eq!(before.id.as_ref(), after.id);
+            assert_eq!(before.revision, after.revision);
+            assert_eq!(before.attributes.get(), after.attributes.get());
+            let source_attributes: BTreeMap<String, serde_json::Value> =
+                serde_json::from_str(before.attributes.get()).map_err(|cause| cause.to_string())?;
+            for field in ["tiny", "max", "fraction"] {
+                for op in ["eq", "lt", "lte", "gt", "gte"] {
+                    let filter = Filter {
+                        field: field.into(),
+                        op: op.into(),
+                        value: source_attributes
+                            .get(field)
+                            .ok_or("Missing numeric fixture")?
+                            .clone(),
+                    };
+                    let expected = matches(&source_attributes, std::slice::from_ref(&filter))?;
+                    assert_eq!(header.allowed(&[filter], &[])?.get(row), Some(expected));
+                }
+            }
+            let source_document = decode_page(frame(old_payload, &before.data)?)?;
+            let expected: Document =
+                serde_json::from_slice(&source_document).map_err(|cause| cause.to_string())?;
+            let data = frame(&migrated[base..], &after.data)?;
+            let vector = header
+                .vector_range(row)?
+                .map(|range| frame(&migrated[base..], range))
+                .transpose()?
+                .unwrap_or_default();
+            assert_eq!(
+                full_document_from_frames(data, vector)?,
+                serde_json::to_string(&expected).map_err(|cause| cause.to_string())?
+            );
+        }
+        for ((before_name, before), (after_name, after)) in
+            old.terms.iter().zip(header.terms.iter())
+        {
+            assert_eq!(before_name, after_name);
+            assert_eq!(before.df, after.df);
+            for (before_block, after_block) in before.blocks.iter().zip(&after.blocks) {
+                assert_eq!(
+                    before_block.data.offset - old_end,
+                    after_block.data.offset - header.vector_end
+                );
+                assert_eq!(before_block.data.length, after_block.data.length);
+                assert_eq!(before_block.first, after_block.first);
+                assert_eq!(before_block.last, after_block.last);
+            }
+        }
+        assert!(migrate_segment(&migrated).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn dense_vector_ranges_cross_multiple_prefix_blocks() -> Result<(), String> {
+        let values = (0_u16..130)
+            .map(|index| Document {
+                id: format!("row-{index:03}"),
+                revision: u64::from(index),
+                title: "rust".into(),
+                text: "cloudflare rust".into(),
+                attributes: BTreeMap::new(),
+                vector: (index % 3 != 1).then_some(vec![f32::from(index), 0.5]),
+            })
+            .collect::<Vec<_>>();
+        let built = build(values.clone(), None)?;
+        let (header, base) = parse_header(&built.bytes)?;
+        for index in [0, 63, 64, 65, 127, 128, 129] {
+            let data = frame(&built.bytes[base..], &header.documents.row(index).data)?;
+            let vector = header
+                .vector_range(index)?
+                .map(|range| frame(&built.bytes[base..], range))
+                .transpose()?
+                .unwrap_or_default();
+            let reconstructed: Document =
+                serde_json::from_str(&full_document_from_frames(data, vector)?)
+                    .map_err(|cause| cause.to_string())?;
+            assert_eq!(reconstructed.vector, values[index].vector);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_flags_and_conversion_size_are_bounded() -> Result<(), String> {
+        let mut metadata = Vec::new();
+        let range = append(&mut metadata, &[2, 128, 0, 0, 0, 0, b'{', b'}'])?;
+        assert!(query_document_from_metadata(frame(&metadata, &range)?).is_err());
+        assert!(migrate_segment(&vec![0; MAX_BYTES + 1]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_partitions_and_vector_frames_fail_closed() -> Result<(), String> {
+        let built = build(documents(), None)?;
+        let (_, base) = parse_header(&built.bytes)?;
+        let payload = &built.bytes[base..];
+        let mut gap = built.header.clone();
+        gap.documents.rows[0].data.offset = 1;
+        assert!(parse_header(&gap.encode(payload)?).is_err());
+        let mut missing = built.header.clone();
+        missing.vector_ranges.pop();
+        assert!(parse_header(&missing.encode(payload)?).is_err());
+        let mut overlap = built.header.clone();
+        overlap.vector_ranges[0].offset = 0;
+        assert!(parse_header(&overlap.encode(payload)?).is_err());
+        let mut end = built.header.clone();
+        end.vector_end -= 1;
+        assert!(parse_header(&end.encode(payload)?).is_err());
+        let metadata = frame(payload, &built.header.documents.row(2).data)?;
+        assert!(full_document_from_frames(metadata, &[]).is_err());
+        let empty_vector = frame(
+            payload,
+            built
+                .header
+                .vector_range(1)?
+                .ok_or("Missing empty vector")?,
+        )?;
+        assert!(full_document_from_frames(metadata, empty_vector).is_err());
+        let mut corrupt = frame(
+            payload,
+            built.header.vector_range(2)?.ok_or("Missing vector")?,
+        )?
+        .to_vec();
+        let last = corrupt.last_mut().ok_or("Missing vector byte")?;
+        *last ^= 1;
+        assert!(full_document_from_frames(metadata, &corrupt).is_err());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod metadata_batch_tests {
+    use super::{append, query_document_from_metadata, query_documents_from_metadata};
+
+    #[test]
+    fn metadata_batch_reuses_scratch_at_exact_decoded_budget() -> Result<(), String> {
+        let prefix = b"{\"id\":\"edge\",\"revision\":1,\"text\":\"";
+        let suffix = b"\",\"attributes\":{}}";
+        let mut document = prefix.to_vec();
+        document.resize(32768 - suffix.len(), b'x');
+        document.extend_from_slice(suffix);
+        let mut bytes = Vec::new();
+        let first = append(&mut bytes, &document)?;
+        let second = append(&mut bytes, &document)?;
+        let scalar = query_document_from_metadata(&bytes[..first.length as usize])?;
+        assert_eq!(
+            query_documents_from_metadata(
+                &bytes,
+                &[first.offset, first.length, second.offset, second.length]
+            )?,
+            Some(format!("[{scalar},{scalar}]"))
+        );
+        document.insert(prefix.len(), b'x');
+        bytes.truncate(first.length as usize);
+        let over = append(&mut bytes, &document)?;
+        assert!(
+            query_documents_from_metadata(
+                &bytes,
+                &[first.offset, first.length, over.offset, over.length]
+            )?
+            .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reused_metadata_inflater_preserves_scalar_validation() -> Result<(), String> {
+        let mut valid = Vec::new();
+        append(&mut valid, br#"{"id":"row","revision":1,"text":"rust rust","attributes":{"a":true,"b":null,"c":1.5}}"#)?;
+        let mut cases = vec![valid.clone()];
+        for index in [0, 4, 8, valid.len() - 1] {
+            let mut corrupt = valid.clone();
+            corrupt[index] ^= 1;
+            cases.push(corrupt);
+        }
+        for length in [0, 1, 7, 8, 9, valid.len() - 1, valid.len() - 4] {
+            cases.push(valid[..length].to_vec());
+        }
+        let mut padded = valid.clone();
+        padded.extend_from_slice(b"extra compressed bytes");
+        cases.push(padded);
+        let mut dictionary = valid[..8].to_vec();
+        dictionary.extend_from_slice(&[0x78, 0x20, 0, 0, 0, 1]);
+        dictionary.extend_from_slice(&valid[10..]);
+        cases.push(dictionary);
+        let mut empty = Vec::new();
+        append(&mut empty, b"")?;
+        cases.push(empty);
+        for bytes in cases {
+            let length = u32::try_from(bytes.len()).map_err(|cause| cause.to_string())?;
+            let scalar = query_document_from_metadata(&bytes);
+            let batch = query_documents_from_metadata(&bytes, &[0, length]);
+            match (scalar, batch) {
+                (Ok(scalar), Ok(Some(batch))) => assert_eq!(batch, format!("[{scalar}]")),
+                (Err(_), Err(_)) => {}
+                _ => return Err("Scalar and batch validation diverged".into()),
+            }
+        }
+        let mut mixed = Vec::new();
+        let mut ranges = Vec::new();
+        let mut expected = Vec::new();
+        for length in [
+            1, 900, 10, 2000, 2, 400, 1, 1000, 60, 500, 3, 2000, 1, 700, 30, 300,
+        ] {
+            let text = format!(
+                r#"{{"id":"row-{length}","revision":1,"text":"{}","attributes":{{}}}}"#,
+                "α".repeat(length)
+            );
+            let page = append(&mut mixed, text.as_bytes())?;
+            ranges.extend_from_slice(&[page.offset, page.length]);
+            expected.push(query_document_from_metadata(
+                &mixed[page.offset as usize..(page.offset + page.length) as usize],
+            )?);
+        }
+        assert_eq!(
+            query_documents_from_metadata(&mixed, &ranges)?,
+            Some(format!("[{}]", expected.join(",")))
+        );
+        mixed[4] ^= 1;
+        assert!(query_documents_from_metadata(&mixed, &ranges).is_err());
+        assert!(query_documents_from_metadata(&mixed, &ranges[2..])?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_repeated_metadata_batch_preserves_projection() -> Result<(), String> {
+        let mut bytes = Vec::new();
+        let mut ranges = Vec::new();
+        for index in 0..16 {
+            let mut metadata = vec![2, 7, 0, 3, 0, 0];
+            metadata.extend_from_slice(format!(r#"{{"id":"row-{index}","revision":1,"title":"á 字","text":"rust search","attributes":{{"n":9007199254740991}}}}"#).as_bytes());
+            let range = append(&mut bytes, &metadata)?;
+            ranges.push(range.offset);
+            ranges.push(range.length);
+        }
+        let requested: Vec<_> = ranges.chunks_exact(2).rev().flatten().copied().collect();
+        let expected: Vec<serde_json::Value> = requested
+            .chunks_exact(2)
+            .map(|range| {
+                let start = range[0] as usize;
+                let end = start + range[1] as usize;
+                serde_json::from_str(&query_document_from_metadata(&bytes[start..end])?)
+                    .map_err(|cause| cause.to_string())
+            })
+            .collect::<Result<_, String>>()?;
+        let actual: Vec<serde_json::Value> = serde_json::from_str(
+            &query_documents_from_metadata(&bytes, &requested)?.ok_or("Unexpected batch limit")?,
+        )
+        .map_err(|cause| cause.to_string())?;
+        assert_eq!(actual, expected);
+        let repeated = [ranges[0], ranges[1], ranges[0], ranges[1]];
+        let duplicate: Vec<serde_json::Value> = serde_json::from_str(
+            &query_documents_from_metadata(&bytes, &repeated)?.ok_or("Unexpected batch limit")?,
+        )
+        .map_err(|cause| cause.to_string())?;
+        assert_eq!(duplicate[0], duplicate[1]);
+        let mut large = Vec::new();
+        let data = format!(
+            r#"{{"id":"large","revision":1,"title":"","text":"{}","attributes":{{}}}}"#,
+            "x".repeat(70_000)
+        );
+        let range = append(&mut large, data.as_bytes())?;
+        assert!(query_documents_from_metadata(&large, &[range.offset, range.length])?.is_none());
+        assert!(query_document_from_metadata(&large).is_ok());
+        bytes[4] ^= 1;
+        assert!(query_documents_from_metadata(&bytes, &ranges[..2]).is_err());
+        assert!(query_documents_from_metadata(&bytes, &ranges[2..4]).is_ok());
+        for invalid in [
+            &[][..],
+            &[0][..],
+            &[u32::MAX, u32::MAX][..],
+            &[0, 0][..],
+            &[0; 34][..],
+        ] {
+            assert!(query_documents_from_metadata(&bytes, invalid).is_err());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod scalar_column_tests {
+    use super::*;
+
+    #[test]
+    fn constant_columns_preserve_late_dense_transitions_and_reverse_order() {
+        for length in [1, 2, 10000] {
+            let mut column = ScalarColumn::new();
+            for _ in 0..length {
+                column.push(7_u32, length);
+            }
+            assert_eq!(column.heap_bytes(), 0);
+            assert_eq!(column.iter().collect::<Vec<_>>(), vec![7; length]);
+            column.push(9, length + 1);
+            assert_eq!(column.len(), length + 1);
+            assert_eq!(column.get(length), 9);
+            assert!(column.iter().take(length).all(|value| value == 7));
+            assert_eq!(column.iter().next_back(), Some(9));
+            assert_eq!(column.heap_bytes(), (length + 1) * size_of::<u32>());
+        }
+    }
+
+    #[test]
+    fn scalar_columns_preserve_document_serialization_and_mixed_flags()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let documents = (0..20)
+            .map(|row| {
+                Ok(DocumentMeta {
+                    id: format!("id-{row:02}").into_boxed_str(),
+                    revision: u64::MAX - row,
+                    title_length: 7,
+                    body_length: u32::try_from(row % 3)?,
+                    attributes: DocumentAttributes::Owned(
+                        serde_json::value::RawValue::from_string("{}".into())?,
+                    ),
+                    data: Range {
+                        offset: u32::try_from(row * 8)?,
+                        length: 8,
+                    },
+                    vector: row % 2 == 1,
+                })
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        let expected = serde_json::to_vec(&documents)?;
+        let table = DocumentTable::from(documents);
+        assert_eq!(table.title_lengths.heap_bytes(), 0);
+        assert_eq!(table.body_lengths.heap_bytes(), 20 * size_of::<u32>());
+        assert_eq!(table.vectors.heap_bytes(), 20 * size_of::<bool>());
+        assert_eq!(serde_json::to_vec(&table)?, expected);
+        let restored: DocumentTable = serde_json::from_slice(&expected)?;
+        assert_eq!(serde_json::to_vec(&restored)?, expected);
+        assert_eq!(vector_prefix(&table)?, [0]);
+        assert_eq!(table.vectors.iter().filter(|value| *value).count(), 10);
         Ok(())
     }
 }

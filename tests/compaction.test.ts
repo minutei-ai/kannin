@@ -2,6 +2,7 @@ import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
 import { CompactResult, QueryResult, Metadata, Health } from "../src/protocol";
 import { clearLeaderIndex, document, request, startWorker, textQuery, write } from "./harness";
+import { useHeaderOnlyCommonFrames } from "./common-posting-fixture";
 
 const worker = await startWorker();
 afterAll(() => worker.dispose());
@@ -224,11 +225,12 @@ test("large gaps between pruned term spans retain separate reads", async () => {
     "posting-ranges",
     "write",
     write(
-      Array.from({ length: 512 }, (_, index) => document(String(index).padStart(4, "0"), text)),
+      Array.from({ length: 512 }, (_, index) => {
+        const id = String(index).padStart(4, "0");
+        if (index === 0) return document(id, `${text} ${text}`);
+        return document(id, text);
+      }),
     ),
-  );
-  const before = Schema.decodeUnknownSync(Health)(
-    await (await fetch(new URL("/health", await worker.ready))).json(),
   );
   const response = await request(worker, "posting-ranges", "query", textQuery("alpha zeta", 10));
   expect(response.status).toBe(200);
@@ -236,24 +238,27 @@ test("large gaps between pruned term spans retain separate reads", async () => {
   expect(result.rows.map((row) => row.id)).toEqual(
     Array.from({ length: 10 }, (_, index) => String(index).padStart(4, "0")),
   );
-  const after = Schema.decodeUnknownSync(Health)(
-    await (await fetch(new URL("/health", await worker.ready))).json(),
+  expect(response.headers.get("server-timing")).toMatch(
+    /text_posting_acquire;dur=[^,]*;desc="spans=2 bytes=\d+ ranges=2"/,
   );
-  expect(after.rangeReads - before.rangeReads).toBe(4);
 });
 
 test("nearby pruned term spans share a bounded range without decoding gap blocks", async () => {
   const namespace = "nearby-pruned-postings";
+  const text = "coalesced postings";
   await request(
     worker,
     namespace,
     "write",
     write(
-      Array.from({ length: 512 }, (_, index) =>
-        document(String(index).padStart(4, "0"), "coalesced postings"),
-      ),
+      Array.from({ length: 512 }, (_, index) => {
+        const id = String(index).padStart(4, "0");
+        if (index === 0) return document(id, `${text} ${text}`);
+        return document(id, text);
+      }),
     ),
   );
+  await useHeaderOnlyCommonFrames(worker, namespace);
   await clearLeaderIndex(worker, namespace);
   const before = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
@@ -273,7 +278,9 @@ test("nearby pruned term spans share a bounded range without decoding gap blocks
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(3);
+  expect(after.rangeReads - before.rangeReads).toBe(2);
+  expect(after.directoryR2CacheReads - before.directoryR2CacheReads).toBe(1);
+  expect(after.directoryCommonHits).toBeGreaterThan(before.directoryCommonHits);
 });
 
 test("adjacent term spans share one range across acquisition windows", async () => {
@@ -283,8 +290,15 @@ test("adjacent term spans share one range across acquisition windows", async () 
     worker,
     namespace,
     "write",
-    write(Array.from({ length: 80 }, (_, index) => document(String(index).padStart(4, "0"), text))),
+    write(
+      Array.from({ length: 80 }, (_, index) => {
+        const id = String(index).padStart(4, "0");
+        if (index === 0) return document(id, `${text} ${text}`);
+        return document(id, text);
+      }),
+    ),
   );
+  await useHeaderOnlyCommonFrames(worker, namespace);
   await clearLeaderIndex(worker, namespace);
   const before = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
@@ -298,7 +312,9 @@ test("adjacent term spans share one range across acquisition windows", async () 
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(3);
+  expect(after.rangeReads - before.rangeReads).toBe(2);
+  expect(after.directoryR2CacheReads - before.directoryR2CacheReads).toBe(1);
+  expect(after.directoryCommonHits).toBeGreaterThan(before.directoryCommonHits);
   for (const match of ["all", "phrase"] as const) {
     const result = Schema.decodeUnknownSync(QueryResult)(
       await (await request(worker, namespace, "query", { ...textQuery(text, 10), match })).json(),
@@ -322,7 +338,11 @@ test("bounded wider gaps merge term reads without decoding unrequested postings"
         namespace,
         "write",
         write(
-          Array.from({ length: 512 }, (_, index) => document(String(index).padStart(4, "0"), text)),
+          Array.from({ length: 512 }, (_, index) => {
+            const id = String(index).padStart(4, "0");
+            if (index === 0) return document(id, `${text} ${text}`);
+            return document(id, text);
+          }),
         ),
       )
     ).status,
@@ -362,7 +382,11 @@ test("several nearby term gaps share one total overfetch budget", async () => {
         namespace,
         "write",
         write(
-          Array.from({ length: 512 }, (_, index) => document(String(index).padStart(4, "0"), text)),
+          Array.from({ length: 512 }, (_, index) => {
+            const id = String(index).padStart(4, "0");
+            if (index === 0) return document(id, `${text} ${text}`);
+            return document(id, text);
+          }),
         ),
       )
     ).status,

@@ -1,15 +1,24 @@
+import { decodeRoot, encodeRoot } from "../src/manifest";
 import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
-import { initSync, Segment, Directory, PreparedQuery } from "../dist/wasm/raio_engine";
+import {
+  initSync,
+  Segment,
+  Directory,
+  PreparedQuery,
+  EligibilityQuery,
+  segment_filter,
+} from "../dist/wasm/raio_engine";
 import {
   ConstantAttributes,
   RankingInput,
-  Root,
   StoredDocument,
   SegmentHeader,
   SegmentHits,
   PostingSpans,
   QueryResult,
+  Attributes,
+  Filter,
 } from "../src/protocol";
 import { document, request, startWorker, textQuery, write } from "./harness";
 
@@ -20,6 +29,41 @@ initSync({
 });
 const worker = await startWorker();
 afterAll(() => worker.dispose());
+
+test("prepared constant filters preserve scalar predicates and recover after malformed attributes", () => {
+  const attributes = Schema.decodeSync(Schema.Array(Attributes))([
+    {},
+    { n: null, flag: false, text: "" },
+    { n: -1.5, flag: true, text: 'ação\n"\\' },
+    { n: 9007199254740991, flag: true, text: "🦀" },
+  ]);
+  const filters = Schema.decodeSync(Schema.Array(Filter))([
+    { field: "n", op: "eq", value: null },
+    { field: "n", op: "ne", value: 0 },
+    { field: "n", op: "in", value: [null, -1.5, 9007199254740991] },
+    { field: "n", op: "gt", value: -2 },
+    { field: "n", op: "gte", value: -1.5 },
+    { field: "n", op: "lt", value: 0 },
+    { field: "n", op: "lte", value: 9007199254740991 },
+    { field: "n", op: "exists", value: false },
+    { field: "flag", op: "eq", value: true },
+    { field: "text", op: "eq", value: 'ação\n"\\' },
+  ]);
+  for (const predicates of [...filters.map((filter) => [filter]), filters]) {
+    const encodedFilters = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Filter)))(
+      predicates,
+    );
+    using prepared = new EligibilityQuery(encodedFilters);
+    for (const values of attributes) {
+      const encoded = Schema.encodeSync(Schema.fromJsonString(Attributes))(values);
+      expect(prepared.matches(encoded)).toBe(segment_filter(encoded, encodedFilters));
+    }
+    expect(() => prepared.matches("{")).toThrow();
+    expect(prepared.matches("{}")).toBe(segment_filter("{}", encodedFilters));
+  }
+  using invalid = new EligibilityQuery('[{"field":"n","op":"unknown","value":0}]');
+  expect(() => invalid.matches("{}")).toThrow("Unknown filter operation");
+});
 
 test("constant proofs retain only present equal scalars within their byte budget", () => {
   const documents = Array.from({ length: 200 }, (_, index) => ({
@@ -309,7 +353,7 @@ test("manifest proofs preserve filtered reads through fallback, tombstones, rebu
   const query = textQuery("rust cloudflare", 10, [{ field: "year", op: "gte", value: 2020 }]);
   const fast = await request(worker, namespace, "query", query);
   expect(fast.status).toBe(200);
-  expect(fast.headers.get("server-timing")).toContain('catalog_root_prefix;desc="hit"');
+  expect(fast.headers.get("server-timing")).toContain('catalog_root_eligibility;desc="hit"');
   expect(fast.headers.get("server-timing")).toMatch(/text_common_leaders;desc="segments=[1-9]/);
   const original = Schema.decodeUnknownSync(QueryResult)(await fast.json());
   expect(original.rows.map((row) => row.id)).toEqual(
@@ -319,7 +363,7 @@ test("manifest proofs preserve filtered reads through fallback, tombstones, rebu
   const key = `namespaces/${namespace}/root.json`;
   const stored = await bucket.get(key);
   if (stored === null) throw new Error("Missing fixture root");
-  const root = Schema.decodeUnknownSync(Root)(await stored.json());
+  const root = decodeRoot(await stored.text());
   expect(root.segments.map((segment) => segment.constantAttributes)).toEqual(
     [0, 1, 0, 1].map((group) => ({ year: 2024, group })),
   );
@@ -349,7 +393,7 @@ test("manifest proofs preserve filtered reads through fallback, tombstones, rebu
     if (!accelerated) {
       await bucket.put(
         key,
-        Schema.encodeSync(Schema.fromJsonString(Root))({
+        encodeRoot({
           ...root,
           segments: root.segments.map((segment) => ({ ...segment, constantAttributes: {} })),
         }),
@@ -361,7 +405,33 @@ test("manifest proofs preserve filtered reads through fallback, tombstones, rebu
       expect(response.status).toBe(200);
       const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
       expect(result.rows.map((row) => row.id)).toEqual([...ids]);
-      if (index === 5 || index === 6) {
+      if (index === 6) {
+        expect(response.headers.get("server-timing")).toContain("catalog_rpc_sum;");
+        expect(response.headers.get("server-timing")).not.toContain(
+          'catalog_root_eligibility;desc="hit"',
+        );
+      } else
+        expect(response.headers.get("server-timing")).toContain(
+          'catalog_root_eligibility;desc="hit"',
+        );
+      if (index === 2 || index === 4)
+        expect(response.headers.get("server-timing")).toContain(
+          'text_uniform_postings;desc="segments=0"',
+        );
+      if (index === 6) {
+        expect(response.headers.get("server-timing")).toContain(
+          'text_uniform_postings;desc="segments=0"',
+        );
+        if (accelerated)
+          expect(response.headers.get("server-timing")).toContain(
+            'text_singleton_hits;desc="segments=2"',
+          );
+        else
+          expect(response.headers.get("server-timing")).toContain(
+            'text_singleton_hits;desc="segments=0"',
+          );
+      }
+      if (index === 5) {
         if (accelerated)
           expect(response.headers.get("server-timing")).toMatch(
             /text_uniform_postings;desc="segments=[1-9]/,
@@ -381,7 +451,7 @@ test("manifest proofs preserve filtered reads through fallback, tombstones, rebu
   }
   await bucket.put(
     key,
-    Schema.encodeSync(Schema.fromJsonString(Root))({
+    encodeRoot({
       ...root,
       segments: root.segments.map((segment) => ({ ...segment, constantAttributes: undefined })),
     }),
@@ -390,9 +460,7 @@ test("manifest proofs preserve filtered reads through fallback, tombstones, rebu
   const refreshed = await bucket.get(key);
   if (refreshed === null) throw new Error("Missing rebuilt fixture root");
   expect(
-    Schema.decodeUnknownSync(Root)(await refreshed.json()).segments.map(
-      (segment) => segment.constantAttributes,
-    ),
+    decodeRoot(await refreshed.text()).segments.map((segment) => segment.constantAttributes),
   ).toEqual(root.segments.map((segment) => segment.constantAttributes));
   expect(
     (
@@ -411,9 +479,7 @@ test("manifest proofs preserve filtered reads through fallback, tombstones, rebu
   const compacted = await bucket.get(key);
   if (compacted === null) throw new Error("Missing compacted fixture root");
   expect(
-    Schema.decodeUnknownSync(Root)(await compacted.json()).segments.map(
-      (segment) => segment.constantAttributes,
-    ),
+    decodeRoot(await compacted.text()).segments.map((segment) => segment.constantAttributes),
   ).toEqual([{ year: 2024 }]);
   for (const consistency of ["strong", "edge-eventual"] as const) {
     const response = await request(worker, namespace, "query", {

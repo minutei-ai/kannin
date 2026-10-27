@@ -1,6 +1,7 @@
+import { decodeRoot } from "../src/manifest";
 import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
-import { Metadata, QueryResult, Root, VectorMessage } from "../src/protocol";
+import { Metadata, QueryResult, VectorMessage } from "../src/protocol";
 import { request, startWorker } from "./harness";
 
 const worker = await startWorker(undefined, true);
@@ -54,7 +55,7 @@ test("native index queue compacts immutable R2 segments without changing live ro
     const object = await bucket.get("namespaces/indexqueue/root.json");
     expect(object).not.toBeNull();
     if (object === null) return;
-    const manifest = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
+    const manifest = decodeRoot(await object.text());
     if (manifest.segments.length <= 4) {
       expect(manifest.documents).toBe(64);
       progress.complete = true;
@@ -94,7 +95,7 @@ test("a malformed queue message retries alone while a healthy namespace is ackno
   const bucket = await dormant.getR2Bucket("STORAGE");
   const object = await bucket.get(`namespaces/${namespace}/root.json`);
   if (object === null) throw new Error("Missing queued root");
-  const root = Schema.decodeSync(Schema.fromJsonString(Root))(await object.text());
+  const root = decodeRoot(await object.text());
   const job = root.vectorJobs[0];
   if (job === undefined) throw new Error("Missing queued job");
   const service = await dormant.getWorker();

@@ -10,7 +10,7 @@ caches.open = async (name) => {
   if (name === "kannin-text-plans-v1")
     return Promise.reject(new Error("Projected caches disabled for overview fixture"));
   const cache = await open(name);
-  if (name !== "raio-overview-batches-v6" || opened.has(cache)) return cache;
+  if (name !== "raio-overview-batches-v8" || opened.has(cache)) return cache;
   opened.add(cache);
   const put = cache.put.bind(cache);
   cache.put = async (input, response) => {

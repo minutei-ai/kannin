@@ -13,6 +13,7 @@ const root = Schema.decodeSync(Root)({
   vectorEpoch: "fixture",
   vectorJobs: [],
   lastReceipt: null,
+  bloomPacks: [],
   segments: [],
 });
 const input = Schema.decodeSync(Query)({

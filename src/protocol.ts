@@ -140,13 +140,14 @@ const VectorQueryFields = {
   ...QueryFields,
   topK: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 50 })),
 };
+const QueryVector = Vector.check(Schema.isBetweenLength(768, 768));
 export const Query = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("text"), ...TextFields, ...QueryFields }),
-  Schema.Struct({ kind: Schema.Literal("vector"), vector: Vector, ...VectorQueryFields }),
+  Schema.Struct({ kind: Schema.Literal("vector"), vector: QueryVector, ...VectorQueryFields }),
   Schema.Struct({
     kind: Schema.Literal("hybrid"),
     ...TextFields,
-    vector: Vector,
+    vector: QueryVector,
     ...VectorQueryFields,
   }),
 ]);

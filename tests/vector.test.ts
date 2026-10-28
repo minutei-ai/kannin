@@ -47,6 +47,35 @@ test("vector dimensions and zero magnitude fail before persistence", async () =>
   ).toBe(0);
 });
 
+test("wrong query dimensions return 400 in empty and populated namespaces", async () => {
+  const namespace = "query-dimensions";
+  for (const populated of [false, true]) {
+    if (populated)
+      expect(
+        (
+          await request(worker, namespace, "write", {
+            requestId: "seed",
+            upserts: [{ id: "a", text: "lexical", attributes: {}, vector: vector(1) }],
+            deletes: [],
+          })
+        ).status,
+      ).toBe(200);
+    for (const values of [
+      [1, 0],
+      [1, ...Array.from({ length: 768 }, () => 0)],
+    ])
+      for (const kind of ["vector", "hybrid"] as const)
+        expect(
+          (await request(worker, namespace, "query", { ...query(kind), vector: values })).status,
+        ).toBe(400);
+  }
+  const response = await request(worker, namespace, "query", vectorQuery());
+  expect(response.status).toBe(200);
+  const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+  expect(result.rows.map((row) => row.id)).toEqual(["a"]);
+  expect(result.sequence).toBe(1);
+});
+
 test("canonical vector outbox survives corrupt log reads and retries", async () => {
   expect(
     (

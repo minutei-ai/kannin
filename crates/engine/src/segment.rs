@@ -1587,7 +1587,7 @@ fn common_term_projection(
     }))
 }
 
-fn append(payload: &mut Vec<u8>, data: &[u8]) -> Result<Range, String> {
+pub(crate) fn append(payload: &mut Vec<u8>, data: &[u8]) -> Result<Range, String> {
     let compressed = miniz_oxide::deflate::compress_to_vec_zlib(data, 3);
     let range = Range {
         offset: u32::try_from(payload.len()).map_err(|cause| cause.to_string())?,

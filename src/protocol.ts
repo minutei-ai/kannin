@@ -4,7 +4,12 @@ const Unicode = Schema.String.check(
   Schema.makeFilter((text) => text.isWellFormed() || "Expected well-formed Unicode"),
 );
 export const Id = Unicode.check(Schema.isBetweenLength(1, 128));
-export const NamespaceName = Schema.String.check(Schema.isPattern(/^[a-zA-Z0-9_-]{1,64}$/));
+export const NamespacePrefix = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9_.-]{1,128}$/));
+export const NamespaceName = NamespacePrefix.check(
+  Schema.makeFilter(
+    (name) => (name !== "." && name !== "..") || "Namespace cannot be a URL dot segment",
+  ),
+);
 export const Operation = Schema.Literals([
   "write",
   "query",
@@ -600,7 +605,7 @@ const BloomColumn = Schema.Struct({
 export const BloomPack = Schema.Struct({
   key: Schema.String.check(
     Schema.isPattern(
-      /^namespaces\/[a-zA-Z0-9_-]{1,64}\/bloom-packs\/[a-f0-9]{64}(?:-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})?\.bin$/,
+      /^namespaces\/[A-Za-z0-9_.-]{1,128}\/bloom-packs\/[a-f0-9]{64}(?:-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})?\.bin$/,
     ),
   ),
   bytes: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(32 * 1024 * 1024)),
@@ -1037,7 +1042,7 @@ export const VectorMessage = Schema.Struct({
 export const IndexMessage = Schema.Struct({ namespace: NamespaceName });
 export const SegmentRange = Schema.Struct({
   key: Schema.String.check(
-    Schema.isPattern(/^namespaces\/[A-Za-z0-9_-]+\/segments\/[A-Za-z0-9-]+\.rsix$/),
+    Schema.isPattern(/^namespaces\/[A-Za-z0-9_.-]{1,128}\/segments\/[A-Za-z0-9-]+\.rsix$/),
   ),
   offset: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   length: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 16777216 })),

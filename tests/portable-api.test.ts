@@ -24,18 +24,19 @@ test("portable API persists native writes and strong queries across application 
   await Effect.runPromise(
     Effect.scoped(
       Effect.gen(function* () {
+        const namespace = `portable.${"x".repeat(119)}`;
         const context = yield* Layer.build(services);
         const app = yield* portableApplication({ token, scope: "portable-contract", module }).pipe(
           Effect.provideContext(context),
         );
         expect(
           (yield* Effect.tryPromise(() =>
-            app.fetch(new Request("http://localhost/v1/namespaces/test/metadata")),
+            app.fetch(new Request(`http://localhost/v1/namespaces/${namespace}/metadata`)),
           )).status,
         ).toBe(401);
         const write = yield* Effect.tryPromise(() =>
           app.fetch(
-            request("/v1/namespaces/test/write", {
+            request(`/v1/namespaces/${namespace}/write`, {
               requestId: "first",
               upserts: [{ id: "one", text: "portable search", attributes: { group: "a" } }],
               deletes: [],
@@ -55,7 +56,7 @@ test("portable API persists native writes and strong queries across application 
         }).pipe(Effect.provideContext(context));
         const result = yield* Effect.tryPromise(() =>
           restarted.fetch(
-            request("/v1/namespaces/test/query", {
+            request(`/v1/namespaces/${namespace}/query`, {
               kind: "text",
               text: "portable",
               topK: 10,
@@ -69,19 +70,19 @@ test("portable API persists native writes and strong queries across application 
         );
         expect(query.rows.map((hit) => hit.id)).toEqual(["one"]);
         const metadata = yield* Effect.tryPromise(() =>
-          restarted.fetch(request("/v1/namespaces/test/metadata")),
+          restarted.fetch(request(`/v1/namespaces/${namespace}/metadata`)),
         );
         const decoded = yield* Effect.tryPromise(() => metadata.json()).pipe(
           Effect.flatMap(Schema.decodeUnknownEffect(Metadata)),
         );
         expect(decoded.documents).toBe(1);
         const reply = yield* Effect.tryPromise(() =>
-          restarted.binding.execute({ namespace: "test", operation: "metadata" }),
+          restarted.binding.execute({ namespace, operation: "metadata" }),
         );
         expect(reply._tag).toBe("Success");
         const catalog = yield* Effect.tryPromise(() => restarted.fetch(request("/v1/namespaces")));
         expect(yield* Effect.tryPromise(() => catalog.json())).toEqual({
-          namespaces: [{ id: "test" }],
+          namespaces: [{ id: namespace }],
         });
         yield* Effect.tryPromise(() => restarted.dispose());
       }),

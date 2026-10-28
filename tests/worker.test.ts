@@ -19,7 +19,7 @@ test("health and authorization run inside workerd", async () => {
       )
     ).status,
   ).toBe(401);
-  expect((await request(state.worker, "bad.name", "metadata")).status).toBe(404);
+  expect((await request(state.worker, "bad!name", "metadata")).status).toBe(404);
 });
 
 test("HTTP errors preserve statuses and use the public error envelope", async () => {

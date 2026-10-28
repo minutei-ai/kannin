@@ -3,6 +3,7 @@ import type { Bucket, ObjectListOptions } from "./platform";
 import {
   NamespaceListCursor,
   NamespaceName,
+  NamespacePrefix,
   type NamespacesInput,
   NamespacesPage,
   Rejected,
@@ -40,7 +41,7 @@ export const listNamespaces = Effect.fn("kannin.namespaces.list")(function* (
       });
     readyBuckets.add(bucket);
   }
-  if (prefix.length > 0 && !Schema.is(NamespaceName)(prefix))
+  if (prefix.length > 0 && !Schema.is(NamespacePrefix)(prefix))
     return yield* Schema.encodeEffect(NamespacesPage)({ namespaces: [] });
   const page = yield* Effect.tryPromise(() => bucket.list(options));
   if (page.truncated && page.objects.length === 0)

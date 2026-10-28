@@ -1,6 +1,6 @@
 import { decodeRoot } from "../src/manifest";
 import { afterAll, expect, test } from "bun:test";
-import { Schema } from "effect";
+import { Match, Schema } from "effect";
 import {
   QueryResult,
   Metadata,
@@ -135,7 +135,10 @@ test("configured vector dimensions survive canonical maintenance and reset witho
       expect(result.consistency).toBe("strong");
       expect(result.sequence).toBe(2);
     }
-    const changed = dimensions === 1 ? 2 : 1;
+    const changed = Match.value(dimensions).pipe(
+      Match.when(1, () => 2),
+      Match.orElse(() => 1),
+    );
     const replacement = [1, ...Array.from({ length: changed - 1 }, () => 0)];
     const reset = {
       schema: { ...schema, vectorDimensions: changed },

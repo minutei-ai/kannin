@@ -35,10 +35,10 @@ test("official SDK warm hints populate the decoded immutable cache without chang
       async () => await (await request(worker, "warm-hint", "metadata")).json(),
     ).pipe(
       Effect.flatMap(Schema.decodeUnknownEffect(Metadata)),
-      Effect.flatMap((metadata) => {
-        if (metadata.cache.directoryCacheChargedBytes > 0) return Effect.succeed(metadata);
-        return new Cause.UnknownError(new Error("Directory warming is not complete"));
-      }),
+      Effect.filterOrElse(
+        (metadata) => metadata.cache.directoryCacheChargedBytes > 0,
+        () => new Cause.UnknownError(new Error("Directory warming is not complete")),
+      ),
       Effect.retry({ schedule: Schedule.spaced("25 millis"), times: 200 }),
     ),
   );
@@ -52,8 +52,9 @@ test("official SDK warm hints populate the decoded immutable cache without chang
   await rejected.arrayBuffer();
   const wrongMethod = await request(worker, "warm-hint", "hint_cache_warm", {});
   expect(wrongMethod.status).toBe(405);
-  await expect(client.namespace("warm-missing").hintCacheWarm()).rejects.toMatchObject({
-    status: 404,
-  });
+  const missing = await Effect.runPromise(
+    Effect.tryPromise(() => client.namespace("warm-missing").hintCacheWarm()).pipe(Effect.flip),
+  );
+  expect(missing.cause).toMatchObject({ status: 404 });
   expect(await bucket.head("namespaces/warm-missing/root.json")).toBeNull();
 });

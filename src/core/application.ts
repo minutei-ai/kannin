@@ -38,7 +38,7 @@ import {
   PreparedQuery,
   directory_compress,
 } from "../../dist/wasm/raio_engine";
-import type { Snapshot, TextPlan } from "../protocol";
+import type { Snapshot, TextPlan, NativeVectorLocation } from "../protocol";
 import {
   Filter,
   StoredDocument,
@@ -94,6 +94,7 @@ import {
   NamespaceSchema,
   TextTerms,
   NativeVectorHits,
+  NativeVectorPage,
   type VectorRebuild,
   VectorRebuildCheckpointMetadata,
   VECTOR_REBUILD_CHECKPOINT_BYTES,
@@ -1727,41 +1728,56 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         Effect.try(() => new VectorRanker(new Float32Array(input.vector), input.topK)),
         (ranker) =>
           Effect.gen(function* () {
-            const retained = new Map<string, typeof Located.Type>();
+            const retained = new Map<
+              string,
+              typeof NativeVectorLocation.Type & {
+                readonly segment: (typeof Root.Type.segments)[number];
+              }
+            >();
             const filters = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Array(Filter)))(
               input.filters,
             );
             for (const segment of root.segments.toReversed()) {
-              const rows = yield* withDirectory(segment.key, segment.headerBytes, (directory) =>
-                Effect.gen(function* () {
-                  const dead = yield* Schema.encodeEffect(integers)(segment.dead);
-                  const encoded = yield* Effect.try(() => directory.vector_rows(filters, dead));
-                  return yield* Schema.decodeEffect(
-                    Schema.fromJsonString(Schema.Array(LocatedDocument)),
-                  )(encoded);
-                }),
+              yield* withDirectory(segment.key, segment.headerBytes, (directory) =>
+                Effect.acquireUseRelease(
+                  Effect.gen(function* () {
+                    const dead = yield* Schema.encodeEffect(integers)(segment.dead);
+                    return yield* Effect.try(() => directory.vector_reader(filters, dead));
+                  }),
+                  (reader) =>
+                    Effect.gen(function* () {
+                      const progress = { complete: false };
+                      while (!progress.complete) {
+                        const encoded = yield* Effect.try(() => reader.next_page());
+                        const page = yield* Schema.decodeEffect(
+                          Schema.fromJsonString(NativeVectorPage),
+                        )(encoded);
+                        progress.complete = page.complete;
+                        for (const row of page.rows) {
+                          const data = row.vectorData;
+                          if (
+                            data.length < 8 ||
+                            data.offset < row.data.offset + row.data.length ||
+                            segment.headerBytes + data.offset + data.length > segment.bytes
+                          )
+                            return yield* new Rejected({
+                              status: 503,
+                              message: "Invalid canonical vector range",
+                            });
+                          const frame = yield* Effect.tryPromise(() =>
+                            range(segment.key, segment.headerBytes + data.offset, data.length),
+                          );
+                          const discarded = yield* Effect.try(() =>
+                            ranker.push_frame(row.id, frame),
+                          );
+                          retained.set(row.id, { ...row, segment });
+                          if (discarded !== undefined) retained.delete(discarded);
+                        }
+                      }
+                    }),
+                  (reader) => Effect.sync(() => reader.free()),
+                ),
               );
-              for (const row of rows) {
-                const data = row.vectorData;
-                if (
-                  data === null ||
-                  data.length < 8 ||
-                  data.offset < row.document.data.offset + row.document.data.length ||
-                  segment.headerBytes + data.offset + data.length > segment.bytes
-                )
-                  return yield* new Rejected({
-                    status: 503,
-                    message: "Invalid canonical vector range",
-                  });
-                const frame = yield* Effect.tryPromise(() =>
-                  range(segment.key, segment.headerBytes + data.offset, data.length),
-                );
-                const discarded = yield* Effect.try(() =>
-                  ranker.push_frame(row.document.id, frame),
-                );
-                retained.set(row.document.id, { ...row, segment });
-                if (discarded !== undefined) retained.delete(discarded);
-              }
             }
             const encoded = yield* Effect.try(() => ranker.finish());
             const selected = yield* Schema.decodeEffect(Schema.fromJsonString(NativeVectorHits))(
@@ -1778,7 +1794,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
                 row: location.row,
                 id,
                 score,
-                data: location.document.data,
+                data: location.data,
                 segment: location.segment,
               });
             });

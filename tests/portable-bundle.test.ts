@@ -24,7 +24,7 @@ for (const { target, name } of [
   });
 }
 
-test("the portable API bundles without Cloudflare or provisioning dependencies", async () => {
+test("the portable API bundles without Cloudflare, provisioning or external vector dependencies", async () => {
   const result = await Bun.build({
     entrypoints: [new URL("../runtime/main.ts", import.meta.url).pathname],
     target: "bun",
@@ -34,7 +34,7 @@ test("the portable API bundles without Cloudflare or provisioning dependencies",
         name: "reject-platform-dependencies",
         setup(builder) {
           builder.onResolve(
-            { filter: /^(?:cloudflare:|@cloudflare\/|@alchemy\.run\/|alchemy(?:\/|$))/ },
+            { filter: /^(?:cloudflare:|@cloudflare\/|@alchemy\.run\/|alchemy(?:\/|$)|@qdrant\/)/ },
             ({ path }) => {
               throw new Error(`Portable API imported a platform dependency: ${path}`);
             },

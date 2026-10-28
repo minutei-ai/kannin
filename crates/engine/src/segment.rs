@@ -14,7 +14,7 @@ const BLOCK_SIZE: usize = 128;
 const FILTER_CACHE_BYTES: usize = 32 * 1024;
 const MAX_QUERY_TERMS: usize = 512;
 
-fn compare_document_ids(left: &str, right: &str) -> Ordering {
+pub(crate) fn compare_document_ids(left: &str, right: &str) -> Ordering {
     if left.is_ascii() {
         left.cmp(right)
     } else {
@@ -1261,6 +1261,68 @@ fn validate_columns(header: &Header) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(any(test, target_arch = "wasm32"))]
+struct VectorScan {
+    header: Rc<Header>,
+    allowed: BitVec,
+    position: usize,
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+#[derive(Serialize)]
+struct VectorLocation<'a> {
+    row: u32,
+    id: &'a str,
+    data: Range,
+    #[serde(rename = "vectorData")]
+    vector_data: Range,
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+#[derive(Serialize)]
+struct VectorPage<'a> {
+    complete: bool,
+    rows: Vec<VectorLocation<'a>>,
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+impl VectorScan {
+    fn new(header: Rc<Header>, filters: &[Filter], dead: &[u32]) -> Result<Self, String> {
+        let allowed = header.allowed(filters, dead)?;
+        Ok(Self {
+            header,
+            allowed,
+            position: 0,
+        })
+    }
+
+    fn page(&mut self) -> Result<VectorPage<'_>, String> {
+        let mut rows = Vec::with_capacity(64);
+        while self.position < self.header.documents.len() && rows.len() < 64 {
+            let index = self.position;
+            self.position += 1;
+            if !self.allowed[index] || !self.header.documents.vectors.get(index) {
+                continue;
+            }
+            let document = self.header.documents.row(index);
+            rows.push(VectorLocation {
+                row: u32::try_from(index).map_err(|cause| cause.to_string())?,
+                id: document.id,
+                data: document.data,
+                vector_data: self
+                    .header
+                    .vector_range(index)?
+                    .cloned()
+                    .ok_or("Missing canonical vector range")?,
+            });
+        }
+        Ok(VectorPage {
+            complete: self.position == self.header.documents.len(),
+            rows,
+        })
+    }
+}
+
 impl Header {
     #[doc = "# Errors\nRejects missing rows or inconsistent vector references."]
     pub fn vector_range(&self, row: usize) -> Result<Option<&Range>, String> {
@@ -1367,7 +1429,7 @@ impl Header {
             ))
     }
 
-    #[cfg(any(test, target_arch = "wasm32"))]
+    #[cfg(test)]
     fn vector_rows(&self, filters: &[Filter], dead: &[u32]) -> Result<Vec<u32>, String> {
         let allowed = self.allowed(filters, dead)?;
         self.documents
@@ -6624,6 +6686,23 @@ pub mod wasm {
         overview_groups: RefCell<Option<Box<[EligibilityGroup]>>>,
     }
 
+    #[wasm_bindgen]
+    pub struct VectorRows {
+        scan: super::VectorScan,
+    }
+
+    #[wasm_bindgen]
+    impl VectorRows {
+        #[doc = "# Errors\nRejects inconsistent vector ranges, row overflow or page serialization failures."]
+        pub fn next_page(&mut self) -> Result<String, JsValue> {
+            let page = self
+                .scan
+                .page()
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            serde_json::to_string(&page).map_err(|cause| JsValue::from_str(&cause.to_string()))
+        }
+    }
+
     struct EligibleCatalog {
         minimum: Option<(u32, u32)>,
         eligibility: Option<EligibilityProjection>,
@@ -7043,8 +7122,8 @@ pub mod wasm {
             serde_json::to_string(&selected).map_err(|e| JsValue::from_str(&e.to_string()))
         }
 
-        #[doc = "# Errors\nRejects malformed filters or tombstones, invalid attributes, row overflow or serialization errors."]
-        pub fn vector_rows(&self, filters: &str, dead: &str) -> Result<String, JsValue> {
+        #[doc = "# Errors\nRejects partial directories, malformed filters/tombstones or invalid filter attributes."]
+        pub fn vector_reader(&self, filters: &str, dead: &str) -> Result<VectorRows, JsValue> {
             if self.partial {
                 return Err(JsValue::from_str("Operation requires a complete directory"));
             }
@@ -7052,13 +7131,9 @@ pub mod wasm {
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
             let dead: Vec<u32> = serde_json::from_str(dead)
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
-            let rows = self
-                .header
-                .vector_rows(&filters, &dead)
+            let scan = super::VectorScan::new(Rc::clone(&self.header), &filters, &dead)
                 .map_err(|cause| JsValue::from_str(&cause))?;
-            let rows = serde_json::to_string(&rows)
-                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
-            self.rows(&rows)
+            Ok(VectorRows { scan })
         }
 
         #[doc = "# Errors\nRejects invalid tombstone JSON, filter attributes, or deleted rows."]
@@ -7768,6 +7843,48 @@ mod filter_cache_tests {
     use serde::de::DeserializeSeed;
     use serde_json::json;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn vector_pages_bound_projection_and_apply_filters_before_emission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let documents = (0..200)
+            .map(|index| {
+                serde_json::from_value::<Document>(json!({
+                    "id": format!("{index:03}"), "text": "paged vectors",
+                    "attributes": {"eligible": index >= 5, "padding": "x".repeat(1024)},
+                    "vector": if index % 3 == 0 { None } else { Some(vec![1.0, 0.0]) }
+                }))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let header = std::rc::Rc::new(build(documents, None)?.header);
+        let filters = [Filter {
+            field: "eligible".into(),
+            op: "eq".into(),
+            value: json!(true),
+        }];
+        let mut scan = super::VectorScan::new(header, &filters, &[7, 128])?;
+        let mut found = Vec::new();
+        loop {
+            let page = scan.page()?;
+            assert!(page.rows.len() <= 64);
+            let encoded = serde_json::to_value(&page)?;
+            for row in encoded["rows"].as_array().ok_or("Missing projected rows")? {
+                assert!(row.get("attributes").is_none());
+                assert!(row.get("document").is_none());
+            }
+            found.extend(page.rows.iter().map(|row| row.row));
+            if page.complete {
+                break;
+            }
+        }
+        let expected: Vec<u32> = (5..200)
+            .filter(|row| row % 3 != 0 && ![7, 128].contains(row))
+            .collect();
+        assert_eq!(found, expected);
+        let complete = scan.page()?;
+        assert!(complete.complete && complete.rows.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn vector_selection_excludes_tombstones_missing_vectors_and_filtered_rows()

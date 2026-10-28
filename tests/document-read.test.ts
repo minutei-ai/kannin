@@ -71,8 +71,6 @@ for (const kind of ["text", "vector"])
             )
           ).status,
         ).toBe(200);
-      if (kind === "vector")
-        expect((await request(worker, namespace, "vector-sync", {})).status).toBe(200);
       const bucket = await worker.getR2Bucket("STORAGE");
       const rootObject = await bucket.get(`namespaces/${namespace}/root.json`);
       if (rootObject === null) throw new Error("Missing root");

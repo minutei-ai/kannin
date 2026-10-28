@@ -963,6 +963,16 @@ export const LocatedDocument = Schema.Struct({
   document: SegmentDocument,
   vectorData: Schema.NullOr(DataRange),
 });
+export const NativeVectorLocation = Schema.Struct({
+  row: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  id: Id,
+  data: DataRange,
+  vectorData: DataRange,
+});
+export const NativeVectorPage = Schema.Struct({
+  complete: Schema.Boolean,
+  rows: Schema.Array(NativeVectorLocation).check(Schema.isMaxLength(64)),
+});
 export const SearchStatistics = Schema.Struct({
   documents: Schema.Int,
   title_length: Schema.Int,

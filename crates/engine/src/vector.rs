@@ -36,7 +36,8 @@ impl VectorRanker {
         }
         let position = self.hits.partition_point(|(existing_key, existing_score)| {
             existing_score.total_cmp(&score).is_gt()
-                || (existing_score.total_cmp(&score).is_eq() && existing_key.as_str() < key)
+                || (existing_score.total_cmp(&score).is_eq()
+                    && crate::segment::compare_document_ids(existing_key, key).is_lt())
         });
         if position >= self.limit {
             return Ok(false);
@@ -249,6 +250,23 @@ mod tests {
         assert!(ranker.offer("3", &[1.0, 0.0]).is_err());
         assert!(VectorRanker::try_new(&[1.0], 0).is_err());
         assert!(VectorRanker::try_new(&[1.0], super::MAX_RESULTS + 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn vector_ties_match_the_existing_text_document_order() -> Result<(), String> {
+        let mut ranker = VectorRanker::try_new(&[1.0], 3)?;
+        for key in ["\u{e000}", "😀", "a"] {
+            ranker.offer(key, &[1.0])?;
+        }
+        assert_eq!(
+            ranker
+                .results()
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "😀", "\u{e000}"]
+        );
         Ok(())
     }
 

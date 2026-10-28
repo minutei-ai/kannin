@@ -130,7 +130,7 @@ test("vectors are namespace isolated", async () => {
   expect(found.rows).toEqual([]);
 });
 
-test("native vector ties preserve UTF8 document ordering through HTTP materialization", async () => {
+test("native vector and hybrid ties preserve the existing document ordering through HTTP materialization", async () => {
   const ids = ["😀", "\uE000", "a"];
   expect(
     (
@@ -141,14 +141,19 @@ test("native vector ties preserve UTF8 document ordering through HTTP materializ
       })
     ).status,
   ).toBe(200);
-  for (const topK of [1, 2, 3]) {
-    const response = await request(worker, "unicode-vector-ties", "query", {
-      ...vectorQuery(),
-      topK,
-    });
-    expect(response.status).toBe(200);
-    const found = Schema.decodeUnknownSync(QueryResult)(await response.json());
-    expect(found.rows.map((row) => row.id)).toEqual(["a", "\uE000", "😀"].slice(0, topK));
+  for (const kind of ["vector", "hybrid"] as const) {
+    for (const topK of [1, 2, 3]) {
+      const response = await request(worker, "unicode-vector-ties", "query", {
+        kind,
+        vector: vector(1),
+        topK,
+        filters: [],
+        ...(kind === "hybrid" && { text: "tied" }),
+      });
+      expect(response.status).toBe(200);
+      const found = Schema.decodeUnknownSync(QueryResult)(await response.json());
+      expect(found.rows.map((row) => row.id)).toEqual(["a", "😀", "\uE000"].slice(0, topK));
+    }
   }
 });
 
@@ -663,4 +668,41 @@ test("native vector queries use canonical revisions without external candidates 
   );
   expect(updated.rows[0]?.text).toBe("new");
   expect(updated.rows[0]?.score).toBeCloseTo(0.6);
+});
+
+test("paged native vector selection finds late winners and applies canonical tombstones", async () => {
+  const namespace = "vector-page-boundary";
+  expect(
+    (
+      await request(worker, namespace, "write", {
+        requestId: "paged-vectors",
+        deletes: [],
+        upserts: Array.from({ length: 130 }, (_, index) => ({
+          id: String(index).padStart(3, "0"),
+          text: "paged vectors",
+          attributes: { padding: "x".repeat(4096) },
+          vector: vector(index + 1, 130 - index),
+        })),
+      })
+    ).status,
+  ).toBe(200);
+  const input = { ...vectorQuery(), topK: 3 };
+  const before = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", input)).json(),
+  );
+  expect(before.rows.map((row) => row.id)).toEqual(["129", "128", "127"]);
+  expect(before.rows.every((row) => row.attributes.padding === "x".repeat(4096))).toBe(true);
+  expect(
+    (
+      await request(worker, namespace, "write", {
+        requestId: "retire-paged",
+        deletes: ["129"],
+        upserts: [{ id: "128", text: "no vector", attributes: {} }],
+      })
+    ).status,
+  ).toBe(200);
+  const after = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", input)).json(),
+  );
+  expect(after.rows.map((row) => row.id)).toEqual(["127", "126", "125"]);
 });

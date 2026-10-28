@@ -130,6 +130,28 @@ test("vectors are namespace isolated", async () => {
   expect(found.rows).toEqual([]);
 });
 
+test("native vector ties preserve UTF8 document ordering through HTTP materialization", async () => {
+  const ids = ["😀", "\uE000", "a"];
+  expect(
+    (
+      await request(worker, "unicode-vector-ties", "write", {
+        requestId: "unicode-ties",
+        upserts: ids.map((id) => ({ id, text: "tied", attributes: {}, vector: vector(1) })),
+        deletes: [],
+      })
+    ).status,
+  ).toBe(200);
+  for (const topK of [1, 2, 3]) {
+    const response = await request(worker, "unicode-vector-ties", "query", {
+      ...vectorQuery(),
+      topK,
+    });
+    expect(response.status).toBe(200);
+    const found = Schema.decodeUnknownSync(QueryResult)(await response.json());
+    expect(found.rows.map((row) => row.id)).toEqual(["a", "\uE000", "😀"].slice(0, topK));
+  }
+});
+
 test("hybrid combines lexical and vector ranking using RRF", async () => {
   await request(worker, "hybrid", "write", {
     schema,

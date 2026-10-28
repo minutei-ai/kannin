@@ -1,4 +1,5 @@
-import { Config, Option, Redacted } from "effect";
+import { Config, Option } from "effect";
+import type { Redacted } from "effect";
 
 const cacheEnvironment = Config.option(Config.String("KANNIN_CACHE_ENDPOINT")).pipe(
   Config.flatMap((endpoint) => {

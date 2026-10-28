@@ -21,7 +21,19 @@ jobs:
           toolchain: 1.99.1
           targets: wasm32-unknown-unknown
           components: rustfmt, clippy
-      - run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        id: wasm-bindgen-cli
+        with:
+          path: ~/.cargo/bin/wasm-bindgen
+          key: ${{ runner.os }}-${{ runner.arch }}-rust-1.99.1-wasm-bindgen-cli-0.2.129
+      - if: steps.wasm-bindgen-cli.outputs.cache-hit != 'true'
+        run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
+      - run: ~/.cargo/bin/wasm-bindgen --version
+      - if: steps.wasm-bindgen-cli.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ~/.cargo/bin/wasm-bindgen
+          key: ${{ steps.wasm-bindgen-cli.outputs.cache-primary-key }}
       - run: bun install --frozen-lockfile
       - run: sudo apt-get update && sudo apt-get install -y podman
       - run: bun run check

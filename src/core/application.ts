@@ -1839,14 +1839,19 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         for (const [rank, hit] of list.entries())
           scores.set(hit.id, { ...hit, score: (scores.get(hit.id)?.score ?? 0) + 1 / (61 + rank) });
     } else for (const hit of [...text, ...vectors]) scores.set(hit.id, hit);
-    const hits = [...scores.values()]
-      .sort((a, b) => {
-        if (a.score !== b.score) return b.score - a.score;
-        if (a.id < b.id) return -1;
-        if (a.id > b.id) return 1;
-        return 0;
-      })
-      .slice(0, input.topK);
+    const hits = Match.value(input.kind).pipe(
+      Match.when("vector", () => vectors),
+      Match.orElse(() =>
+        [...scores.values()]
+          .sort((a, b) => {
+            if (a.score !== b.score) return b.score - a.score;
+            if (a.id < b.id) return -1;
+            if (a.id > b.id) return 1;
+            return 0;
+          })
+          .slice(0, input.topK),
+      ),
+    );
     const started = Effect.runSync(Clock.currentTimeNanos);
     const rows = await Effect.runPromise(
       readDocumentHits(hits.map((hit) => [hit.segment, hit.data, hit.score] as const)),

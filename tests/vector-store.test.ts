@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { Effect, Layer } from "effect";
 import { VectorStore } from "../src/vector-store";
+import type { VectorStorePredicate } from "../src/protocol";
 import { vectorStoreFixtureLive } from "./vector-store-fixture";
 
 test("native vector search isolates namespaces and filters before top-k", async () => {
@@ -20,7 +21,7 @@ test("native vector search isolates namespaces and filters before top-k", async 
             id: "second",
             namespace: "a",
             values: [0.8, 0.2, 0],
-            metadata: { id: "two", revision: 2, group: "yes", n0: 3 },
+            metadata: { id: "two", revision: 2, group: "yes", n0: 3.5 },
           },
           {
             id: "third",
@@ -37,6 +38,28 @@ test("native vector search isolates namespaces and filters before top-k", async 
         });
         expect(result.matches.map((point) => point.id)).toEqual(["second"]);
         expect(result.matches[0]?.metadata.id).toBe("two");
+        const equalityFilters: Record<string, typeof VectorStorePredicate.Type>[] = [
+          { n0: { $eq: 3.5 } },
+          { n0: { $in: [3.5, 99] } },
+          { group: { $in: [3.5, "yes"] } },
+        ];
+        for (const filter of equalityFilters) {
+          const selected = yield* store.query([1, 0, 0], {
+            namespace: "a",
+            topK: 1,
+            returnMetadata: "all",
+            filter,
+          });
+          expect(selected.matches.map((point) => point.id)).toEqual(["second"]);
+        }
+        expect(
+          (yield* store.query([1, 0, 0], {
+            namespace: "a",
+            topK: 1,
+            returnMetadata: "all",
+            filter: { group: { $in: [] } },
+          })).matches,
+        ).toEqual([]);
         yield* store.deleteByIds(["second"]);
         expect(
           (yield* store.query([1, 0, 0], {

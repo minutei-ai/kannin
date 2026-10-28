@@ -19,13 +19,17 @@ const pointId = Effect.fn("kannin.qdrant.pointId")(function* (id: string) {
   const digest = yield* Effect.tryPromise(() => sha256(id));
   return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-${digest.slice(12, 16)}-${digest.slice(16, 20)}-${digest.slice(20, 32)}`;
 });
+function exactMatch(key: string, value: string | number): Schemas["Condition"] {
+  if (typeof value === "number") return { key, range: { gte: value, lte: value } };
+  return { key, match: { value } };
+}
 function filters(input: typeof VectorStoreQuery.Type): Schemas["Filter"] {
   const must: Schemas["Condition"][] = [{ key: "namespace", match: { value: input.namespace } }];
   for (const [key, predicate] of Object.entries(input.filter ?? {})) {
     const field = `metadata.${key}`;
-    if (predicate.$eq !== undefined) must.push({ key: field, match: { value: predicate.$eq } });
+    if (predicate.$eq !== undefined) must.push(exactMatch(field, predicate.$eq));
     if (predicate.$in !== undefined)
-      must.push({ should: predicate.$in.map((value) => ({ key: field, match: { value } })) });
+      must.push({ should: predicate.$in.map((value) => exactMatch(field, value)) });
     const range = {
       ...(predicate.$gt !== undefined && { gt: predicate.$gt }),
       ...(predicate.$gte !== undefined && { gte: predicate.$gte }),
@@ -110,6 +114,8 @@ export const qdrantVectorStore = (config: typeof QdrantStoreConfig.Type) =>
               onExcessProperty: "error",
             })(options);
             const query = yield* Schema.decodeEffect(vector)(values);
+            if (Object.values(input.filter ?? {}).some((predicate) => predicate.$in?.length === 0))
+              return { matches: [] };
             const result = yield* Effect.tryPromise(() =>
               client.query(checked.collection, {
                 query: [...query],

@@ -94,6 +94,32 @@ test("Qdrant rejects malformed collection existence as a declared initialization
   expect(failure.cause).toBeDefined();
 });
 
+test("Qdrant treats an empty in-list as no candidates before contacting query transport", async () => {
+  await Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const store = yield* fixture({ query: null });
+        const result = yield* store.query([1, 0, 0], {
+          namespace: "a",
+          topK: 1,
+          returnMetadata: "all",
+          filter: { group: { $in: [] } },
+        });
+        expect(result.matches).toEqual([]);
+        const invalid = yield* store
+          .query([1], {
+            namespace: "a",
+            topK: 1,
+            returnMetadata: "all",
+            filter: { group: { $in: [] } },
+          })
+          .pipe(Effect.exit);
+        expect(invalid).toMatchObject({ _tag: "Failure" });
+      }),
+    ),
+  );
+});
+
 test("Qdrant rejects a null query envelope as a declared query failure", async () => {
   const failure = await Effect.runPromise(
     Effect.scoped(

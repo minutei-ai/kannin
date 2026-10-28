@@ -51,6 +51,8 @@ const page = Search.namespaces({ prefix: "legal-", page_size: 100 }).pipe(
 
 The result contains `namespaces` and an optional `next_cursor`. Pass it back as `cursor` with the same prefix. The same migration readiness, catalog validation and page limits as the public listing apply; the namespace coordinator is not acquired for this global operation.
 
+Request the same bounded asynchronous directory warming through `Search.hintCacheWarm("legal-corpus")`, provided with `Search.Kannin` as above. It returns the decoded `ACCEPTED` acknowledgement through the native binding, without Worker-to-Worker HTTP. See the resource limits and error behavior in [the API contract](api.md).
+
 Declare filterable attributes through the same binding before querying them:
 
 ```ts

@@ -47,6 +47,7 @@ import {
   ErrorBody,
   Log,
   Metadata,
+  CacheWarmHintResult,
   Health,
   NamespaceName,
   Operation,
@@ -158,6 +159,7 @@ function excludesPhrase(
 export function createApplication(runtime: SearchRuntime, searchStorage: Storage) {
   const workerEnv = runtime.env;
   const caches = runtime.cache;
+  const warming = new Set<string>();
   const {
     range,
     publishQueryCache,
@@ -2013,6 +2015,51 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       return this.current;
     }
 
+    private async hintCacheWarm() {
+      const current = await this.root();
+      if (current.etag === null)
+        throw new Rejected({ status: 404, message: "Namespace does not exist" });
+      const identity = `${this.env.STORAGE_CACHE_SCOPE}:${this.namespace}`;
+      if (!warming.has(identity)) {
+        if (warming.size >= 4)
+          throw new Rejected({ status: 503, message: "Cache warming capacity exceeded" });
+        const selected: (typeof Root.Type.segments)[number][] = [];
+        const budget = { bytes: 0 };
+        for (const segment of current.manifest.segments.toReversed()) {
+          if (selected.length >= 64) break;
+          if (segment.headerBytes > 2 * 1024 * 1024) continue;
+          if (budget.bytes + segment.headerBytes > 16 * 1024 * 1024) break;
+          selected.push(segment);
+          budget.bytes += segment.headerBytes;
+        }
+        const lease = Symbol();
+        warming.add(identity);
+        this.readers.set(lease, current.manifest);
+        this.ctx.waitUntil(
+          Effect.runPromise(
+            Effect.forEach(
+              selected,
+              (segment) => withDirectory(segment.key, segment.headerBytes, () => Effect.void),
+              { concurrency: 1, discard: true },
+            ).pipe(
+              Effect.timeout("20 seconds"),
+              Effect.catchCause((cause) => Effect.logError("kannin.cache.warm", cause)),
+              Effect.ensuring(
+                Effect.sync(() => {
+                  this.readers.delete(lease);
+                  warming.delete(identity);
+                }),
+              ),
+            ),
+          ),
+        );
+      }
+      return Schema.encodeSync(CacheWarmHintResult)({
+        status: "ACCEPTED",
+        message: "cache warm hint accepted",
+      });
+    }
+
     private async readRebuildCheckpoint(object: ObjectBody) {
       if (object.size > VECTOR_REBUILD_CHECKPOINT_BYTES) {
         await object.body.cancel();
@@ -3170,6 +3217,14 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
                   },
                 });
               }
+              if (command.operation === "hint_cache_warm")
+                return yield* Effect.tryPromise({
+                  try: () => this.hintCacheWarm(),
+                  catch: (cause) => {
+                    if (Schema.is(Rejected)(cause)) return cause;
+                    return new Cause.UnknownError(cause);
+                  },
+                });
               if (command.operation === "metadata") {
                 const current = yield* Effect.tryPromise({
                   try: () => this.root(),
@@ -3449,6 +3504,8 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
           const value = yield* this.perform(command, queryTimings);
           const ended = yield* Clock.currentTimeNanos;
           queryTimings.append("server-timing", `raio;dur=${Number(ended - started) / 1e6}`);
+          if (operation === "hint_cache_warm")
+            return Response.json(value, { status: 202, headers: queryTimings });
           return Response.json(value, { headers: queryTimings });
         }).pipe(
           Effect.tapError((error) => {
@@ -4178,6 +4235,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         write: "POST",
         query: "POST",
         metadata: "GET",
+        hint_cache_warm: "GET",
         "vector-sync": "POST",
         "vector-rebuild": "POST",
         rebuild: "POST",

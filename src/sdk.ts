@@ -4,6 +4,7 @@ import {
   type Collection,
   CollectionResult,
   CompactResult,
+  CacheWarmHintResult,
   Metadata,
   type NamespacesInput,
   NamespacesPage,
@@ -61,6 +62,9 @@ export const write = Effect.fn("kannin.write")(function* (
 });
 export const metadata = Effect.fn("kannin.metadata")(function* (namespace: string) {
   return yield* invoke({ namespace, operation: "metadata" }, Metadata);
+});
+export const hintCacheWarm = Effect.fn("kannin.hintCacheWarm")(function* (namespace: string) {
+  return yield* invoke({ namespace, operation: "hint_cache_warm" }, CacheWarmHintResult);
 });
 export const compact = Effect.fn("kannin.compact")(function* (namespace: string) {
   return yield* invoke({ namespace, operation: "compact" }, CompactResult);

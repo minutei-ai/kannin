@@ -22,7 +22,7 @@ test("portable HTTP server serves native endpoints and official SDK namespace li
         });
         const port = reservation.port ?? 3000;
         yield* Effect.promise(() => reservation.stop(true));
-        const { server } = yield* servePortable({
+        const { server, app } = yield* servePortable({
           token: Redacted.make("http-contract-token"),
           host: "127.0.0.1",
           port,
@@ -49,6 +49,12 @@ test("portable HTTP server serves native endpoints and official SDK namespace li
         const client = new Turbopuffer({ apiKey: "http-contract-token", baseURL });
         const page = yield* Effect.tryPromise(() => client.namespaces({ page_size: 1 }));
         expect(page.namespaces).toEqual([{ id: "http" }]);
+        const hinted = yield* Effect.tryPromise(() =>
+          client.namespace("http").hintCacheWarm().withResponse(),
+        );
+        expect(hinted.response.status).toBe(202);
+        expect(hinted.data.status).toBe("ACCEPTED");
+        yield* Effect.promise(app.drain);
         const unauthorized = yield* Effect.tryPromise(() =>
           fetch(`${baseURL}/v1/namespaces/http/metadata`),
         );

@@ -8,6 +8,7 @@ import { workerOptions } from "./harness";
 import {
   CollectionResult,
   CompactResult,
+  CacheWarmHintResult,
   Metadata,
   NamespacesPage,
   QueryResult,
@@ -97,6 +98,11 @@ test("Effect SDK performs native binding RPC with Worker and coordinator HTTP di
   const written = await call({ namespace: "rpc", operation: "write", input });
   expect(written.status, await written.clone().text()).toBe(200);
   expect(Schema.decodeUnknownSync(WriteResult)(await written.json()).sequence).toBe(1);
+  const hinted = await call({ namespace: "rpc", operation: "hint_cache_warm" });
+  expect(hinted.status).toBe(200);
+  expect(Schema.decodeUnknownSync(CacheWarmHintResult)(await hinted.json()).status).toBe(
+    "ACCEPTED",
+  );
   expect(
     Schema.decodeUnknownSync(WriteResult)(
       await (await call({ namespace: "rpc", operation: "write", input })).json(),

@@ -14,6 +14,7 @@ export default {
           Match.when({ operation: "query" }, (c) => Kannin.query(c.namespace, c.input)),
           Match.when({ operation: "write" }, (c) => Kannin.write(c.namespace, c.input)),
           Match.when({ operation: "metadata" }, (c) => Kannin.metadata(c.namespace)),
+          Match.when({ operation: "hint_cache_warm" }, (c) => Kannin.hintCacheWarm(c.namespace)),
           Match.when({ operation: "compact" }, (c) => Kannin.compact(c.namespace)),
           Match.when({ operation: "collect" }, (c) => Kannin.collect(c.namespace, c.input)),
           Match.when({ operation: "rebuild" }, (c) => Kannin.rebuild(c.namespace)),

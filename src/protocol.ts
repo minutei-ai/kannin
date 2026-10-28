@@ -9,6 +9,7 @@ export const Operation = Schema.Literals([
   "write",
   "query",
   "metadata",
+  "hint_cache_warm",
   "vector-sync",
   "vector-rebuild",
   "rebuild",
@@ -1163,7 +1164,16 @@ export const RebuildResult = Schema.Struct({
   sequence: Schema.Int,
   rebuilt: Schema.Literal(true),
 });
+export const CacheWarmHintResult = Schema.Struct({
+  status: Schema.Literal("ACCEPTED"),
+  message: Schema.optional(Unicode),
+});
 export const NamespaceRpcCommand = Schema.Union([
+  Schema.Struct({
+    namespace: NamespaceName,
+    operation: Schema.Literal("hint_cache_warm"),
+    input: Schema.optional(Schema.Struct({})),
+  }),
   Schema.Struct({
     namespace: NamespaceName,
     operation: Schema.Literal("migrate-root"),
@@ -1230,6 +1240,7 @@ export const RootMigrationResult = Schema.Struct({
   expiredSnapshots: Schema.Int,
 });
 export const RpcValue = Schema.Union([
+  CacheWarmHintResult,
   NamespacesPage,
   RootMigrationResult,
   QueryResult,

@@ -32,29 +32,35 @@
     "lint:ts": "oxlint --deny-warnings --report-unused-disable-directives .",
     "lint:rust": "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings && cargo clippy --workspace --lib --target wasm32-unknown-unknown --release --locked -- -D warnings",
     "quality": "bun run build && bun tooling/quality.ts",
-    "typecheck": "tsc --singleThreaded --noEmit"
+    "typecheck": "tsc --singleThreaded --noEmit",
+    "start": "bun dist/server/main.js"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "5.20261013.1",
-    "@effect/platform-bun": "4.0.4",
-    "@effect/platform-node": "4.0.4",
-    "@effect/tsgo": "0.48.0",
-    "@oxlint/plugins": "1.86.0",
-    "@turbopuffer/turbopuffer": "2.11.0",
-    "@types/bun": "1.4.2",
-    "alchemy": "2.0.0-beta.83",
-    "effect": "4.0.4",
-    "miniflare": "5.20261006.1-alpha",
-    "oxfmt": "0.71.0",
-    "oxlint": "1.86.0",
-    "oxlint-tsgolint": "7.0.2003",
+    "@alchemy.run/cloudflare": "2.0.0-beta.84",
+    "@alchemy.run/docker": "2.0.0-beta.84",
+    "@alchemy.run/railway": "2.0.0-beta.84",
+    "@aws-sdk/client-s3": "^3.1158.0",
+    "@cloudflare/workers-types": "5.20261027.1",
+    "@effect/platform-bun": "4.0.6",
+    "@effect/platform-node": "4.0.6",
+    "@effect/tsgo": "0.62.0",
+    "@oxlint/plugins": "1.90.0",
+    "@qdrant/js-client-rest": "^1.20.0",
+    "@turbopuffer/turbopuffer": "2.12.0",
+    "@types/bun": "1.4.4",
+    "alchemy": "2.0.0-beta.84",
+    "effect": "4.0.6",
+    "miniflare": "5.20261023.1-beta",
+    "oxfmt": "0.75.0",
+    "oxlint": "1.90.0",
+    "oxlint-tsgolint": "7.0.2005",
     "typescript": "7.0.2"
   },
   "peerDependencies": {
     "effect": "^4.0.0"
   },
-  "packageManager": "bun@1.4.3",
+  "packageManager": "bun@1.4.4",
   "patchedDependencies": {
-    "alchemy@2.0.0-beta.83": "patches/alchemy@2.0.0-beta.83.patch"
+    "@alchemy.run/cloudflare@2.0.0-beta.84": "patches/@alchemy.run%2Fcloudflare@2.0.0-beta.84.patch"
   }
 }

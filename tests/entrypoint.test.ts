@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import * as Cloudflare from "alchemy/Cloudflare";
+import * as Cloudflare from "@alchemy.run/cloudflare";
 import { Effect } from "effect";
 
 test("named service bindings preserve lazy references to another stack", () => {

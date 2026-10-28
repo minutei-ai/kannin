@@ -13,6 +13,26 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 - Bounded immutable range and term-catalog caches, native Worker Cache and Cache API; explicit edge reads with snapshots younger than one second at selection.
 - Vectorize metadata filtering, stale-revision reconciliation and reciprocal rank fusion.
 
+## Cloud portability and local development
+
+Railway and Docker are the priority deployment targets. Cloud independence is a product requirement: both targets must run without Cloudflare services, credentials or accounts. R2 and Vectorize may only remain optional backend adapters. The same TypeScript/Effect and Rust/WASM core now runs as a Worker or a complete Bun API image. The portable adapters use S3-compatible object storage and Qdrant. Local conformance uses real RustFS/Qdrant and executes the OCI image with rootless Podman; a hosted Railway deployment and full provider conformance remain delivery gates. See [running the portable API](docs/portable-runtime.md) and [the portability gates](docs/architecture.md#cloud-portability-gates).
+
+Alchemy is pinned to `2.0.0-beta.84`, with the matching `@alchemy.run/cloudflare` provider and Effect `4.0.6`. The provider split replaces `alchemy/Cloudflare`; the former InferEnv and WorkerEntrypoint patches are fixed upstream. A [packaging patch](docs/alchemy-patch.md) restores the missing local queue gateway required to import the published Cloudflare provider.
+
+Local emulation coverage, checked against the official Alchemy documentation on 2026-10-27:
+
+| Target            | Local development coverage                                                                                                                                | Kannin status                                                                                                        |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| AWS               | Docker/floci emulates Lambda/ECS, S3, SQS and S3 Vectors among roughly 40 services. Unsupported resources still use the real cloud.                       | Emulation reference; Railway/Docker are the selected next targets.                                                   |
+| Cloudflare        | workerd emulates Workers, R2, Queues and Durable Objects. Vectorize Index and metadata resources still use the real cloud.                                | Existing backend; full vector/hybrid development is not offline.                                                     |
+| GCP, Fly, Hetzner | No complete provider emulation is documented in the shared local-development guide. Running a container locally does not emulate the cloud control plane. | No application adapters for these targets.                                                                           |
+| Railway           | No complete Railway control-plane emulator. Local tests run the same OCI image and real selected backends.                                                | Alchemy Railway stack added; hosted deployment unverified.                                                           |
+| Docker            | Runs containers directly; it does not emulate a cloud provider.                                                                                           | Root Dockerfile runs the complete native API with S3/Qdrant; `crates/native/Dockerfile` remains the internal ranker. |
+
+No provider offers complete emulation of every cloud service. AWS is the documented option for a fully local stack when all selected resources have local implementations; this is not yet a validated local Kannin stack. Cloudflare vector fixture results do not establish real Vectorize ANN behavior. Separate portable checks exercise Qdrant itself, without establishing hosted latency or ANN recall parity.
+
+Sources: [shared local development](https://alchemy.run/environments/local-development/), [AWS local development](https://alchemy.run/aws/local-development/), [Cloudflare local development](https://alchemy.run/cloudflare/local-development/).
+
 ## Performance
 
 The latest Rust overview format separates singleton facts from shared score summaries and projects only requested facts. The final six-cohort, million-document comparison checks **864 complete responses** against baseline oracles with an identical-binary control. Rare-query WASM capacity falls from **4.94 to 4.5 MiB**; directory acquisition remains unnecessary for these queries. These are local measurements, not hosted parity or production heap evidence.
@@ -34,7 +54,7 @@ Five public BEIR test splits cover **3,677 queries**. [Ranking quality](docs/qua
 
 ## Run
 
-Requires Bun, Rust 1.96 with `wasm32-unknown-unknown`, and `wasm-bindgen-cli` 0.2.129. The WASM build enables SIMD, supported by Cloudflare Workers.
+Requires Bun, Rust 1.99.1 with `wasm32-unknown-unknown`, and `wasm-bindgen-cli` 0.2.129. The WASM build enables SIMD, supported by Cloudflare Workers.
 
 ```sh
 bun install --frozen-lockfile

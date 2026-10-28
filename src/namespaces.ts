@@ -1,4 +1,5 @@
 import { Effect, Schema } from "effect";
+import type { Bucket, ObjectListOptions } from "./platform";
 import {
   NamespaceListCursor,
   NamespaceName,
@@ -9,16 +10,16 @@ import {
 
 export const namespaceCatalogPrefix = "namespace-catalog-v1/";
 export const namespaceCatalogReadyKey = "namespace-catalog-v1.ready";
-const readyBuckets = new WeakSet<R2Bucket>();
+const readyBuckets = new WeakSet<Bucket>();
 
 export const listNamespaces = Effect.fn("kannin.namespaces.list")(function* (
-  bucket: R2Bucket,
+  bucket: Bucket,
   scope: string,
   input: typeof NamespacesInput.Type,
 ) {
   const prefix = input.prefix ?? "";
   const physicalPrefix = `${namespaceCatalogPrefix}${prefix}`;
-  const options: R2ListOptions = {
+  const options: ObjectListOptions = {
     prefix: physicalPrefix,
     limit: input.page_size ?? 100,
   };

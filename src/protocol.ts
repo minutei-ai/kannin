@@ -145,6 +145,7 @@ export const Query = Schema.Union([
   }),
 ]);
 const RootFields = {
+  collectionFence: Schema.optional(Schema.String.check(Schema.isUUID())),
   schema: Schema.optional(NamespaceSchema),
   version: Schema.Literal(1),
   sequence: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
@@ -426,8 +427,8 @@ export const Health = Schema.Struct({
   snapshotCachePutSkipped: Schema.Int,
   name: Schema.Literal("kannin"),
   version: Schema.Literal("0.1.0"),
-  engine: Schema.Literal("rust-wasm-r2"),
-  vectors: Schema.Literal("cloudflare-vectorize"),
+  engine: Schema.Literals(["rust-wasm-r2", "rust-wasm-object-storage"]),
+  vectors: Schema.Literals(["cloudflare-vectorize", "qdrant"]),
   wasmMemoryBytes: Schema.Int,
   ...CacheMetrics.fields,
 });
@@ -597,7 +598,9 @@ const BloomColumn = Schema.Struct({
 );
 export const BloomPack = Schema.Struct({
   key: Schema.String.check(
-    Schema.isPattern(/^namespaces\/[a-zA-Z0-9_-]{1,64}\/bloom-packs\/[a-f0-9]{64}\.bin$/),
+    Schema.isPattern(
+      /^namespaces\/[a-zA-Z0-9_-]{1,64}\/bloom-packs\/[a-f0-9]{64}(?:-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})?\.bin$/,
+    ),
   ),
   bytes: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(32 * 1024 * 1024)),
   segmentKeys: Schema.Array(Schema.suspend(() => SegmentRange.fields.key)).check(
@@ -1055,7 +1058,7 @@ export const TermFilters = Schema.fromJsonString(QueryFields.filters);
 export const TermFilterHeader = Schema.StringFromBase64.pipe(Schema.decodeTo(TermFilters));
 export const TextTerms = Schema.Array(Schema.String).check(Schema.isMaxLength(512));
 export const TermProjectionProps = Schema.Struct({
-  bucket: Schema.String.check(Schema.isBetweenLength(1, 63)),
+  bucket: Schema.String.check(Schema.isBetweenLength(1, 128)),
   terms: Schema.fromJsonString(TextTerms),
   prefixes: Schema.optional(Schema.Array(CommonTerms).check(Schema.isBetweenLength(1, 16))),
   selection: Schema.Union([
@@ -1121,12 +1124,15 @@ export const NativeRankingResult = Schema.Struct({
     blocks: Schema.Int,
   }),
 });
-export class Rejected extends Schema.TaggedError<Rejected>()("Rejected", {
-  status: Schema.Int,
-  message: Schema.String,
-  upstreamStatus: Schema.optional(Schema.Int),
-  upstreamRay: Schema.optional(Schema.NullOr(Schema.String)),
-}) {}
+export class Rejected extends Schema.TaggedError<Rejected, { readonly brand: unique symbol }>()(
+  "Rejected",
+  {
+    status: Schema.Int,
+    message: Schema.String,
+    upstreamStatus: Schema.optional(Schema.Int),
+    upstreamRay: Schema.optional(Schema.NullOr(Schema.String)),
+  },
+) {}
 
 export const VectorSelection = Schema.Struct({
   epoch: Root.fields.vectorEpoch,
@@ -1239,3 +1245,146 @@ export const RpcReply = Schema.Union([
   Schema.TaggedStruct("Success", { value: RpcValue }),
   Schema.TaggedStruct("Failure", { error: Rejected }),
 ]);
+
+export const ObjectKey = Schema.String.check(Schema.isMinLength(1));
+export const ObjectVersion = Schema.Struct({ etag: Schema.String.check(Schema.isMinLength(1)) });
+export const ObjectMetadata = Schema.Struct({
+  key: ObjectKey,
+  etag: ObjectVersion.fields.etag,
+  size: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  uploaded: Schema.Date,
+  customMetadata: Schema.Record(Schema.String, Schema.String),
+  sha256: Schema.optional(Schema.Uint8Array),
+});
+export const ObjectWriteCondition = Schema.Struct({
+  ifMatch: Schema.optional(Schema.String),
+  ifNoneMatch: Schema.optional(Schema.String),
+  customMetadata: Schema.optional(Schema.Record(Schema.String, Schema.String)),
+  sha256: Schema.optional(Schema.Uint8Array),
+  contentType: Schema.optional(Schema.String),
+});
+export class ObjectStoreFailure extends Schema.TaggedError<
+  ObjectStoreFailure,
+  { readonly brand: unique symbol }
+>()("ObjectStoreFailure", {
+  operation: Schema.Literals(["read", "write", "head", "list", "remove"]),
+  key: Schema.String,
+  cause: Schema.Defect(),
+}) {}
+
+export const S3StoreConfig = Schema.Struct({
+  bucket: Schema.String.check(Schema.isMinLength(1)),
+  endpoint: Schema.String.check(Schema.isPattern(/^https?:\/\//)),
+  region: Schema.String.check(Schema.isMinLength(1)),
+  accessKeyId: Schema.Redacted(Schema.String),
+  secretAccessKey: Schema.Redacted(Schema.String),
+});
+
+export const ObjectReadOptions = Schema.Struct({
+  range: Schema.optional(
+    Schema.Struct({
+      offset: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER })),
+      length: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER })),
+    }).check(
+      Schema.makeFilter(
+        (range) =>
+          Number.isSafeInteger(range.offset + range.length) || "Range overflows integer precision",
+      ),
+    ),
+  ),
+});
+export const ObjectContentRange = Schema.String.check(Schema.isPattern(/^bytes \d+-\d+\/\d+$/));
+
+export const ObjectCatalogMetadata = ObjectMetadata.mapFields((fields) => ({
+  ...fields,
+  customMetadata: Schema.optional(fields.customMetadata),
+}));
+export const ObjectListInput = Schema.Struct({
+  prefix: Schema.optional(Schema.String),
+  limit: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 1000 }))),
+  delimiter: Schema.optional(Schema.String),
+  cursor: Schema.optional(Schema.String),
+  includeMetadata: Schema.optional(Schema.Boolean),
+});
+export const ObjectPage = Schema.Union([
+  Schema.Struct({
+    objects: Schema.Array(ObjectCatalogMetadata),
+    delimitedPrefixes: Schema.Array(Schema.String),
+    truncated: Schema.Literal(true),
+    cursor: Schema.String.check(Schema.isMinLength(1)),
+  }),
+  Schema.Struct({
+    objects: Schema.Array(ObjectCatalogMetadata),
+    delimitedPrefixes: Schema.Array(Schema.String),
+    truncated: Schema.Literal(false),
+  }),
+]);
+
+export const ObjectUserMetadata = Schema.Record(Unicode, Unicode);
+export const ObjectUserMetadataJson = Schema.fromJsonString(ObjectUserMetadata);
+
+export const VectorStoreMetadata = Schema.Record(Unicode, Schema.Union([Unicode, Schema.Finite]));
+export const VectorStorePoint = Schema.Struct({
+  id: Unicode.check(Schema.isMinLength(1)),
+  namespace: Unicode.check(Schema.isMinLength(1)),
+  values: Schema.Array(Schema.Finite).check(Schema.isMinLength(1)),
+  metadata: VectorStoreMetadata,
+});
+export const VectorStorePredicate = Schema.Struct({
+  $eq: Schema.optional(Schema.Union([Unicode, Schema.Finite])),
+  $in: Schema.optional(Schema.Array(Schema.Union([Unicode, Schema.Finite]))),
+  $gt: Schema.optional(Schema.Finite),
+  $gte: Schema.optional(Schema.Finite),
+  $lt: Schema.optional(Schema.Finite),
+  $lte: Schema.optional(Schema.Finite),
+});
+export const VectorStoreQuery = Schema.Struct({
+  namespace: VectorStorePoint.fields.namespace,
+  topK: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 10000 })),
+  returnMetadata: Schema.Literal("all"),
+  filter: Schema.optional(Schema.Record(FieldName, VectorStorePredicate)),
+});
+export const VectorStorePayload = Schema.Struct({
+  vectorId: VectorStorePoint.fields.id,
+  namespace: VectorStorePoint.fields.namespace,
+  metadata: VectorStoreMetadata,
+});
+export const QdrantPoint = Schema.Struct({
+  id: Schema.String,
+  payload: VectorStorePayload,
+});
+export const QdrantScoredPoint = Schema.Struct({
+  ...QdrantPoint.fields,
+  score: Schema.Finite,
+});
+export const QdrantStoreConfig = Schema.Struct({
+  endpoint: S3StoreConfig.fields.endpoint,
+  collection: Schema.String.check(Schema.isPattern(/^[a-zA-Z0-9_-]{1,128}$/)),
+  dimensions: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 65536 })),
+  apiKey: Schema.Redacted(Schema.String),
+});
+export class VectorStoreFailure extends Schema.TaggedError<
+  VectorStoreFailure,
+  { readonly brand: unique symbol }
+>()("VectorStoreFailure", {
+  operation: Schema.Literals(["initialize", "query", "upsert", "delete"]),
+  cause: Schema.Defect(),
+}) {}
+export const QdrantCollectionVectorConfig = Schema.Struct({
+  config: Schema.Struct({
+    params: Schema.Struct({
+      vectors: Schema.Struct({ size: Schema.Int, distance: Schema.Literal("Cosine") }),
+    }),
+  }),
+});
+
+export const PortableServerConfig = Schema.Struct({
+  token: Schema.Redacted(Unicode.check(Schema.isMinLength(1))),
+  host: Unicode.check(Schema.isMinLength(1)),
+  port: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 65535 })),
+  wasmPath: Unicode.check(Schema.isMinLength(1)),
+  objectStore: S3StoreConfig,
+  vectorStore: QdrantStoreConfig,
+});
+
+export const DeploymentTarget = Schema.Literals(["railway", "docker", "cloudflare"]);

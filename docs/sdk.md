@@ -11,7 +11,7 @@ The package root exports Effect operations; `kannin/protocol` owns their Schemas
 Bind the deployed Search Worker's **KanninRpc** entrypoint. With Alchemy, resolve the existing Worker from its owning stack and state store:
 
 ```ts
-import * as Cloudflare from "alchemy/Cloudflare";
+import * as Cloudflare from "@alchemy.run/cloudflare";
 import type { Entrypoint } from "kannin/rpc";
 
 const search =
@@ -24,7 +24,7 @@ const search =
 KANNIN: Cloudflare.WorkerEntrypoint<Entrypoint>(search, "KanninRpc");
 ```
 
-The Alchemy example requires the declared [entrypoint patch](../patches/alchemy@2.0.0-beta.83.patch) for beta.83. Its original guard recognizes only objects, while a lazy `Worker.ref` is a callable proxy. Without the fix, a foreign named binding silently becomes a binding to the consumer's default entrypoint. The patch accepts callable resource references in both the TypeScript and emitted runtime entry points. Carry the same fix at the consumer's package-manager patch owner when using an affected Alchemy version; installing the SDK does not patch the consumer's infrastructure dependencies. Remove this patch section when the resolved upstream implementation passes `entrypoint.test.ts` without it. Minutei's Alchemy version must be checked independently before configuring its production binding.
+The example targets `@alchemy.run/cloudflare@2.0.0-beta.84`. Its native resource guard recognizes lazy callable `Worker.ref` values; no package patch is needed. The regression is covered by `tests/entrypoint.test.ts`. Consumers on older Alchemy versions must independently check their resolved provider before configuring production bindings.
 
 Use the consumer's existing process runtime and native environment. For example, at the service Layer that owns the binding:
 

@@ -1,14 +1,17 @@
 import { Clock, Config, Effect, Redacted, Schema } from "effect";
 import { Metadata, NamespaceName, Query, QueryResult, Row } from "../src/protocol";
 
-class LoadFailure extends Schema.TaggedError<LoadFailure>()("LoadFailure", {
-  message: Schema.String,
-  status: Schema.optional(Schema.Int),
-  body: Schema.optional(Schema.String),
-  query: Schema.optional(Query),
-  serverTiming: Schema.optional(Schema.Union([Schema.String, Schema.Null])),
-  ray: Schema.optional(Schema.Union([Schema.String, Schema.Null])),
-}) {}
+class LoadFailure extends Schema.TaggedError<LoadFailure, { readonly brand: unique symbol }>()(
+  "LoadFailure",
+  {
+    message: Schema.String,
+    status: Schema.optional(Schema.Int),
+    body: Schema.optional(Schema.String),
+    query: Schema.optional(Query),
+    serverTiming: Schema.optional(Schema.Union([Schema.String, Schema.Null])),
+    ray: Schema.optional(Schema.Union([Schema.String, Schema.Null])),
+  },
+) {}
 
 const url = new URL(Effect.runSync(Config.String("RAIO_URL")));
 const namespace = Effect.runSync(Config.schema(NamespaceName, "RAIO_LOAD_NAMESPACE"));

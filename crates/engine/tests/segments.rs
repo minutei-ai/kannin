@@ -157,7 +157,10 @@ fn tombstones_and_filters_apply_before_top_k() -> Result<(), Box<dyn std::error:
         search(vec![private, allowed], "rust", "any", &[], &[filter], 1)?[0].0,
         "b"
     );
-    assert!(search(vec![document("a", "rust")], "rust", "any", &[0], &[], 10)?.is_empty());
+    assert_eq!(
+        search(vec![document("a", "rust")], "rust", "any", &[0], &[], 10)?,
+        Vec::<(String, f64)>::new()
+    );
 
     Ok(())
 }
@@ -494,7 +497,10 @@ fn batched_blooms_match_independent_membership_and_reject_bad_framing()
     assert!(segment::bloom_filter_many(&bytes, &[1], &values).is_err());
     assert!(segment::bloom_filter_many(&bytes, &[0, u32::MAX], &values).is_err());
     assert!(segment::bloom_filter_many(&[], &[], &values).is_err());
-    assert!(segment::bloom_filter_many(&[], &[0], &values)?.is_empty());
+    assert_eq!(
+        segment::bloom_filter_many(&[], &[0], &values)?,
+        Vec::<Vec<&str>>::new()
+    );
     Ok(())
 }
 
@@ -573,7 +579,7 @@ fn intersections_match_exhaustive_membership_and_phrase_positions()
             }
         }
     }
-    assert!(
+    assert_eq!(
         search(
             vec![document("a", "alpha"), document("b", "beta")],
             "alpha beta",
@@ -581,8 +587,8 @@ fn intersections_match_exhaustive_membership_and_phrase_positions()
             &[],
             &[],
             10
-        )?
-        .is_empty()
+        )?,
+        Vec::<(String, f64)>::new()
     );
     Ok(())
 }

@@ -4,21 +4,26 @@ on:
   pull_request:
 permissions:
   contents: read
+concurrency:
+  group: check-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
-          bun-version: 1.4.3
+          bun-version: 1.4.4
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
         with:
-          toolchain: 1.96.0
+          toolchain: 1.99.1
           targets: wasm32-unknown-unknown
           components: rustfmt, clippy
       - run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
       - run: bun install --frozen-lockfile
+      - run: sudo apt-get update && sudo apt-get install -y podman
       - run: bun run check
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -26,4 +31,5 @@ jobs:
           path: |
             dist/worker/
             dist/wasm/
+            dist/server/
           retention-days: 1

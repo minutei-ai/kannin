@@ -1,7 +1,8 @@
 import { Effect, Schema } from "effect";
 import { Scalar } from "./protocol";
 import type { Attributes, Filter, VectorFilterFields } from "./protocol";
-import { sha256 } from "./storage";
+import { sha256 } from "./hash";
+import type { VectorFilter, VectorBoundOp } from "./platform";
 
 const scalarDigest = Effect.fn("raio.scalarDigest")(function* (value: typeof Scalar.Type) {
   const encoded = yield* Schema.encodeEffect(Schema.fromJsonString(Scalar))(value);
@@ -27,7 +28,7 @@ export const vectorPrefilter = Effect.fn("raio.vectorPrefilter")(function* (
   filters: ReadonlyArray<typeof Filter.Type>,
   fields: typeof VectorFilterFields.Type,
 ) {
-  const native: VectorizeVectorMetadataFilter = {};
+  const native: VectorFilter = {};
   for (const [index, field] of fields.entries()) {
     const selected =
       filters.find((filter) => filter.field === field && filter.op === "eq") ??
@@ -36,7 +37,7 @@ export const vectorPrefilter = Effect.fn("raio.vectorPrefilter")(function* (
         (filter) => filter.field === field && ["gt", "gte", "lt", "lte"].includes(filter.op),
       );
     if (selected === undefined) continue;
-    const candidate: VectorizeVectorMetadataFilter = { ...native };
+    const candidate: VectorFilter = { ...native };
     if (selected.op === "eq") candidate[`e${index}`] = { $eq: yield* scalarDigest(selected.value) };
     else if (selected.op === "in")
       candidate[`e${index}`] = {
@@ -69,7 +70,7 @@ export const vectorPrefilter = Effect.fn("raio.vectorPrefilter")(function* (
           if (b.op === "lt") return 1;
           return 0;
         })[0];
-      const bounds: Partial<Record<VectorizeVectorMetadataFilterOp, number>> = {};
+      const bounds: Partial<Record<VectorBoundOp, number>> = {};
       if (lower?.op === "gt") bounds.$gt = lower.value;
       if (lower?.op === "gte") bounds.$gte = lower.value;
       if (upper?.op === "lt") bounds.$lt = upper.value;

@@ -5,7 +5,10 @@ import type { Filter } from "../src/protocol";
 import { Query, QueryResult, Write, Metadata } from "../src/protocol";
 import { corpus } from "./corpus";
 
-class ComparisonFailure extends Schema.TaggedError<ComparisonFailure>()("ComparisonFailure", {
+class ComparisonFailure extends Schema.TaggedError<
+  ComparisonFailure,
+  { readonly brand: unique symbol }
+>()("ComparisonFailure", {
   phase: Schema.Literals(["metadata", "strong", "edge", "final-metadata"]),
   status: Schema.Int,
   body: Schema.String,

@@ -45,3 +45,16 @@ await Bun.write(
   Bun.file(join(root, "dist/wasm/raio_engine_bg.wasm")),
 );
 console.log("Built Raio Rust/WASM + Effect Worker");
+
+const portable = await Bun.build({
+  entrypoints: [join(root, "runtime/main.ts"), join(root, "runtime/healthcheck.ts")],
+  outdir: join(root, "dist/server"),
+  target: "bun",
+  format: "esm",
+  minify: true,
+});
+if (!portable.success) {
+  console.error(portable.logs);
+  process.exit(1);
+}
+console.log("Built Kannin portable API server");

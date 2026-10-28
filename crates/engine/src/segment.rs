@@ -385,7 +385,9 @@ pub fn query_documents_from_metadata(
         return Err("Invalid metadata batch framing".into());
     }
     let frames = ranges
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|range| {
             let offset = usize::try_from(range[0]).map_err(|cause| cause.to_string())?;
             let length = usize::try_from(range[1]).map_err(|cause| cause.to_string())?;
@@ -758,7 +760,6 @@ impl DocumentTable {
     fn first(&self) -> Option<DocumentMeta<&str, &DocumentAttributes>> {
         self.get(0)
     }
-    #[must_use]
     pub fn iter(
         &self,
     ) -> impl ExactSizeIterator<Item = DocumentMeta<&str, &DocumentAttributes>> + DoubleEndedIterator
@@ -920,21 +921,18 @@ impl TermDictionary {
             .map(|index| &mut self.entries[index].1)
     }
 
-    #[must_use]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (&str, &TermMeta)> {
         self.entries
             .iter()
             .map(|(term, metadata)| (&self.text[term.clone()], metadata))
     }
 
-    #[must_use]
     pub fn keys(&self) -> impl ExactSizeIterator<Item = &str> {
         self.entries
             .iter()
             .map(|(term, _)| &self.text[term.clone()])
     }
 
-    #[must_use]
     pub fn values(&self) -> impl ExactSizeIterator<Item = &TermMeta> {
         self.entries.iter().map(|(_, metadata)| metadata)
     }
@@ -8582,7 +8580,7 @@ mod frequency_tests {
                 &[],
             )?;
             search.add("alpha", &later)?;
-            assert!(search.finish()?.is_empty());
+            assert_eq!(search.finish()?, Vec::<super::Hit>::new());
             assert_eq!(search.last_decoded_rows.get("alpha"), Some(&Some(2)));
             match &search.lists {
                 PostingLists::Positions(lists) => assert!(lists.values().all(Vec::is_empty)),
@@ -10706,9 +10704,18 @@ mod metadata_batch_tests {
             ranges.push(range.offset);
             ranges.push(range.length);
         }
-        let requested: Vec<_> = ranges.chunks_exact(2).rev().flatten().copied().collect();
+        let requested: Vec<_> = ranges
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .rev()
+            .flatten()
+            .copied()
+            .collect();
         let expected: Vec<serde_json::Value> = requested
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|range| {
                 let start = range[0] as usize;
                 let end = start + range[1] as usize;

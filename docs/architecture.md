@@ -24,11 +24,13 @@ The portable queue is a bounded, process-local dispatch optimization. It dedupli
 
 ### Validation and remaining gates
 
+The complete [CI gate for `0b6fc71`](https://github.com/minutei-ai/kannin/actions/runs/40757107730) passed formatting, Rust/WASM/Worker/API/cache builds, strict TypeScript lint, native/WASM Clippy, type checking, 98 Rust tests and 470 Bun/workerd tests with 18,054 assertions. This includes the real Varnish cache/restart test, the complete OCI API image/restart test, real S3/Qdrant fixtures, competing portable writers and official SDK namespace listing over portable HTTP. Later changes require a new complete gate; this result does not prove hosted deployment or full Turbopuffer compatibility.
+
 Local tests use real pinned RustFS and Qdrant containers, with bounded memory/CPU, temporary backend storage, no app volume and no Cloudflare credentials or network services. They cover CAS ownership, partial-object identity, checksums, pagination, opaque keys, Unicode metadata, vector isolation/prefilters/deletion, native text/vector/hybrid operations, all maintenance routes, reset, idempotency, restart recovery, strong sequence barriers and competing writers. The complete OCI image is built and restarted under rootless Podman. A separate real HTTP test uses the official Turbopuffer SDK for namespace listing only.
 
 Remaining delivery gates:
 
-- Pass the complete `bun run check` after extraction, including the unchanged Cloudflare/workerd regression suite and Rust/WASM checks.
+- Keep the complete `bun run check` green on the delivery head, including the Cloudflare/workerd regression suite, Rust/WASM checks and real portable backends. The passed extraction gate above precedes the additional fractional-filter and CDN-failure regression cases.
 - Validate hostile timing around collector/checkpoint expiry and interrupted background acknowledgement across independent processes; the focused replica tests are bounded evidence, not exhaustive distributed-system certification.
 - Validate Docker Engine execution and a hosted Railway deployment separately. Local OCI execution does not emulate Railway networking, autoscaling, deployments or control-plane behavior. Native Railway bucket conditional-write semantics must be tested before selecting it as canonical storage.
 - Measure cold/warm full-API performance with comparable datasets and cache definitions; the old Rust ranker benchmark is not an API-container benchmark. Report real Vectorize, Qdrant recall, ranking quality and hosted competitor measurements separately.

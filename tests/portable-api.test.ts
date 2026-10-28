@@ -195,8 +195,9 @@ test("two portable replicas fence concurrent writes and expose fresh strong read
           const metadata = yield* Effect.tryPromise(() => metadataResponse.json()).pipe(
             Effect.flatMap(Schema.decodeUnknownEffect(Metadata)),
           );
-          const dimensions = metadata.schema?.vectorDimensions;
-          if (dimensions === undefined) throw new Error("Missing winning canonical dimensions");
+          const dimensions = yield* Schema.decodeUnknownEffect(Schema.Literals([1, 2]))(
+            metadata.schema?.vectorDimensions,
+          );
           expect(metadata.sequence).toBe(1);
           expect(metadata.documents).toBe(1);
           const response = yield* Effect.tryPromise(() =>

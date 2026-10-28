@@ -2229,6 +2229,7 @@ test("query document projection preserves fields and rejects invalid vectors and
     [0.5, 0, -0.25],
     Array.from({ length: 768 }, (_, index) => Math.sin(index + 1)),
     [...Array<number>(4095).fill(0), 1],
+    [...Array<number>(10_751).fill(0), 1],
   ]) {
     const frames = documentFrames({ ...document, vector });
     const full = decodeFull(segment_document(frames.metadata, frames.vector));
@@ -2237,7 +2238,7 @@ test("query document projection preserves fields and rejects invalid vectors and
     expect(full.vector).toHaveLength(vector.length);
     expect(projected).not.toHaveProperty("vector");
   }
-  for (const vector of [[], [0, -0], Array<number>(4097).fill(1), [1e-100], [3.5e38]]) {
+  for (const vector of [[], [0, -0], Array<number>(10_753).fill(1), [1e-100], [3.5e38]]) {
     expect(() => {
       const frames = documentFrames({ ...document, vector });
       return decodeFull(segment_document(frames.metadata, frames.vector));

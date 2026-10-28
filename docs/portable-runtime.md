@@ -56,9 +56,9 @@ KANNIN_TARGET=cloudflare bun run deploy --stage prod
 
 The scripts already include `--profile minutei`. Railway uses the local Docker context containing the generated artifacts, external backend variables, port 3000 and `/health`. Its native provider credentials come from the selected Alchemy profile. Docker uses the native provider's CLI selection (`DOCKER_BIN=podman` is supported upstream). These commands provision real resources; Railway has no complete local platform emulator. Build and inspect a plan before deployment. Keep Alchemy state, credentials and environment-specific values outside the tracked tree.
 
-`bun run check` includes real RustFS conformance and native vector regressions and OCI image execution through Podman. Install Podman before running the gate. Test fixtures bind backend ports to loopback, enforce CPU/memory caps and remove only their own containers/images. The OCI test uses host networking to reach those loopback fixtures; production networking is configured by the selected host.
+`bun run check` includes real RustFS conformance and native vector regressions and OCI image execution through Podman and the local default Docker Engine context. Both engines are prerequisites for the gate. Test fixtures bind backend ports to loopback, enforce CPU/memory caps and remove only their own containers/images. The OCI test transfers one native-built image through a temporary Docker archive, checks the same image ID in both engines, then checks writes and text/vector reads after restarting each container. The transfer archive is removed after loading and the fixture scopes remove their own images/containers. This new Docker Engine case awaits the delivery gate. Tests use host networking to reach loopback fixtures; production networking is configured by the selected host.
 
-Test containers also have a three-minute native Podman timeout, so an interrupted
+Test containers also have a three-minute lifetime: native Podman timeout or GNU timeout inside the Docker test image, so an interrupted
 test runner cannot leave them running indefinitely. On shared development hosts,
 run heavy commands through the host's `resource-run` wrapper and use CI when the
 full gate exceeds its resource budget. Do not create a fresh package cache or copy

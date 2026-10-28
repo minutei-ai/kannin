@@ -303,19 +303,20 @@ test("dotted and 128-character namespace identities survive writes, SDK paginati
   });
   for (const namespace of names) {
     expect(
-      (await request(worker, namespace, "write", write([document("one", namespace)]))).status,
+      (await request(worker, namespace, "write", write([document("one", `marker ${namespace}`)])))
+        .status,
     ).toBe(200);
     const hinted = await client.namespace(namespace).hintCacheWarm().withResponse();
     expect(hinted.response.status).toBe(202);
     const response = await request(worker, namespace, "query", {
       kind: "text",
-      text: "identity",
+      text: "marker",
       topK: 1,
       filters: [],
     });
     expect(response.status).toBe(200);
     const found = Schema.decodeUnknownSync(QueryResult)(await response.json());
-    expect(found.rows.map((row) => row.text)).toEqual([namespace]);
+    expect(found.rows.map((row) => row.text)).toEqual([`marker ${namespace}`]);
   }
   for (const prefix of ["identity.", "."]) {
     const listed: string[] = [];

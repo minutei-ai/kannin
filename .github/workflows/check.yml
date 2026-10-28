@@ -10,6 +10,22 @@ concurrency:
   group: check-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 jobs:
+  dependency-refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.4
+      - run: bun add --ignore-scripts --dev --exact effect@4.0.7 @effect/platform-bun@4.0.7 @effect/platform-node@4.0.7 @effect/tsgo@0.63.0 @aws-sdk/client-s3@3.1159.0 @cloudflare/workers-types@5.20261028.1 @turbopuffer/turbopuffer@2.13.0 miniflare@5.20261023.2-beta
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: dependency-refresh-candidate
+          path: |
+            package.json
+            bun.lock
+          retention-days: 1
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 45

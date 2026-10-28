@@ -9,19 +9,22 @@ import { containerCommand } from "./container-command";
 
 const image = `localhost/kannin-portable-contract:${crypto.randomUUID()}`;
 const services = objectStoreFixtureLive;
-const imageContent = Schema.fromJsonString(
-  Schema.Tuple([
-    Schema.Struct({
-      Architecture: Schema.String,
-      Os: Schema.String,
-      Config: Schema.Unknown,
-      RootFS: Schema.Struct({
-        Type: Schema.Literal("layers"),
-        Layers: Schema.Array(Schema.String),
-      }),
-    }),
-  ]),
-);
+const imageInspection = Schema.Struct({
+  Architecture: Schema.String,
+  Os: Schema.String,
+  Config: Schema.Record(Schema.String, Schema.Unknown),
+  HealthCheck: Schema.optional(Schema.Unknown),
+  RootFS: Schema.Struct({
+    Type: Schema.Literal("layers"),
+    Layers: Schema.Array(Schema.String),
+  }),
+});
+const imageContent = Schema.fromJsonString(Schema.Tuple([imageInspection]));
+function imageIdentity(inspection: typeof imageInspection.Type) {
+  const { HealthCheck, Config, ...content } = inspection;
+  const { Healthcheck, ...config } = Config;
+  return { ...content, Config: config, Healthcheck: HealthCheck ?? Healthcheck };
+}
 
 test("same OCI API image runs on Podman and Docker Engine with canonical state across restarts", async () => {
   await Effect.runPromise(
@@ -78,7 +81,14 @@ test("same OCI API image runs on Podman and Docker Engine with canonical state a
           image,
         ]).pipe(Effect.flatMap(Schema.decodeEffect(imageContent)));
         expect(source.RootFS.Layers.length).toBeGreaterThan(0);
-        expect(loaded).toEqual(source);
+        const identity = imageIdentity(source);
+        expect(identity.Healthcheck).toMatchObject({
+          Test: ["CMD", "bun", "dist/server/healthcheck.js"],
+          Interval: 30_000_000_000,
+          Timeout: 5_000_000_000,
+          StartPeriod: 30_000_000_000,
+        });
+        expect(imageIdentity(loaded)).toEqual(identity);
         for (const engine of ["podman", "docker"] as const) {
           const namespace = `container-${engine}`;
           const options = Match.value(engine).pipe(

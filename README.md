@@ -19,7 +19,7 @@ Railway and Docker are the priority deployment targets. Both use the same comple
 
 Docker includes a private immutable HTTP cache built on the official Varnish image. Its TypeScript/Effect adapter implements `match/put/delete`, with bucket/version-scoped keys, a separate service credential and bounded memory. Cache loss recovers through S3-compatible storage; see [the cache contract and limits](docs/portable-runtime.md#self-hosted-immutable-cdn-cache).
 
-Alchemy is pinned to `2.0.0-beta.84`, with the matching `@alchemy.run/cloudflare` provider and Effect `4.0.6`. The provider split replaces `alchemy/Cloudflare`; the WorkerEntrypoint guard is fixed upstream. A [pinned provider patch](docs/alchemy-patch.md) restores the missing local queue gateway and missing Vectorize/Secrets Store binding inference in the published Cloudflare provider.
+Alchemy is pinned to `2.0.0-beta.84`, with the matching `@alchemy.run/cloudflare` provider and Effect `4.0.7`. The current dependency refresh awaits the full gate. The provider split replaces `alchemy/Cloudflare`; the WorkerEntrypoint guard is fixed upstream. A [pinned provider patch](docs/alchemy-patch.md) restores the missing local queue gateway and missing Vectorize/Secrets Store binding inference in the published Cloudflare provider.
 
 Local emulation coverage, checked against the official Alchemy documentation on 2026-10-27:
 

@@ -14,6 +14,8 @@ Public sources were captured on 2026-10-26: the documentation index, every page 
 
 A local workerd route probe of the gate072 Worker retains five authenticated 404 responses for public listing, row-write, BM25 query, metadata and schema-read requests, plus a 401 without authentication. All six error bodies lack the published `status: error` member. No canonical namespace objects were written. This proves these observed mismatches, not a complete API audit. Evidence: `/home/yorizel/.cache/kannin-turbopuffer-parity-20261026/audit/{probe.ts,results.json,receipt.json}`. No hosted competitor test was executed.
 
+A dependency refresh on 2026-10-28 selects official TypeScript SDK 2.13.0 for the next complete gate. Earlier SDK 2.12.0 results below remain historical evidence; they do not validate the new installed client. The pinned public-source baseline remains explicit rather than being silently relabeled.
+
 ## Implemented conformance boundaries
 
 The public HTTP error envelope now includes the required `status: error` member alongside its message, preserving the numeric HTTP status. Query, coordinator, gateway and administrative-list failures use the owning ErrorBody Schema. Administrative listing catches native acquisition and namespace-validation failures, logs the original failure and returns a sanitized, private/no-store 503. The native binding RpcReply/Rejected wire contract is unchanged.

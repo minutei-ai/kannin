@@ -41,8 +41,6 @@ const exit = await Effect.runPromiseExit(
               "-p",
               "vsl_space=16m",
               "-p",
-              "vsc_space=1m",
-              "-p",
               "thread_pool_min=10",
               "-p",
               "thread_pool_max=50",
@@ -73,11 +71,24 @@ const exit = await Effect.runPromiseExit(
             await child.exited;
           }),
       );
+      const died = Effect.tryPromise(() => varnish.exited).pipe(
+        Effect.flatMap((code) =>
+          Effect.fail(
+            new CacheFailure({
+              operation: "initialize",
+              cause: new Error(`Varnish exited with code ${code}`),
+            }),
+          ),
+        ),
+      );
       yield* Effect.tryPromise(async () => {
         const response = await fetch(`http://127.0.0.1:6081/health`);
         await response.arrayBuffer();
         if (response.status !== 404) throw new Error("Unexpected cache origin health response");
-      }).pipe(Effect.retry({ schedule: Schedule.spaced("100 millis"), times: 50 }));
+      }).pipe(
+        Effect.retry({ schedule: Schedule.spaced("100 millis"), times: 50 }),
+        Effect.raceFirst(died),
+      );
       const server = yield* Effect.acquireRelease(
         Effect.sync(() =>
           Bun.serve({
@@ -99,16 +110,6 @@ const exit = await Effect.runPromiseExit(
           process.removeListener("SIGINT", stop);
         });
       });
-      const died = Effect.tryPromise(() => varnish.exited).pipe(
-        Effect.flatMap((code) =>
-          Effect.fail(
-            new CacheFailure({
-              operation: "initialize",
-              cause: new Error(`Varnish exited with code ${code}`),
-            }),
-          ),
-        ),
-      );
       yield* Effect.raceFirst(shutdown, died);
     }),
   ).pipe(Effect.tapCause((cause) => Effect.logError("kannin.cache.startup", cause))),

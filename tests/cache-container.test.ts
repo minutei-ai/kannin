@@ -51,9 +51,9 @@ test("official Varnish image implements CachePort and loses only cache data on r
           if (!response.ok) throw new Error("CDN is not ready");
         }).pipe(Effect.retry({ schedule: Schedule.spaced("200 millis"), times: 150 }));
         yield* ready.pipe(
-          Effect.tapError(() =>
-            containerCommand(["podman", "logs", id]).pipe(
-              Effect.flatMap((logs) => new Cause.UnknownError(new Error(logs))),
+          Effect.tapError((cause) =>
+            containerCommand(["podman", "logs", id], "combined").pipe(
+              Effect.flatMap((logs) => new Cause.UnknownError(new Error(logs, { cause }))),
             ),
           ),
         );

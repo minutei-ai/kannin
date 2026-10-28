@@ -1357,6 +1357,9 @@ export const QdrantScoredPoint = Schema.Struct({
   ...QdrantPoint.fields,
   score: Schema.Finite,
 });
+export const QdrantCollectionExists = Schema.Struct({ exists: Schema.Boolean });
+export const QdrantQueryResult = Schema.Struct({ points: Schema.Array(QdrantScoredPoint) });
+export const QdrantMutationResult = Schema.Struct({ status: Schema.Literal("completed") });
 export const QdrantStoreConfig = Schema.Struct({
   endpoint: S3StoreConfig.fields.endpoint,
   collection: Schema.String.check(Schema.isPattern(/^[a-zA-Z0-9_-]{1,128}$/)),
@@ -1378,6 +1381,66 @@ export const QdrantCollectionVectorConfig = Schema.Struct({
   }),
 });
 
+export const DeploymentTarget = Schema.Literals(["railway", "docker", "cloudflare"]);
+
+export const ImmutableCacheName = Schema.Literals([
+  "raio-segments-v1",
+  "raio-overview-batches-v8",
+  "kannin-text-plans-v1",
+  "kannin-vectors-v2",
+]);
+export const CacheObjectId = Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/));
+export const CacheGeneration = Schema.String.check(Schema.isPattern(/^[a-f0-9-]{36}$/));
+export const CacheHeaders = Schema.Record(
+  Schema.String.check(Schema.isPattern(/^[a-z0-9-]{1,128}$/)),
+  Unicode.check(Schema.isMaxLength(8192)),
+).check(
+  Schema.makeFilter(
+    (headers) => Object.keys(headers).length <= 64 || "Too many cached response headers",
+  ),
+  Schema.makeFilter(
+    (headers) =>
+      !["authorization", "cookie", "set-cookie", "proxy-authorization"].some(
+        (name) => headers[name] !== undefined,
+      ) || "Authenticated response headers cannot enter a shared cache",
+  ),
+);
+export const CacheHeadersJson = Schema.fromJsonString(CacheHeaders);
+export const CacheTtlSeconds = Schema.Int.check(
+  Schema.isBetween({ minimum: 1, maximum: 31536000 }),
+);
+export const CacheEntryBytes = Schema.Int.check(
+  Schema.isBetween({ minimum: 1, maximum: 16 * 1024 * 1024 }),
+);
+export const CacheClientConfig = Schema.Struct({
+  endpoint: S3StoreConfig.fields.endpoint,
+  token: Schema.Redacted(Unicode.check(Schema.isMinLength(1))),
+  timeoutMillis: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 5000 })),
+  maxEntryBytes: CacheEntryBytes,
+});
+export const CacheServerConfig = Schema.Struct({
+  token: CacheClientConfig.fields.token,
+  host: Unicode.check(Schema.isMinLength(1)),
+  port: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 65535 })),
+  edgeEndpoint: S3StoreConfig.fields.endpoint,
+  maxEntries: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 65536 })),
+  maxMetadataBytes: Schema.Int.check(
+    Schema.isBetween({ minimum: 1024, maximum: 64 * 1024 * 1024 }),
+  ),
+  maxStagingBytes: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 128 * 1024 * 1024 })),
+  maxEntryBytes: CacheEntryBytes,
+  maxTtlSeconds: CacheTtlSeconds,
+});
+export const CacheDeleteResult = Schema.Struct({ deleted: Schema.Boolean });
+export const CacheDeleteResultJson = Schema.fromJsonString(CacheDeleteResult);
+export class CacheFailure extends Schema.TaggedError<
+  CacheFailure,
+  { readonly brand: unique symbol }
+>()("CacheFailure", {
+  operation: Schema.Literals(["initialize", "match", "put", "delete"]),
+  cause: Schema.Defect(),
+}) {}
+
 export const PortableServerConfig = Schema.Struct({
   token: Schema.Redacted(Unicode.check(Schema.isMinLength(1))),
   host: Unicode.check(Schema.isMinLength(1)),
@@ -1385,6 +1448,5 @@ export const PortableServerConfig = Schema.Struct({
   wasmPath: Unicode.check(Schema.isMinLength(1)),
   objectStore: S3StoreConfig,
   vectorStore: QdrantStoreConfig,
+  cache: Schema.optional(CacheClientConfig),
 });
-
-export const DeploymentTarget = Schema.Literals(["railway", "docker", "cloudflare"]);

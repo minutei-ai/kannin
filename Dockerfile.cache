@@ -1,0 +1,11 @@
+FROM oven/bun:1.4.4@sha256:1d22548f177f4ff38e0c15baa3c2c46c6c2060ba2d1bc573bb4720b407548f1d AS bun
+FROM varnish:9.1.0@sha256:4c6066279af88edcdd97d35a45579c77f363e551cd9cb5597644ac856d8ebbdf
+COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
+COPY infra/cache.vcl /etc/varnish/default.vcl
+WORKDIR /app
+COPY dist/cache/main.js dist/cache/main.js
+COPY dist/server/healthcheck.js dist/server/healthcheck.js
+ENV PORT=3000
+EXPOSE 3000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s CMD ["bun", "dist/server/healthcheck.js"]
+CMD ["bun", "dist/cache/main.js"]

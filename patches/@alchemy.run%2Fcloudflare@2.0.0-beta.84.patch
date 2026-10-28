@@ -79,3 +79,45 @@ index 0000000000000000000000000000000000000000..b8a05ef9286f24ae144e8d8181ea49a0
 +
 +  return { raw, use, tryPromise };
 +};
+diff --git a/lib/Workers/InferEnv.d.ts b/lib/Workers/InferEnv.d.ts
+--- a/lib/Workers/InferEnv.d.ts
++++ b/lib/Workers/InferEnv.d.ts
+@@ -20,6 +20,8 @@
+ import type * as PipelinesNs from "../Pipelines/index.ts";
+ import type * as Queues from "../Queues/index.ts";
+ import type * as R2 from "../R2/index.ts";
++import type { Secret as SecretsStoreBinding } from "../SecretsStore/Secret.ts";
++import type { Index as VectorizeIndex } from "../Vectorize/VectorizeIndex.ts";
+ import type * as StreamNs from "../Stream/index.ts";
+ import type { VpcService } from "../VpcService/VpcService.ts";
+ import type { VpcServiceLookup } from "../VpcService/VpcServiceLookup.ts";
+@@ -42,7 +44,7 @@
+ } ? InferEnv<Env> : {
+     [k in keyof W]: GetBindingType<W[k]>;
+ };
+-export type GetBindingType<T> = T extends WorkerEntrypointBinding<infer Entrypoint> ? Service<Entrypoint> : T extends Self ? Service : T extends Container.Decl<any, any, any, any, infer DOShape> ? DurableObjectNamespace<DOShape & Rpc.DurableObjectBranded> : T extends WorkerOnlyBinding.BindingEffect<infer B> ? GetBindingType<B> : T extends R2.S3Credentials ? string : T extends Output<infer A, infer _Req> | Effect.Effect<infer A, infer _E, infer _R> ? GetBindingType<A> : T extends FlagshipNs.App ? Flagship : T extends Assets ? Service : T extends AlchemyRpc<infer Shape extends object> ? RpcWireShape<Shape> & Service : T extends D1.Database ? D1Database : T extends R2.Bucket ? R2Bucket : T extends KV.InstantNamespace ? KV.InstantNamespaceBindingClient : T extends KV.Namespace ? KVNamespace : T extends DispatchNamespaceResource ? DispatchNamespace : T extends Queues.Queue ? Queue<unknown> : T extends AI.Gateway ? Ai : T extends AIBinding ? Ai : T extends AI.Search ? AiSearchInstance : T extends AI.SearchNamespace ? AiSearchNamespace : T extends Email.SendEmail ? SendEmail : T extends AnalyticsEngine.Dataset ? AnalyticsEngineDataset : T extends ArtifactsNs.Namespace ? Artifacts : T extends RateLimitBinding ? RateLimit : T extends SecretKeyBinding ? CryptoKey : T extends ImagesNs.ImagesBinding ? ImagesBinding : T extends BrowserBinding ? BrowserRun : T extends StreamNs.StreamBinding ? StreamBinding : T extends HyperdriveNs.Connection | HyperdriveNs.ConnectionLookup ? Hyperdrive : T extends VersionMetadataBinding ? WorkerVersionMetadata : T extends WorkerLoaderResource ? WorkerLoader : T extends WorkflowLike<infer Params> | WorkflowBinding<infer Params> ? Workflow<Params> : T extends DurableObjectLike ? DurableObjectNamespace<Exclude<T["Shape"], undefined>> : T extends VpcService | VpcServiceLookup | MtlsCertificate ? Fetcher : T extends PipelinesNs.Stream | PipelinesNs.LegacyPipeline ? Pipeline : T extends K2Ns.Stream ? K2StreamBinding : T extends Redacted<any> ? string : T;
++export type GetBindingType<T> = T extends WorkerEntrypointBinding<infer Entrypoint> ? Service<Entrypoint> : T extends Self ? Service : T extends Container.Decl<any, any, any, any, infer DOShape> ? DurableObjectNamespace<DOShape & Rpc.DurableObjectBranded> : T extends WorkerOnlyBinding.BindingEffect<infer B> ? GetBindingType<B> : T extends R2.S3Credentials ? string : T extends Output<infer A, infer _Req> | Effect.Effect<infer A, infer _E, infer _R> ? GetBindingType<A> : T extends FlagshipNs.App ? Flagship : T extends Assets ? Service : T extends AlchemyRpc<infer Shape extends object> ? RpcWireShape<Shape> & Service : T extends D1.Database ? D1Database : T extends SecretsStoreBinding ? SecretsStoreSecret : T extends VectorizeIndex ? Vectorize : T extends R2.Bucket ? R2Bucket : T extends KV.InstantNamespace ? KV.InstantNamespaceBindingClient : T extends KV.Namespace ? KVNamespace : T extends DispatchNamespaceResource ? DispatchNamespace : T extends Queues.Queue ? Queue<unknown> : T extends AI.Gateway ? Ai : T extends AIBinding ? Ai : T extends AI.Search ? AiSearchInstance : T extends AI.SearchNamespace ? AiSearchNamespace : T extends Email.SendEmail ? SendEmail : T extends AnalyticsEngine.Dataset ? AnalyticsEngineDataset : T extends ArtifactsNs.Namespace ? Artifacts : T extends RateLimitBinding ? RateLimit : T extends SecretKeyBinding ? CryptoKey : T extends ImagesNs.ImagesBinding ? ImagesBinding : T extends BrowserBinding ? BrowserRun : T extends StreamNs.StreamBinding ? StreamBinding : T extends HyperdriveNs.Connection | HyperdriveNs.ConnectionLookup ? Hyperdrive : T extends VersionMetadataBinding ? WorkerVersionMetadata : T extends WorkerLoaderResource ? WorkerLoader : T extends WorkflowLike<infer Params> | WorkflowBinding<infer Params> ? Workflow<Params> : T extends DurableObjectLike ? DurableObjectNamespace<Exclude<T["Shape"], undefined>> : T extends VpcService | VpcServiceLookup | MtlsCertificate ? Fetcher : T extends PipelinesNs.Stream | PipelinesNs.LegacyPipeline ? Pipeline : T extends K2Ns.Stream ? K2StreamBinding : T extends Redacted<any> ? string : T;
+ /**
+  * Cloudflare service-binding wire shape for an Effect-native Worker.
+  *
+diff --git a/src/Workers/InferEnv.ts b/src/Workers/InferEnv.ts
+--- a/src/Workers/InferEnv.ts
++++ b/src/Workers/InferEnv.ts
+@@ -30,6 +30,8 @@
+ import type * as PipelinesNs from "../Pipelines/index.ts";
+ import type * as Queues from "../Queues/index.ts";
+ import type * as R2 from "../R2/index.ts";
++import type { Secret as SecretsStoreBinding } from "../SecretsStore/Secret.ts";
++import type { Index as VectorizeIndex } from "../Vectorize/VectorizeIndex.ts";
+ import type * as StreamNs from "../Stream/index.ts";
+ import type { VpcService } from "../VpcService/VpcService.ts";
+ import type { VpcServiceLookup } from "../VpcService/VpcServiceLookup.ts";
+@@ -100,7 +102,7 @@
+                     ? RpcWireShape<Shape> & Service
+                     : T extends D1.Database
+                       ? D1Database
+-                      : T extends R2.Bucket
++                      : T extends SecretsStoreBinding ? SecretsStoreSecret : T extends VectorizeIndex ? Vectorize : T extends R2.Bucket
+                         ? R2Bucket
+                         : T extends KV.InstantNamespace
+                           ? KV.InstantNamespaceBindingClient

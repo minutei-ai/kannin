@@ -17,7 +17,9 @@ BM25, vector and hybrid search on Cloudflare Workers. R2 owns documents and inde
 
 Railway and Docker are the priority deployment targets. Cloud independence is a product requirement: both targets must run without Cloudflare services, credentials or accounts. R2 and Vectorize may only remain optional backend adapters. The same TypeScript/Effect and Rust/WASM core now runs as a Worker or a complete Bun API image. The portable adapters use S3-compatible object storage and Qdrant. Local conformance uses real RustFS/Qdrant and executes the OCI image with rootless Podman; a hosted Railway deployment and full provider conformance remain delivery gates. See [running the portable API](docs/portable-runtime.md) and [the portability gates](docs/architecture.md#cloud-portability-gates).
 
-Alchemy is pinned to `2.0.0-beta.84`, with the matching `@alchemy.run/cloudflare` provider and Effect `4.0.6`. The provider split replaces `alchemy/Cloudflare`; the former InferEnv and WorkerEntrypoint patches are fixed upstream. A [packaging patch](docs/alchemy-patch.md) restores the missing local queue gateway required to import the published Cloudflare provider.
+Docker includes a private immutable HTTP cache built on the official Varnish image. Its TypeScript/Effect adapter implements `match/put/delete`, with bucket/version-scoped keys, a separate service credential and bounded memory. Cache loss recovers through S3-compatible storage; see [the cache contract and limits](docs/portable-runtime.md#self-hosted-immutable-cdn-cache).
+
+Alchemy is pinned to `2.0.0-beta.84`, with the matching `@alchemy.run/cloudflare` provider and Effect `4.0.6`. The provider split replaces `alchemy/Cloudflare`; the WorkerEntrypoint guard is fixed upstream. A [pinned provider patch](docs/alchemy-patch.md) restores the missing local queue gateway and missing Vectorize/Secrets Store binding inference in the published Cloudflare provider.
 
 Local emulation coverage, checked against the official Alchemy documentation on 2026-10-27:
 

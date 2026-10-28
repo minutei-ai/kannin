@@ -58,3 +58,16 @@ if (!portable.success) {
   process.exit(1);
 }
 console.log("Built Kannin portable API server");
+
+const cache = await Bun.build({
+  entrypoints: [join(root, "runtime/cache/main.ts")],
+  outdir: join(root, "dist/cache"),
+  target: "bun",
+  format: "esm",
+  minify: true,
+});
+if (!cache.success) {
+  console.error(cache.logs);
+  process.exit(1);
+}
+console.log("Built Kannin immutable CDN cache gateway");

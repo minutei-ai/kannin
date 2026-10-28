@@ -8,7 +8,9 @@ import {
   VectorStoreFailure,
   QdrantStoreConfig,
   QdrantPoint,
-  QdrantScoredPoint,
+  QdrantCollectionExists,
+  QdrantQueryResult,
+  QdrantMutationResult,
   QdrantCollectionVectorConfig,
 } from "../src/protocol";
 import { sha256 } from "../src/hash";
@@ -48,15 +50,19 @@ export const qdrantVectorStore = (config: typeof QdrantStoreConfig.Type) =>
         timeout: 15000,
         checkCompatibility: false,
       });
-      const exists = yield* Effect.tryPromise(() => client.collectionExists(checked.collection));
+      const exists = yield* Effect.tryPromise(() =>
+        client.collectionExists(checked.collection),
+      ).pipe(Effect.flatMap(Schema.decodeUnknownEffect(QdrantCollectionExists)));
       if (!exists.exists)
         yield* Effect.tryPromise(() =>
           client.createCollection(checked.collection, {
             vectors: { size: checked.dimensions, distance: "Cosine" },
           }),
         ).pipe(
-          Effect.catchIf(Schema.is(Schema.Struct({ status: Schema.Literal(409) })), () =>
-            Effect.succeed(false),
+          Effect.flatMap(Schema.decodeUnknownEffect(Schema.Boolean)),
+          Effect.catchIf(
+            Schema.is(Schema.Struct({ cause: Schema.Struct({ status: Schema.Literal(409) }) })),
+            () => Effect.succeed(false),
           ),
         );
       const info = yield* Effect.tryPromise(() => client.getCollection(checked.collection)).pipe(
@@ -113,12 +119,9 @@ export const qdrantVectorStore = (config: typeof QdrantStoreConfig.Type) =>
                 with_vector: false,
                 consistency: "all",
               }),
-            );
-            const points = yield* Schema.decodeUnknownEffect(Schema.Array(QdrantScoredPoint))(
-              result.points,
-            );
+            ).pipe(Effect.flatMap(Schema.decodeUnknownEffect(QdrantQueryResult)));
             const matches = [];
-            for (const point of points) {
+            for (const point of result.points) {
               if (
                 point.payload.namespace !== input.namespace ||
                 point.id !== (yield* pointId(point.payload.vectorId))
@@ -162,7 +165,7 @@ export const qdrantVectorStore = (config: typeof QdrantStoreConfig.Type) =>
             if (rows.length > 0)
               yield* Effect.tryPromise(() =>
                 client.upsert(checked.collection, { points: rows, wait: true, ordering: "strong" }),
-              );
+              ).pipe(Effect.flatMap(Schema.decodeUnknownEffect(QdrantMutationResult)));
           },
           (effect) =>
             effect.pipe(
@@ -180,7 +183,7 @@ export const qdrantVectorStore = (config: typeof QdrantStoreConfig.Type) =>
                   wait: true,
                   ordering: "strong",
                 }),
-              );
+              ).pipe(Effect.flatMap(Schema.decodeUnknownEffect(QdrantMutationResult)));
           },
           (effect) =>
             effect.pipe(

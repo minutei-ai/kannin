@@ -10,19 +10,14 @@ import { namespaceCatalogPrefix, namespaceCatalogReadyKey } from "../src/namespa
 import { ErrorBody, IndexMessage, NamespaceName, VectorMessage } from "../src/protocol";
 import type { CacheProvider, Environment, SearchRuntime } from "../src/platform";
 import type { RpcCommand } from "../src/protocol";
+import { disabledCache } from "./cache/client";
 
 export interface PortableOptions {
   readonly token: string;
   readonly scope: string;
   readonly module: WebAssembly.Module;
+  readonly cache?: CacheProvider;
 }
-const disabledCache: CacheProvider = {
-  open: async () => ({
-    match: async () => undefined,
-    put: async () => undefined,
-    delete: async () => false,
-  }),
-};
 const conflictMessage = "R2 manifest changed; retry the operation with the same requestId";
 
 export const portableApplication = Effect.fn("kannin.portableApplication")(function* (
@@ -133,7 +128,7 @@ export const portableApplication = Effect.fn("kannin.portableApplication")(funct
   }
   const runtime: SearchRuntime = {
     env,
-    cache: disabledCache,
+    cache: options.cache ?? disabledCache,
     engineModule: options.module,
     version: "portable-v1",
     freshRoots: true,

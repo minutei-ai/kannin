@@ -1,4 +1,18 @@
-import { Config, Redacted } from "effect";
+import { Config, Option, Redacted } from "effect";
+
+const cacheEnvironment = Config.option(Config.String("KANNIN_CACHE_ENDPOINT")).pipe(
+  Config.flatMap((endpoint) => {
+    if (Option.isNone(endpoint))
+      return Config.succeed<Record<string, string | Redacted.Redacted>>({});
+    return Config.all({
+      KANNIN_CACHE_ENDPOINT: Config.succeed(endpoint.value),
+      KANNIN_CACHE_TOKEN: Config.Redacted("KANNIN_CACHE_TOKEN"),
+      KANNIN_CACHE_TIMEOUT_MS: Config.String("KANNIN_CACHE_TIMEOUT_MS").pipe(
+        Config.withDefault("250"),
+      ),
+    });
+  }),
+);
 
 export const portableEnvironment = Config.all({
   RAIO_API_TOKEN: Config.Redacted("RAIO_API_TOKEN"),
@@ -16,4 +30,8 @@ export const portableEnvironment = Config.all({
   KANNIN_VECTOR_API_KEY: Config.Redacted("KANNIN_VECTOR_API_KEY").pipe(
     Config.withDefault(Redacted.make("")),
   ),
-});
+}).pipe(
+  Config.flatMap((base) =>
+    cacheEnvironment.pipe(Config.map((cache) => Object.assign({}, base, cache))),
+  ),
+);

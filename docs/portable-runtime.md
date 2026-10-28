@@ -67,4 +67,30 @@ run heavy commands through the host's `resource-run` wrapper and use CI when the
 full gate exceeds its resource budget. Do not create a fresh package cache or copy
 Rust targets into each test attempt.
 
-The portable image currently disables the optional HTTP cache and preserves the legacy native `vectorize-eventual` wire consistency label while identifying Qdrant correctly in health. Local tests establish only their asserted behavior. They do not establish hosted Railway behavior, real Vectorize behavior, performance parity or complete Turbopuffer compatibility. See [architecture gates](architecture.md#cloud-portability-gates) and the [public compatibility contract](turbopuffer-contracts.md).
+The portable image uses the optional immutable CDN cache when `KANNIN_CACHE_ENDPOINT` and `KANNIN_CACHE_TOKEN` are configured. It preserves the legacy native `vectorize-eventual` wire consistency label while identifying Qdrant correctly in health. Local tests establish only their asserted behavior. They do not establish hosted Railway behavior, real Vectorize behavior, performance parity or complete Turbopuffer compatibility. See [architecture gates](architecture.md#cloud-portability-gates) and the [public compatibility contract](turbopuffer-contracts.md).
+
+## Self-hosted immutable CDN cache
+
+The Docker Alchemy stack creates a private cache service from `Dockerfile.cache`, based on the [official Varnish image](https://hub.docker.com/_/varnish) at version `9.1.0`, pinned by its multi-platform digest. A TypeScript/Effect gateway implements the existing internal `CacheProvider.open` and `CachePort.match/put/delete` contract. This is a single self-hosted cache location; geographic distribution requires deploying additional locations. Cloudflare keeps its native Cache API adapter.
+
+The cache sits beside the API and accelerates immutable object reads. It does not proxy the public search API or handle S3 credentials. Each namespace request is still authenticated by the application. The application sends a separate service credential to the gateway; user Authorization and cookies are rejected as cache keys and response headers. The Docker stack publishes only the API port, with the cache reachable through the private network alias `http://kannin-cache:3000`.
+
+For an existing Docker or Railway API deployment, supply `KANNIN_CACHE_ENDPOINT` and a separate nonempty `KANNIN_CACHE_TOKEN` through an external secret manager. An endpoint without a token is a startup configuration error. The default cache request budget is 250 ms (`KANNIN_CACHE_TIMEOUT_MS`); optional writes have a one-second minimum budget. A failed or unavailable cache leaves the existing canonical object-store fallback in control.
+
+The private gateway protocol uses `GET`, `PUT` and `DELETE` at `/v1/cache/<cache-name>/<sha256-key>`, authenticated with `x-kannin-cache-token`. PUT includes the original immutable response headers encoded as base64 JSON in `x-kannin-cache-headers` and the body digest in `x-kannin-cache-sha256`. Transport responses use `Cache-Control: no-store`; only the internal client reconstructs the cached response. Direct access to the private Varnish or temporary fill origin is unavailable outside the container.
+
+Only the four versioned immutable cache families are allowed: segments, overview batches, text plans and vector materializations. Keys include the object-store endpoint/bucket scope, cache family and complete internal versioned URL. Snapshot caches are disabled for this adapter, so mutable Roots and strong-read manifests never enter Varnish. This implements the immutable subset Kannin consumes from the [Cloudflare Cache API](https://developers.cloudflare.com/workers/runtime-apis/cache/); it does not promise every browser Cache API option or Cloudflare network behavior.
+
+PUT stages bounded bytes, warms a unique Varnish generation and publishes its metadata only after validation. DELETE removes the metadata pointer before acknowledging; an in-flight older fill cannot republish after deletion or replace a newer generation. Unreachable old generations expire or are evicted from the bounded Varnish cache. Body checksums and original response headers are validated at the adapter boundary. Eviction, restart, invalid data and network failure recover through canonical object storage.
+
+Varnish uses a 64 MiB malloc cache and a 16 MiB shared log. The gateway caps entries at 8 MiB, staging at 32 MiB, metadata at 8 MiB, entry count at 4096, lifetime at one day and concurrent operations at four. The Alchemy Docker stack applies native 512 MiB memory, zero-swap and 0.5 CPU limits to both owned app and cache containers before starting them. No canonical state or persistent cache volume is added. Varnish's bounded working files remain in the container writable layer; standalone deployments can put them on an executable tmpfs:
+
+```sh
+docker build -f Dockerfile.cache -t kannin-cache .
+docker run --rm --memory=512m --memory-swap=512m --cpus=0.5 --pids-limit=128 \
+  --tmpfs /var/lib/varnish/varnishd:rw,exec,size=64m,mode=1777 \
+  --network <private-app-network> --network-alias kannin-cache \
+  --env-file /absolute/external/path/kannin-cache.env kannin-cache
+```
+
+The external cache environment file contains `KANNIN_CACHE_TOKEN`, matching the API's cache service credential. Do not publish the gateway port on a public interface. `GET /health` is public for container health checks. Build artifacts are generated by `bun run build`; no dependencies are installed when the container starts. Cache conformance covers the HTTP adapter and a real Varnish OCI image, including restart invalidation. These checks remain distinct from the complete `bun run check` gate and hosted deployment proof.

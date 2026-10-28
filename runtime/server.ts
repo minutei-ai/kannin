@@ -1,9 +1,10 @@
-import { Config, Effect, Layer, Redacted, Schedule, Schema } from "effect";
+import { Config, Effect, Layer, Option, Redacted, Schedule, Schema } from "effect";
 import { PortableServerConfig } from "../src/protocol";
 import { sha256 } from "../src/hash";
 import { s3ObjectStore } from "./s3-object-store";
 import { qdrantVectorStore } from "./qdrant-vector-store";
 import { portableApplication } from "./application";
+import { cdnCache, disabledCache } from "./cache/client";
 
 export const serverConfig = Config.all({
   token: Config.Redacted("RAIO_API_TOKEN"),
@@ -19,6 +20,17 @@ export const serverConfig = Config.all({
     accessKeyId: Config.Redacted("KANNIN_STORAGE_ACCESS_KEY_ID"),
     secretAccessKey: Config.Redacted("KANNIN_STORAGE_SECRET_ACCESS_KEY"),
   }),
+  cache: Config.option(Config.String("KANNIN_CACHE_ENDPOINT")).pipe(
+    Config.flatMap((endpoint) => {
+      if (Option.isNone(endpoint)) return Config.succeed(undefined);
+      return Config.all({
+        endpoint: Config.succeed(endpoint.value),
+        token: Config.Redacted("KANNIN_CACHE_TOKEN"),
+        timeoutMillis: Config.Int("KANNIN_CACHE_TIMEOUT_MS").pipe(Config.withDefault(250)),
+        maxEntryBytes: Config.succeed(8 * 1024 * 1024),
+      });
+    }),
+  ),
   vectorStore: Config.all({
     endpoint: Config.String("KANNIN_VECTOR_ENDPOINT"),
     collection: Config.String("KANNIN_VECTOR_COLLECTION").pipe(
@@ -42,7 +54,12 @@ export const servePortable = Effect.fn("kannin.servePortable")(function* (
   const scope = yield* Effect.tryPromise(() =>
     sha256(`${config.objectStore.endpoint}\0${config.objectStore.bucket}`),
   );
+  const cache = yield* Effect.gen(function* () {
+    if (config.cache === undefined) return disabledCache;
+    return yield* cdnCache(config.cache, scope);
+  });
   const app = yield* portableApplication({
+    cache,
     token: Redacted.value(config.token),
     scope,
     module,

@@ -32,4 +32,5 @@ jobs:
             dist/worker/
             dist/wasm/
             dist/server/
+            dist/cache/
           retention-days: 1

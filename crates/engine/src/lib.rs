@@ -3,6 +3,7 @@ use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub mod segment;
+pub mod vector;
 
 pub const MAX_LOG_BYTES: usize = 2 * 1024 * 1024;
 const HEADER_BYTES: usize = 16;

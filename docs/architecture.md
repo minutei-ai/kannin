@@ -4,6 +4,10 @@ Kannin is a separate OSS repository. No Minutei production data, fixtures, secre
 
 ## Cloud portability gates
 
+### Native vector ownership (migration in progress)
+
+Kannin must own vector indexing and search in its Rust engine, persisting canonical vectors and index structures in S3/R2. Embedding generation belongs to the caller or an optional model provider, such as Workers AI; Vectorize is a vector database, not an embedding model. The existing Vectorize and Qdrant candidate paths described below are transitional implementation debt, not the target architecture. They remain active until native scoring, filtered selection and runtime integration pass conformance. Existing immutable segments already contain separately addressable vector frames. The initial native exact-search path must apply filters and tombstones before bounded top-k selection, and must not claim ANN performance or external-service removal before implementation and validation.
+
 Railway and Docker are the priority targets. The shared runtime is implemented in `src/core/application.ts` and `src/core/storage.ts`, with structural platform ports in `src/platform.ts`. `src/worker.ts` and `src/providers/cloudflare.ts` own the Cloudflare bindings. `runtime/main.ts` serves the same operations through Bun without importing Cloudflare runtime or provisioning code. Alchemy `2.0.0-beta.84` owns three selectable stacks under `infra/`, loaded lazily by `alchemy.run.ts`; Railway is the default. Native commands retain `--profile minutei`.
 
 ### Portable immutable cache

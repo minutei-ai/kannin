@@ -1367,6 +1367,17 @@ impl Header {
             ))
     }
 
+    #[cfg(any(test, target_arch = "wasm32"))]
+    fn vector_rows(&self, filters: &[Filter], dead: &[u32]) -> Result<Vec<u32>, String> {
+        let allowed = self.allowed(filters, dead)?;
+        self.documents
+            .iter()
+            .enumerate()
+            .filter(|(index, document)| document.vector && allowed[*index])
+            .map(|(index, _)| u32::try_from(index).map_err(|cause| cause.to_string()))
+            .collect()
+    }
+
     fn allowed(&self, filters: &[Filter], dead: &[u32]) -> Result<BitVec, String> {
         let mut allowed = if filters.is_empty() {
             BitVec::from_elem(self.documents.len(), true)
@@ -7032,6 +7043,24 @@ pub mod wasm {
             serde_json::to_string(&selected).map_err(|e| JsValue::from_str(&e.to_string()))
         }
 
+        #[doc = "# Errors\nRejects malformed filters or tombstones, invalid attributes, row overflow or serialization errors."]
+        pub fn vector_rows(&self, filters: &str, dead: &str) -> Result<String, JsValue> {
+            if self.partial {
+                return Err(JsValue::from_str("Operation requires a complete directory"));
+            }
+            let filters: Vec<Filter> = serde_json::from_str(filters)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            let dead: Vec<u32> = serde_json::from_str(dead)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            let rows = self
+                .header
+                .vector_rows(&filters, &dead)
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            let rows = serde_json::to_string(&rows)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            self.rows(&rows)
+        }
+
         #[doc = "# Errors\nRejects invalid tombstone JSON, filter attributes, or deleted rows."]
         pub fn ranker_prepared(
             &self,
@@ -7739,6 +7768,30 @@ mod filter_cache_tests {
     use serde::de::DeserializeSeed;
     use serde_json::json;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn vector_selection_excludes_tombstones_missing_vectors_and_filtered_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let documents = (0..4)
+            .map(|index| {
+                serde_json::from_value::<Document>(json!({
+                    "id": format!("{index}"), "text": "vector",
+                    "attributes": {"group": if index == 3 { "other" } else { "selected" }},
+                    "vector": if index == 1 { None } else { Some(vec![1.0, 0.0]) }
+                }))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let header = build(documents, None)?.header;
+        let filters = [Filter {
+            field: "group".into(),
+            op: "eq".into(),
+            value: json!("selected"),
+        }];
+        assert_eq!(header.vector_rows(&filters, &[0])?, vec![2]);
+        assert_eq!(header.vector_rows(&filters, &[])?, vec![0, 2]);
+        assert_eq!(header.vector_rows(&[], &[])?, vec![0, 2, 3]);
+        Ok(())
+    }
 
     #[test]
     fn configured_headers_keep_selected_attributes_and_preserve_document_payloads()

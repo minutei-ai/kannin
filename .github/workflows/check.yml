@@ -8,24 +8,6 @@ concurrency:
   group: check-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 jobs:
-  dependency-cleanup:
-    if: github.event_name == 'pull_request' && github.head_ref == 'feat/multicloud-alchemy-emulation'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
-        with:
-          bun-version: 1.4.4
-      - run: bun remove --ignore-scripts @qdrant/js-client-rest
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: dependency-cleanup-candidate
-          path: |
-            package.json
-            bun.lock
-          if-no-files-found: error
-          retention-days: 1
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 45

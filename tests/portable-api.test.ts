@@ -165,6 +165,58 @@ test("two portable replicas fence concurrent writes and expose fresh strong read
             "row-3",
           ]);
         }
+        const competing = yield* Effect.tryPromise(() =>
+          Promise.all(
+            [first, second].map((app, index) =>
+              app.fetch(
+                request("/v1/namespaces/dimension-race/write", {
+                  requestId: `dimension-owner-${index + 1}`,
+                  schema: { filterable: [], vectorFilterFields: [], vectorDimensions: index + 1 },
+                  upserts: [
+                    {
+                      id: `owner-${index + 1}`,
+                      text: "dimension race",
+                      attributes: {},
+                      vector: [1, ...Array.from({ length: index }, () => 0)],
+                    },
+                  ],
+                  deletes: [],
+                }),
+              ),
+            ),
+          ),
+        );
+        expect(competing.map((response) => response.status).toSorted()).toEqual([200, 409]);
+        for (const app of [first, second]) {
+          const metadataResponse = yield* Effect.tryPromise(() =>
+            app.fetch(request("/v1/namespaces/dimension-race/metadata")),
+          );
+          expect(metadataResponse.status).toBe(200);
+          const metadata = yield* Effect.tryPromise(() => metadataResponse.json()).pipe(
+            Effect.flatMap(Schema.decodeUnknownEffect(Metadata)),
+          );
+          const dimensions = metadata.schema?.vectorDimensions;
+          if (dimensions === undefined) throw new Error("Missing winning canonical dimensions");
+          expect(metadata.sequence).toBe(1);
+          expect(metadata.documents).toBe(1);
+          const response = yield* Effect.tryPromise(() =>
+            app.fetch(
+              request("/v1/namespaces/dimension-race/query", {
+                kind: "vector",
+                vector: [1, ...Array.from({ length: dimensions - 1 }, () => 0)],
+                topK: 1,
+                filters: [],
+                minimumSequence: 1,
+              }),
+            ),
+          );
+          expect(response.status).toBe(200);
+          const selected = yield* Effect.tryPromise(() => response.json()).pipe(
+            Effect.flatMap(Schema.decodeUnknownEffect(QueryResult)),
+          );
+          expect(selected.rows.map((row) => row.id)).toEqual([`owner-${dimensions}`]);
+          expect(selected.consistency).toBe("strong");
+        }
       }),
     ),
   );

@@ -9,6 +9,19 @@ import { containerCommand } from "./container-command";
 
 const image = `localhost/kannin-portable-contract:${crypto.randomUUID()}`;
 const services = objectStoreFixtureLive;
+const imageContent = Schema.fromJsonString(
+  Schema.Tuple([
+    Schema.Struct({
+      Architecture: Schema.String,
+      Os: Schema.String,
+      Config: Schema.Unknown,
+      RootFS: Schema.Struct({
+        Type: Schema.Literal("layers"),
+        Layers: Schema.Array(Schema.String),
+      }),
+    }),
+  ]),
+);
 
 test("same OCI API image runs on Podman and Docker Engine with canonical state across restarts", async () => {
   await Effect.runPromise(
@@ -53,26 +66,19 @@ test("same OCI API image runs on Podman and Docker Engine with canonical state a
             ),
         );
         yield* Effect.tryPromise(() => rm(archive));
-        const imageId = (yield* containerCommand([
-          "podman",
+        const [source] = yield* containerCommand(["podman", "image", "inspect", image]).pipe(
+          Effect.flatMap(Schema.decodeEffect(imageContent)),
+        );
+        const [loaded] = yield* containerCommand([
+          "docker",
+          "--context",
+          "default",
           "image",
           "inspect",
-          "--format",
-          "{{.Id}}",
           image,
-        ])).replace(/^sha256:/, "");
-        expect(
-          (yield* containerCommand([
-            "docker",
-            "--context",
-            "default",
-            "image",
-            "inspect",
-            "--format",
-            "{{.Id}}",
-            image,
-          ])).replace(/^sha256:/, ""),
-        ).toBe(imageId);
+        ]).pipe(Effect.flatMap(Schema.decodeEffect(imageContent)));
+        expect(source.RootFS.Layers.length).toBeGreaterThan(0);
+        expect(loaded).toEqual(source);
         for (const engine of ["podman", "docker"] as const) {
           const namespace = `container-${engine}`;
           const options = Match.value(engine).pipe(

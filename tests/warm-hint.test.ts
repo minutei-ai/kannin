@@ -29,7 +29,7 @@ test("official SDK warm hints populate the decoded immutable cache without chang
   const hinted = await client.namespace("warm-hint").hintCacheWarm().withResponse();
   expect(hinted.response.status).toBe(202);
   expect(hinted.response.headers.get("cache-control")).toBe("private, no-store");
-  expect(Schema.decodeUnknownSync(CacheWarmHintResult)(hinted.data).status).toBe("ACCEPTED");
+  expect(Schema.decodeSync(CacheWarmHintResult)(hinted.data).status).toBe("ACCEPTED");
   const after = await Effect.runPromise(
     Effect.tryPromise(
       async () => await (await request(worker, "warm-hint", "metadata")).json(),

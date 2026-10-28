@@ -31,11 +31,11 @@ import {
   segment_document_terms,
   segment_migrate,
   segment_header,
-  segment_filter,
   segment_term_bounds,
   segment_term_bounds_compact,
   segment_term_bounds_compact_minimum,
   EligibilityQuery,
+  VectorRanker,
   PreparedQuery,
   directory_compress,
 } from "../../dist/wasm/raio_engine";
@@ -95,9 +95,7 @@ import {
   VectorSyncResult,
   NamespaceSchema,
   TextTerms,
-  VectorSelection,
-  VectorCandidates,
-  VectorCandidateFrame,
+  NativeVectorHits,
   type VectorRebuild,
   VectorRebuildCheckpointMetadata,
   VECTOR_REBUILD_CHECKPOINT_BYTES,
@@ -118,7 +116,7 @@ import {
   SegmentCacheProps,
 } from "../protocol";
 
-import { vectorMetadata, vectorPrefilter } from "../vector-filters";
+import { vectorMetadata } from "../vector-filters";
 
 import { snapshotFrameHeader, readSnapshotFrame } from "../snapshot";
 
@@ -132,7 +130,6 @@ import type {
   ObjectBody,
   ObjectListOptions,
   ObjectCondition,
-  VectorQueryOptions,
   VectorPoint,
   JobBatch,
 } from "../platform";
@@ -1727,160 +1724,80 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
     return ranked.slice(0, input.topK);
   }
 
-  async function rankVectors(
-    env: Environment,
-    input: typeof Query.Type,
-    root: typeof Root.Type,
-    timings: Headers,
-    ctx: BackgroundContext,
-  ) {
-    if (input.kind === "text") return [];
-    if (input.vector.length !== 768)
-      throw new Rejected({ status: 400, message: "Vector dimension must be 768" });
-    if (input.topK > 50)
-      throw new Rejected({
-        status: 400,
-        message: "Vector and hybrid topK is limited to 50 by the Vectorize metadata contract",
-      });
-    if (root.documents === 0) return [];
-    const encodedFilters = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Filter)))(
-      input.filters,
-    );
-    const fields = root.schema?.vectorFilterFields ?? [];
-    const indexStarted = Effect.runSync(Clock.currentTimeNanos);
-    const selector = Schema.encodeSync(Schema.fromJsonString(VectorSelection))({
-      epoch: root.vectorEpoch,
-      sequence: root.sequence,
-      pending: root.vectorJobs,
-      vector: input.vector,
-      filters: input.filters,
-      fields,
-    });
-    const cacheKey = new URL(`https://raio-cache.internal/vectors-v2/${await sha256(selector)}`);
-    cacheKey.searchParams.set("bucket", env.STORAGE_CACHE_SCOPE);
-    const cache = await Effect.runPromise(
-      Effect.tryPromise(() => caches.open("kannin-vectors-v2")).pipe(
-        Effect.orElseSucceed(() => undefined),
+  async function rankVectors(input: typeof Query.Type, root: typeof Root.Type, timings: Headers) {
+    if (input.kind === "text" || root.documents === 0) return [];
+    const started = Effect.runSync(Clock.currentTimeNanos);
+    const hits = await Effect.runPromise(
+      Effect.acquireUseRelease(
+        Effect.try(() => new VectorRanker(new Float32Array(input.vector), input.topK)),
+        (ranker) =>
+          Effect.gen(function* () {
+            const retained = new Map<string, typeof Located.Type>();
+            const filters = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Array(Filter)))(
+              input.filters,
+            );
+            // Only one segment's filtered metadata and one vector frame are resident during the scan.
+            for (const segment of root.segments.toReversed()) {
+              const rows = yield* withDirectory(segment.key, segment.headerBytes, (directory) =>
+                Effect.gen(function* () {
+                  const dead = yield* Schema.encodeEffect(integers)(segment.dead);
+                  const encoded = yield* Effect.try(() => directory.vector_rows(filters, dead));
+                  return yield* Schema.decodeEffect(
+                    Schema.fromJsonString(Schema.Array(LocatedDocument)),
+                  )(encoded);
+                }),
+              );
+              for (const row of rows) {
+                const data = row.vectorData;
+                if (
+                  data === null ||
+                  data.length < 8 ||
+                  data.offset < row.document.data.offset + row.document.data.length ||
+                  segment.headerBytes + data.offset + data.length > segment.bytes
+                )
+                  return yield* new Rejected({
+                    status: 503,
+                    message: "Invalid canonical vector range",
+                  });
+                const frame = yield* Effect.tryPromise(() =>
+                  range(segment.key, segment.headerBytes + data.offset, data.length),
+                );
+                const discarded = yield* Effect.try(() =>
+                  ranker.push_frame(row.document.id, frame),
+                );
+                retained.set(row.document.id, { ...row, segment });
+                if (discarded !== undefined) retained.delete(discarded);
+              }
+            }
+            const encoded = yield* Effect.try(() => ranker.finish());
+            const selected = yield* Schema.decodeEffect(Schema.fromJsonString(NativeVectorHits))(
+              encoded,
+            );
+            return yield* Effect.forEach(selected, ([id, score]) => {
+              const location = retained.get(id);
+              if (location === undefined)
+                return new Rejected({
+                  status: 503,
+                  message: "Native vector selection omitted its location",
+                });
+              return Effect.succeed({
+                row: location.row,
+                id,
+                score,
+                data: location.document.data,
+                segment: location.segment,
+              });
+            });
+          }),
+        (ranker) => Effect.sync(() => ranker.free()),
       ),
     );
-    const candidates: { value: typeof VectorCandidates.Type | undefined } = { value: undefined };
-    if (cache !== undefined) {
-      const cached = await Effect.runPromise(
-        Effect.tryPromise(() => cache.match(cacheKey)).pipe(Effect.orElseSucceed(() => undefined)),
-      );
-      if (cached !== undefined) {
-        const decoded = await Effect.runPromise(
-          Effect.tryPromise(() => cached.text()).pipe(
-            Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(VectorCandidateFrame))),
-            Effect.orElseSucceed(() => undefined),
-          ),
-        );
-        if (decoded !== undefined) {
-          const now = Effect.runSync(Clock.currentTimeMillis);
-          if (decoded.observedAt <= now && now - decoded.observedAt < 1000)
-            candidates.value = decoded.candidates;
-          else timings.append("server-timing", "vector_cache_rejected");
-        }
-      }
-    }
-    if (candidates.value === undefined) {
-      const prefilter = await Effect.runPromise(vectorPrefilter(input.filters, fields));
-      const options: VectorQueryOptions = {
-        namespace: root.vectorEpoch,
-        topK: 50,
-        returnMetadata: "all",
-      };
-      if (Object.keys(prefilter).length > 0) options.filter = prefilter;
-      const observedAt = Effect.runSync(Clock.currentTimeMillis);
-      const result = await env.VECTORS.query([...input.vector], options);
-      candidates.value = Schema.decodeUnknownSync(VectorCandidates)(result.matches);
-      timings.append("server-timing", 'vector_cache;desc="miss"');
-      if (cache !== undefined && candidates.value.length > 0) {
-        const encoded = Schema.encodeSync(Schema.fromJsonString(VectorCandidateFrame))({
-          observedAt,
-          candidates: candidates.value,
-        });
-        const bytes = new TextEncoder().encode(encoded);
-        const charge = bytes.byteLength * 4 + cacheKey.href.length * 4 + 128;
-        const scheduled = publishQueryCache(
-          cacheKey.href,
-          charge,
-          Effect.tryPromise(() =>
-            cache.put(
-              cacheKey,
-              new Response(new Uint8Array(bytes), {
-                headers: {
-                  "cache-control": "public, max-age=2",
-                  "content-type": "application/json",
-                },
-              }),
-            ),
-          ),
-          ctx,
-        );
-        if (scheduled) timings.append("server-timing", "vector_publish_scheduled");
-        else timings.append("server-timing", "vector_publish_skipped");
-      }
-    } else timings.append("server-timing", 'vector_cache;desc="hit"');
-    const indexEnded = Effect.runSync(Clock.currentTimeNanos);
-    timings.append("server-timing", `vector_index;dur=${Number(indexEnded - indexStarted) / 1e6}`);
-    const matches = candidates.value;
-    const eligible = [];
-    const cursor = { offset: 0, size: input.topK };
-    while (cursor.offset < matches.length && eligible.length < input.topK) {
-      const window = matches.slice(cursor.offset, cursor.offset + cursor.size);
-      cursor.offset += window.length;
-      const current = await locate(
-        window.map((item) => item.metadata.id),
-        root,
-        input.kind === "vector",
-      );
-      const validated = await Effect.runPromise(
-        Effect.forEach(
-          window,
-          (item) =>
-            Effect.gen(function* () {
-              const location = current.get(item.metadata.id);
-              if (
-                location === undefined ||
-                location.document.revision !== item.metadata.revision ||
-                !location.document.vector
-              )
-                return Option.none();
-              const expected = yield* Effect.tryPromise(() =>
-                vectorId(root.vectorEpoch, item.metadata.id, item.metadata.revision),
-              );
-              if (item.id !== expected) return Option.none();
-              if (input.filters.length > 0) {
-                const attributes = yield* Schema.encodeEffect(Schema.fromJsonString(Attributes))(
-                  location.document.attributes,
-                );
-                if (!segment_filter(attributes, encodedFilters)) return Option.none();
-              }
-              return Option.some({ location, score: item.score });
-            }),
-          { concurrency: 4 },
-        ).pipe(Effect.map(EffectArray.getSomes)),
-      );
-      eligible.push(...validated);
-      cursor.size = Math.max(4, input.topK - eligible.length);
-    }
-    const reconciled = Effect.runSync(Clock.currentTimeNanos);
-    timings.append(
-      "server-timing",
-      `vector_reconcile;dur=${Number(reconciled - indexEnded) / 1e6}`,
-    );
-    return eligible.slice(0, input.topK).map(({ location, score }) => ({
-      row: location.row,
-      id: location.document.id,
-      score,
-      data: location.document.data,
-      segment: location.segment,
-    }));
+    const ended = Effect.runSync(Clock.currentTimeNanos);
+    timings.append("server-timing", `vector_index;dur=${Number(ended - started) / 1e6}`);
+    return hits;
   }
 
   async function query(
-    env: Environment,
     input: typeof Query.Type,
     manifest: typeof Root.Type,
     ctx: BackgroundContext,
@@ -1920,7 +1837,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
     }
     const [text, vectors] = await Promise.all([
       rankText(input, manifest, timings, ctx),
-      rankVectors(env, input, manifest, timings, ctx),
+      rankVectors(input, manifest, timings),
     ]);
     const scores = new Map<string, Awaited<ReturnType<typeof rankText>>[number]>();
     if (input.kind === "hybrid") {
@@ -1957,7 +1874,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
     return encodeQueryResult({
       rows,
       sequence: manifest.sequence,
-      consistency: "vectorize-eventual",
+      consistency: "strong",
     });
   }
 
@@ -3148,7 +3065,6 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
                 Effect.tryPromise({
                   try: async () => {
                     const response = await query(
-                      this.env,
                       input,
                       manifest,
                       this.ctx,
@@ -3574,7 +3490,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
                 );
                 if (manifest !== undefined) {
                   const value = yield* Effect.tryPromise({
-                    try: () => query(env, command.input, manifest, ctx, new Headers()),
+                    try: () => query(command.input, manifest, ctx, new Headers()),
                     catch: (cause) => {
                       if (Schema.is(Rejected)(cause)) return cause;
                       return new Cause.UnknownError(cause);
@@ -4281,7 +4197,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
               const snapshotEnded = yield* Clock.currentTimeNanos;
               if (manifest !== undefined) {
                 const evaluated = yield* Effect.tryPromise({
-                  try: () => query(env, input, manifest, ctx, queryTimings),
+                  try: () => query(input, manifest, ctx, queryTimings),
                   catch: (cause) => {
                     if (Schema.is(Rejected)(cause)) return cause;
                     return new Cause.UnknownError(cause);

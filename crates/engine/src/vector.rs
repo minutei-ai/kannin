@@ -9,7 +9,7 @@ const MAX_RESULTS: usize = 10_000;
 pub struct VectorRanker {
     query: VectorQuery,
     limit: usize,
-    hits: Vec<(u32, f64)>,
+    hits: Vec<(String, f64)>,
 }
 
 impl VectorRanker {
@@ -26,14 +26,17 @@ impl VectorRanker {
     }
 
     #[doc = "# Errors\nRejects malformed candidate vectors and duplicate retained keys."]
-    pub fn offer(&mut self, key: u32, values: &[f32]) -> Result<bool, String> {
+    pub fn offer(&mut self, key: &str, values: &[f32]) -> Result<bool, String> {
+        if key.is_empty() || key.len() > 512 {
+            return Err("Vector candidate key exceeds its byte budget".into());
+        }
         let score = self.query.cosine(values)?;
-        if self.hits.iter().any(|(existing, _)| *existing == key) {
+        if self.hits.iter().any(|(existing, _)| existing == key) {
             return Err("Vector candidate key is already retained".into());
         }
         let position = self.hits.partition_point(|(existing_key, existing_score)| {
             existing_score.total_cmp(&score).is_gt()
-                || (existing_score.total_cmp(&score).is_eq() && *existing_key < key)
+                || (existing_score.total_cmp(&score).is_eq() && existing_key.as_str() < key)
         });
         if position >= self.limit {
             return Ok(false);
@@ -41,12 +44,47 @@ impl VectorRanker {
         if self.hits.len() == self.limit {
             self.hits.pop();
         }
-        self.hits.insert(position, (key, score));
+        self.hits.insert(position, (key.to_owned(), score));
         Ok(true)
     }
 
+    #[doc = "# Errors\nRejects corrupt frames, wrong dimensions, invalid vectors or duplicate retained keys. Returns the key the caller should discard, if any."]
+    pub fn offer_frame(&mut self, key: &str, frame: &[u8]) -> Result<Option<String>, String> {
+        let expected = self.query.values.len() * size_of::<f32>();
+        let declared = frame.get(..4).ok_or("Truncated vector frame")?;
+        let declared = u32::from_le_bytes(
+            declared
+                .try_into()
+                .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
+        );
+        if usize::try_from(declared).map_err(|cause| cause.to_string())? != expected
+            || frame.len() > expected + 8192
+        {
+            return Err("Vector frame exceeds query dimensions".into());
+        }
+        let decoded = crate::segment::decode_page(frame)?;
+        let (chunks, remainder) = decoded.as_chunks::<4>();
+        if !remainder.is_empty() {
+            return Err("Vector frame length is not divisible by four".into());
+        }
+        let values: Vec<_> = chunks
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
+            .collect();
+        let discarded = if self.hits.len() == self.limit {
+            self.hits.last().map(|(key, _)| key.clone())
+        } else {
+            None
+        };
+        if self.offer(key, &values)? {
+            Ok(discarded)
+        } else {
+            Ok(Some(key.to_owned()))
+        }
+    }
+
     #[must_use]
-    pub fn results(&self) -> &[(u32, f64)] {
+    pub fn results(&self) -> &[(String, f64)] {
         &self.hits
     }
 }
@@ -60,9 +98,9 @@ impl VectorRanker {
         Self::try_new(values, limit).map_err(|cause| JsValue::from_str(&cause))
     }
 
-    #[doc = "# Errors\nRejects malformed candidate vectors or duplicate retained keys."]
-    pub fn push(&mut self, key: u32, values: &[f32]) -> Result<bool, JsValue> {
-        self.offer(key, values)
+    #[doc = "# Errors\nRejects corrupt frames, wrong dimensions, invalid candidate vectors or duplicate retained keys."]
+    pub fn push_frame(&mut self, key: &str, frame: &[u8]) -> Result<Option<String>, JsValue> {
+        self.offer_frame(key, frame)
             .map_err(|cause| JsValue::from_str(&cause))
     }
 
@@ -145,16 +183,70 @@ impl VectorQuery {
 mod tests {
     use super::{MAX_DIMENSIONS, VectorQuery, VectorRanker};
 
+    fn frame(values: &[f32]) -> Result<Vec<u8>, String> {
+        let raw: Vec<_> = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let mut frame = Vec::new();
+        crate::segment::append(&mut frame, &raw)?;
+        Ok(frame)
+    }
+
+    #[test]
+    fn frame_selection_reports_eviction_and_rejects_corruption_atomically() -> Result<(), String> {
+        let mut ranker = VectorRanker::try_new(&[1.0, 0.0], 1)?;
+        assert_eq!(ranker.offer_frame("z", &frame(&[0.0, 1.0])?)?, None);
+        assert_eq!(
+            ranker.offer_frame("b", &frame(&[1.0, 0.0])?)?,
+            Some("z".into())
+        );
+        assert_eq!(
+            ranker.offer_frame("a", &frame(&[1.0, 0.0])?)?,
+            Some("b".into())
+        );
+        assert_eq!(
+            ranker.offer_frame("c", &frame(&[1.0, 0.0])?)?,
+            Some("c".into())
+        );
+        let original = ranker.results().to_vec();
+        let mut corrupt = frame(&[1.0, 0.0])?;
+        corrupt[4] ^= 1;
+        for invalid in [
+            corrupt,
+            frame(&[1.0])?,
+            frame(&[f32::NAN, 0.0])?,
+            vec![255; 4],
+        ] {
+            assert!(ranker.offer_frame("invalid", &invalid).is_err());
+            assert_eq!(ranker.results(), original);
+        }
+        Ok(())
+    }
+
     #[test]
     fn selection_is_bounded_exact_and_deterministic() -> Result<(), String> {
         let mut ranker = VectorRanker::try_new(&[1.0, 0.0], 2)?;
-        assert!(ranker.offer(9, &[-1.0, 0.0])?);
-        assert!(ranker.offer(8, &[0.0, 1.0])?);
-        assert!(ranker.offer(7, &[1.0, 0.0])?);
-        assert!(!ranker.offer(10, &[-1.0, 0.0])?);
-        assert!(ranker.offer(3, &[1.0, 0.0])?);
-        assert_eq!(ranker.results(), &[(3, 1.0), (7, 1.0)]);
-        assert!(ranker.offer(3, &[1.0, 0.0]).is_err());
+        assert!(ranker.offer("9", &[-1.0, 0.0])?);
+        assert!(ranker.offer("8", &[0.0, 1.0])?);
+        assert!(ranker.offer("7", &[1.0, 0.0])?);
+        assert!(!ranker.offer("10", &[-1.0, 0.0])?);
+        assert!(ranker.offer("3", &[1.0, 0.0])?);
+        assert_eq!(
+            ranker
+                .results()
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["3", "7"]
+        );
+        assert!(
+            ranker
+                .results()
+                .iter()
+                .all(|(_, score)| (*score - 1.0).abs() < 1.0e-12)
+        );
+        assert!(ranker.offer("3", &[1.0, 0.0]).is_err());
         assert!(VectorRanker::try_new(&[1.0], 0).is_err());
         assert!(VectorRanker::try_new(&[1.0], super::MAX_RESULTS + 1).is_err());
         Ok(())

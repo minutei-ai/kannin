@@ -74,7 +74,7 @@ test("vector outbox survives provider failure and retries", async () => {
     await (await request(worker, "retry", "query", vectorQuery())).json(),
   );
   expect(found.rows.map((row) => row.id)).toEqual(["a"]);
-  expect(found.consistency).toBe("vectorize-eventual");
+  expect(found.consistency).toBe("strong");
 });
 
 test("delayed obsolete vectors cannot impersonate newer document revisions", async () => {
@@ -507,16 +507,15 @@ test("vector top-k materializes only the requested live document pages", async (
   const response = await request(worker, namespace, "query", { ...vectorQuery(), topK: 1 });
   const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
   expect(response.headers.get("server-timing")).toContain("vector_index;dur=");
-  expect(response.headers.get("server-timing")).toContain("vector_reconcile;dur=");
   expect(response.headers.get("server-timing")).toContain("vector_documents;dur=");
   expect(result.rows.map((row) => row.id)).toEqual(["0000"]);
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(1);
+  expect(after.rangeReads - before.rangeReads).toBeLessThanOrEqual(21);
 });
 
-test("vector materialization shares byte windows while preserving provider score order", async () => {
+test("vector materialization preserves native cosine score order", async () => {
   const namespace = "vector-reverse-pages";
   await request(worker, namespace, "write", {
     schema,
@@ -548,10 +547,10 @@ test("vector materialization shares byte windows while preserving provider score
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(1);
+  expect(after.rangeReads - before.rangeReads).toBeLessThanOrEqual(21);
 });
 
-test("small vector top-k avoids locating every candidate segment", async () => {
+test("exact vector top-k remains stable across scattered segments", async () => {
   const namespace = "vector-scattered";
   for (const index of Array.from({ length: 20 }, (_, ordinal) => ordinal))
     await request(worker, namespace, "write", {
@@ -575,10 +574,7 @@ test("small vector top-k avoids locating every candidate segment", async () => {
   const after = Schema.decodeUnknownSync(Health)(
     await (await fetch(new URL("/health", await worker.ready))).json(),
   );
-  expect(after.rangeReads - before.rangeReads).toBe(1);
-  expect(after.directoryR2CacheReads - before.directoryR2CacheReads).toBe(0);
-  expect(after.directoryR2CacheHits - before.directoryR2CacheHits).toBe(0);
-  expect(after.cacheApiHits - before.cacheApiHits).toBe(1);
+  expect(after.rangeReads - before.rangeReads).toBeLessThanOrEqual(41);
 });
 
 test("candidate windows continue through stale revisions and residual filters before top-k", async () => {
@@ -630,50 +626,52 @@ test("candidate windows continue through stale revisions and residual filters be
   expect(compactedSingle.rows).toEqual(single.rows);
 });
 
-test("bounded ANN cache avoids provider calls and expires without caching document authority", async () => {
-  const namespace = "ann-cache";
-  const filtered = {
-    ...vectorQuery(),
-    filters: [{ field: "group", op: "in", value: ["a", "b", "c", "d"] }],
-  };
-  await request(worker, namespace, "write", {
-    schema,
-    requestId: "seed",
-    upserts: [{ id: "a", text: "lexical", attributes: { group: "a" }, vector: vector(1) }],
-    deletes: [],
-  });
-  await request(worker, namespace, "vector-sync", {});
+test("native vector queries use canonical revisions without external candidates or snapshot caches", async () => {
+  const namespace = "native-no-ann";
   const service = await worker.getWorker("vectors");
   const controlSchema = Schema.Struct({ queryCalls: Schema.Int });
   const before = Schema.decodeUnknownSync(controlSchema)(
-    await (await service.fetch("http://fixture/healthy")).json(),
+    await (await service.fetch("http://fixture/fail")).json(),
   );
-  const first = await request(worker, namespace, "query", filtered);
-  expect(first.headers.get("server-timing")).toContain('vector_cache;desc="miss"');
-  const next = await request(worker, namespace, "query", filtered);
-  expect(next.headers.get("server-timing")).toContain('vector_cache;desc="hit"');
-  expect(Schema.decodeUnknownSync(QueryResult)(await next.json()).rows).toEqual(
-    Schema.decodeUnknownSync(QueryResult)(await first.json()).rows,
-  );
-  const reused = Schema.decodeUnknownSync(controlSchema)(
-    await (await service.fetch("http://fixture/healthy")).json(),
-  );
-  expect(reused.queryCalls).toBe(before.queryCalls + 1);
-  await Effect.runPromise(Effect.sleep("1100 millis"));
-  const expired = await request(worker, namespace, "query", filtered);
-  expect(expired.headers.get("server-timing")).toContain('vector_cache;desc="miss"');
-  const renewed = Schema.decodeUnknownSync(controlSchema)(
-    await (await service.fetch("http://fixture/healthy")).json(),
-  );
-  expect(renewed.queryCalls).toBe(before.queryCalls + 2);
-  await request(worker, namespace, "write", {
-    schema,
-    requestId: "replace",
-    upserts: [{ id: "a", text: "new", attributes: { group: "b" }, vector: vector(0.6, 0.8) }],
-    deletes: [],
-  });
-  await request(worker, namespace, "vector-sync", {});
-  const updated = await request(worker, namespace, "query", filtered);
-  expect(updated.headers.get("server-timing")).toContain('vector_cache;desc="miss"');
-  expect(Schema.decodeUnknownSync(QueryResult)(await updated.json()).rows[0]?.text).toBe("new");
+  try {
+    expect(
+      (
+        await request(worker, namespace, "write", {
+          schema,
+          requestId: "seed",
+          deletes: [],
+          upserts: [{ id: "a", text: "old", attributes: { eligible: true }, vector: vector(1) }],
+        })
+      ).status,
+    ).toBe(200);
+    const input = { ...vectorQuery(), filters: [{ field: "eligible", op: "eq", value: true }] };
+    const first = Schema.decodeUnknownSync(QueryResult)(
+      await (await request(worker, namespace, "query", input)).json(),
+    );
+    expect(first.consistency).toBe("strong");
+    expect(first.rows.map((row) => row.id)).toEqual(["a"]);
+    expect(
+      (
+        await request(worker, namespace, "write", {
+          schema,
+          requestId: "replace",
+          deletes: [],
+          upserts: [
+            { id: "a", text: "new", attributes: { eligible: true }, vector: vector(0.6, 0.8) },
+          ],
+        })
+      ).status,
+    ).toBe(200);
+    const updated = Schema.decodeUnknownSync(QueryResult)(
+      await (await request(worker, namespace, "query", { ...input, minimumSequence: 2 })).json(),
+    );
+    expect(updated.rows[0]?.text).toBe("new");
+    expect(updated.rows[0]?.score).toBeCloseTo(0.6);
+    const after = Schema.decodeUnknownSync(controlSchema)(
+      await (await service.fetch("http://fixture/fail")).json(),
+    );
+    expect(after.queryCalls).toBe(before.queryCalls);
+  } finally {
+    await mode("/healthy");
+  }
 });

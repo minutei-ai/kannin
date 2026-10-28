@@ -1135,6 +1135,10 @@ export class Rejected extends Schema.TaggedError<Rejected, { readonly brand: uni
   },
 ) {}
 
+export const NativeVectorHits = Schema.Array(Schema.Tuple([Id, Schema.Finite])).check(
+  Schema.isMaxLength(100),
+);
+
 export const VectorSelection = Schema.Struct({
   epoch: Root.fields.vectorEpoch,
   sequence: Root.fields.sequence,

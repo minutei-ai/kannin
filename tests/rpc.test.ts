@@ -207,7 +207,7 @@ test("Effect SDK performs native binding RPC with Worker and coordinator HTTP di
   });
   expect(vectorResponse.status).toBe(200);
   const vectorResult = Schema.decodeUnknownSync(QueryResult)(await vectorResponse.json());
-  expect(vectorResult.consistency).toBe("vectorize-eventual");
+  expect(vectorResult.consistency).toBe("strong");
   expect(vectorResult.sequence).toBe(1);
   expect(vectorResult.rows.map((row) => row.id)).toEqual(["a"]);
   expect(vectorResult.rows[0]?.attributes).toEqual({ group: 1 });
@@ -219,7 +219,7 @@ test("Effect SDK performs native binding RPC with Worker and coordinator HTTP di
   });
   expect(hybridResponse.status).toBe(200);
   const hybridResult = Schema.decodeUnknownSync(QueryResult)(await hybridResponse.json());
-  expect(hybridResult.consistency).toBe("vectorize-eventual");
+  expect(hybridResult.consistency).toBe("strong");
   expect(hybridResult.sequence).toBe(1);
   expect(hybridResult.rows.map((row) => row.id)).toEqual(["a", "b"]);
   expect(hybridResult.rows[0]?.score).toBeCloseTo(2 / 61, 12);

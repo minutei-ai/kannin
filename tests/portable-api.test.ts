@@ -186,7 +186,9 @@ test("two portable replicas fence concurrent writes and expose fresh strong read
             ),
           ),
         );
-        expect(competing.map((response) => response.status).toSorted()).toEqual([200, 409]);
+        expect(
+          competing.map((response) => response.status).toSorted((left, right) => left - right),
+        ).toEqual([200, 409]);
         for (const app of [first, second]) {
           const metadataResponse = yield* Effect.tryPromise(() =>
             app.fetch(request("/v1/namespaces/dimension-race/metadata")),

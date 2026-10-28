@@ -1774,6 +1774,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
                           if (discarded !== undefined) retained.delete(discarded);
                         }
                       }
+                      return undefined;
                     }),
                   (reader) => Effect.sync(() => reader.free()),
                 ),

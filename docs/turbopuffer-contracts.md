@@ -14,7 +14,7 @@ Public sources were captured on 2026-10-26: the documentation index, every page 
 
 A local workerd route probe of the gate072 Worker retains five authenticated 404 responses for public listing, row-write, BM25 query, metadata and schema-read requests, plus a 401 without authentication. All six error bodies lack the published `status: error` member. No canonical namespace objects were written. This proves these observed mismatches, not a complete API audit. Evidence: `/home/yorizel/.cache/kannin-turbopuffer-parity-20261026/audit/{probe.ts,results.json,receipt.json}`. No hosted competitor test was executed.
 
-A dependency refresh on 2026-10-28 selects official TypeScript SDK 2.13.0 for the next complete gate. Earlier SDK 2.12.0 results below remain historical evidence; they do not validate the new installed client. The pinned public-source baseline remains explicit rather than being silently relabeled.
+A dependency refresh on 2026-10-28 selects official TypeScript SDK 2.13.0 for the next complete gate. Earlier SDK 2.12.0 results below remain historical evidence; they do not validate the new installed client. The pinned public-source baseline remains explicit rather than being silently relabeled. The [2.13.0 release](https://github.com/turbopuffer/turbopuffer-typescript/releases/tag/v2.13.0) includes customer-managed `encryption_context` and separate strong/eventual consistency variants with `max_staleness_seconds`. Kannin's native edge-text snapshot contract does not implement that public eventual-consistency policy; accepting these fields without their behavior would not establish compatibility.
 
 ## Implemented conformance boundaries
 

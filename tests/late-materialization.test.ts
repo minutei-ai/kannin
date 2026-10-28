@@ -60,7 +60,6 @@ async function seed(namespace: string) {
       )
     ).status,
   ).toBe(200);
-  expect((await request(worker, namespace, "vector-sync", {})).status).toBe(200);
 }
 
 test("hybrid projects RRF overlap and disjoint ID ties with the existing scores", async () => {
@@ -89,7 +88,6 @@ test("hybrid projects RRF overlap and disjoint ID ties with the existing scores"
       )
     ).status,
   ).toBe(200);
-  expect((await request(worker, "late-disjoint", "vector-sync", {})).status).toBe(200);
   const tied = await request(worker, "late-disjoint", "query", { ...hybrid, topK: 1 });
   expect(tied.status).toBe(200);
   const tie = Schema.decodeUnknownSync(QueryResult)(await tied.json());

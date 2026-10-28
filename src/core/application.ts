@@ -1738,46 +1738,52 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
               input.filters,
             );
             for (const segment of root.segments.toReversed()) {
-              yield* withDirectory(segment.key, segment.headerBytes, (directory) =>
-                Effect.acquireUseRelease(
-                  Effect.gen(function* () {
-                    const dead = yield* Schema.encodeEffect(integers)(segment.dead);
-                    return yield* Effect.try(() => directory.vector_reader(filters, dead));
-                  }),
-                  (reader) =>
+              yield* withDirectory(
+                segment.key,
+                segment.headerBytes,
+                (directory) =>
+                  Effect.acquireUseRelease(
                     Effect.gen(function* () {
-                      const progress = { complete: false };
-                      while (!progress.complete) {
-                        const encoded = yield* Effect.try(() => reader.next_page());
-                        const page = yield* Schema.decodeEffect(
-                          Schema.fromJsonString(NativeVectorPage),
-                        )(encoded);
-                        progress.complete = page.complete;
-                        for (const row of page.rows) {
-                          const data = row.vectorData;
-                          if (
-                            data.length < 8 ||
-                            data.offset < row.data.offset + row.data.length ||
-                            segment.headerBytes + data.offset + data.length > segment.bytes
-                          )
-                            return yield* new Rejected({
-                              status: 503,
-                              message: "Invalid canonical vector range",
-                            });
-                          const frame = yield* Effect.tryPromise(() =>
-                            range(segment.key, segment.headerBytes + data.offset, data.length),
-                          );
-                          const discarded = yield* Effect.try(() =>
-                            ranker.push_frame(row.id, frame),
-                          );
-                          retained.set(row.id, { ...row, segment });
-                          if (discarded !== undefined) retained.delete(discarded);
-                        }
-                      }
-                      return undefined;
+                      const dead = yield* Schema.encodeEffect(integers)(segment.dead);
+                      return yield* Effect.try(() => directory.vector_reader(filters, dead));
                     }),
-                  (reader) => Effect.sync(() => reader.free()),
-                ),
+                    (reader) =>
+                      Effect.gen(function* () {
+                        const progress = { complete: false };
+                        while (!progress.complete) {
+                          const encoded = yield* Effect.try(() => reader.next_page());
+                          const page = yield* Schema.decodeEffect(
+                            Schema.fromJsonString(NativeVectorPage),
+                          )(encoded);
+                          progress.complete = page.complete;
+                          for (const row of page.rows) {
+                            const data = row.vectorData;
+                            if (
+                              data.length < 8 ||
+                              data.offset < row.data.offset + row.data.length ||
+                              segment.headerBytes + data.offset + data.length > segment.bytes
+                            )
+                              return yield* new Rejected({
+                                status: 503,
+                                message: "Invalid canonical vector range",
+                              });
+                            const frame = yield* Effect.tryPromise(() =>
+                              range(segment.key, segment.headerBytes + data.offset, data.length),
+                            );
+                            const discarded = yield* Effect.try(() =>
+                              ranker.push_frame(row.id, frame),
+                            );
+                            retained.set(row.id, { ...row, segment });
+                            if (discarded !== undefined) retained.delete(discarded);
+                          }
+                        }
+                        return undefined;
+                      }),
+                    (reader) => Effect.sync(() => reader.free()),
+                  ),
+                undefined,
+                false,
+                input.kind === "vector",
               );
             }
             const encoded = yield* Effect.try(() => ranker.finish());

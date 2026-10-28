@@ -13,7 +13,7 @@ const imageInspection = Schema.Struct({
   Architecture: Schema.String,
   Os: Schema.String,
   Config: Schema.Record(Schema.String, Schema.Unknown),
-  HealthCheck: Schema.optional(Schema.Unknown),
+  Healthcheck: Schema.optional(Schema.Unknown),
   RootFS: Schema.Struct({
     Type: Schema.Literal("layers"),
     Layers: Schema.Array(Schema.String),
@@ -21,9 +21,9 @@ const imageInspection = Schema.Struct({
 });
 const imageContent = Schema.fromJsonString(Schema.Tuple([imageInspection]));
 function imageIdentity(inspection: typeof imageInspection.Type) {
-  const { HealthCheck, Config, ...content } = inspection;
-  const { Healthcheck, ...config } = Config;
-  return { ...content, Config: config, Healthcheck: HealthCheck ?? Healthcheck };
+  const { Healthcheck: imageHealthcheck, Config, ...content } = inspection;
+  const { Healthcheck: configHealthcheck, ...config } = Config;
+  return { ...content, Config: config, Healthcheck: imageHealthcheck ?? configHealthcheck };
 }
 
 test("same OCI API image runs on Podman and Docker Engine with canonical state across restarts", async () => {

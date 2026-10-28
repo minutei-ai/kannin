@@ -49,7 +49,7 @@ export const VectorFilterFields = Schema.Array(FieldName).check(
   ),
 );
 const MIN_VECTOR_DIMENSIONS = 1;
-const MAX_VECTOR_DIMENSIONS = 4096;
+const MAX_VECTOR_DIMENSIONS = 10_752;
 export const DEFAULT_VECTOR_DIMENSIONS = 768;
 export const NamespaceSchema = Schema.Struct({
   vectorDimensions: Schema.optional(

@@ -22,7 +22,7 @@ Supply configuration from an external environment file or secret manager. Never 
 | `HOST` / `PORT`                    | Listener, defaults `0.0.0.0:3000`                                |
 | `KANNIN_WASM_PATH`                 | Native build artifact, default `./dist/wasm/raio_engine_bg.wasm` |
 
-The Rust/WASM engine performs exact cosine search over the canonical vector frames in immutable segments. The native API accepts client-generated vectors with `schema.vectorDimensions` from 1 to 4096, defaulting to 768. Dimension changes require reset; this extension awaits the complete gate. Use the same bucket configuration across replicas. No app volume or vector-service credentials are required. Persist and back up the object-storage service independently; ephemeral test backends are disposable fixtures, not production durability.
+The Rust/WASM engine performs exact cosine search over the canonical vector frames in immutable segments. The native API accepts client-generated vectors with `schema.vectorDimensions` from 1 to 10,752, defaulting to 768. Dimension changes require reset; this extension awaits the complete gate. Use the same bucket configuration across replicas. No app volume or vector-service credentials are required. Persist and back up the object-storage service independently; ephemeral test backends are disposable fixtures, not production durability.
 
 Run the built server with the external variables already loaded:
 

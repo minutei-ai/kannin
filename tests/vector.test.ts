@@ -87,7 +87,7 @@ test("wrong query dimensions return 400 in empty and populated namespaces", asyn
 });
 
 test("configured vector dimensions survive canonical maintenance and reset without changing old receipts", async () => {
-  for (const dimensions of [1, 2, 4096]) {
+  for (const dimensions of [1, 2, 4096, 10_752]) {
     const namespace = `custom-dimension-${dimensions}`;
     const values = [1, ...Array.from({ length: dimensions - 1 }, () => 0)];
     const initial = {
@@ -136,6 +136,7 @@ test("configured vector dimensions survive canonical maintenance and reset witho
       expect(result.sequence).toBe(2);
     }
     const changed = dimensions === 1 ? 2 : 1;
+    const replacement = [1, ...Array.from({ length: changed - 1 }, () => 0)];
     const reset = {
       schema: { ...schema, vectorDimensions: changed },
       requestId: "changed",
@@ -144,7 +145,7 @@ test("configured vector dimensions survive canonical maintenance and reset witho
           id: "new",
           text: "lexical",
           attributes: {},
-          vector: [1, ...Array.from({ length: changed - 1 }, () => 0)],
+          vector: replacement,
         },
       ],
       deletes: [],
@@ -161,7 +162,32 @@ test("configured vector dimensions survive canonical maintenance and reset witho
     );
     expect(current.sequence).toBe(3);
     expect(current.schema?.vectorDimensions).toBe(changed);
+    const selected = await request(worker, namespace, "query", {
+      ...vectorQuery(),
+      vector: replacement,
+    });
+    expect(selected.status).toBe(200);
+    const live = Schema.decodeUnknownSync(QueryResult)(await selected.json());
+    expect(live.rows.map((row) => row.id)).toEqual(["new"]);
+    expect(live.sequence).toBe(3);
   }
+});
+
+test("invalid dimension declarations cannot create a canonical namespace", async () => {
+  const namespace = "invalid-dimension-schema";
+  for (const vectorDimensions of [0, 10_753, 1.5])
+    expect(
+      (
+        await request(worker, namespace, "write", {
+          requestId: String(vectorDimensions),
+          schema: { ...schema, vectorDimensions },
+          upserts: [],
+          deletes: [],
+        })
+      ).status,
+    ).toBe(400);
+  const bucket = await worker.getR2Bucket("STORAGE");
+  expect(await bucket.head(`namespaces/${namespace}/root.json`)).toBeNull();
 });
 
 test("canonical vector outbox survives corrupt log reads and retries", async () => {

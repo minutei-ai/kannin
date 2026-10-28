@@ -512,7 +512,7 @@ test("fresh cache headers cannot make an expired snapshot body eligible", async 
   expect(after.snapshotCacheDecodes - before.snapshotCacheDecodes).toBe(1);
 });
 
-test("future sequence barriers fail for both modes without waiting for Vectorize", async () => {
+test("future sequence barriers fail for both modes before query evaluation", async () => {
   await request(worker, "edge-future", "write", write([document("a", "text")]));
   for (const consistency of ["strong", "edge-eventual"])
     expect(

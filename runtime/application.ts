@@ -212,8 +212,8 @@ export const portableApplication = Effect.fn("kannin.portableApplication")(funct
     active.value = false;
     actors.clear();
   }
-  yield* Effect.tryPromise(recover);
   yield* Effect.addFinalizer(() => Effect.promise(dispose));
+  yield* Effect.tryPromise(recover);
   return {
     binding: new app.KanninRpc({ waitUntil }, env),
     fetch: (request: Request) => app.handler.fetch(request, env, { waitUntil }),

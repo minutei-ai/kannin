@@ -238,7 +238,7 @@ test("namespace schema rejects duplicate, excessive and undeclared vector fields
     expect(Schema.is(NamespaceSchema)(input)).toBe(false);
 });
 
-test("each namespace assigns its own Vectorize slots and schema-only migration isolates old metadata", async () => {
+test("namespace-local canonical filters are immediately visible after schema-only configuration", async () => {
   const vector = [1, ...Array.from({ length: 767 }, () => 0)];
   for (const field of ["customer", "region"]) {
     const namespace = `schema-${field}`;
@@ -303,10 +303,11 @@ test("each namespace assigns its own Vectorize slots and schema-only migration i
   const before = Schema.decodeUnknownSync(QueryResult)(
     await (await request(worker, "schema-migrate", "query", input)).json(),
   );
-  expect(before.rows).toEqual([]);
+  expect(before.rows.map((row) => row.id)).toEqual(["a"]);
+  expect(before.consistency).toBe("strong");
   expect((await request(worker, "schema-migrate", "vector-rebuild", {})).status).toBe(200);
   const after = Schema.decodeUnknownSync(QueryResult)(
     await (await request(worker, "schema-migrate", "query", input)).json(),
   );
-  expect(after.rows.map((row) => row.id)).toEqual(["a"]);
+  expect(after).toEqual(before);
 });

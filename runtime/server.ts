@@ -56,6 +56,7 @@ export const servePortable = Effect.fn("kannin.servePortable")(function* (
   yield* Effect.tryPromise(app.recover).pipe(
     Effect.catch((cause) => Effect.logError("kannin.recovery", cause)),
     Effect.repeat(Schedule.spaced("30 seconds")),
+    Effect.delay("30 seconds"),
     Effect.forkScoped,
   );
   const server = yield* Effect.acquireRelease(

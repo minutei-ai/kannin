@@ -64,7 +64,7 @@ test("compaction drops superseded records and tombstones", async () => {
   expect((await query("dead")).rows).toEqual([]);
 });
 
-test("compaction retains Vectorize identity across document moves", async () => {
+test("compaction retains canonical vector identity across document moves", async () => {
   const values = [1, ...Array.from({ length: 767 }, () => 0)];
   await request(worker, "vectors", "write", {
     ...write([]),

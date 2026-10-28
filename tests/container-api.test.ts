@@ -20,6 +20,7 @@ test("same OCI API image runs on Podman and Docker Engine with canonical state a
           containerCommand([
             "podman",
             "build",
+            "--format=docker",
             "--memory=512m",
             "--memory-swap=512m",
             "--cpu-period=100000",

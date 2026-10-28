@@ -22,31 +22,6 @@ export const Bucket = Cloudflare.R2.Bucket("Storage", {
     },
   ],
 });
-export const Vectors = Cloudflare.Vectorize.Index("Vectors", { dimensions: 768, metric: "cosine" });
-const EqualityIndexes = Array.from({ length: 5 }, (_, index) =>
-  Cloudflare.Vectorize.MetadataIndex(
-    `Equality${index}`,
-    Effect.gen(function* () {
-      return {
-        indexName: (yield* Vectors).indexName,
-        propertyName: `e${index}`,
-        indexType: "string" as const,
-      };
-    }),
-  ),
-);
-const NumericIndexes = Array.from({ length: 5 }, (_, index) =>
-  Cloudflare.Vectorize.MetadataIndex(
-    `Numeric${index}`,
-    Effect.gen(function* () {
-      return {
-        indexName: (yield* Vectors).indexName,
-        propertyName: `n${index}`,
-        indexType: "number" as const,
-      };
-    }),
-  ),
-);
 export const VectorJobs = Cloudflare.Queues.Queue("VectorJobs");
 export const VectorDeadLetters = Cloudflare.Queues.Queue("VectorDeadLetters");
 export const IndexJobs = Cloudflare.Queues.Queue("IndexJobs");
@@ -55,11 +30,6 @@ export const Worker = Cloudflare.Worker(
   "Search",
   Effect.gen(function* () {
     const token = yield* Config.Redacted("RAIO_API_TOKEN");
-    const indexes = yield* Effect.forEach(
-      [...EqualityIndexes, ...NumericIndexes],
-      (resource) => resource,
-    );
-    const indexesReady = yield* Output.all(...indexes.map((index) => Output.of(index)));
     return {
       main: join(root, "dist/worker/worker.js"),
       bundle: false,
@@ -76,7 +46,6 @@ export const Worker = Cloudflare.Worker(
         API_TOKEN: token,
         STORAGE: yield* Bucket,
         STORAGE_CACHE_SCOPE: (yield* Bucket).bucketName,
-        VECTORS: Effect.as(indexesReady, yield* Vectors),
         VECTOR_JOBS: yield* VectorJobs,
         INDEX_JOBS: yield* IndexJobs,
         NAMESPACES: Cloudflare.DurableObject<Binding & Rpc.DurableObjectBranded>("SearchNamespace"),

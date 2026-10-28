@@ -109,6 +109,6 @@ console.log(
     visibilityPolls: observed.samples,
     numericIntervalMatches: numeric.matches,
     numericVisibilityPolls: numeric.samples,
-    consistency: "vectorize-eventual",
+    consistency: "strong",
   }),
 );

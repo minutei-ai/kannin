@@ -1,6 +1,6 @@
 import { decodeRoot } from "../src/manifest";
 import { afterAll, expect, test } from "bun:test";
-import { Effect, Schema } from "effect";
+import { Schema } from "effect";
 import {
   QueryResult,
   Metadata,
@@ -26,10 +26,6 @@ const query = (kind: "vector" | "hybrid" = "vector") => ({
   filters: [],
 });
 const vectorQuery = () => ({ kind: "vector", vector: vector(1), topK: 10, filters: [] });
-async function mode(path: string) {
-  const service = await worker.getWorker("vectors");
-  await service.fetch(`http://fixture${path}`);
-}
 
 test("vector dimensions and zero magnitude fail before persistence", async () => {
   for (const values of [[1, 0], Array.from({ length: 768 }, () => 0)]) {
@@ -51,8 +47,7 @@ test("vector dimensions and zero magnitude fail before persistence", async () =>
   ).toBe(0);
 });
 
-test("vector outbox survives provider failure and retries", async () => {
-  await mode("/fail");
+test("canonical vector outbox survives corrupt log reads and retries", async () => {
   expect(
     (
       await request(worker, "retry", "write", {
@@ -63,12 +58,21 @@ test("vector outbox survives provider failure and retries", async () => {
       })
     ).status,
   ).toBe(200);
+  const bucket = await worker.getR2Bucket("STORAGE");
+  const rootObject = await bucket.get("namespaces/retry/root.json");
+  if (rootObject === null) throw new Error("Missing canonical root");
+  const logKey = decodeRoot(await rootObject.text()).vectorJobs[0]?.log;
+  if (logKey === undefined) throw new Error("Missing vector job");
+  const log = await bucket.get(logKey);
+  if (log === null) throw new Error("Missing committed log");
+  const bytes = await log.arrayBuffer();
+  await bucket.put(logKey, new Uint8Array(8));
   expect((await request(worker, "retry", "vector-sync", {})).status).toBe(503);
   expect(
     Schema.decodeUnknownSync(Metadata)(await (await request(worker, "retry", "metadata")).json())
       .vectorOutbox,
   ).toBe(1);
-  await mode("/healthy");
+  await bucket.put(logKey, bytes);
   expect((await request(worker, "retry", "vector-sync", {})).status).toBe(200);
   const found = Schema.decodeUnknownSync(QueryResult)(
     await (await request(worker, "retry", "query", vectorQuery())).json(),
@@ -77,8 +81,7 @@ test("vector outbox survives provider failure and retries", async () => {
   expect(found.consistency).toBe("strong");
 });
 
-test("delayed obsolete vectors cannot impersonate newer document revisions", async () => {
-  await mode("/defer");
+test("native vector search immediately exposes the newest committed revision", async () => {
   await request(worker, "revision", "write", {
     schema,
     requestId: "old",
@@ -93,7 +96,6 @@ test("delayed obsolete vectors cannot impersonate newer document revisions", asy
     deletes: [],
   });
   await request(worker, "revision", "vector-sync", {});
-  await mode("/commit-reversed");
   const found = Schema.decodeUnknownSync(QueryResult)(
     await (await request(worker, "revision", "query", vectorQuery())).json(),
   );
@@ -101,7 +103,7 @@ test("delayed obsolete vectors cannot impersonate newer document revisions", asy
   expect(found.rows[0]?.score).toBeCloseTo(0.6);
 });
 
-test("deletion hides stale Vectorize results immediately", async () => {
+test("deletion immediately removes canonical vectors from native ranking", async () => {
   await request(worker, "delete", "write", {
     schema,
     requestId: "create",
@@ -255,7 +257,7 @@ test("numeric metadata ranges apply before candidate limits and retain exact res
   ).toBe(true);
 });
 
-test("R2-backed rebuild cursors resume after provider failure and reconcile intervening mutations", async () => {
+test("R2-backed rebuild cursors resume after checkpoint corruption and reconcile intervening mutations", async () => {
   const upserts = Array.from({ length: 205 }, (_, index) => ({
     id: String(index).padStart(3, "0"),
     text: "lexical",
@@ -281,9 +283,16 @@ test("R2-backed rebuild cursors resume after provider failure and reconcile inte
     upserts: [{ id: "150", text: "updated", attributes: { group: "new" }, vector: vector(1) }],
     deletes: ["151"],
   });
-  await mode("/fail");
+  const bucket = await worker.getR2Bucket("STORAGE");
+  const checkpointKey = `namespaces/rebuild-index/vector-rebuild/${first.snapshot}.json`;
+  const checkpoint = await bucket.get(checkpointKey);
+  if (checkpoint === null) throw new Error("Missing canonical checkpoint");
+  const checkpointBytes = await checkpoint.arrayBuffer();
+  await bucket.put(checkpointKey, "{}", { customMetadata: checkpoint.customMetadata ?? {} });
   expect((await request(worker, "rebuild-index", "vector-rebuild", cursor)).status).toBe(503);
-  await mode("/healthy");
+  await bucket.put(checkpointKey, checkpointBytes, {
+    customMetadata: checkpoint.customMetadata ?? {},
+  });
   const second = Schema.decodeUnknownSync(VectorRebuildResult)(
     await (await request(worker, "rebuild-index", "vector-rebuild", cursor)).json(),
   );
@@ -354,13 +363,7 @@ test("rebuild cursor validation and namespace reset cannot silently change the s
   ).toBe(409);
 });
 
-test("obsolete queued revisions do not allocate extra provider vectors", async () => {
-  await mode("/healthy");
-  const service = await worker.getWorker("vectors");
-  const count = Schema.Struct({ vectors: Schema.Int, pending: Schema.Int });
-  const before = Schema.decodeUnknownSync(count)(
-    await (await service.fetch("http://fixture/healthy")).json(),
-  );
+test("obsolete queued revisions are acknowledged without replacing live canonical vectors", async () => {
   for (const revision of [1, 2, 3])
     await request(worker, "skip-obsolete", "write", {
       schema,
@@ -369,10 +372,6 @@ test("obsolete queued revisions do not allocate extra provider vectors", async (
       deletes: [],
     });
   expect((await request(worker, "skip-obsolete", "vector-sync", {})).status).toBe(200);
-  const after = Schema.decodeUnknownSync(count)(
-    await (await service.fetch("http://fixture/healthy")).json(),
-  );
-  expect(after.vectors - before.vectors).toBe(1);
   const result = Schema.decodeUnknownSync(QueryResult)(
     await (await request(worker, "skip-obsolete", "query", vectorQuery())).json(),
   );
@@ -384,12 +383,7 @@ test("obsolete queued revisions do not allocate extra provider vectors", async (
   ).toBe(0);
 });
 
-test("reset before vector synchronization drops allocations for the retired epoch", async () => {
-  const service = await worker.getWorker("vectors");
-  const count = Schema.Struct({ vectors: Schema.Int, pending: Schema.Int });
-  const before = Schema.decodeUnknownSync(count)(
-    await (await service.fetch("http://fixture/healthy")).json(),
-  );
+test("reset before vector synchronization retires the old canonical epoch", async () => {
   await request(worker, "skip-old-epoch", "write", {
     schema,
     requestId: "old",
@@ -404,18 +398,13 @@ test("reset before vector synchronization drops allocations for the retired epoc
     deletes: [],
   });
   expect((await request(worker, "skip-old-epoch", "vector-sync", {})).status).toBe(200);
-  const after = Schema.decodeUnknownSync(count)(
-    await (await service.fetch("http://fixture/healthy")).json(),
-  );
-  expect(after.vectors - before.vectors).toBe(1);
   const result = Schema.decodeUnknownSync(QueryResult)(
     await (await request(worker, "skip-old-epoch", "query", vectorQuery())).json(),
   );
   expect(result.rows.map((row) => row.id)).toEqual(["b"]);
 });
 
-test("one queue delivery drains sixteen committed jobs with one vector mutation batch", async () => {
-  await mode("/healthy");
+test("one queue delivery validates at most sixteen committed canonical jobs", async () => {
   const namespace = "queue-window";
   for (const index of Array.from({ length: 17 }, (_, value) => value))
     expect(
@@ -439,11 +428,6 @@ test("one queue delivery drains sixteen committed jobs with one vector mutation 
   if (first === undefined || last === undefined) throw new Error("Expected seventeen queued jobs");
   const bindings = await worker.getDurableObjectNamespace("NAMESPACES");
   const stub = bindings.get(bindings.idFromName(namespace));
-  const controlSchema = Schema.Struct({ upsertCalls: Schema.Int });
-  const backend = await worker.getWorker("vectors");
-  const before = Schema.decodeUnknownSync(controlSchema)(
-    await (await backend.fetch("http://fixture/control")).json(),
-  );
   const response = await stub.fetch(
     `http://internal/v1/namespaces/${namespace}/internal-vector-sync`,
     {
@@ -455,10 +439,6 @@ test("one queue delivery drains sixteen committed jobs with one vector mutation 
   expect(response.status).toBe(200);
   const result = Schema.decodeUnknownSync(VectorSyncResult)(await response.json());
   expect(result.submitted).toBe(16);
-  const after = Schema.decodeUnknownSync(controlSchema)(
-    await (await backend.fetch("http://fixture/control")).json(),
-  );
-  expect(after.upsertCalls - before.upsertCalls).toBe(1);
   expect(
     Schema.decodeUnknownSync(Metadata)(await (await request(worker, namespace, "metadata")).json())
       .vectorOutbox,
@@ -628,50 +608,37 @@ test("candidate windows continue through stale revisions and residual filters be
 
 test("native vector queries use canonical revisions without external candidates or snapshot caches", async () => {
   const namespace = "native-no-ann";
-  const service = await worker.getWorker("vectors");
-  const controlSchema = Schema.Struct({ queryCalls: Schema.Int });
-  const before = Schema.decodeUnknownSync(controlSchema)(
-    await (await service.fetch("http://fixture/fail")).json(),
+  expect(
+    (
+      await request(worker, namespace, "write", {
+        schema,
+        requestId: "seed",
+        deletes: [],
+        upserts: [{ id: "a", text: "old", attributes: { eligible: true }, vector: vector(1) }],
+      })
+    ).status,
+  ).toBe(200);
+  const input = { ...vectorQuery(), filters: [{ field: "eligible", op: "eq", value: true }] };
+  const first = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", input)).json(),
   );
-  try {
-    expect(
-      (
-        await request(worker, namespace, "write", {
-          schema,
-          requestId: "seed",
-          deletes: [],
-          upserts: [{ id: "a", text: "old", attributes: { eligible: true }, vector: vector(1) }],
-        })
-      ).status,
-    ).toBe(200);
-    const input = { ...vectorQuery(), filters: [{ field: "eligible", op: "eq", value: true }] };
-    const first = Schema.decodeUnknownSync(QueryResult)(
-      await (await request(worker, namespace, "query", input)).json(),
-    );
-    expect(first.consistency).toBe("strong");
-    expect(first.rows.map((row) => row.id)).toEqual(["a"]);
-    expect(
-      (
-        await request(worker, namespace, "write", {
-          schema,
-          requestId: "replace",
-          deletes: [],
-          upserts: [
-            { id: "a", text: "new", attributes: { eligible: true }, vector: vector(0.6, 0.8) },
-          ],
-        })
-      ).status,
-    ).toBe(200);
-    const updated = Schema.decodeUnknownSync(QueryResult)(
-      await (await request(worker, namespace, "query", { ...input, minimumSequence: 2 })).json(),
-    );
-    expect(updated.rows[0]?.text).toBe("new");
-    expect(updated.rows[0]?.score).toBeCloseTo(0.6);
-    const after = Schema.decodeUnknownSync(controlSchema)(
-      await (await service.fetch("http://fixture/fail")).json(),
-    );
-    expect(after.queryCalls).toBe(before.queryCalls);
-  } finally {
-    await mode("/healthy");
-  }
+  expect(first.consistency).toBe("strong");
+  expect(first.rows.map((row) => row.id)).toEqual(["a"]);
+  expect(
+    (
+      await request(worker, namespace, "write", {
+        schema,
+        requestId: "replace",
+        deletes: [],
+        upserts: [
+          { id: "a", text: "new", attributes: { eligible: true }, vector: vector(0.6, 0.8) },
+        ],
+      })
+    ).status,
+  ).toBe(200);
+  const updated = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", { ...input, minimumSequence: 2 })).json(),
+  );
+  expect(updated.rows[0]?.text).toBe("new");
+  expect(updated.rows[0]?.score).toBeCloseTo(0.6);
 });

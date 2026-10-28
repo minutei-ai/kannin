@@ -342,7 +342,7 @@ export const Row = Schema.Struct({
 export const QueryResult = Schema.Struct({
   rows: Schema.Array(Row),
   sequence: Schema.Int,
-  consistency: Schema.Literals(["strong", "edge-eventual", "vectorize-eventual"]),
+  consistency: Schema.Literals(["strong", "edge-eventual"]),
 });
 export const WriteResult = Schema.Struct({
   sequence: Schema.Int,
@@ -429,7 +429,7 @@ export const Health = Schema.Struct({
   name: Schema.Literal("kannin"),
   version: Schema.Literal("0.1.0"),
   engine: Schema.Literals(["rust-wasm-r2", "rust-wasm-object-storage"]),
-  vectors: Schema.Literals(["cloudflare-vectorize", "qdrant"]),
+  vectors: Schema.Literal("rust-wasm-object-storage"),
   wasmMemoryBytes: Schema.Int,
   ...CacheMetrics.fields,
 });
@@ -1027,7 +1027,7 @@ export const SegmentHits = Schema.Array(
 );
 export const VectorSyncResult = Schema.Struct({
   submitted: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 16 })),
-  visibility: Schema.Literal("vectorize-eventual"),
+  visibility: Schema.Literal("strong"),
 });
 export const VectorMessage = Schema.Struct({
   namespace: NamespaceName,
@@ -1138,26 +1138,6 @@ export class Rejected extends Schema.TaggedError<Rejected, { readonly brand: uni
 export const NativeVectorHits = Schema.Array(Schema.Tuple([Id, Schema.Finite])).check(
   Schema.isMaxLength(100),
 );
-
-export const VectorSelection = Schema.Struct({
-  epoch: Root.fields.vectorEpoch,
-  sequence: Root.fields.sequence,
-  pending: Root.fields.vectorJobs,
-  vector: Vector,
-  filters: Schema.Array(Filter),
-  fields: VectorFilterFields,
-});
-export const VectorCandidates = Schema.Array(
-  Schema.Struct({
-    id: Schema.String,
-    score: Schema.Finite,
-    metadata: Schema.Struct({ id: Id, revision: Schema.Int }),
-  }),
-).check(Schema.isMaxLength(50));
-export const VectorCandidateFrame = Schema.Struct({
-  observedAt: Schema.Finite,
-  candidates: VectorCandidates.check(Schema.isMinLength(1)),
-});
 
 export const CompactResult = Schema.Struct({
   compacted: Schema.Int,
@@ -1338,64 +1318,6 @@ export const ObjectPage = Schema.Union([
 export const ObjectUserMetadata = Schema.Record(Unicode, Unicode);
 export const ObjectUserMetadataJson = Schema.fromJsonString(ObjectUserMetadata);
 
-export const VectorStoreMetadata = Schema.Record(Unicode, Schema.Union([Unicode, Schema.Finite]));
-export const VectorStorePoint = Schema.Struct({
-  id: Unicode.check(Schema.isMinLength(1)),
-  namespace: Unicode.check(Schema.isMinLength(1)),
-  values: Schema.Array(Schema.Finite).check(Schema.isMinLength(1)),
-  metadata: VectorStoreMetadata,
-});
-export const VectorStorePredicate = Schema.Struct({
-  $eq: Schema.optional(Schema.Union([Unicode, Schema.Finite])),
-  $in: Schema.optional(Schema.Array(Schema.Union([Unicode, Schema.Finite]))),
-  $gt: Schema.optional(Schema.Finite),
-  $gte: Schema.optional(Schema.Finite),
-  $lt: Schema.optional(Schema.Finite),
-  $lte: Schema.optional(Schema.Finite),
-});
-export const VectorStoreQuery = Schema.Struct({
-  namespace: VectorStorePoint.fields.namespace,
-  topK: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 10000 })),
-  returnMetadata: Schema.Literal("all"),
-  filter: Schema.optional(Schema.Record(FieldName, VectorStorePredicate)),
-});
-export const VectorStorePayload = Schema.Struct({
-  vectorId: VectorStorePoint.fields.id,
-  namespace: VectorStorePoint.fields.namespace,
-  metadata: VectorStoreMetadata,
-});
-export const QdrantPoint = Schema.Struct({
-  id: Schema.String,
-  payload: VectorStorePayload,
-});
-export const QdrantScoredPoint = Schema.Struct({
-  ...QdrantPoint.fields,
-  score: Schema.Finite,
-});
-export const QdrantCollectionExists = Schema.Struct({ exists: Schema.Boolean });
-export const QdrantQueryResult = Schema.Struct({ points: Schema.Array(QdrantScoredPoint) });
-export const QdrantMutationResult = Schema.Struct({ status: Schema.Literal("completed") });
-export const QdrantStoreConfig = Schema.Struct({
-  endpoint: S3StoreConfig.fields.endpoint,
-  collection: Schema.String.check(Schema.isPattern(/^[a-zA-Z0-9_-]{1,128}$/)),
-  dimensions: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 65536 })),
-  apiKey: Schema.Redacted(Schema.String),
-});
-export class VectorStoreFailure extends Schema.TaggedError<
-  VectorStoreFailure,
-  { readonly brand: unique symbol }
->()("VectorStoreFailure", {
-  operation: Schema.Literals(["initialize", "query", "upsert", "delete"]),
-  cause: Schema.Defect(),
-}) {}
-export const QdrantCollectionVectorConfig = Schema.Struct({
-  config: Schema.Struct({
-    params: Schema.Struct({
-      vectors: Schema.Struct({ size: Schema.Int, distance: Schema.Literal("Cosine") }),
-    }),
-  }),
-});
-
 export const DeploymentTarget = Schema.Literals(["railway", "docker", "cloudflare"]);
 
 export const ImmutableCacheName = Schema.Literals([
@@ -1462,6 +1384,5 @@ export const PortableServerConfig = Schema.Struct({
   port: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 65535 })),
   wasmPath: Unicode.check(Schema.isMinLength(1)),
   objectStore: S3StoreConfig,
-  vectorStore: QdrantStoreConfig,
   cache: Schema.optional(CacheClientConfig),
 });

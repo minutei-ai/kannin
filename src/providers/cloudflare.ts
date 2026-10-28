@@ -11,7 +11,7 @@ export const runtime: SearchRuntime = {
   freshRoots: false,
   immutableIdentity: (digest) => digest,
   engineName: "rust-wasm-r2",
-  vectorName: "cloudflare-vectorize",
+  vectorName: "rust-wasm-object-storage",
   equalBytes: (left, right) => crypto.subtle.timingSafeEqual(left, right),
   waitUntil,
   namespace: (name) => env.NAMESPACES.get(env.NAMESPACES.idFromName(name)),

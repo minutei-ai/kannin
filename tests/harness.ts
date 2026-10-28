@@ -10,16 +10,6 @@ export async function workerOptions(
   artifactRoot = join(root, "dist/worker"),
   versionId = "kannin-local-test-version",
 ) {
-  const bundle = await Bun.build({
-    entrypoints: [join(root, "tests/vector-backend.ts")],
-    target: "browser",
-    format: "esm",
-    external: ["cloudflare:workers"],
-  });
-  if (!bundle.success) throw new AggregateError(bundle.logs);
-  const artifact = bundle.outputs[0];
-  if (artifact === undefined) throw new Error("Missing vector fixture artifact");
-  const vectorScript = await artifact.text();
   const triggers = [];
   if (consumeQueues)
     triggers.push(
@@ -70,22 +60,11 @@ export async function workerOptions(
             },
             VECTOR_JOBS: { type: "queue" as const, name: "raio-vector-jobs" },
             INDEX_JOBS: { type: "queue" as const, name: "raio-index-jobs" },
-            VECTORS: { type: "worker" as const, worker: "vectors", exportName: "VectorBackend" },
           },
           exports: {
             SearchNamespace: { type: "durable-object" as const, storage: "legacy-kv" as const },
           },
           triggers,
-        },
-      },
-      {
-        config: {
-          name: "vectors",
-          compatibilityDate: "2026-10-01",
-          manifest: {
-            mainModule: "vectors.js",
-            modules: { "vectors.js": { type: "esm" as const, contents: vectorScript } },
-          },
         },
       },
     ],

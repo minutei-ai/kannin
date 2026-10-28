@@ -4,9 +4,8 @@ import { Effect, Layer, Redacted, Schema } from "effect";
 import { QueryResult } from "../src/protocol";
 import { servePortable } from "../runtime/server";
 import { ObjectStoreFixtureConfig, objectStoreFixtureLive } from "./object-store-fixture";
-import { VectorStoreFixtureConfig, vectorStoreFixture } from "./vector-store-fixture";
 
-const services = Layer.merge(objectStoreFixtureLive, vectorStoreFixture(768));
+const services = objectStoreFixtureLive;
 
 test("portable HTTP server serves native endpoints and official SDK namespace listing", async () => {
   await Effect.runPromise(
@@ -14,7 +13,6 @@ test("portable HTTP server serves native endpoints and official SDK namespace li
       Effect.gen(function* () {
         const context = yield* Layer.build(services);
         const objectStore = yield* ObjectStoreFixtureConfig.pipe(Effect.provideContext(context));
-        const vectorStore = yield* VectorStoreFixtureConfig.pipe(Effect.provideContext(context));
         const reservation = Bun.serve({
           hostname: "127.0.0.1",
           port: 0,
@@ -28,7 +26,6 @@ test("portable HTTP server serves native endpoints and official SDK namespace li
           port,
           wasmPath: "./dist/wasm/raio_engine_bg.wasm",
           objectStore,
-          vectorStore,
         });
         const baseURL = server.url.origin;
         const response = yield* Effect.tryPromise(() =>
@@ -93,7 +90,6 @@ test("portable HTTP queries recover through real object storage when the CDN is 
         );
         const context = yield* Layer.build(services);
         const objectStore = yield* ObjectStoreFixtureConfig.pipe(Effect.provideContext(context));
-        const vectorStore = yield* VectorStoreFixtureConfig.pipe(Effect.provideContext(context));
         const reservation = Bun.serve({
           hostname: "127.0.0.1",
           port: 0,
@@ -107,7 +103,6 @@ test("portable HTTP queries recover through real object storage when the CDN is 
           port,
           wasmPath: "./dist/wasm/raio_engine_bg.wasm",
           objectStore,
-          vectorStore,
           cache: {
             endpoint: unavailable.url.origin,
             token: Redacted.make("separate-cdn-token"),

@@ -57,33 +57,6 @@ export interface Bucket {
   delete(key: string): Promise<void>;
   list(options?: ObjectListOptions): Promise<ObjectList>;
 }
-export interface VectorPredicate {
-  $eq?: string | number;
-  $in?: (string | number)[];
-  $gt?: number;
-  $gte?: number;
-  $lt?: number;
-  $lte?: number;
-}
-export type VectorFilter = Record<string, VectorPredicate>;
-export type VectorBoundOp = "$gt" | "$gte" | "$lt" | "$lte";
-export interface VectorPoint {
-  readonly id: string;
-  readonly values: number[];
-  readonly namespace: string;
-  readonly metadata: Record<string, string | number>;
-}
-export interface VectorQueryOptions {
-  readonly namespace: string;
-  readonly topK: number;
-  readonly returnMetadata: "all";
-  filter?: VectorFilter;
-}
-export interface VectorIndex {
-  query(vector: number[], options: VectorQueryOptions): Promise<{ readonly matches: unknown }>;
-  upsert(vectors: VectorPoint[]): Promise<unknown>;
-  deleteByIds(ids: string[]): Promise<unknown>;
-}
 export interface QueuePort {
   send(message: unknown): Promise<unknown>;
 }
@@ -99,7 +72,6 @@ export interface Environment {
   readonly API_TOKEN: string;
   readonly STORAGE: Bucket;
   readonly STORAGE_CACHE_SCOPE: string;
-  readonly VECTORS: VectorIndex;
   readonly VECTOR_JOBS: QueuePort;
   readonly INDEX_JOBS: QueuePort;
 }
@@ -122,7 +94,7 @@ export interface SearchRuntime extends BackgroundContext {
   readonly freshRoots: boolean;
   readonly immutableIdentity: (digest: string) => string;
   readonly engineName: "rust-wasm-r2" | "rust-wasm-object-storage";
-  readonly vectorName: "cloudflare-vectorize" | "qdrant";
+  readonly vectorName: "rust-wasm-object-storage";
   readonly equalBytes: (left: ArrayBufferView, right: ArrayBufferView) => boolean;
   readonly namespace: (name: string) => FetchService & Binding;
   readonly segments: (options: { readonly props: typeof SegmentCacheProps.Type }) => FetchService;

@@ -2,11 +2,10 @@ import { expect, test } from "bun:test";
 import { Cause, Effect, Layer, Redacted, Schedule, Schema } from "effect";
 import { QueryResult } from "../src/protocol";
 import { ObjectStoreFixtureConfig, objectStoreFixtureLive } from "./object-store-fixture";
-import { VectorStoreFixtureConfig, vectorStoreFixture } from "./vector-store-fixture";
 import { containerCommand } from "./container-command";
 
 const image = `localhost/kannin-portable-contract:${crypto.randomUUID()}`;
-const services = Layer.merge(objectStoreFixtureLive, vectorStoreFixture(768));
+const services = objectStoreFixtureLive;
 
 test("complete OCI API image runs without Cloudflare and survives a container restart", async () => {
   await Effect.runPromise(
@@ -14,7 +13,6 @@ test("complete OCI API image runs without Cloudflare and survives a container re
       Effect.gen(function* () {
         const context = yield* Layer.build(services);
         const objects = yield* ObjectStoreFixtureConfig.pipe(Effect.provideContext(context));
-        const vectors = yield* VectorStoreFixtureConfig.pipe(Effect.provideContext(context));
         yield* Effect.acquireRelease(
           containerCommand([
             "podman",
@@ -60,10 +58,6 @@ test("complete OCI API image runs without Cloudflare and survives a container re
             `KANNIN_STORAGE_ACCESS_KEY_ID=${Redacted.value(objects.accessKeyId)}`,
             "--env",
             `KANNIN_STORAGE_SECRET_ACCESS_KEY=${Redacted.value(objects.secretAccessKey)}`,
-            "--env",
-            `KANNIN_VECTOR_ENDPOINT=${vectors.endpoint}`,
-            "--env",
-            `KANNIN_VECTOR_COLLECTION=${vectors.collection}`,
             image,
           ]),
           (owned) =>
@@ -82,13 +76,14 @@ test("complete OCI API image runs without Cloudflare and survives a container re
           authorization: "Bearer oci-contract-token",
           "content-type": "application/json",
         };
+        const vector = [1, ...Array.from({ length: 767 }, () => 0)];
         const written = yield* Effect.tryPromise(() =>
           fetch(`${baseURL}/v1/namespaces/container/write`, {
             method: "POST",
             headers,
             body: JSON.stringify({
               requestId: "container-write",
-              upserts: [{ id: "one", text: "container durable state", attributes: {} }],
+              upserts: [{ id: "one", text: "container durable state", attributes: {}, vector }],
               deletes: [],
             }),
           }),
@@ -116,6 +111,26 @@ test("complete OCI API image runs without Cloudflare and survives a container re
         );
         expect(result.rows.map((row) => row.id)).toEqual(["one"]);
         expect(result.sequence).toBe(1);
+        const vectorResponse = yield* Effect.tryPromise(() =>
+          fetch(`${baseURL}/v1/namespaces/container/query`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              kind: "vector",
+              vector,
+              topK: 1,
+              filters: [],
+              minimumSequence: 1,
+            }),
+          }),
+        );
+        expect(vectorResponse.status).toBe(200);
+        const vectors = yield* Effect.tryPromise(() => vectorResponse.json()).pipe(
+          Effect.flatMap(Schema.decodeUnknownEffect(QueryResult)),
+        );
+        expect(vectors.consistency).toBe("strong");
+        expect(vectors.rows.map((row) => row.id)).toEqual(["one"]);
+        expect(vectors.rows[0]?.score).toBeCloseTo(1);
       }),
     ),
   );

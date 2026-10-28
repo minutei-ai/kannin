@@ -2,7 +2,6 @@ import { Config, Effect, Layer, Option, Redacted, Schedule, Schema } from "effec
 import { PortableServerConfig } from "../src/protocol";
 import { sha256 } from "../src/hash";
 import { s3ObjectStore } from "./s3-object-store";
-import { qdrantVectorStore } from "./qdrant-vector-store";
 import { portableApplication } from "./application";
 import { cdnCache, disabledCache } from "./cache/client";
 
@@ -31,23 +30,13 @@ export const serverConfig = Config.all({
       });
     }),
   ),
-  vectorStore: Config.all({
-    endpoint: Config.String("KANNIN_VECTOR_ENDPOINT"),
-    collection: Config.String("KANNIN_VECTOR_COLLECTION").pipe(
-      Config.withDefault("kannin_vectors"),
-    ),
-    dimensions: Config.succeed(768),
-    apiKey: Config.Redacted("KANNIN_VECTOR_API_KEY").pipe(Config.withDefault(Redacted.make(""))),
-  }),
 });
 
 export const servePortable = Effect.fn("kannin.servePortable")(function* (
   configuration: typeof PortableServerConfig.Type,
 ) {
   const config = yield* Schema.decodeEffect(PortableServerConfig)(configuration);
-  const context = yield* Layer.build(
-    Layer.merge(s3ObjectStore(config.objectStore), qdrantVectorStore(config.vectorStore)),
-  );
+  const context = yield* Layer.build(s3ObjectStore(config.objectStore));
   const module = yield* Effect.tryPromise(async () =>
     WebAssembly.compile(await Bun.file(config.wasmPath).arrayBuffer()),
   );
@@ -85,7 +74,7 @@ export const servePortable = Effect.fn("kannin.servePortable")(function* (
     port: server.port,
     host: config.host,
     engine: "rust-wasm-object-storage",
-    vectors: "qdrant",
+    vectors: "rust-wasm-object-storage",
   });
   return { server, app };
 });

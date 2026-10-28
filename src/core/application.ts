@@ -11,7 +11,6 @@ import {
   decodeVectorRebuildSnapshotForMigration,
 } from "../manifest";
 import {
-  Array as EffectArray,
   Cause,
   Clock,
   Effect,
@@ -41,7 +40,6 @@ import {
 } from "../../dist/wasm/raio_engine";
 import type { Snapshot, TextPlan } from "../protocol";
 import {
-  Attributes,
   Filter,
   StoredDocument,
   ErrorBody,
@@ -116,8 +114,6 @@ import {
   SegmentCacheProps,
 } from "../protocol";
 
-import { vectorMetadata } from "../vector-filters";
-
 import { snapshotFrameHeader, readSnapshotFrame } from "../snapshot";
 
 import type { Storage } from "./storage";
@@ -130,7 +126,6 @@ import type {
   ObjectBody,
   ObjectListOptions,
   ObjectCondition,
-  VectorPoint,
   JobBatch,
 } from "../platform";
 import type { ObjectVersion } from "../protocol";
@@ -1736,7 +1731,6 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
             const filters = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Array(Filter)))(
               input.filters,
             );
-            // Only one segment's filtered metadata and one vector frame are resident during the scan.
             for (const segment of root.segments.toReversed()) {
               const rows = yield* withDirectory(segment.key, segment.headerBytes, (directory) =>
                 Effect.gen(function* () {
@@ -2603,9 +2597,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
           status: 409,
           message: "Namespace reset during rebuild; start a new snapshot",
         });
-      const vectors: VectorPoint[] = [];
-      const removed: string[] = [];
-      const budget = { processed: 0 };
+      const budget = { processed: 0, validated: 0 };
       while (cursor.segment < saved.root.segments.length && budget.processed < 100) {
         const segment = saved.root.segments[cursor.segment];
         if (segment === undefined)
@@ -2636,7 +2628,6 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
             !location.document.vector ||
             location.document.revision !== metadata.revision
           ) {
-            removed.push(await vectorId(saved.root.vectorEpoch, metadata.id, metadata.revision));
             continue;
           }
           const document = await readDocument(
@@ -2648,29 +2639,23 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
           );
           if (document.vector === undefined)
             throw new Rejected({ status: 503, message: "Rebuild vector payload missing" });
-          vectors.push({
-            id: await vectorId(saved.root.vectorEpoch, document.id, document.revision),
-            values: [...document.vector],
-            namespace: saved.root.vectorEpoch,
-            metadata: {
-              id: document.id,
-              revision: document.revision,
-              ...(await Effect.runPromise(vectorMetadata(document.attributes, fields))),
-            },
-          });
+          if (document.id !== metadata.id || document.revision !== metadata.revision)
+            throw new Rejected({
+              status: 503,
+              message: "Rebuild vector identity differs from its directory",
+            });
+          budget.validated += 1;
         }
         if (cursor.row === rows.length) {
           cursor.segment += 1;
           cursor.row = 0;
         }
       }
-      if (removed.length > 0) await this.env.VECTORS.deleteByIds(removed);
-      if (vectors.length > 0) await this.env.VECTORS.upsert(vectors);
       const complete = cursor.segment === saved.root.segments.length;
       const result = {
         snapshot,
         ...cursor,
-        submitted: vectors.length,
+        submitted: budget.validated,
         complete,
       };
       if (complete) return Schema.encodeSync(VectorRebuildResult)({ ...result, snapshot: null });
@@ -2680,10 +2665,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
     private async synchronizeVectors() {
       const current = await this.root();
       const jobs = current.manifest.vectorJobs.slice(0, 16);
-      const vectors: VectorPoint[] = [];
-      const deletes: string[] = [];
       const completed = new Set<number>();
-      const fields = current.manifest.schema?.vectorFilterFields ?? [];
       for (const job of jobs) {
         const object = await this.env.STORAGE.get(job.log);
         if (object === null)
@@ -2691,10 +2673,6 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         const log = decodeLog(unpack(new Uint8Array(await object.arrayBuffer())));
         if (log.sequence !== job.sequence)
           throw new Rejected({ status: 503, message: "Vector log sequence mismatch" });
-        for (const id of log.vectorDeletes) {
-          deletes.push(id);
-          if (deletes.length === 100) await this.env.VECTORS.deleteByIds(deletes.splice(0));
-        }
         const candidates = log.write.upserts.filter((document) => document.vector !== undefined);
         if (log.vectorEpoch !== current.manifest.vectorEpoch || candidates.length === 0) {
           completed.add(job.sequence);
@@ -2704,28 +2682,40 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
           candidates.map((document) => document.id),
           current.manifest,
         );
-        for (const document of candidates)
+        for (const candidate of candidates) {
+          const location = live.get(candidate.id);
           if (
-            document.vector !== undefined &&
-            live.get(document.id)?.document.revision === log.sequence &&
-            live.get(document.id)?.document.vector === true
-          ) {
-            vectors.push({
-              id: await vectorId(log.vectorEpoch, document.id, log.sequence),
-              values: [...document.vector],
-              namespace: log.vectorEpoch,
-              metadata: {
-                id: document.id,
-                revision: log.sequence,
-                ...(await Effect.runPromise(vectorMetadata(document.attributes, fields))),
-              },
+            location === undefined ||
+            !location.document.vector ||
+            location.document.revision !== log.sequence
+          )
+            continue;
+          const document = await readDocument(
+            location.segment.key,
+            location.segment.headerBytes,
+            location.document.data,
+            location.segment.bytes,
+            location.vectorData,
+          );
+          const expected = candidate.vector;
+          const actual = document.vector;
+          if (
+            document.id !== candidate.id ||
+            document.revision !== log.sequence ||
+            expected === undefined ||
+            actual === undefined ||
+            actual.length !== expected.length ||
+            actual.some(
+              (value, index) => Math.fround(value) !== Math.fround(expected[index] ?? Number.NaN),
+            )
+          )
+            throw new Rejected({
+              status: 503,
+              message: "Canonical vector differs from its committed log",
             });
-            if (vectors.length === 100) await this.env.VECTORS.upsert(vectors.splice(0));
-          }
+        }
         completed.add(job.sequence);
       }
-      if (deletes.length > 0) await this.env.VECTORS.deleteByIds(deletes);
-      if (vectors.length > 0) await this.env.VECTORS.upsert(vectors);
       if (completed.size > 0)
         await this.commit(
           {
@@ -2736,7 +2726,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         );
       return Schema.encodeSync(VectorSyncResult)({
         submitted: completed.size,
-        visibility: "vectorize-eventual",
+        visibility: "strong",
       });
     }
 
@@ -3235,7 +3225,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
                 if (job === undefined) {
                   const completed = yield* Schema.encodeEffect(VectorSyncResult)({
                     submitted: 0,
-                    visibility: "vectorize-eventual",
+                    visibility: "strong",
                   });
                   return completed;
                 }

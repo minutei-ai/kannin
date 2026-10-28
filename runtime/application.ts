@@ -1,7 +1,6 @@
 import { Cause, Effect, Schema, Schedule, Semaphore } from "effect";
 import { timingSafeEqual } from "node:crypto";
 import { ObjectStore } from "../src/object-store";
-import { VectorStore } from "../src/vector-store";
 import { ObjectBucket } from "./object-bucket";
 import { createApplication } from "../src/core/application";
 import { createStorage } from "../src/core/storage";
@@ -23,9 +22,8 @@ const conflictMessage = "R2 manifest changed; retry the operation with the same 
 export const portableApplication = Effect.fn("kannin.portableApplication")(function* (
   options: PortableOptions,
 ) {
-  const run = Effect.runPromiseWith(yield* Effect.context<ObjectStore | VectorStore>());
+  const run = Effect.runPromiseWith(yield* Effect.context<ObjectStore>());
   const objects = yield* ObjectStore;
-  const vectors = yield* VectorStore;
   const bucket = new ObjectBucket(objects);
   const background = new Set<Promise<unknown>>();
   const active = { value: true };
@@ -103,11 +101,6 @@ export const portableApplication = Effect.fn("kannin.portableApplication")(funct
     API_TOKEN: options.token,
     STORAGE: bucket,
     STORAGE_CACHE_SCOPE: options.scope,
-    VECTORS: {
-      query: (values, input) => run(vectors.query(values, input)),
-      upsert: (points) => run(vectors.upsert(points)),
-      deleteByIds: (ids) => run(vectors.deleteByIds(ids)),
-    },
     VECTOR_JOBS: { send },
     INDEX_JOBS: { send },
   };
@@ -134,7 +127,7 @@ export const portableApplication = Effect.fn("kannin.portableApplication")(funct
     freshRoots: true,
     immutableIdentity: (digest) => `${digest}-${crypto.randomUUID()}`,
     engineName: "rust-wasm-object-storage",
-    vectorName: "qdrant",
+    vectorName: "rust-wasm-object-storage",
     waitUntil,
     equalBytes: (left, right) =>
       left.byteLength === right.byteLength &&

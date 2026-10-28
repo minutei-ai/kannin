@@ -199,7 +199,7 @@ test("Effect SDK performs native binding RPC with Worker and coordinator HTTP di
     Schema.decodeUnknownSync(VectorSyncResult)(
       await (await call({ namespace: "rpc", operation: "vector-sync" })).json(),
     ).visibility,
-  ).toBe("vectorize-eventual");
+  ).toBe("strong");
   const vectorResponse = await call({
     namespace: "rpc",
     operation: "query",

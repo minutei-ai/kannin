@@ -3,13 +3,12 @@ import { Effect, Layer, Schema } from "effect";
 import { portableApplication } from "../runtime/application";
 import { Metadata, QueryResult, WriteResult } from "../src/protocol";
 import { objectStoreFixtureLive } from "./object-store-fixture";
-import { vectorStoreFixture } from "./vector-store-fixture";
 
 const module = await WebAssembly.compile(
   await Bun.file(new URL("../dist/wasm/raio_engine_bg.wasm", import.meta.url)).arrayBuffer(),
 );
 const token = "portable-api-contract-token";
-const services = Layer.merge(objectStoreFixtureLive, vectorStoreFixture(768));
+const services = objectStoreFixtureLive;
 function request(path: string, body?: unknown) {
   const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
   if (body !== undefined)

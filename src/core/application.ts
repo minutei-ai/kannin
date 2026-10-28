@@ -41,6 +41,7 @@ import {
 import type { Snapshot, TextPlan, NativeVectorLocation } from "../protocol";
 import {
   Filter,
+  DEFAULT_VECTOR_DIMENSIONS,
   StoredDocument,
   ErrorBody,
   Log,
@@ -1821,6 +1822,9 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
     timings: Headers,
     executions?: TextExecutions,
   ) {
+    const dimensions = manifest.schema?.vectorDimensions ?? DEFAULT_VECTOR_DIMENSIONS;
+    if (input.kind !== "text" && input.vector.length !== dimensions)
+      throw new Rejected({ status: 400, message: `Vector dimension must be ${dimensions}` });
     if (manifest.sequence < (input.minimumSequence ?? 0))
       throw new Rejected({ status: 409, message: "Requested sequence is not committed" });
     const filterable = manifest.schema?.filterable ?? [];
@@ -2378,9 +2382,6 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         throw new Rejected({ status: 400, message: "Duplicate ids within a write" });
       if (input.reset !== true && input.schema === undefined && ids.length === 0)
         throw new Rejected({ status: 400, message: "Empty write" });
-      for (const document of input.upserts)
-        if (document.vector !== undefined && document.vector.length !== 768)
-          throw new Rejected({ status: 400, message: "Vector dimension must be 768" });
       const fingerprint = await sha256(Schema.encodeSync(Schema.fromJsonString(Write))(input));
       const current = await this.root();
       if (current.manifest.lastReceipt !== null)
@@ -2415,6 +2416,18 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         if (encodeSchema(input.schema) !== encodeSchema(current.manifest.schema))
           throw new Rejected({ status: 409, message: "Changing namespace schema requires reset" });
       }
+      const schema = input.schema ?? current.manifest.schema;
+      const dimensions = schema?.vectorDimensions ?? DEFAULT_VECTOR_DIMENSIONS;
+      if (
+        current.manifest.sequence > 0 &&
+        current.manifest.schema === undefined &&
+        dimensions !== DEFAULT_VECTOR_DIMENSIONS &&
+        input.reset !== true
+      )
+        throw new Rejected({ status: 409, message: "Changing vector dimensions requires reset" });
+      for (const document of input.upserts)
+        if (document.vector !== undefined && document.vector.length !== dimensions)
+          throw new Rejected({ status: 400, message: `Vector dimension must be ${dimensions}` });
       const prior = await locate(ids, current.manifest);
       const sequence = current.manifest.sequence + 1;
       const dead = new Map<string, number[]>();
@@ -2464,7 +2477,6 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
           removedFrequencies: Object.fromEntries(removedFrequencies),
         };
       });
-      const schema = input.schema ?? current.manifest.schema;
       const epoch = { value: current.manifest.vectorEpoch };
       if (input.schema !== undefined && current.manifest.schema === undefined)
         epoch.value = await sha256(`${current.manifest.vectorEpoch}\0schema\0${sequence}`);

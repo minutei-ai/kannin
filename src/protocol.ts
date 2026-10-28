@@ -48,7 +48,15 @@ export const VectorFilterFields = Schema.Array(FieldName).check(
     (fields) => new Set(fields).size === fields.length || "Duplicate indexed field",
   ),
 );
+const MIN_VECTOR_DIMENSIONS = 1;
+const MAX_VECTOR_DIMENSIONS = 4096;
+export const DEFAULT_VECTOR_DIMENSIONS = 768;
 export const NamespaceSchema = Schema.Struct({
+  vectorDimensions: Schema.optional(
+    Schema.Int.check(
+      Schema.isBetween({ minimum: MIN_VECTOR_DIMENSIONS, maximum: MAX_VECTOR_DIMENSIONS }),
+    ),
+  ),
   filterable: Schema.Array(FieldName).check(
     Schema.isMaxLength(64),
     Schema.makeFilter(
@@ -63,8 +71,6 @@ export const NamespaceSchema = Schema.Struct({
       "Vector filter fields must be filterable",
   ),
 );
-const MIN_VECTOR_DIMENSIONS = 1;
-const MAX_VECTOR_DIMENSIONS = 4096;
 export const Vector = Schema.Array(
   Schema.Finite.check(
     Schema.isBetween({ minimum: -3.4028234663852886e38, maximum: 3.4028234663852886e38 }),
@@ -140,14 +146,13 @@ const VectorQueryFields = {
   ...QueryFields,
   topK: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 50 })),
 };
-const QueryVector = Vector.check(Schema.isBetweenLength(768, 768));
 export const Query = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("text"), ...TextFields, ...QueryFields }),
-  Schema.Struct({ kind: Schema.Literal("vector"), vector: QueryVector, ...VectorQueryFields }),
+  Schema.Struct({ kind: Schema.Literal("vector"), vector: Vector, ...VectorQueryFields }),
   Schema.Struct({
     kind: Schema.Literal("hybrid"),
     ...TextFields,
-    vector: QueryVector,
+    vector: Vector,
     ...VectorQueryFields,
   }),
 ]);

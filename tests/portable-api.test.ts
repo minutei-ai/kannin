@@ -38,7 +38,10 @@ test("portable API persists native writes and strong queries across application 
           app.fetch(
             request(`/v1/namespaces/${namespace}/write`, {
               requestId: "first",
-              upserts: [{ id: "one", text: "portable search", attributes: { group: "a" } }],
+              schema: { filterable: [], vectorFilterFields: [], vectorDimensions: 2 },
+              upserts: [
+                { id: "one", text: "portable search", attributes: { group: "a" }, vector: [1, 0] },
+              ],
               deletes: [],
             }),
           ),
@@ -69,6 +72,24 @@ test("portable API persists native writes and strong queries across application 
           Effect.flatMap(Schema.decodeUnknownEffect(QueryResult)),
         );
         expect(query.rows.map((hit) => hit.id)).toEqual(["one"]);
+        const vectorResponse = yield* Effect.tryPromise(() =>
+          restarted.fetch(
+            request(`/v1/namespaces/${namespace}/query`, {
+              kind: "vector",
+              vector: [1, 0],
+              topK: 1,
+              filters: [],
+              minimumSequence: 1,
+            }),
+          ),
+        );
+        expect(vectorResponse.status).toBe(200);
+        const vectors = yield* Effect.tryPromise(() => vectorResponse.json()).pipe(
+          Effect.flatMap(Schema.decodeUnknownEffect(QueryResult)),
+        );
+        expect(vectors.rows.map((hit) => hit.id)).toEqual(["one"]);
+        expect(vectors.rows[0]?.score).toBeCloseTo(1);
+        expect(vectors.consistency).toBe("strong");
         const metadata = yield* Effect.tryPromise(() =>
           restarted.fetch(request(`/v1/namespaces/${namespace}/metadata`)),
         );
@@ -76,6 +97,7 @@ test("portable API persists native writes and strong queries across application 
           Effect.flatMap(Schema.decodeUnknownEffect(Metadata)),
         );
         expect(decoded.documents).toBe(1);
+        expect(decoded.schema?.vectorDimensions).toBe(2);
         const reply = yield* Effect.tryPromise(() =>
           restarted.binding.execute({ namespace, operation: "metadata" }),
         );
@@ -156,8 +178,12 @@ test("portable vector, hybrid, schema filters and maintenance share the canonica
         const app = yield* portableApplication({ token, scope: "portable-vectors", module }).pipe(
           Effect.provideContext(context),
         );
-        const vector = [1, ...Array.from({ length: 767 }, () => 0)];
-        const schema = { filterable: ["group"], vectorFilterFields: ["group"] };
+        const vector = [1, 0];
+        const schema = {
+          filterable: ["group"],
+          vectorFilterFields: ["group"],
+          vectorDimensions: 2,
+        };
         const initial = {
           requestId: "vector-first",
           schema,

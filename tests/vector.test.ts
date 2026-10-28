@@ -74,6 +74,94 @@ test("wrong query dimensions return 400 in empty and populated namespaces", asyn
   const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
   expect(result.rows.map((row) => row.id)).toEqual(["a"]);
   expect(result.sequence).toBe(1);
+  expect(
+    (
+      await request(worker, namespace, "write", {
+        requestId: "legacy-dimension-change",
+        schema: { ...schema, vectorDimensions: 2 },
+        upserts: [],
+        deletes: [],
+      })
+    ).status,
+  ).toBe(409);
+});
+
+test("configured vector dimensions survive canonical maintenance and reset without changing old receipts", async () => {
+  for (const dimensions of [1, 2, 4096]) {
+    const namespace = `custom-dimension-${dimensions}`;
+    const values = [1, ...Array.from({ length: dimensions - 1 }, () => 0)];
+    const initial = {
+      schema: { ...schema, vectorDimensions: dimensions },
+      requestId: "first",
+      upserts: [{ id: "a", text: "lexical", attributes: {}, vector: values }],
+      deletes: [],
+    };
+    expect((await request(worker, namespace, "write", initial)).status).toBe(200);
+    expect(
+      (
+        await request(worker, namespace, "write", {
+          requestId: "mixed-dimensions",
+          upserts: [
+            { id: "valid", text: "lexical", attributes: {}, vector: values },
+            { id: "invalid", text: "lexical", attributes: {}, vector: [...values, 0] },
+          ],
+          deletes: [],
+        })
+      ).status,
+    ).toBe(400);
+    expect(
+      (
+        await request(worker, namespace, "write", {
+          requestId: "second",
+          upserts: [{ id: "b", text: "lexical", attributes: {}, vector: values.map((v) => -v) }],
+          deletes: [],
+        })
+      ).status,
+    ).toBe(200);
+    for (const operation of ["compact", "vector-sync", "vector-rebuild"])
+      expect((await request(worker, namespace, operation, {})).status).toBe(200);
+    const bucket = await worker.getR2Bucket("STORAGE");
+    const stored = await bucket.get(`namespaces/${namespace}/root.json`);
+    if (stored === null) throw new Error("Missing configured root");
+    expect(decodeRoot(await stored.text()).schema?.vectorDimensions).toBe(dimensions);
+    for (const kind of ["vector", "hybrid"] as const) {
+      const response = await request(worker, namespace, "query", {
+        ...query(kind),
+        vector: values,
+      });
+      expect(response.status).toBe(200);
+      const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+      expect(result.rows.map((row) => row.id)).toEqual(["a", "b"]);
+      expect(result.consistency).toBe("strong");
+      expect(result.sequence).toBe(2);
+    }
+    const changed = dimensions === 1 ? 2 : 1;
+    const reset = {
+      schema: { ...schema, vectorDimensions: changed },
+      requestId: "changed",
+      upserts: [
+        {
+          id: "new",
+          text: "lexical",
+          attributes: {},
+          vector: [1, ...Array.from({ length: changed - 1 }, () => 0)],
+        },
+      ],
+      deletes: [],
+    };
+    expect((await request(worker, namespace, "write", reset)).status).toBe(409);
+    expect((await request(worker, namespace, "write", { ...reset, reset: true })).status).toBe(200);
+    expect(
+      (await request(worker, namespace, "query", { ...vectorQuery(), vector: values })).status,
+    ).toBe(400);
+    const replay = await request(worker, namespace, "write", initial);
+    expect(replay.status).toBe(200);
+    const current = Schema.decodeUnknownSync(Metadata)(
+      await (await request(worker, namespace, "metadata")).json(),
+    );
+    expect(current.sequence).toBe(3);
+    expect(current.schema?.vectorDimensions).toBe(changed);
+  }
 });
 
 test("canonical vector outbox survives corrupt log reads and retries", async () => {

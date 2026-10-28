@@ -186,7 +186,7 @@ test("hybrid combines lexical and vector ranking using RRF", async () => {
 });
 
 test("native metadata equality finds eligible vectors outside the unfiltered top fifty", async () => {
-  const upserts = Array.from({ length: 120 }, (_, index) => {
+  const upserts = Array.from({ length: 160 }, (_, index) => {
     const attributes = { group: "distractor", year: 2020 };
     const values = vector(1);
     if (index >= 100) {
@@ -196,18 +196,40 @@ test("native metadata equality finds eligible vectors outside the unfiltered top
     }
     return { id: String(index), text: "lexical", attributes, vector: values };
   });
-  await request(worker, "prefilter", "write", { schema, requestId: "seed", upserts, deletes: [] });
-  await request(worker, "prefilter", "vector-sync", {});
+  expect(
+    (
+      await request(worker, "prefilter", "write", {
+        schema,
+        requestId: "seed",
+        upserts,
+        deletes: [],
+      })
+    ).status,
+  ).toBe(200);
+  const unfiltered = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, "prefilter", "query", { ...vectorQuery(), topK: 50 })).json(),
+  );
+  expect(unfiltered.rows).toHaveLength(50);
+  expect(unfiltered.rows.every((row) => row.attributes.group === "distractor")).toBe(true);
   for (const filters of [
     [{ field: "group", op: "eq", value: "eligible" }],
     [{ field: "group", op: "in", value: ["eligible", "absent"] }],
-  ]) {
-    const response = await request(worker, "prefilter", "query", { ...vectorQuery(), filters });
-    expect(response.status).toBe(200);
-    const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
-    expect(result.rows.length).toBe(10);
-    expect(result.rows.every((row) => row.attributes.group === "eligible")).toBe(true);
-  }
+    [{ field: "group", op: "ne", value: "distractor" }],
+  ])
+    for (const topK of [10, 50]) {
+      const response = await request(worker, "prefilter", "query", {
+        ...vectorQuery(),
+        filters,
+        topK,
+      });
+      expect(response.status).toBe(200);
+      const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+      expect(result.consistency).toBe("strong");
+      expect(result.rows.map((row) => row.id)).toEqual(
+        Array.from({ length: topK }, (_, index) => String(100 + index)),
+      );
+      expect(result.rows.every((row) => row.attributes.group === "eligible")).toBe(true);
+    }
 });
 
 test("typed scalar hashes preserve null, booleans and strings beyond sixty-four UTF8 bytes", async () => {

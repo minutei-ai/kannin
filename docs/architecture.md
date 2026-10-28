@@ -233,7 +233,7 @@ Writers and compaction prepare eligible directory frames alongside correlated su
 
 The [search research reference](search-research.md) owns the dated Turbopuffer article/documentation inventory, open-source comparisons and local experiment priorities. Provider performance claims and native-library benchmarks are research inputs, not Kannin measurements.
 
-The next local priority is reducing cold manifest bytes and unnecessary allocation during segment opening, then evaluating bounded batched scoring and posting codecs. Preserve corruption checks, memory admission, exact filtered results and cold recovery when derived artifacts are absent. R2 remains canonical and Vectorize remains the ANN owner; no research item changes a query contract without its own implementation and validation.
+The next local priority is reducing cold manifest bytes and unnecessary allocation during segment opening, then evaluating bounded batched scoring and posting codecs. Preserve corruption checks, memory admission, exact filtered results and cold recovery when derived artifacts are absent. S3/R2 remains canonical and the Rust engine owns vector search; no research item changes a query contract without its own implementation and validation.
 
 ### Exact uniform term scoring
 

@@ -1,8 +1,9 @@
 import { expect, test } from "bun:test";
-import { Cause, Deferred, Effect, Exit, Layer, Option, Stream } from "effect";
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Option, Stream } from "effect";
 import type { Scope } from "effect";
 import { ObjectBucket } from "../runtime/object-bucket";
 import { ObjectStore } from "../src/object-store";
+import { ObjectStoreFailure } from "../src/protocol";
 import { objectStoreFixtureLive } from "./object-store-fixture";
 import { checkObjectStore } from "../tooling/object-store-conformance";
 
@@ -255,6 +256,47 @@ test("shared storage probe checks real S3 semantics and cleans up after a reject
       );
       expect(Exit.isFailure(rejected)).toBe(true);
       expect(removed).toEqual([]);
+      const entered = yield* Deferred.make<void>();
+      const blocked = ObjectStore.of({
+        ...store,
+        write: (key, bytes, condition) =>
+          store.write(key, bytes, condition).pipe(
+            Effect.tap(() => {
+              if (key.endsWith("/x/../a"))
+                return Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never));
+              return Effect.void;
+            }),
+          ),
+      });
+      const running = yield* checkObjectStore().pipe(
+        Effect.provideService(ObjectStore, blocked),
+        Effect.forkScoped,
+      );
+      yield* Deferred.await(entered).pipe(Effect.timeout("5 seconds"));
+      yield* Fiber.interrupt(running);
+      expect((yield* store.list({ prefix: "kannin-conformance/" })).objects).toEqual([]);
+      const lostReply = new Error("Initial conditional reply was lost after commit");
+      const expected: { value: ObjectStoreFailure | undefined } = { value: undefined };
+      const ambiguous = ObjectStore.of({
+        ...store,
+        write: (key, bytes, condition) =>
+          store.write(key, bytes, condition).pipe(
+            Effect.flatMap((version) => {
+              if (condition?.customMetadata?.probeOwner === undefined)
+                return Effect.succeed(version);
+              const failure = new ObjectStoreFailure({ operation: "write", key, cause: lostReply });
+              expected.value = failure;
+              return Effect.fail(failure);
+            }),
+          ),
+      });
+      const uncertain = yield* checkObjectStore().pipe(
+        Effect.provideService(ObjectStore, ambiguous),
+        Effect.exit,
+      );
+      if (Exit.isSuccess(uncertain)) throw new Error("Ambiguous create unexpectedly verified");
+      expect(Option.getOrUndefined(Cause.findErrorOption(uncertain.cause))).toBe(expected.value);
+      expect((yield* store.list({ prefix: "kannin-conformance/" })).objects).toEqual([]);
     }),
   );
 }, 30000);

@@ -1,4 +1,4 @@
-import { Cause, Clock, Effect, Option, Stream } from "effect";
+import { Cause, Clock, Effect, Exit, Fiber, Option, Stream } from "effect";
 import { ObjectStore } from "../src/object-store";
 
 function verify(condition: boolean, step: string) {
@@ -24,6 +24,21 @@ const readText = Effect.fn("kannin.storageProbe.read")(function* (key: string) {
   };
 });
 
+const removeProbeObject = Effect.fn("kannin.storageProbe.cleanup")(function* (
+  key: string,
+  owner?: string,
+) {
+  const store = yield* ObjectStore;
+  const cleanup = yield* Effect.gen(function* () {
+    if (owner !== undefined) {
+      const current = yield* store.head(key);
+      if (Option.isNone(current) || current.value.customMetadata.probeOwner !== owner) return;
+    }
+    yield* store.remove(key);
+  }).pipe(Effect.timeout("5 seconds"), Effect.forkDetach({ uninterruptible: false }));
+  yield* Fiber.join(cleanup).pipe(Effect.orDie);
+});
+
 export const checkObjectStore = Effect.fn("kannin.storageProbe")(function* () {
   const store = yield* ObjectStore;
   const prefix = `kannin-conformance/${crypto.randomUUID()}/`;
@@ -31,18 +46,38 @@ export const checkObjectStore = Effect.fn("kannin.storageProbe")(function* () {
   const metadataKey = `${prefix}b`;
   const opaqueKey = `${prefix}x/../a`;
   const encoder = new TextEncoder();
+  const owner = crypto.randomUUID();
   const result = yield* Effect.scoped(
     Effect.gen(function* () {
-      const removeOwned = (owned: string) =>
-        store.remove(owned).pipe(Effect.interruptible, Effect.timeout("5 seconds"), Effect.orDie);
-      const initial = yield* Effect.acquireRelease(
-        store
-          .write(key, encoder.encode("initial"), { ifNoneMatch: "*" })
-          .pipe(Effect.flatMap((value) => present(value, "conditional create"))),
-        () => removeOwned(key),
+      const claim = { cleanup: false, ambiguous: false };
+      yield* Effect.addFinalizer(() => {
+        if (!claim.cleanup) return Effect.void;
+        if (claim.ambiguous) return removeProbeObject(key, owner);
+        return removeProbeObject(key);
+      });
+      const initial = yield* Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const outcome = yield* restore(
+            store
+              .write(key, encoder.encode("initial"), {
+                ifNoneMatch: "*",
+                customMetadata: { probeOwner: owner },
+              })
+              .pipe(Effect.timeout("5 seconds")),
+          ).pipe(Effect.exit);
+          if (Exit.isFailure(outcome)) {
+            claim.cleanup = true;
+            claim.ambiguous = true;
+            return yield* Effect.failCause(outcome.cause);
+          }
+          if (Option.isNone(outcome.value))
+            return yield* present(outcome.value, "conditional create");
+          claim.cleanup = true;
+          return outcome.value.value;
+        }),
       );
       for (const owned of [metadataKey, opaqueKey])
-        yield* Effect.addFinalizer(() => removeOwned(owned));
+        yield* Effect.addFinalizer(() => removeProbeObject(owned));
       const duplicate = yield* store.write(key, encoder.encode("ignored"), { ifNoneMatch: "*" });
       yield* verify(Option.isNone(duplicate), "ifNoneMatch rejected an existing object");
       const stale = yield* store.write(key, encoder.encode("ignored"), { ifMatch: '"stale"' });
@@ -69,15 +104,13 @@ export const checkObjectStore = Effect.fn("kannin.storageProbe")(function* () {
       const range = yield* store
         .read(key, { range: { offset: 1, length: 3 } })
         .pipe(Effect.flatMap((value) => present(value, "range")));
+      const rangeText = yield* Stream.mkString(Stream.decodeText(range.body));
       yield* verify(
         range.metadata.size === encoder.encode(winner.text).byteLength &&
           range.metadata.etag === committed.etag,
         "range retains full object identity",
       );
-      yield* verify(
-        (yield* Stream.mkString(Stream.decodeText(range.body))) === winner.text.slice(1, 4),
-        "range bytes",
-      );
+      yield* verify(rangeText === winner.text.slice(1, 4), "range bytes");
       const metadata = {
         source: "ação 日本語",
         expiresAt: String((yield* Clock.currentTimeMillis) + 60000),
@@ -123,7 +156,7 @@ export const checkObjectStore = Effect.fn("kannin.storageProbe")(function* () {
       return { prefix, conditionalWriters: winners.length, keys: 3 };
     }).pipe(Effect.timeout("30 seconds")),
   );
-  const remaining = yield* store.list({ prefix, limit: 1 });
+  const remaining = yield* store.list({ prefix, limit: 1 }).pipe(Effect.timeout("5 seconds"));
   yield* verify(
     remaining.objects.length === 0 && !remaining.truncated,
     "owned probe objects cleaned up",

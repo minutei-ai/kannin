@@ -21,7 +21,7 @@ const vector = (x: number, y = 0) => [x, y, ...Array.from({ length: 766 }, () =>
 const query = (kind: "vector" | "hybrid" = "vector") => ({
   kind,
   vector: vector(1),
-  text: "lexical",
+  ...(kind === "hybrid" && { text: "lexical" }),
   topK: 10,
   filters: [],
 });

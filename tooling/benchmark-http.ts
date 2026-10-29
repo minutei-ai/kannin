@@ -67,7 +67,7 @@ export function benchmarkHttpApi<E, R>(
     for (const ordinal of Array.from({ length: batches }, (_, index) => index)) {
       const documents = corpus(ordinal * 500, config.documents);
       corpusHash.update(JSON.stringify(documents));
-      const input = Schema.decodeSync(Write)(write(documents));
+      const input = yield* Schema.decodeEffect(Write)(write(documents));
       const encoded = yield* post(config, "write", encodeWrite(input));
       const acknowledged = yield* Schema.decodeEffect(Schema.fromJsonString(WriteResult))(encoded);
       if (acknowledged.sequence !== ordinal + 1 || acknowledged.requestId !== input.requestId)
@@ -78,7 +78,7 @@ export function benchmarkHttpApi<E, R>(
     const ingestMs = performance.now() - ingestion;
     const reports = [];
     for (const [name, selected] of benchmarkQueries) {
-      const input = Schema.decodeUnknownSync(Query, { onExcessProperty: "error" })({
+      const input = yield* Schema.decodeUnknownEffect(Query, { onExcessProperty: "error" })({
         ...selected,
         consistency: "strong",
         minimumSequence: batches,

@@ -11,17 +11,18 @@ test("a blocked query preserves its captured root while writes and reads progres
   const worker = fixture.worker;
   await using cleanup = new AsyncDisposableStack();
   const entered = Promise.withResolvers<void>();
-  const release = Promise.withResolvers<Response>();
+  const release = Promise.withResolvers<void>();
   const gate = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
-    fetch() {
+    async fetch() {
       entered.resolve();
-      return release.promise;
+      await release.promise;
+      return new Response("released");
     },
   });
   cleanup.defer(() => gate.stop(true));
-  cleanup.defer(() => release.resolve(new Response("released")));
+  cleanup.defer(() => release.resolve());
   const namespace = "query-overlap";
   const vector = [1, ...Array.from({ length: 767 }, () => 0)];
   for (const index of [0, 1, 2])
@@ -65,7 +66,7 @@ test("a blocked query preserves its captured root while writes and reads progres
     Effect.tryPromise(() => mutation).pipe(Effect.timeoutOption("2 seconds")),
   );
   if (Option.isNone(progress)) {
-    release.resolve(new Response("released"));
+    release.resolve();
     await blocked;
     await mutation;
   }
@@ -99,7 +100,7 @@ test("a blocked query preserves its captured root while writes and reads progres
   expect(collection.deleted).toBe(0);
   expect(collection.pinned).toBe(6);
   for (const key of capturedKeys) expect(await bucket.head(key)).not.toBeNull();
-  release.resolve(new Response("released"));
+  release.resolve();
   const captured = Schema.decodeUnknownSync(QueryResult)(await (await blocked).json());
   expect(captured.sequence).toBe(3);
   expect(captured.rows.map((row) => row.id)).toEqual(["0", "1", "2"]);

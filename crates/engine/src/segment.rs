@@ -8278,10 +8278,10 @@ mod query_document_projection_tests {
 
     fn document(vector: Option<Vec<f32>>) -> Document {
         Document::native(
-            "row-1".into(),
+            "row-1",
             7,
-            "title".into(),
-            "body".into(),
+            "title",
+            "body",
             BTreeMap::from([("field".into(), json!("value"))]),
             vector,
         )
@@ -8588,7 +8588,7 @@ mod filter_cache_tests {
                     format!("{index}"),
                     1,
                     String::new(),
-                    "target".into(),
+                    "target",
                     std::collections::BTreeMap::new(),
                     None,
                 )
@@ -9157,7 +9157,7 @@ mod frequency_tests {
                     Document::native(
                         format!("{index:05}"),
                         0,
-                        "beta alpha".into(),
+                        "beta alpha",
                         "alpha beta alpha ".repeat(repetitions),
                         BTreeMap::from([("group".into(), json!(index % 4))]),
                         None,
@@ -9331,7 +9331,7 @@ mod frequency_tests {
                     format!("{index:05}"),
                     0,
                     String::new(),
-                    "alpha beta alpha".into(),
+                    "alpha beta alpha",
                     BTreeMap::from([("group".into(), json!(index % 8))]),
                     None,
                 )
@@ -10514,8 +10514,8 @@ mod dictionary_frames_tests {
                             Document::native(
                                 format!("ação-{i:06}😀"),
                                 u64::MAX,
-                                "cloudflare rust".into(),
-                                "cloudflare rust search".into(),
+                                "cloudflare rust",
+                                "cloudflare rust search",
                                 BTreeMap::from([
                                     ("group".into(), serde_json::json!(i % cardinality)),
                                     ("nested".into(), serde_json::json!([null, true, "😀"])),
@@ -10805,8 +10805,8 @@ mod common_frame_validation_tests {
                     Document::native(
                         format!("row{value:04}"),
                         1,
-                        "common term".into(),
-                        "common term common".into(),
+                        "common term",
+                        "common term common",
                         BTreeMap::new(),
                         None,
                     )
@@ -10990,7 +10990,7 @@ mod selected_hot_posting_tests {
                     Document::native(
                         format!("row{index:04}"),
                         1,
-                        "common".into(),
+                        "common",
                         "dense ".repeat(512),
                         BTreeMap::new(),
                         None,
@@ -11081,8 +11081,8 @@ mod columnar_v2_tests {
             Document::native(
                 format!("row-{index}"),
                 7,
-                "ação 日本語".into(),
-                "cloudflare rust cloudflare".into(),
+                "ação 日本語",
+                "cloudflare rust cloudflare",
                 BTreeMap::from([
                     ("tiny".into(), serde_json::json!(1e-307)),
                     ("max".into(), serde_json::json!(3.402_823_466_385_288_6e38)),
@@ -11294,8 +11294,8 @@ mod columnar_v2_tests {
                 Document::native(
                     format!("row-{index:03}"),
                     u64::from(index),
-                    "rust".into(),
-                    "cloudflare rust".into(),
+                    "rust",
+                    "cloudflare rust",
                     BTreeMap::new(),
                     (index % 3 != 1).then_some(vec![f32::from(index), 0.5]),
                 )

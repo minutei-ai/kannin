@@ -10,7 +10,7 @@ fn common_directory_matches_full_positional_search_and_rejects_uncovered_terms()
                 Document::native(
                     format!("row{index:04}"),
                     u64::from(index),
-                    "cloudflare rust".into(),
+                    "cloudflare rust",
                     format!(
                         "{} unique{index}",
                         "rust cloudflare rust ".repeat(1 + (index % 5) as usize)
@@ -103,7 +103,7 @@ fn covering_common_headers_keep_uncached_terms_in_remaining_spans()
                 Document::native(
                     format!("row{index:04}"),
                     1,
-                    "common dense".into(),
+                    "common dense",
                     "dense ".repeat(512),
                     BTreeMap::from([("group".into(), serde_json::json!(index % 2))]),
                     None,

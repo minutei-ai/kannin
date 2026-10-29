@@ -2,14 +2,7 @@ use raio_engine::segment::{self, Document, Filter, Header, Search, Statistics};
 use std::collections::{BTreeMap, BTreeSet};
 
 fn document(id: impl Into<String>, text: impl Into<String>) -> Document {
-    Document::native(
-        id.into(),
-        0,
-        String::new(),
-        text.into(),
-        BTreeMap::new(),
-        None,
-    )
+    Document::native(id, 0, String::new(), text, BTreeMap::new(), None)
 }
 
 fn role_text<'a>(

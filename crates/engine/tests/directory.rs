@@ -22,7 +22,7 @@ fn directory_budget_is_exact_and_unicode_and_u64_values_are_lossless()
                 Document::native(
                     format!("ação{index:04}😀"),
                     u64::MAX,
-                    "日本語 busca".into(),
+                    "日本語 busca",
                     format!("rust busca unique{index}"),
                     BTreeMap::from([
                         ("escape\nkey".into(), serde_json::json!("\0á😀")),

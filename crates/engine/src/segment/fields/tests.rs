@@ -1119,6 +1119,14 @@ fn tombstones_match_physical_removal_with_explicit_and_derived_statistics() -> R
         local_field_statistics(&removed, &fields, "red fox", "any", &[])?
     );
     assert_eq!(derived.documents, 37);
+    assert_eq!(
+        scored(&full, &tombstoned(&fields, &dead, Some(&derived)))?,
+        scored(&removed, &query(&fields, "red fox", Some(&derived)))?
+    );
+    assert_eq!(
+        scored(&full, &tombstoned(&fields, &dead, Some(&derived)))?,
+        scored(&full, &tombstoned(&fields, &dead, None))?
+    );
     let global = local_field_statistics(&full, &fields, "red fox", "any", &[])?;
     assert_eq!(global.documents, 40);
     let live = scored(&full, &tombstoned(&fields, &dead, Some(&global)))?;

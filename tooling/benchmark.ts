@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { availableParallelism, cpus } from "node:os";
 import { Schema } from "effect";
-import { QueryResult, Health, Row } from "../src/protocol";
+import { Query, QueryResult, Health, Row } from "../src/protocol";
 import { request, startWorker, write } from "../tests/harness";
 import { corpus } from "./corpus";
 import { benchmarkQueries } from "./benchmark-queries";
@@ -34,10 +34,11 @@ for (const offset of Array.from({ length: Math.ceil(size / 500) }, (_, ordinal) 
 const ingestMs = performance.now() - ingestion;
 const reports = [];
 const baselines = new Map<string, string>();
+const encodeQuery = Schema.encodeSync(Schema.fromJsonString(Query));
 
 for (const consistency of ["strong", "edge-eventual"] as const)
   for (const [name, selected] of benchmarkQueries) {
-    const query = { ...selected, consistency };
+    const query = { ...selected, consistency, minimumSequence: Math.ceil(size / 500) };
     for (const _warmup of Array.from({ length: 5 }, (_, ordinal) => ordinal)) {
       const response = await request(worker, "benchmark", "query", query);
       if (!response.ok) throw new Error(`Warmup failed ${response.status}`);
@@ -61,10 +62,14 @@ for (const consistency of ["strong", "edge-eventual"] as const)
         throw new Error("Benchmark ranking changed across requests or consistency modes");
       samples.push(elapsed);
     }
+    const baseline = baselines.get(name);
+    if (baseline === undefined) throw new Error("Missing verified benchmark rows");
     const ordered = [...samples].sort((a, b) => a - b);
     reports.push({
       name,
       consistency,
+      querySha256: Bun.CryptoHasher.hash("sha256", encodeQuery(query), "hex"),
+      rowsSha256: Bun.CryptoHasher.hash("sha256", baseline, "hex"),
       p50: ordered[24],
       p95: ordered[47],
       p99: ordered[49],

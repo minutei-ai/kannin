@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { availableParallelism, cpus, tmpdir } from "node:os";
 import { join } from "node:path";
 import { Schema } from "effect";
-import { QueryResult, Row } from "../src/protocol";
+import { Query, QueryResult, Row } from "../src/protocol";
 import { request, startWorker, write } from "../tests/harness";
 import { benchmarkQueries } from "./benchmark-queries";
 import { corpus } from "./corpus";
@@ -18,6 +18,7 @@ await using cleanup = new AsyncDisposableStack();
 const persistence = await mkdtemp(join(tmpdir(), "kannin-process-cold-"));
 cleanup.defer(() => rm(persistence, { recursive: true, force: true }));
 const encodeRows = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Row)));
+const encodeQuery = Schema.encodeSync(Schema.fromJsonString(Query));
 const corpusHash = createHash("sha256");
 const batches = Math.ceil(size / 500);
 const ingestion = performance.now();
@@ -36,6 +37,7 @@ await ingestCleanup.disposeAsync();
 
 const reports = [];
 for (const [name, selected] of benchmarkQueries) {
+  const input = { ...selected, consistency: "strong" as const, minimumSequence: batches };
   const samples = [];
   const baselines = new Set<string>();
   for (const repetition of Array.from({ length: repetitions }, (_, ordinal) => ordinal)) {
@@ -45,11 +47,7 @@ for (const [name, selected] of benchmarkQueries) {
     sampleCleanup.defer(() => worker.dispose());
     const startupMs = performance.now() - starting;
     const started = performance.now();
-    const response = await request(worker, "benchmark", "query", {
-      ...selected,
-      consistency: "strong",
-      minimumSequence: batches,
-    });
+    const response = await request(worker, "benchmark", "query", input);
     if (!response.ok)
       throw new Error(`Cold query failed: ${response.status} ${await response.text()}`);
     const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
@@ -61,7 +59,15 @@ for (const [name, selected] of benchmarkQueries) {
     if (baselines.size !== 1) throw new Error("Cold query ranking changed across restarts");
     samples.push({ repetition, startupMs, readMs });
   }
-  reports.push({ name, consistency: "strong", samples });
+  const baseline = baselines.values().next().value;
+  if (baseline === undefined) throw new Error("Missing verified cold benchmark rows");
+  reports.push({
+    name,
+    consistency: "strong",
+    querySha256: Bun.CryptoHasher.hash("sha256", encodeQuery(input), "hex"),
+    rowsSha256: Bun.CryptoHasher.hash("sha256", baseline, "hex"),
+    samples,
+  });
 }
 const bundleSha256 = Bun.CryptoHasher.hash(
   "sha256",

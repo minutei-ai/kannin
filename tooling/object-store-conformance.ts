@@ -9,10 +9,14 @@ function verify(condition: boolean, step: string) {
 }
 
 function present<A>(value: Option.Option<A>, step: string) {
-  return Option.match(value, {
-    onNone: () => Effect.fail(new Cause.UnknownError(new Error(`Missing probe object: ${step}`))),
-    onSome: Effect.succeed,
-  });
+  return Effect.fromOption(
+    value,
+    () => new Cause.UnknownError(new Error(`Missing probe object: ${step}`)),
+  );
+}
+
+function randomProbeIdentity() {
+  return crypto.randomUUID();
 }
 
 const readText = Effect.fn("kannin.storageProbe.read")(function* (key: string) {
@@ -41,12 +45,12 @@ const removeProbeObject = Effect.fn("kannin.storageProbe.cleanup")(function* (
 
 export const checkObjectStore = Effect.fn("kannin.storageProbe")(function* () {
   const store = yield* ObjectStore;
-  const prefix = `kannin-conformance/${crypto.randomUUID()}/`;
+  const prefix = `kannin-conformance/${yield* Effect.sync(randomProbeIdentity)}/`;
   const key = `${prefix}a`;
   const metadataKey = `${prefix}b`;
   const opaqueKey = `${prefix}x/../a`;
   const encoder = new TextEncoder();
-  const owner = crypto.randomUUID();
+  const owner = yield* Effect.sync(randomProbeIdentity);
   const result = yield* Effect.scoped(
     Effect.gen(function* () {
       const claim = { cleanup: false, ambiguous: false };
@@ -148,7 +152,7 @@ export const checkObjectStore = Effect.fn("kannin.storageProbe")(function* () {
         "continuation preserves opaque keys",
       );
       yield* verify(
-        second.objects[0]?.customMetadata.expiresAt === metadata.expiresAt,
+        second.objects[0]?.customMetadata?.expiresAt === metadata.expiresAt,
         "listed checkpoint metadata",
       );
       yield* store.remove(metadataKey);

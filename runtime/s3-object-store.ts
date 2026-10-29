@@ -7,7 +7,7 @@ import {
   DeleteObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
-import { Effect, Layer, Option, Redacted, Schema, Stream } from "effect";
+import { Effect, Layer, Option, Redacted, Schedule, Schema, Stream } from "effect";
 import { ObjectStore } from "../src/object-store";
 import {
   ObjectKey,
@@ -33,6 +33,12 @@ function logicalKey(key: string) {
 const preconditionFailed = Schema.is(
   Schema.Struct({
     $metadata: Schema.Struct({ httpStatusCode: Schema.Literal(412) }),
+  }),
+);
+const conditionalConflict = Schema.is(
+  Schema.Struct({
+    name: Schema.Literal("ConditionalRequestConflict"),
+    $metadata: Schema.Struct({ httpStatusCode: Schema.Literal(409) }),
   }),
 );
 const missingHead = Schema.is(
@@ -312,6 +318,13 @@ export const s3ObjectStore = (config: typeof S3StoreConfig.Type) =>
               try: (signal) => client.send(request, { abortSignal: signal }),
               catch: (cause) => new ObjectStoreFailure({ operation: "write", key, cause }),
             }).pipe(
+              Effect.retry({
+                times: 2,
+                schedule: Schedule.spaced("100 millis"),
+                while: (failure) =>
+                  (onlyIf.ifMatch !== undefined || onlyIf.ifNoneMatch !== undefined) &&
+                  conditionalConflict(failure.cause),
+              }),
               Effect.flatMap((result) =>
                 Schema.decodeUnknownEffect(ObjectVersion)({ etag: result.ETag }),
               ),

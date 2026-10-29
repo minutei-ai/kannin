@@ -15,19 +15,18 @@ test("workerd preserves uint64 IDs and applies filters and tombstones before eve
     requestId: "seed",
     idType: "uint",
     schema: { filterable: ["group"], vectorFilterFields: ["group"], vectorDimensions: 2 },
-    upserts: ["18446744073709551615", "10", "2"].map((value) => ({
+    upserts: [
+      { value: "0", group: "excluded" },
+      { value: "18446744073709551615", group: "selected" },
+      { value: "10", group: "selected" },
+      { value: "2", group: "selected" },
+    ].map(({ value, group }) => ({
       id: id(value),
       roles: { title: "", text: "identity" },
-      attributes: { group: "selected" },
+      attributes: { group },
       vector: [1, 0],
     })),
     deletes: [],
-  };
-  write.upserts[0] = {
-    id: id("18446744073709551615"),
-    roles: { title: "", text: "identity" },
-    attributes: { group: "excluded" },
-    vector: [1, 0],
   };
   const response = await request(worker, namespace, "write", write);
   expect(response.status).toBe(200);
@@ -40,13 +39,17 @@ test("workerd preserves uint64 IDs and applies filters and tombstones before eve
   ]) {
     const selected = await request(worker, namespace, "query", {
       ...query,
-      topK: 2,
+      topK: 3,
       filters: [{ field: "group", op: "eq", value: "selected" }],
       minimumSequence: 1,
     });
     expect(selected.status).toBe(200);
     const result = Schema.decodeUnknownSync(QueryResult)(await selected.json());
-    expect(result.rows.map((row) => row.id)).toEqual([id("2"), id("10")]);
+    expect(result.rows.map((row) => row.id)).toEqual([
+      id("2"),
+      id("10"),
+      id("18446744073709551615"),
+    ]);
   }
   const removed = await request(worker, namespace, "write", {
     kind: "canonical",

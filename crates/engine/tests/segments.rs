@@ -701,8 +701,8 @@ fn compressed_directories_preserve_headers_and_reject_frame_corruption()
     let compact = miniz_oxide::inflate::decompress_to_vec_zlib(&encoded[20..])
         .map_err(|cause| cause.to_string())?;
     let mut payload = compact;
-    assert_eq!(payload.first(), Some(&3));
-    payload[0] = 4;
+    assert_eq!(payload.first(), Some(&4));
+    payload[0] = 5;
     let mut forged = encoded[..12].to_vec();
     forged.extend_from_slice(&u32::try_from(payload.len())?.to_le_bytes());
     let mut checksum = crc32fast::Hasher::new();

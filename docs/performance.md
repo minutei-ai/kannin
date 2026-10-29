@@ -18,6 +18,8 @@ The separate `Measure validated runtime` workflow accepts a successful `Check` r
 
 `tooling/verify-benchmarks.ts` rejects reports with different corpus, engine WASM, acknowledged sequence, query hashes or exact row/score hashes. It requires every strong benchmark query exactly once; duplicated or omitted cases fail. The measurement workflow runs this integrity check before retaining successful reports. Matching these fields establishes workload/result integrity only; equivalent resource budgets and cache phases must still be checked separately before comparing timings.
 
+The prepared Docker driver reuses the OCI API image, S3 fixture and Varnish fixture. It builds images before starting the disposable backend, so image pulls cannot consume that backend's bounded lifetime. Its API, S3 and CDN containers have explicit limits; workerd currently inherits runner limits. Reports identify this difference. Matching output hashes alone does not establish a fair resource-budget comparison. Docker restarts measure shutdown plus readiness separately from read latency; that duration is not interchangeable with workerd startup time. Docker execution still awaits fixture integration and validation.
+
 `RAIO_BENCH_COLD_SAMPLES` accepts 1–20. The corpus size matches the warm driver. Comparable Docker/workerd cold and warm measurements and hosted Railway validation remain delivery gates.
 
 ## Historical deployed BM25 comparison

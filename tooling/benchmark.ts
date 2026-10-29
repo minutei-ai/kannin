@@ -92,6 +92,8 @@ console.log(
       runtime: "local-workerd",
       cpu: cpus()[0]?.model,
       availableParallelism: availableParallelism(),
+      resourceConditions:
+        "workerd and R2 emulator inherit runner limits; no per-service CPU or memory cap; resource equivalence with containers not established",
       bun: Bun.version,
       bundleSha256,
       wasmSha256,

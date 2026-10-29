@@ -1,10 +1,10 @@
 import { encodeCanonicalDocuments } from "./segment-fixture";
+import { emptyStoredTermFixture, mutateStoredHeaderFixture } from "./stored-header-fixture";
 import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { crc32 } from "node:zlib";
 import { SegmentHeader } from "../src/protocol";
 import { startWorker } from "./harness";
 import {
@@ -170,25 +170,12 @@ test("hot metadata can reject large directories without lowering the forty-MiB v
   using segment = new Segment(
     encodeCanonicalDocuments([{ id: "a", text: "alpha", attributes: {} }]),
   );
-  const original = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
-  const json = new TextEncoder().encode(
-    JSON.stringify([
-      original.version,
-      original.documents,
-      Object.fromEntries(Array.from({ length: 840000 }, (_, index) => [String(index), [0, []]])),
-      original.total_title_length,
-      original.total_body_length,
-      original.metadata_end,
-      original.vector_end,
-      original.vector_ranges,
-    ]),
-  );
-  const frame = new Uint8Array(16 + json.byteLength);
-  frame.set(segment.bytes().subarray(0, 8));
-  const view = new DataView(frame.buffer);
-  view.setUint32(8, json.byteLength, true);
-  view.setUint32(12, crc32(json), true);
-  frame.set(json, 16);
+  const frame = mutateStoredHeaderFixture(segment.bytes(), {
+    terms: () =>
+      Object.fromEntries(
+        Array.from({ length: 840000 }, (_, index) => [String(index), emptyStoredTermFixture]),
+      ),
+  });
   expect(frame.byteLength).toBeLessThan(16 * 1024 * 1024);
   const bucket = await worker.getR2Bucket("STORAGE");
   const hotKey = key.replace(".rsix", "-hot.rsix");
@@ -262,26 +249,17 @@ test("repeated directory scans retain a hot subset when the namespace exceeds ad
   using segment = new Segment(
     encodeCanonicalDocuments([{ id: "a", text: "alpha", attributes: {} }]),
   );
-  const original = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
-  const document = original.documents[0];
-  if (document === undefined) throw new Error("Missing header fixture row");
-  const json = new TextEncoder().encode(
-    Schema.encodeSync(Schema.fromJsonString(SegmentHeader))({
-      ...original,
-      documents: [
-        {
-          ...document,
-          attributes: { entropy: Schema.encodeSync(Schema.Uint8ArrayFromBase64)(entropy) },
-        },
-      ],
-    }),
-  );
-  const frame = new Uint8Array(16 + json.byteLength);
-  frame.set(segment.bytes().subarray(0, 8));
-  const view = new DataView(frame.buffer);
-  view.setUint32(8, json.byteLength, true);
-  view.setUint32(12, crc32(json), true);
-  frame.set(json, 16);
+  const encodedEntropy = Schema.encodeSync(Schema.Uint8ArrayFromBase64)(entropy);
+  const frame = mutateStoredHeaderFixture(segment.bytes(), {
+    documents: (rows) =>
+      rows.map((row): typeof row => [
+        row[0],
+        row[1],
+        { ...row[2], entropy: encodedEntropy },
+        row[3],
+        row[4],
+      ]),
+  });
   const inputs = Array.from({ length: 10 }, (_, index) => ({
     key: `namespaces/range-directory-scan/segments/blob-${index}.rsix`,
     offset: 0,
@@ -312,23 +290,14 @@ test("decoded directory scans retain validated metadata beyond cache capacity", 
     encodeCanonicalDocuments([{ id: "a", text: "alpha", attributes: {} }]),
   );
   const original = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
-  const json = new TextEncoder().encode(
-    Schema.encodeSync(Schema.fromJsonString(SegmentHeader))({
-      ...original,
-      terms: {
-        ...original.terms,
-        ...Object.fromEntries(
-          Array.from({ length: 40000 }, (_, index) => [`term${index}`, { df: 0, blocks: [] }]),
-        ),
-      },
+  const frame = mutateStoredHeaderFixture(segment.bytes(), {
+    terms: (terms) => ({
+      ...terms,
+      ...Object.fromEntries(
+        Array.from({ length: 40000 }, (_, index) => [`term${index}`, emptyStoredTermFixture]),
+      ),
     }),
-  );
-  const frame = new Uint8Array(16 + json.byteLength);
-  frame.set(segment.bytes().subarray(0, 8));
-  const view = new DataView(frame.buffer);
-  view.setUint32(8, json.byteLength, true);
-  view.setUint32(12, crc32(json), true);
-  frame.set(json, 16);
+  });
   const inputs = Array.from({ length: 8 }, (_, index) => ({
     key: `namespaces/decoded-directory-scan/segments/blob-${index}.rsix`,
     offset: 0,

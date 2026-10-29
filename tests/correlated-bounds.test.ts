@@ -1,8 +1,8 @@
 import { encodeCanonicalDocuments } from "./segment-fixture";
+import { mutateStoredHeaderFixture } from "./stored-header-fixture";
 import { decodeRoot } from "../src/manifest";
 import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
-import { crc32 } from "node:zlib";
 import {
   initSync,
   Segment,
@@ -258,10 +258,6 @@ test("derived overview ranges reject WASM integer overflow without trapping", ()
     ]),
   );
   const bytes = segment.bytes();
-  const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
-  const term = header.terms.alpha;
-  const block = term?.blocks[0];
-  if (term === undefined || block === undefined) throw new Error("Missing fixture term");
   for (const sample of [
     { data: { offset: 4294967295, length: 8 }, expected: "Posting range overflow" },
     {
@@ -269,17 +265,31 @@ test("derived overview ranges reject WASM integer overflow without trapping", ()
       expected: "Posting block overlaps document columns",
     },
   ]) {
-    const json = new TextEncoder().encode(
-      Schema.encodeSync(Schema.fromJsonString(SegmentHeader))({
-        ...header,
-        terms: { alpha: { ...term, blocks: [{ ...block, data: sample.data }] } },
-      }),
-    );
-    const forged = new Uint8Array(16 + json.byteLength);
-    forged.set(bytes.subarray(0, 8));
-    new DataView(forged.buffer).setUint32(8, json.byteLength, true);
-    new DataView(forged.buffer).setUint32(12, crc32(json), true);
-    forged.set(json, 16);
+    const forged = mutateStoredHeaderFixture(bytes, {
+      terms: (terms) => {
+        const term = terms.alpha;
+        const block = term?.[1][0];
+        if (term === undefined || block === undefined) throw new Error("Missing fixture term");
+        return {
+          ...terms,
+          alpha: [
+            term[0],
+            [
+              [
+                block[0],
+                block[1],
+                block[2],
+                block[3],
+                block[4],
+                block[5],
+                block[6],
+                [sample.data.offset, sample.data.length],
+              ],
+            ],
+          ],
+        };
+      },
+    });
     expect(() => segment_correlated_overview(forged)).toThrow(sample.expected);
   }
 });

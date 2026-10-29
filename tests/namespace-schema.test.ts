@@ -404,6 +404,15 @@ test("scalar arrays survive queries, replacement and canonical maintenance", asy
   );
   expect(before.rows.map((row) => row.id)).toEqual(["a", "c"]);
   expect(before.rows[0]?.attributes).toEqual({ tags: ["changed"], scores: [8, 9] });
+  const retired = {
+    kind: "vector",
+    vector,
+    topK: 10,
+    filters: [{ field: "tags", op: "contains", value: "ação" }],
+  };
+  const removed = await request(worker, namespace, "query", retired);
+  expect(removed.status).toBe(200);
+  expect(Schema.decodeUnknownSync(QueryResult)(await removed.json()).rows).toEqual([]);
   for (const operation of ["compact", "rebuild", "vector-sync", "vector-rebuild"])
     expect((await request(worker, namespace, operation, {})).status).toBe(200);
   const after = Schema.decodeUnknownSync(QueryResult)(
@@ -411,6 +420,17 @@ test("scalar arrays survive queries, replacement and canonical maintenance", asy
   );
   expect(after.rows).toEqual(before.rows);
   expect(after.sequence).toBe(2);
+  const selected = await request(worker, namespace, "query", {
+    ...retired,
+    filters: [{ field: "tags", op: "contains", value: "changed" }],
+  });
+  expect(selected.status).toBe(200);
+  expect(
+    Schema.decodeUnknownSync(QueryResult)(await selected.json()).rows.map((row) => row.id),
+  ).toEqual(["a"]);
+  const collected = await request(worker, namespace, "query", retired);
+  expect(collected.status).toBe(200);
+  expect(Schema.decodeUnknownSync(QueryResult)(await collected.json()).rows).toEqual([]);
 });
 
 test("oversized, nested and object-valued arrays fail before persistence", async () => {

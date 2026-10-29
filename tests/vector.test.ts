@@ -331,7 +331,7 @@ test("hybrid combines lexical and vector ranking using RRF", async () => {
   expect(filtered.rows.map((row) => row.id)).toEqual(["vector"]);
 });
 
-test("native metadata equality finds eligible vectors outside the unfiltered top fifty", async () => {
+test("native scalar and array filters find eligible vectors outside the unfiltered top fifty", async () => {
   const upserts = Array.from({ length: 160 }, (_, index) => {
     const attributes = { group: "distractor", year: 2020, eligible: ["distractor"] };
     const values = vector(1);

@@ -124,6 +124,63 @@ test("separate segments use shared unfiltered global statistics and apply live f
   expect(tombstoned.map(({ row }) => row)).toEqual([2]);
 });
 
+test("WASM forwards BM25 parameters without changing equal-frequency scores when b is zero", () => {
+  const bytes = segment_build_text_fields(
+    encodeBuild({
+      documents: canonicalFixtureDocuments([
+        { id: "a", text: "native", attributes: { tags: "fox" } },
+        { id: "b", text: "native", attributes: { tags: "fox dog dog dog" } },
+        { id: "c", text: "native", attributes: { tags: "fox fox" } },
+        { id: "d", text: "native", attributes: { tags: "dog" } },
+      ]),
+      text_fields: [{ name: "tags" }],
+    }),
+  );
+  const scores = (k1: number, b: number) =>
+    new Map(
+      decodeHits(
+        segment_rank_fields(
+          bytes,
+          query([tags], {
+            text: "fox",
+            mode: "any",
+            bm25: { k1, b },
+          }),
+        ),
+      ).map(({ row, score }) => [row, score]),
+    );
+  const flat = scores(1.2, 0);
+  expect(flat.get(0)).toBe(flat.get(1));
+  const normalized = scores(1.2, 1);
+  expect(normalized.get(0)).toBeGreaterThan(normalized.get(1) ?? Infinity);
+  expect(scores(2.4, 0).get(2)).not.toBe(flat.get(2));
+});
+
+test("WASM named phrases preserve WordV4 stopword positions and array boundaries", () => {
+  const bytes = segment_build_text_fields(
+    encodeBuild({
+      documents: canonicalFixtureDocuments([
+        { id: "a", text: "native", attributes: { tags: ["red", "fox"] } },
+        { id: "b", text: "native", attributes: { tags: ["red the fox"] } },
+        { id: "c", text: "native", attributes: { tags: ["red fox"] } },
+      ]),
+      text_fields: [{ name: "tags" }],
+    }),
+  );
+  const rows = (value: string) =>
+    decodeHits(
+      segment_rank_fields(
+        bytes,
+        query([tags], {
+          text: value,
+          mode: "phrase",
+        }),
+      ),
+    ).map(({ row }) => row);
+  expect(rows("red fox")).toEqual([2]);
+  expect(rows("red the fox")).toEqual([1]);
+});
+
 test("field JSON rejects unknown contract keys and unsafe global counts", () => {
   const bytes = build(documents);
   expect(() =>

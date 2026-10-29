@@ -141,7 +141,7 @@ test("typed identities survive the real object-store writer, restart, ranking an
         );
         expect(root.segments[0]?.minimumId).toEqual({ kind: "uint", value: "2" });
         const expected = ["2", "10", "18446744073709551615"].map((value) => ({
-          kind: "uint",
+          kind: "uint" as const,
           value,
         }));
         for (const query of [
@@ -238,7 +238,7 @@ test("typed identities survive the real object-store writer, restart, ranking an
         for (const name of ["typed-uuid", "native-uuid-looking"]) {
           const fixture = (() => {
             if (name === "typed-uuid") {
-              const id = { kind: "uuid", value: uuid };
+              const id = { kind: "uuid" as const, value: uuid };
               return {
                 id,
                 input: {

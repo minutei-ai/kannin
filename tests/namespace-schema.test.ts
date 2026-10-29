@@ -359,7 +359,7 @@ test("scalar arrays survive queries, replacement and canonical maintenance", asy
       expect(filtered.status).toBe(200);
       expect(
         Schema.decodeUnknownSync(QueryResult)(await filtered.json()).rows.map((row) => row.id),
-      ).toEqual(ids);
+      ).toEqual([...ids]);
     }
   }
   expect(

@@ -47,11 +47,7 @@ const decodeDocument = Schema.decodeSync(Schema.fromJsonString(CanonicalDocument
 const decodeQuery = Schema.decodeSync(Schema.fromJsonString(CanonicalQueryDocument), {
   onExcessProperty: "error",
 });
-const canonicalLocation = LocatedDocument.mapFields((fields) => ({
-  ...fields,
-  document: fields.document.mapFields((document) => ({ ...document, id: CanonicalId })),
-}));
-const decodeLocations = Schema.decodeSync(Schema.fromJsonString(Schema.Array(canonicalLocation)), {
+const decodeLocations = Schema.decodeSync(Schema.fromJsonString(Schema.Array(LocatedDocument)), {
   onExcessProperty: "error",
 });
 const documents = ids.map((id) => ({
@@ -68,7 +64,7 @@ test("typed IDs keep exact domains and numeric order through canonical WASM meta
   expect(new TextDecoder().decode(bytes.subarray(0, 8))).toBe("RAIOSEG5");
   using directory = new Directory(bytes);
   const locations = decodeLocations(directory.rows(JSON.stringify(ordered.map((_id, row) => row))));
-  expect(locations.map((location) => location.document.id)).toEqual(ordered);
+  expect(locations.map((location) => location.document.id)).toEqual([...ordered]);
   const restored = locations.map((location) => {
     const data = location.document.data;
     const frame = bytes.subarray(base + data.offset, base + data.offset + data.length);
@@ -101,7 +97,7 @@ test("typed directory frames and lookup never alias string IDs or ignore tombsto
     uuid,
     { kind: "uuid", value: uuid },
   ] as const;
-  expect(lookup(selected).map((location) => location.document.id)).toEqual(selected);
+  expect(lookup(selected).map((location) => location.document.id)).toEqual([...selected]);
   expect(lookup(selected, [2]).map((location) => location.document.id)).toEqual([
     "1",
     uuid,

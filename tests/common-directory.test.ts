@@ -71,10 +71,10 @@ test("segments without common terms publish only useful directory caches", async
   const segment = decodeRoot(await stored.text()).segments[0];
   if (segment === undefined) throw new Error("Missing no-common segment");
   expect(
-    await bucket.head(`cache/directory-v6/${segment.key}/${segment.headerBytes}`),
+    await bucket.head(`cache/directory-v7/${segment.key}/${segment.headerBytes}`),
   ).not.toBeNull();
   expect(
-    await bucket.head(`cache/directory-common-v4/${segment.key}/${segment.headerBytes}`),
+    await bucket.head(`cache/directory-common-v5/${segment.key}/${segment.headerBytes}`),
   ).toBeNull();
   expect(await bucket.head(`cache/correlated-pool-v3/${segment.key}`)).not.toBeNull();
   const query = await request(worker, namespace, "query", textQuery("uniquealpha"));
@@ -119,7 +119,7 @@ test("common positional directories preserve cold and warm results through evict
     const root = decodeRoot(await stored.text());
     expect(root.segments).toHaveLength(2);
     for (const segment of root.segments) {
-      const key = `cache/directory-common-v4/${segment.key}/${segment.headerBytes}`;
+      const key = `cache/directory-common-v5/${segment.key}/${segment.headerBytes}`;
       if (phase === "missing") await bucket.delete(key);
       if (phase === "corrupt")
         await bucket.put(key, new Uint8Array([1, 2, 3]), {
@@ -166,7 +166,7 @@ test("common positional directories preserve cold and warm results through evict
       else expect(result).toEqual(expected);
       if (temperature === "cold" && (phase === "prepared" || phase === "repaired")) {
         for (const segment of root.segments)
-          await bucket.delete(`cache/directory-common-v4/${segment.key}/${segment.headerBytes}`);
+          await bucket.delete(`cache/directory-common-v5/${segment.key}/${segment.headerBytes}`);
       }
     }
     const phraseResponse = await request(reader, namespace, "metadata");
@@ -178,7 +178,7 @@ test("common positional directories preserve cold and warm results through evict
     else {
       expect(phraseMetadata.cache.directoryCommonHits - before.cache.directoryCommonHits).toBe(0);
       for (const segment of root.segments) {
-        const key = `cache/directory-common-v4/${segment.key}/${segment.headerBytes}`;
+        const key = `cache/directory-common-v5/${segment.key}/${segment.headerBytes}`;
         if (phase === "corrupt") {
           const preserved = await bucket.get(key);
           if (preserved === null) throw new Error("Missing preserved corrupt frame");
@@ -264,7 +264,7 @@ test("projected and full directories share decoded admission and recover an evic
     const frame = new Uint8Array(common_directory_compress(bytes.subarray(0, segment.headerBytes)));
     using projected = Directory.common(frame, segment.headerBytes, 40 * 1024 * 1024);
     footprint.bytes += projected.heap_bytes();
-    await bucket.put(`cache/directory-common-v4/${segment.key}/${segment.headerBytes}`, frame, {
+    await bucket.put(`cache/directory-common-v5/${segment.key}/${segment.headerBytes}`, frame, {
       customMetadata: {
         source: Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))({
           key: segment.key,

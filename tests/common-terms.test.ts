@@ -302,7 +302,7 @@ test("unfiltered phrase Root fallback leaves later correlated projections visibl
   await bucket.delete(
     manifest.segments.flatMap((segment) => [
       `cache/correlated-pool-v3/${segment.key}`,
-      `cache/directory-v6/${segment.key}/${segment.headerBytes}`,
+      `cache/directory-v7/${segment.key}/${segment.headerBytes}`,
     ]),
   );
   await writer.dispose();

@@ -9,7 +9,7 @@ bun install --frozen-lockfile
 bun run build
 ```
 
-Supply configuration from an external environment file or secret manager. Never commit a deployment environment file. The bucket must already exist; startup checks existing canonical Roots and fails on unavailable or invalid storage.
+Supply configuration from an external environment file or secret manager. Never commit a deployment environment file. The bucket must already exist; startup checks existing canonical Roots and fails on unavailable or invalid storage. The Root7 candidate reuses the bounded `migrate-root` operation during startup for supported older Root formats, then rereads the committed Root before resuming background jobs. Compare-and-swap conflicts are retried at most six times, preserving current manifests and immutable legacy logs/receipts. Root6-to-7 conversion is schema-only; older physical migrations retain their existing bounds and retirement policy. Malformed or unavailable canonical state still fails startup. This upgrade path remains pending the full gate.
 
 The S3 adapter selects addressing through `KANNIN_STORAGE_URL_STYLE`: `path` preserves the existing default, while `virtual` selects virtual-hosted addressing. Railway documents virtual-hosted addressing for new buckets and path-style addressing for some older buckets; see [Railway URL styles](https://docs.railway.com/storage-buckets#url-style). The configuration tests and adapter change passed the [complete gate](https://github.com/minutei-ai/kannin/actions/runs/40877887921). Native Railway bucket wiring is present; hosted conditional-write conformance remains open; local path-style RustFS checks do not validate a new Railway bucket.
 

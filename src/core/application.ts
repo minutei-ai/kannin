@@ -51,6 +51,13 @@ import {
   Filter,
   DEFAULT_VECTOR_DIMENSIONS,
   CanonicalDocument,
+  CanonicalId,
+  CanonicalWrite,
+  type WriteCommand,
+  canonicalIdKey,
+  canonicalIdType,
+  compareCanonicalIds,
+  sameCanonicalId,
   nativeToCanonicalDocument,
   ErrorBody,
   Log,
@@ -230,12 +237,12 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       if (
         decoded._tag === "Failure" ||
         directoryMiss._tag === "Failure" ||
-        (directoryMiss.value !== null && url.pathname !== "/directory-v6") ||
+        (directoryMiss.value !== null && url.pathname !== "/directory-v7") ||
         request.method !== "GET" ||
         props._tag === "Failure" ||
         props.value.bucket !== this.env.STORAGE_CACHE_SCOPE ||
-        (url.pathname !== "/range" && url.pathname !== "/directory-v6") ||
-        (url.pathname === "/directory-v6" && decoded.value.offset !== 0)
+        (url.pathname !== "/range" && url.pathname !== "/directory-v7") ||
+        (url.pathname === "/directory-v7" && decoded.value.offset !== 0)
       )
         return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });
       const input = decoded.value;
@@ -282,13 +289,13 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
                       });
                     const encoded = yield* Effect.try(() =>
                       Match.value(url.pathname).pipe(
-                        Match.when("/directory-v6", () =>
+                        Match.when("/directory-v7", () =>
                           directory_compress(new Uint8Array(bytes)).slice(),
                         ),
                         Match.orElse(() => bytes),
                       ),
                     );
-                    if (url.pathname === "/directory-v6")
+                    if (url.pathname === "/directory-v7")
                       publishDirectoryFrame(
                         input.key,
                         input.length,
@@ -309,7 +316,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
                   return Effect.tryPromise(() => object.body.cancel()).pipe(Effect.ignore);
                 },
               );
-              if (url.pathname !== "/directory-v6" || directoryMiss.value !== null)
+              if (url.pathname !== "/directory-v7" || directoryMiss.value !== null)
                 return yield* canonical;
               const reader = yield* acquireDirectoryFrame(input.key, input.length);
               const observed = yield* waitDirectoryFrame(reader);
@@ -393,7 +400,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       return pending;
     }
   }
-  const decodeLog = Schema.decodeSync(Schema.fromJsonString(Log));
+  const decodeLog = Schema.decodeSync(Schema.fromJsonString(Log), { onExcessProperty: "error" });
   const encodeLog = Schema.encodeSync(Schema.fromJsonString(Log));
   const decodeQuery = Schema.decodeEffect(Schema.fromJsonString(Query), {
     onExcessProperty: "error",
@@ -530,6 +537,9 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
     }
   }
 
+  const canonicalIdJson = Schema.fromJsonString(CanonicalId);
+  const encodeCanonicalId = Schema.encodeSync(canonicalIdJson);
+  const decodeCanonicalId = Schema.decodeSync(canonicalIdJson);
   const strings = Schema.fromJsonString(Schema.Array(Schema.String));
   const integers = Schema.fromJsonString(Schema.Array(Schema.Int));
   const Located = LocatedDocument.mapFields((fields) => ({
@@ -579,7 +589,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
   });
 
   async function locate(
-    ids: ReadonlyArray<string>,
+    ids: ReadonlyArray<typeof CanonicalId.Type>,
     root: typeof Root.Type,
     preferR2: boolean = false,
   ) {
@@ -589,7 +599,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       (_, index) => (Math.ceil(root.segments.length / 64) - index - 1) * 64,
     )) {
       const segments = root.segments.slice(offset, offset + 64).toReversed();
-      const remaining = ids.filter((id) => !found.has(id));
+      const remaining = ids.filter((id) => !found.has(canonicalIdKey(id)));
       if (remaining.length === 0) break;
       const matches = (
         await Effect.runPromise(bloomCandidates(root, remaining, "document", offset, 64))
@@ -598,7 +608,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         const selected = matches[index];
         if (selected === undefined)
           throw new Rejected({ status: 503, message: "Bloom batch omitted a segment" });
-        const candidates = selected.filter((id) => !found.has(id));
+        const candidates = selected.filter((id) => !found.has(canonicalIdKey(id)));
         if (candidates.length === 0) continue;
         const rows = await Effect.runPromise(
           withDirectory(
@@ -606,7 +616,9 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
             segment.headerBytes,
             (decoded) =>
               Effect.gen(function* () {
-                const lookup = yield* Schema.encodeEffect(strings)(candidates);
+                const lookup = yield* Schema.encodeEffect(
+                  Schema.fromJsonString(Schema.Array(CanonicalId)),
+                )(candidates);
                 const dead = yield* Schema.encodeEffect(integers)(segment.dead);
                 return yield* Schema.decodeEffect(
                   Schema.fromJsonString(Schema.Array(LocatedDocument)),
@@ -619,14 +631,16 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
             true,
           ),
         );
-        for (const row of rows) found.set(row.document.id, { ...row, segment });
+        for (const row of rows) found.set(canonicalIdKey(row.document.id), { ...row, segment });
         if (found.size === ids.length) break;
       }
     }
     return found;
   }
 
-  async function vectorId(epoch: string, id: string, sequence: number) {
+  async function vectorId(epoch: string, id: typeof CanonicalId.Type, sequence: number) {
+    if (typeof id !== "string")
+      return sha256(`typed-id\0${epoch}\0${id.kind}\0${id.value}\0${sequence}`);
     return sha256(`${epoch}\0${id}\0${sequence}`);
   }
 
@@ -832,7 +846,11 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
           timings.append("server-timing", 'text_membership;desc="manifest"');
           return Effect.succeed(root.segments.map(() => terms));
         }),
-        Match.orElse(() => bloomCandidates(root, terms, "term")),
+        Match.orElse(() =>
+          bloomCandidates(root, terms, "term").pipe(
+            Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(Schema.Array(Schema.String)))),
+          ),
+        ),
       ),
       signal,
     );
@@ -1335,7 +1353,10 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
           if (learned.bound < retained.bound) {
             retained.bound = learned.bound;
             retained.minimumId = learned.minimumId;
-          } else if (learned.bound === retained.bound && learned.minimumId > retained.minimumId)
+          } else if (
+            learned.bound === retained.bound &&
+            compareCanonicalIds(learned.minimumId, retained.minimumId) > 0
+          )
             retained.minimumId = learned.minimumId;
           reuse.bounds += 1;
         }
@@ -1354,8 +1375,8 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
     });
     const prioritized = bounded.sort((left, right) => {
       if (left.bound !== right.bound) return right.bound - left.bound;
-      if (left.minimumId < right.minimumId) return -1;
-      if (left.minimumId > right.minimumId) return 1;
+      if (compareCanonicalIds(left.minimumId, right.minimumId) < 0) return -1;
+      if (compareCanonicalIds(left.minimumId, right.minimumId) > 0) return 1;
       return 0;
     });
     timings.append(
@@ -1423,7 +1444,10 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         if (ranked.length === input.topK) {
           if (cutoff === undefined)
             throw new Rejected({ status: 503, message: "Invalid ranking cutoff" });
-          if (bound + 1e-12 < cutoff.score || (bound === cutoff.score && minimumId >= cutoff.id))
+          if (
+            bound + 1e-12 < cutoff.score ||
+            (bound === cutoff.score && compareCanonicalIds(minimumId, cutoff.id) >= 0)
+          )
             return false;
         }
         return true;
@@ -1508,7 +1532,9 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
                         if (uniform === undefined) {
                           const encodedSpans = Match.value(cutoff).pipe(
                             Match.when(undefined, () => ranker.posting_spans_seeded()),
-                            Match.orElse((hit) => ranker.posting_spans_after(hit.score, hit.id)),
+                            Match.orElse((hit) =>
+                              ranker.posting_spans_after_id(hit.score, encodeCanonicalId(hit.id)),
+                            ),
                           );
                           const requested = yield* decodePostingSpans(encodedSpans);
                           const spans = yield* Effect.forEach(requested, (metadata) =>
@@ -1671,13 +1697,16 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
               Effect.map((hits) => {
                 if (selection.digest !== "") {
                   const upper = { bound: cutoff?.score ?? 0, minimumId: segment.minimumId };
-                  if (cutoff !== undefined && cutoff.id > upper.minimumId)
+                  if (cutoff !== undefined && compareCanonicalIds(cutoff.id, upper.minimumId) > 0)
                     upper.minimumId = cutoff.id;
                   for (const hit of hits) {
                     if (hit.score > upper.bound) {
                       upper.bound = hit.score;
                       upper.minimumId = hit.id;
-                    } else if (hit.score === upper.bound && hit.id < upper.minimumId)
+                    } else if (
+                      hit.score === upper.bound &&
+                      compareCanonicalIds(hit.id, upper.minimumId) < 0
+                    )
                       upper.minimumId = hit.id;
                   }
                   rememberSegmentScoreBound(identity, upper);
@@ -1693,8 +1722,8 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       ranked.push(...batches.flat());
       ranked.sort((a, b) => {
         if (a.score !== b.score) return b.score - a.score;
-        if (a.id < b.id) return -1;
-        if (a.id > b.id) return 1;
+        if (compareCanonicalIds(a.id, b.id) < 0) return -1;
+        if (compareCanonicalIds(a.id, b.id) > 0) return 1;
         return 0;
       });
       ranked.splice(input.topK);
@@ -1710,7 +1739,8 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
           upper !== undefined &&
           original !== undefined &&
           (upper.bound < original.bound ||
-            (upper.bound === original.bound && upper.minimumId > original.minimumId))
+            (upper.bound === original.bound &&
+              compareCanonicalIds(upper.minimumId, original.minimumId) > 0))
         ) {
           tightened[entry.index] = { ...original, ...upper };
           publication.improved = true;
@@ -1861,10 +1891,11 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
                               ),
                             );
                             const discarded = yield* Effect.try(() =>
-                              ranker.push_frame(row.id, frame),
+                              ranker.push_frame_id(encodeCanonicalId(row.id), frame),
                             );
-                            retained.set(row.id, { ...row, segment });
-                            if (discarded !== undefined) retained.delete(discarded);
+                            retained.set(canonicalIdKey(row.id), { ...row, segment });
+                            if (discarded !== undefined)
+                              retained.delete(canonicalIdKey(decodeCanonicalId(discarded)));
                           }
                         }
                         return undefined;
@@ -1879,12 +1910,12 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
                 signal,
               );
             }
-            const encoded = yield* Effect.try(() => ranker.finish());
+            const encoded = yield* Effect.try(() => ranker.finish_ids());
             const selected = yield* Schema.decodeEffect(Schema.fromJsonString(NativeVectorHits))(
               encoded,
             );
             return yield* Effect.forEach(selected, ([id, score]) => {
-              const location = retained.get(id);
+              const location = retained.get(canonicalIdKey(id));
               if (location === undefined)
                 return new Rejected({
                   status: 503,
@@ -1979,16 +2010,19 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
     if (input.kind === "hybrid") {
       for (const list of [text, vectors])
         for (const [rank, hit] of list.entries())
-          scores.set(hit.id, { ...hit, score: (scores.get(hit.id)?.score ?? 0) + 1 / (61 + rank) });
-    } else for (const hit of [...text, ...vectors]) scores.set(hit.id, hit);
+          scores.set(canonicalIdKey(hit.id), {
+            ...hit,
+            score: (scores.get(canonicalIdKey(hit.id))?.score ?? 0) + 1 / (61 + rank),
+          });
+    } else for (const hit of [...text, ...vectors]) scores.set(canonicalIdKey(hit.id), hit);
     const hits = Match.value(input.kind).pipe(
       Match.when("vector", () => vectors),
       Match.orElse(() =>
         [...scores.values()]
           .sort((a, b) => {
             if (a.score !== b.score) return b.score - a.score;
-            if (a.id < b.id) return -1;
-            if (a.id > b.id) return 1;
+            if (compareCanonicalIds(a.id, b.id) < 0) return -1;
+            if (compareCanonicalIds(a.id, b.id) > 0) return 1;
             return 0;
           })
           .slice(0, input.topK),
@@ -2007,7 +2041,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         throw new Rejected({ status: 503, message: "Hybrid document projection omitted a hit" });
       for (const [index, row] of rows.entries()) {
         const hit = hits[index];
-        if (hit === undefined || row.id !== hit.id)
+        if (hit === undefined || !sameCanonicalId(row.id, hit.id))
           throw new Rejected({
             status: 503,
             message: "Hybrid document identity differs from its header",
@@ -2172,7 +2206,10 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       const bytes = new Uint8Array(segment_migrate(source));
       const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment_header(bytes));
       const headerBytes = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
-      if (header.documents.length !== segment.count || header.documents[0].id !== segment.minimumId)
+      if (
+        header.documents.length !== segment.count ||
+        !sameCanonicalId(header.documents[0].id, segment.minimumId)
+      )
         throw new Rejected({ status: 503, message: "Migration changed segment row identity" });
       const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)).toHex();
       const key = `${this.prefix}/segments/${runtime.immutableIdentity(`${digest}-${await sha256(segment.key)}`)}.rsix`;
@@ -2200,7 +2237,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         ...leader,
         documents: leader.documents.map((document) => {
           const row = header.documents[document.row];
-          if (row === undefined || row.id !== document.id)
+          if (row === undefined || !sameCanonicalId(row.id, document.id))
             throw new Rejected({ status: 503, message: "Migration leader row identity mismatch" });
           return { ...document, data: row.data };
         }),
@@ -2355,7 +2392,8 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
             saved.kind === "current" ||
             saved.sourceVersion === 3 ||
             saved.sourceVersion === 4 ||
-            saved.sourceVersion === 5
+            saved.sourceVersion === 5 ||
+            saved.sourceVersion === 6
           )
             expiration.value = Schema.decodeUnknownSync(VectorRebuildCheckpointMetadata)(
               captured.customMetadata,
@@ -2395,7 +2433,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       }
       if (root === undefined || object === null)
         return Schema.encodeSync(RootMigrationResult)({
-          version: 6,
+          version: 7,
           sequence: 0,
           rootRewritten: false,
           migratedSnapshots: progress.migrated,
@@ -2418,7 +2456,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       this.namespacePublished = false;
       await this.publishNamespace();
       return Schema.encodeSync(RootMigrationResult)({
-        version: 6,
+        version: 7,
         sequence: root.root.sequence,
         rootRewritten: root.kind !== "current",
         migratedSnapshots: progress.migrated,
@@ -2519,13 +2557,25 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         await this.env.INDEX_JOBS.send(Schema.encodeSync(IndexMessage)({ namespace }));
     }
 
-    private async write(input: typeof Write.Type, namespace: string) {
+    private async write(input: typeof WriteCommand.Type, namespace: string) {
+      const canonical = "kind" in input;
+      const idType: (typeof CanonicalWrite.Type)["idType"] = (() => {
+        if (canonical) return input.idType;
+        return "string";
+      })();
+
       const ids = [...input.upserts.map((document) => document.id), ...input.deletes];
-      if (new Set(ids).size !== ids.length)
+      if (new Set(ids.map(canonicalIdKey)).size !== ids.length)
         throw new Rejected({ status: 400, message: "Duplicate ids within a write" });
-      if (input.reset !== true && input.schema === undefined && ids.length === 0)
+      if (!canonical && input.reset !== true && input.schema === undefined && ids.length === 0)
         throw new Rejected({ status: 400, message: "Empty write" });
-      const fingerprint = await sha256(Schema.encodeSync(Schema.fromJsonString(Write))(input));
+      if (ids.some((id) => canonicalIdType(id) !== idType))
+        throw new Rejected({ status: 400, message: "Write IDs must match the namespace ID type" });
+      const encodedWrite = (() => {
+        if (canonical) return Schema.encodeSync(Schema.fromJsonString(CanonicalWrite))(input);
+        return Schema.encodeSync(Schema.fromJsonString(Write))(input);
+      })();
+      const fingerprint = await sha256(encodedWrite);
       const current = await this.root();
       if (current.manifest.lastReceipt !== null)
         await this.persistReceipt(current.manifest.lastReceipt);
@@ -2550,6 +2600,8 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
           vectorSync: "queued",
         });
       }
+      if ((current.manifest.idType ?? "string") !== idType && current.manifest.sequence > 0)
+        throw new Rejected({ status: 409, message: "Namespace ID type cannot change" });
       if (
         input.schema !== undefined &&
         current.manifest.schema !== undefined &&
@@ -2644,25 +2696,27 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         manifest: { ...current.manifest, segments, bloomPacks: packs.value },
       };
       const writes: Array<() => Promise<ObjectVersionType | null>> = [];
-      const log = {
-        version: 1,
+      const logFields = {
         sequence,
         previous: current.manifest.head,
         digest: fingerprint,
         vectorEpoch: epoch.value,
         vectorDeletes,
-        write: input,
       } as const;
+      const log: typeof Log.Type = (() => {
+        if (canonical) return { ...logFields, version: 2, write: input };
+        return { ...logFields, version: 1, write: input };
+      })();
       const encodedLog = pack(encodeLog(log));
       const logKey = `${this.prefix}/log/${sequence}-${runtime.immutableIdentity(await sha256Bytes(encodedLog))}.bin`;
       writes.push(() => this.env.STORAGE.put(logKey, encodedLog));
       if (input.upserts.length > 0) {
-        const built = await Effect.runPromise(
-          buildSegment(
-            input.upserts.map((document) => nativeToCanonicalDocument(document, sequence)),
-            filterableNames(columns),
-          ),
-        );
+        const documents = (() => {
+          if (canonical)
+            return input.upserts.map((document) => ({ ...document, revision: sequence }));
+          return input.upserts.map((document) => nativeToCanonicalDocument(document, sequence));
+        })();
+        const built = await Effect.runPromise(buildSegment(documents, filterableNames(columns)));
         const key = `${this.prefix}/segments/${sequence}-${runtime.immutableIdentity(await sha256Bytes(built.bytes))}.rsix`;
         const headerBytes =
           16 + new DataView(built.bytes.buffer, built.bytes.byteOffset).getUint32(8, true);
@@ -2719,6 +2773,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         jobs.push({ log: logKey, sequence });
       const receipt = { sequence, requestId: input.requestId, digest: fingerprint };
       const manifest = {
+        idType,
         schema: columns,
         version: 1,
         sequence,
@@ -2813,7 +2868,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         for (const metadata of selected) {
           cursor.row += 1;
           budget.processed += 1;
-          const location = current.get(metadata.id);
+          const location = current.get(canonicalIdKey(metadata.id));
           if (
             location === undefined ||
             !location.document.vector ||
@@ -2830,7 +2885,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
           );
           if (document.vector === undefined)
             throw new Rejected({ status: 503, message: "Rebuild vector payload missing" });
-          if (document.id !== metadata.id || document.revision !== metadata.revision)
+          if (!sameCanonicalId(document.id, metadata.id) || document.revision !== metadata.revision)
             throw new Rejected({
               status: 503,
               message: "Rebuild vector identity differs from its directory",
@@ -2874,7 +2929,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
           current.manifest,
         );
         for (const candidate of candidates) {
-          const location = live.get(candidate.id);
+          const location = live.get(canonicalIdKey(candidate.id));
           if (
             location === undefined ||
             !location.document.vector ||
@@ -2891,7 +2946,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
           const expected = candidate.vector;
           const actual = document.vector;
           if (
-            document.id !== candidate.id ||
+            !sameCanonicalId(document.id, candidate.id) ||
             document.revision !== log.sequence ||
             expected === undefined ||
             actual === undefined ||
@@ -4025,7 +4080,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
   async function acquireCachedSnapshot(cacheKey: URL, minimumSequence: number) {
     return Effect.runPromise(
       Effect.gen(function* () {
-        const cache = yield* Effect.tryPromise(() => caches.open("raio-snapshots-v6")).pipe(
+        const cache = yield* Effect.tryPromise(() => caches.open("raio-snapshots-v7")).pipe(
           Effect.orElseSucceed(() => undefined),
         );
         if (cache === undefined) return { cache, snapshot: undefined, rejected: false };
@@ -4104,7 +4159,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
     minimumSequence: number,
     timings: Headers,
   ) {
-    const cacheKey = new URL(`https://raio-cache.internal/snapshots-v6/${namespace}`);
+    const cacheKey = new URL(`https://raio-cache.internal/snapshots-v7/${namespace}`);
     cacheKey.searchParams.set("bucket", env.STORAGE_CACHE_SCOPE);
     const cache: { value: CachePort | undefined } = { value: undefined };
     const memory = warmSnapshots.get(cacheKey.href);
@@ -4184,7 +4239,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         const refresh = yield* Effect.forkDetach(
           Effect.gen(function* () {
             const refreshCache = yield* Effect.tryPromise(() =>
-              caches.open("raio-snapshots-v6"),
+              caches.open("raio-snapshots-v7"),
             ).pipe(Effect.orElseSucceed(() => undefined));
             yield* refreshSnapshot(ctx, env, namespace, 0, cacheKey, refreshCache);
           }).pipe(

@@ -119,7 +119,7 @@ for (const version of [3, 4] as const)
       await (await request(worker.worker, namespace, "migrate-root", {})).json(),
     );
     expect(migrated).toMatchObject({
-      version: 6,
+      version: 7,
       rootRewritten: true,
       migratedSnapshots: 1,
       expiredSnapshots: 0,

@@ -11,6 +11,10 @@ import {
   LegacyStoredRootV3,
   LegacyStoredRootV4,
   LegacyStoredRootV5,
+  LegacyStoredRootV6,
+  CanonicalId,
+  canonicalIdKey,
+  compareCanonicalIds,
   LegacyPackedRoot,
   NamespaceColumns,
   NamespaceSchema,
@@ -162,7 +166,7 @@ const storedV2 = Schema.decodeSync(LegacyStoredRoot)({
   segments: storedV3.segments.map(({ eligibilityIndex: _eligibilityIndex, ...segment }) => segment),
 });
 
-test("Root v6 pools shared metadata and retains valid Bloom pack holes", () => {
+test("Root v7 pools shared metadata and retains valid Bloom pack holes", () => {
   const wire = encodeRoot(root);
   const expanded = decodeRoot(wire);
   expect(expanded).toEqual(root);
@@ -171,7 +175,7 @@ test("Root v6 pools shared metadata and retains valid Bloom pack holes", () => {
   expect(expanded.segments[0]?.commonTerms).toBe(expanded.segments[1]?.commonTerms);
   expect(expanded.segments[0]?.commonProjection).toBe(expanded.segments[1]?.commonProjection);
   expect(expanded.segments[0]?.eligibility).toBe(expanded.segments[1]?.eligibility);
-  expect(wire).toContain('"version":6');
+  expect(wire).toContain('"version":7');
   expect(wire).toContain('"bloomPacks"');
   expect(wire).toContain('"bloom":{"packIndex":0,"row":2}');
   expect(wire).not.toContain('"documentBloom":');
@@ -184,7 +188,7 @@ test("Root v6 pools shared metadata and retains valid Bloom pack holes", () => {
   ]);
 });
 
-test("Root v6 rejects invalid Bloom pack descriptors and segment references", () => {
+test("Root v7 rejects invalid Bloom pack descriptors and segment references", () => {
   const wire = encodeRoot(root);
   const invalidPackIndex = wire.replace('"packIndex":0', '"packIndex":2');
   expect(() => decodeRoot(invalidPackIndex)).toThrow();
@@ -218,7 +222,7 @@ test("pooled Root references remain bounds checked", () => {
   expect(() => decodeRoot(missingEligibility)).toThrow();
 });
 
-test("migration decoder distinguishes current v6 from legacy v1, v2, v3, packed v4, and schema v5", async () => {
+test("migration decoder distinguishes current v7 from legacy v1, v2, v3, packed v4, and schema v5", async () => {
   const wire = encodeRoot(root);
   expect(decodeRootForMigration(wire)).toEqual({ kind: "current", root });
   const storedCurrent = Schema.decodeSync(Schema.fromJsonString(StoredRoot))(wire);
@@ -274,7 +278,7 @@ test("migration decoder distinguishes current v6 from legacy v1, v2, v3, packed 
 test("rebuild snapshots retain their envelope and use the same migration classification", () => {
   const wire = new TextDecoder().decode(encodeVectorRebuildSnapshot(snapshot));
   expect(decodeVectorRebuildSnapshot(wire)).toEqual(snapshot);
-  expect(wire).toContain('"version":6');
+  expect(wire).toContain('"version":7');
   const legacy = Schema.encodeSync(
     Schema.fromJsonString(
       VectorRebuildSnapshot.mapFields((fields) => ({ ...fields, root: LegacyRoot })),
@@ -409,4 +413,52 @@ test("stored column readers reject unsupported declaration properties", () => {
       decodeVectorRebuildSnapshot(JSON.stringify({ root: corrupted, fields: [] })),
     ).toThrow();
   }
+});
+
+test("Root 6 migration changes only its envelope and preserves checkpoint Roots", () => {
+  const current = Schema.decodeSync(Schema.fromJsonString(StoredRoot))(encodeRoot(root));
+  const legacy = Schema.decodeSync(LegacyStoredRootV6)({ ...current, version: 6 });
+  const wire = Schema.encodeSync(Schema.fromJsonString(LegacyStoredRootV6))(legacy);
+  expect(() => decodeRoot(wire)).toThrow();
+  expect(decodeRootForMigration(wire)).toEqual({ kind: "schema", sourceVersion: 6, root });
+  const checkpoint = Schema.encodeSync(
+    Schema.fromJsonString(
+      VectorRebuildSnapshot.mapFields((fields) => ({ ...fields, root: LegacyStoredRootV6 })),
+    ),
+  )({ root: legacy, fields: [] });
+  expect(decodeVectorRebuildSnapshotForMigration(checkpoint)).toEqual({
+    kind: "schema",
+    sourceVersion: 6,
+    snapshot: { root, fields: [] },
+  });
+  const migrated = decodeRootForMigration(wire);
+  if (migrated.kind !== "schema") throw new Error("Root 6 must use envelope-only migration");
+  expect(encodeRoot(migrated.root)).toBe(encodeRoot(root));
+});
+
+test("canonical identity keys and ordering preserve the full uint64 domain without coercion", () => {
+  const decode = Schema.decodeSync(CanonicalId);
+  const ids = ["18446744073709551615", "10", "2", "0"].map((value) =>
+    decode({ kind: "uint", value }),
+  );
+  expect(ids.toSorted(compareCanonicalIds)).toEqual(
+    ["0", "2", "10", "18446744073709551615"].map((value) => ({ kind: "uint", value })),
+  );
+  expect(canonicalIdKey(decode({ kind: "uint", value: "18446744073709551615" }))).not.toBe(
+    canonicalIdKey("uint:18446744073709551615"),
+  );
+  const uuid = "00112233-4455-6677-8899-aabbccddeeff";
+  expect(canonicalIdKey(uuid)).not.toBe(canonicalIdKey(decode({ kind: "uuid", value: uuid })));
+  for (const value of ["01", "-1", "18446744073709551616"])
+    expect(() => decode({ kind: "uint", value })).toThrow();
+  const canonical = Schema.decodeSync(Root)({
+    ...root,
+    idType: "uint",
+    segments: root.segments.map((segment) => ({
+      ...Struct.omit(segment, ["commonLeaders", "commonTerms"]),
+      minimumId: { kind: "uint", value: "18446744073709551615" },
+    })),
+  });
+  expect(decodeRoot(encodeRoot(canonical))).toEqual(canonical);
+  expect(() => Schema.decodeSync(Root)({ ...canonical, idType: "string" })).toThrow();
 });

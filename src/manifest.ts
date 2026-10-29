@@ -95,7 +95,7 @@ const poolRoot = (root: typeof Root.Type) => {
   });
   return {
     ...root,
-    version: 6 as const,
+    version: 7 as const,
     segments,
     commonProjections: projections,
     commonTermDictionaries: dictionaries,
@@ -104,6 +104,7 @@ const poolRoot = (root: typeof Root.Type) => {
 };
 
 const expandSharedSegments = <
+  Dictionary extends typeof CommonTerms.Type,
   Segment extends
     | (typeof StoredRoot.Type.segments)[number]
     | (typeof LegacyStoredRootV3.Type.segments)[number]
@@ -111,7 +112,7 @@ const expandSharedSegments = <
 >(
   segments: ReadonlyArray<Segment>,
   commonProjections: ReadonlyArray<typeof CommonTermProjection.Type>,
-  commonTermDictionaries: ReadonlyArray<typeof CommonTerms.Type>,
+  commonTermDictionaries: ReadonlyArray<Dictionary>,
   eligibilityModels: ReadonlyArray<typeof EligibilityProjection.Type>,
 ) =>
   segments.map((segment) => {
@@ -275,6 +276,12 @@ const migrationRoot = (stored: typeof RootMigrationInput.Type) => {
       kind: "schema" as const,
       sourceVersion: 5 as const,
       root: expandStoredSchema(stored),
+    };
+  if (stored.version === 6)
+    return {
+      kind: "schema" as const,
+      sourceVersion: 6 as const,
+      root: expandRoot({ ...stored, version: 7 }),
     };
   return { kind: "current" as const, root: expandRoot(stored) };
 };

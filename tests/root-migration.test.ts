@@ -129,7 +129,7 @@ test("migrates pooled Root and rebuild checkpoint without changing logical reads
     await (await request(worker, namespace, "migrate-root", {})).json(),
   );
   expect(migrated).toEqual({
-    version: 6,
+    version: 7,
     sequence: logicalRoot.sequence,
     rootRewritten: true,
     migratedSnapshots: 1,
@@ -375,7 +375,7 @@ test("v5 roots become column declarations without rewriting segments, logs, or r
     await (await request(worker, namespace, "migrate-root", {})).json(),
   );
   expect(migrated).toMatchObject({
-    version: 6,
+    version: 7,
     sequence: logical.sequence,
     rootRewritten: true,
     migratedSnapshots: 1,
@@ -417,6 +417,6 @@ test("v5 roots become column declarations without rewriting segments, logs, or r
   const repeated = Schema.decodeUnknownSync(RootMigrationResult)(
     await (await request(worker, namespace, "migrate-root", {})).json(),
   );
-  expect(repeated).toMatchObject({ version: 6, rootRewritten: false, migratedSnapshots: 0 });
+  expect(repeated).toMatchObject({ version: 7, rootRewritten: false, migratedSnapshots: 0 });
   expect((await bucket.head(logKey))?.etag).toBe(log.etag);
 });

@@ -179,7 +179,7 @@ test("native Cache API retains compressed canonical directories after memory evi
   if (segment === undefined) throw new Error("Missing committed segment");
   const caches = await worker.getCaches();
   const cache = await caches.open("raio-segments-v1");
-  const key = new URL("https://raio-cache.internal/directory-v6");
+  const key = new URL("https://raio-cache.internal/directory-v7");
   key.searchParams.set("key", segment.key);
   key.searchParams.set("offset", "0");
   key.searchParams.set("length", String(segment.headerBytes));
@@ -243,7 +243,7 @@ test("previous-generation derived directory objects are neither read nor replace
   expect(
     Schema.decodeUnknownSync(QueryResult)(await queried.json()).rows.map((row) => row.id),
   ).toEqual(["a"]);
-  const current = `cache/directory-v6/${segment.key}/${segment.headerBytes}`;
+  const current = `cache/directory-v7/${segment.key}/${segment.headerBytes}`;
   const published = await (async () => {
     for (const attempt of Array.from({ length: 50 }, (_, index) => index)) {
       const object = await bucket.get(current);
@@ -291,7 +291,7 @@ test("cached old segments cannot resurrect updated or deleted documents", async 
 });
 
 test("the authenticated gateway never exposes immutable cache entrypoints", async () => {
-  for (const path of ["/range", "/directory-v6", "/catalog-v12"]) {
+  for (const path of ["/range", "/directory-v7", "/catalog-v12"]) {
     const url = new URL(path, await worker.ready);
     const anonymous = await fetch(url);
     expect(anonymous.status).toBe(401);

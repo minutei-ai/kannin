@@ -5,7 +5,7 @@ import { ObjectBucket } from "./object-bucket";
 import { NamespaceCoordinators } from "./namespace-coordinators";
 import { createApplication } from "../src/core/application";
 import { createStorage } from "../src/core/storage";
-import { decodeRoot } from "../src/manifest";
+import { decodeRootForMigration } from "../src/manifest";
 import { namespaceCatalogPrefix, namespaceCatalogReadyKey } from "../src/namespaces";
 import { ErrorBody, IndexMessage, NamespaceName, VectorMessage } from "../src/protocol";
 import type { CacheProvider, Environment, SearchRuntime } from "../src/platform";
@@ -175,6 +175,22 @@ export const portableApplication = Effect.fn("kannin.portableApplication")(funct
     }),
   };
   const app = createApplication(runtime, createStorage(runtime));
+  async function recoverRoot(namespace: string, key: string) {
+    for (const attempt of [0, 1, 2, 3, 4, 5, 6]) {
+      const object = await bucket.get(key);
+      if (object === null) return undefined;
+      const saved = decodeRootForMigration(await object.text());
+      if (saved.kind === "current") return saved.root;
+      if (attempt === 6) break;
+      const reply = await new app.KanninRpc({ waitUntil }, env).execute({
+        namespace,
+        operation: "migrate-root",
+        input: {},
+      });
+      if (reply._tag === "Failure" && reply.error.status !== 409) throw reply.error;
+    }
+    throw new Error("Namespace Root migration did not settle during recovery");
+  }
   async function recover() {
     const cursor: { value: string | undefined } = { value: undefined };
     do {
@@ -185,9 +201,8 @@ export const portableApplication = Effect.fn("kannin.portableApplication")(funct
       });
       for (const prefix of page.delimitedPrefixes) {
         const namespace = Schema.decodeSync(NamespaceName)(prefix.slice("namespaces/".length, -1));
-        const object = await bucket.get(`${prefix}root.json`);
-        if (object === null) continue;
-        const root = decodeRoot(await object.text());
+        const root = await recoverRoot(namespace, `${prefix}root.json`);
+        if (root === undefined) continue;
         await bucket.put(`${namespaceCatalogPrefix}${namespace}`, "", {
           onlyIf: { etagDoesNotMatch: "*" },
         });

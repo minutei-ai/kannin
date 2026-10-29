@@ -90,7 +90,7 @@ export default {
     }
     if (path === "/probe") {
       const input = Schema.decodeUnknownSync(Probe)(await request.json());
-      state.key = `cache/directory-common-v4/${input.source.key}/${input.source.headerBytes}`;
+      state.key = `cache/directory-common-v5/${input.source.key}/${input.source.headerBytes}`;
       state.miss = input.miss;
       state.budgetReject = input.budgetReject;
       clearImmutableCache(input.source.key);
@@ -135,7 +135,7 @@ export default {
     }
     if (path === "/hot") {
       const source = Schema.decodeUnknownSync(TermProjectionRange)(await request.json());
-      state.key = `cache/directory-common-v4/${source.key}/${source.headerBytes}`;
+      state.key = `cache/directory-common-v5/${source.key}/${source.headerBytes}`;
       const object = await env.STORAGE.get(source.key);
       if (object === null) return new Response(null, { status: 404 });
       const bytes = new Uint8Array(await object.arrayBuffer());

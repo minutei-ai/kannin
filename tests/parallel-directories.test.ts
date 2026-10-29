@@ -41,7 +41,7 @@ test("parallel cold ranking preserves complete results through missing and corru
       if (source === null) throw new Error("Missing canonical segment");
       const bytes = new Uint8Array(await source.arrayBuffer());
       await bucket.put(
-        `cache/directory-v6/${segment.key}/${segment.headerBytes}`,
+        `cache/directory-v7/${segment.key}/${segment.headerBytes}`,
         new Uint8Array(directory_compress(bytes.subarray(0, segment.headerBytes))),
         {
           customMetadata: {
@@ -67,7 +67,7 @@ test("parallel cold ranking preserves complete results through missing and corru
     if (object === null) throw new Error("Missing persisted root");
     const root = decodeRoot(await object.text());
     for (const segment of root.segments) {
-      const key = `cache/directory-v6/${segment.key}/${segment.headerBytes}`;
+      const key = `cache/directory-v7/${segment.key}/${segment.headerBytes}`;
       if (phase === "missing") await bucket.delete(key);
       if (phase === "corrupt")
         await bucket.put(key, new Uint8Array([1, 2, 3]), {
@@ -109,7 +109,7 @@ test("parallel cold ranking preserves complete results through missing and corru
       expect(metadata.cache.directoryR2CacheReads).toBeGreaterThanOrEqual(4);
       for (const segment of root.segments) {
         const repaired = await bucket.get(
-          `cache/directory-v6/${segment.key}/${segment.headerBytes}`,
+          `cache/directory-v7/${segment.key}/${segment.headerBytes}`,
         );
         expect(repaired).not.toBeNull();
         if (repaired === null) throw new Error("Missing recovered directory frame");
@@ -148,7 +148,7 @@ test("filtered cold seed reads the prepared R2 directory without a segment origi
       if (source === null) throw new Error("Missing filtered segment");
       const bytes = new Uint8Array(await source.arrayBuffer());
       await bucket.put(
-        `cache/directory-v6/${segment.key}/${segment.headerBytes}`,
+        `cache/directory-v7/${segment.key}/${segment.headerBytes}`,
         new Uint8Array(directory_compress(bytes.subarray(0, segment.headerBytes))),
         {
           customMetadata: {

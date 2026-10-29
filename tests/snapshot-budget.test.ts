@@ -56,9 +56,9 @@ test("a stalled snapshot cache cannot delay R2 selection or replace its newer ro
     (await request(worker, namespace, "write", write([document("a", "alpha new")]))).status,
   ).toBe(200);
   const observedAt = Date.now();
-  const cache = await (await worker.getCaches()).open("raio-snapshots-v6");
+  const cache = await (await worker.getCaches()).open("raio-snapshots-v7");
   await cache.put(
-    `https://raio-cache.internal/snapshots-v6/${namespace}?bucket=raio-test`,
+    `https://raio-cache.internal/snapshots-v7/${namespace}?bucket=raio-test`,
     new Response(await snapshotFrame({ observedAt, manifest }, payload).arrayBuffer(), {
       headers: {
         "cache-control": "public, max-age=60",

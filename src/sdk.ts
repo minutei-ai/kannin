@@ -17,7 +17,7 @@ import {
   type VectorRebuild,
   VectorRebuildResult,
   VectorSyncResult,
-  type Write,
+  type WriteCommand,
   WriteResult,
 } from "./protocol";
 
@@ -56,7 +56,7 @@ export const query = Effect.fn("kannin.query")(function* (
 });
 export const write = Effect.fn("kannin.write")(function* (
   namespace: string,
-  input: typeof Write.Type,
+  input: typeof WriteCommand.Type,
 ) {
   return yield* invoke({ namespace, operation: "write", input }, WriteResult);
 });

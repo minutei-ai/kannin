@@ -313,6 +313,42 @@ export const CanonicalId = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("uint"), value: CanonicalUintIdValue }),
   Schema.Struct({ kind: Schema.Literal("uuid"), value: CanonicalUuidIdValue }),
 ]);
+export const IdType = Schema.Literals(["string", "uint", "uuid"]);
+export function canonicalIdType(id: typeof CanonicalId.Type): typeof IdType.Type {
+  if (typeof id === "string") return "string";
+  return id.kind;
+}
+export function canonicalIdKey(id: typeof CanonicalId.Type): string {
+  if (typeof id === "string") return `string:${id}`;
+  return `${id.kind}:${id.value}`;
+}
+function canonicalIdValue(id: typeof CanonicalId.Type): string {
+  if (typeof id === "string") return id;
+  return id.value;
+}
+export function compareCanonicalIds(
+  left: typeof CanonicalId.Type,
+  right: typeof CanonicalId.Type,
+): number {
+  const a = canonicalIdType(left);
+  const b = canonicalIdType(right);
+  if (a !== b) {
+    if (a < b) return -1;
+    return 1;
+  }
+  const x = canonicalIdValue(left);
+  const y = canonicalIdValue(right);
+  if (a === "uint" && x.length !== y.length) return x.length - y.length;
+  if (x < y) return -1;
+  if (x > y) return 1;
+  return 0;
+}
+export function sameCanonicalId(
+  left: typeof CanonicalId.Type,
+  right: typeof CanonicalId.Type,
+): boolean {
+  return compareCanonicalIds(left, right) === 0;
+}
 export const CanonicalDocument = Schema.Struct({
   id: CanonicalId,
   revision: StoredDocument.fields.revision,
@@ -320,6 +356,26 @@ export const CanonicalDocument = Schema.Struct({
   attributes: Attributes,
   vector: Document.fields.vector,
 });
+export const CanonicalWriteDocument = CanonicalDocument.mapFields((fields) =>
+  Struct.omit(fields, ["revision"]),
+);
+export const CanonicalWrite = Schema.Struct({
+  kind: Schema.Literal("canonical"),
+  requestId: Id,
+  idType: IdType,
+  schema: Schema.optional(NamespaceSchema),
+  upserts: Schema.Array(CanonicalWriteDocument).check(Schema.isMaxLength(1000)),
+  deletes: Schema.Array(CanonicalId).check(Schema.isMaxLength(1000)),
+  reset: Schema.optional(Schema.Boolean),
+}).check(
+  Schema.makeFilter(
+    (write) =>
+      [...write.upserts.map((document) => document.id), ...write.deletes].every(
+        (id) => canonicalIdType(id) === write.idType,
+      ) || "Canonical write IDs differ from declared type",
+  ),
+);
+export const WriteCommand = Schema.Union([CanonicalWrite, Write]);
 export const CanonicalDocumentMetadata = CanonicalDocument.mapFields((fields) =>
   Struct.omit(fields, ["vector"]),
 );
@@ -356,7 +412,7 @@ export function canonicalToQueryRow(
   score: number,
 ): typeof Row.Type {
   return {
-    id: nativeProjectionId(document.id),
+    id: document.id,
     revision: document.revision,
     title: document.roles.title,
     text: document.roles.text,
@@ -520,9 +576,9 @@ const LegacyInlineSegment = Schema.Struct({
   termBloom: Schema.String,
   dead: Schema.Array(Schema.Int),
   removedFrequencies: Schema.Record(Schema.String, Schema.Int),
-  commonTerms: Schema.optional(Schema.suspend(() => CommonTerms)),
+  commonTerms: Schema.optional(Schema.suspend(() => LegacyCommonTerms)),
   commonProjection: Schema.optional(Schema.NullOr(Schema.suspend(() => CommonTermProjection))),
-  commonLeaders: Schema.optional(Schema.suspend(() => CommonLeaders)),
+  commonLeaders: Schema.optional(Schema.suspend(() => LegacyCommonLeaders)),
   constantAttributes: Schema.optional(ConstantAttributes),
   eligibility: Schema.NullOr(Schema.suspend(() => EligibilityProjection)),
 });
@@ -539,7 +595,10 @@ const PackedRootValue = Schema.Struct({
   bloomPacks: Schema.Array(Schema.suspend(() => BloomPack)),
   segments: Schema.Array(LegacyPackedSegment),
 });
-const validBloomReferences = (root: Pick<typeof PackedRootValue.Type, "bloomPacks" | "segments">) =>
+const validBloomReferences = (root: {
+  readonly bloomPacks: typeof PackedRootValue.Type.bloomPacks;
+  readonly segments: ReadonlyArray<Pick<typeof LegacyPackedSegment.Type, "key" | "bloom">>;
+}) =>
   root.segments.every(
     (segment) =>
       root.bloomPacks[segment.bloom.packIndex]?.segmentKeys[segment.bloom.row] === segment.key,
@@ -554,11 +613,36 @@ const validMetadataBoundary = (
 ) =>
   (segment.metadataEnd >= segment.headerBytes && segment.metadataEnd <= segment.bytes) ||
   "Invalid segment metadata boundary";
+const CurrentMetadataSegment = MetadataSegment.mapFields((fields) => ({
+  ...fields,
+  minimumId: CanonicalId,
+  commonTerms: Schema.optional(Schema.suspend(() => CommonTerms)),
+  commonLeaders: Schema.optional(Schema.suspend(() => CommonLeaders)),
+}));
 export const Root = PackedRootValue.mapFields((fields) => ({
   ...fields,
   schema: Schema.optional(NamespaceColumns),
-  segments: Schema.Array(MetadataSegment.check(Schema.makeFilter(validMetadataBoundary))),
-})).check(Schema.makeFilter(validBloomReferences));
+  idType: Schema.optional(IdType),
+  segments: Schema.Array(CurrentMetadataSegment.check(Schema.makeFilter(validMetadataBoundary))),
+})).check(
+  Schema.makeFilter(validBloomReferences),
+  Schema.makeFilter((root) => {
+    const valid = (id: typeof CanonicalId.Type) =>
+      canonicalIdType(id) === (root.idType ?? "string");
+    return (
+      root.segments.every(
+        (segment) =>
+          valid(segment.minimumId) &&
+          (segment.commonLeaders ?? []).every((leader) =>
+            leader.documents.every((document) => valid(document.id)),
+          ) &&
+          Object.values(segment.commonTerms ?? {}).every(
+            (term) => term.single === undefined || valid(term.single.id),
+          ),
+      ) || "Root metadata ID type differs from namespace policy"
+    );
+  }),
+);
 export const UnpackedSegment = Root.fields.segments.value
   .mapFields((fields) => Struct.omit(fields, ["bloom"]))
   .check(Schema.makeFilter(validMetadataBoundary));
@@ -671,7 +755,7 @@ export const NamespaceListCursor = Schema.StringFromBase64Url.pipe(
     ),
   ),
 );
-export const Log = Schema.Struct({
+const NativeLog = Schema.Struct({
   version: Schema.Literal(1),
   sequence: Schema.Int.check(Schema.isGreaterThan(0)),
   previous: Schema.Union([Schema.String, Schema.Null]),
@@ -680,8 +764,16 @@ export const Log = Schema.Struct({
   vectorDeletes: Schema.Array(Schema.String),
   write: Write,
 });
+export const Log = Schema.Union([
+  NativeLog,
+  NativeLog.mapFields((fields) => ({
+    ...fields,
+    version: Schema.Literal(2),
+    write: CanonicalWrite,
+  })),
+]);
 export const Row = Schema.Struct({
-  id: Id,
+  id: CanonicalId,
   title: Schema.String,
   text: Schema.String,
   attributes: Attributes,
@@ -789,7 +881,7 @@ export const Receipt = Schema.Struct({
 });
 export const DataRange = Schema.Struct({ offset: Schema.Int, length: Schema.Int });
 export const SegmentDocument = Schema.Struct({
-  id: Id,
+  id: CanonicalId,
   revision: Schema.Int,
   title_length: Schema.Int,
   body_length: Schema.Int,
@@ -821,7 +913,7 @@ export const EligibleMinimum = Schema.Union([
 ]);
 const TermDocument = Schema.Struct({
   row: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 9999 })),
-  id: Id,
+  id: CanonicalId,
   data: DataRange,
 });
 export const TermSummary = Schema.Struct({
@@ -858,6 +950,20 @@ export const CommonTerms = Schema.Record(
     ),
   ),
 ).check(Schema.isMaxProperties(16));
+const LegacyTermDocument = TermDocument.mapFields((fields) => ({ ...fields, id: Id }));
+const LegacyTermSummary = TermSummary.mapFields((fields) => ({
+  ...fields,
+  single: Schema.optional(LegacyTermDocument),
+}));
+const LegacyCommonTerms = Schema.Record(CommonTerms.key, LegacyTermSummary).check(
+  Schema.makeFilter((value) => Schema.is(CommonTerms)(value) || "Invalid legacy common terms"),
+);
+const LegacyCommonLeaders = Schema.Array(
+  CommonLeaders.value.mapFields((fields) => ({
+    ...fields,
+    documents: Schema.Array(LegacyTermDocument).check(Schema.isMaxLength(16)),
+  })),
+).check(Schema.isMaxLength(2));
 const CommonTermBound = TermSummary.fields.bounds.value.check(
   Schema.makeFilter(
     (bound) =>
@@ -977,7 +1083,7 @@ const PackedStoredRoot = LegacyPackedRoot.mapFields((fields) => ({
   ...fields,
   version: Schema.Literal(4),
   commonProjections: Schema.Array(CommonTermProjection),
-  commonTermDictionaries: Schema.Array(CommonTerms),
+  commonTermDictionaries: Schema.Array(LegacyCommonTerms),
   eligibilityModels: Schema.Array(Schema.suspend(() => EligibilityProjection)),
   segments: Schema.Array(
     fields.segments.value.mapFields((segment) => ({
@@ -990,12 +1096,18 @@ const PackedStoredRoot = LegacyPackedRoot.mapFields((fields) => ({
     })),
   ),
 }));
-const validStoredRootMetadata = (
-  root: Pick<
-    typeof PackedStoredRoot.Type,
-    "bloomPacks" | "segments" | "commonProjections" | "commonTermDictionaries" | "eligibilityModels"
-  >,
-) => {
+const validStoredRootMetadata = (root: {
+  readonly bloomPacks: typeof PackedStoredRoot.Type.bloomPacks;
+  readonly segments: ReadonlyArray<
+    Pick<
+      (typeof PackedStoredRoot.Type.segments)[number],
+      "key" | "bloom" | "commonProjectionIndex" | "commonTermsIndex" | "eligibilityIndex"
+    >
+  >;
+  readonly commonProjections: ReadonlyArray<unknown>;
+  readonly commonTermDictionaries: ReadonlyArray<unknown>;
+  readonly eligibilityModels: ReadonlyArray<unknown>;
+}) => {
   const packedSegmentKeys = root.bloomPacks.flatMap((pack) => pack.segmentKeys);
   return (
     (new Set(packedSegmentKeys).size === packedSegmentKeys.length &&
@@ -1029,11 +1141,45 @@ export const LegacyStoredRootV5 = PackedStoredRoot.mapFields((fields) => ({
       .check(Schema.makeFilter(validMetadataBoundary)),
   ),
 })).check(Schema.makeFilter(validStoredRootMetadata));
-export const StoredRoot = LegacyStoredRootV5.mapFields((fields) => ({
+export const LegacyStoredRootV6 = LegacyStoredRootV5.mapFields((fields) => ({
   ...fields,
   version: Schema.Literal(6),
   schema: Schema.optional(NamespaceColumns),
 })).check(Schema.makeFilter(validStoredRootMetadata));
+export const StoredRoot = LegacyStoredRootV6.mapFields((fields) => ({
+  ...fields,
+  version: Schema.Literal(7),
+  idType: Schema.optional(IdType),
+  commonTermDictionaries: Schema.Array(CommonTerms),
+  segments: Schema.Array(
+    fields.segments.value.mapFields((segment) => ({
+      ...segment,
+      minimumId: CanonicalId,
+      commonLeaders: Schema.optional(CommonLeaders),
+    })),
+  ),
+})).check(
+  Schema.makeFilter(validStoredRootMetadata),
+  Schema.makeFilter((root) => {
+    const valid = (id: typeof CanonicalId.Type) =>
+      canonicalIdType(id) === (root.idType ?? "string");
+    return (
+      (root.segments.every(
+        (segment) =>
+          valid(segment.minimumId) &&
+          (segment.commonLeaders ?? []).every((leader) =>
+            leader.documents.every((document) => valid(document.id)),
+          ),
+      ) &&
+        root.commonTermDictionaries.every((dictionary) =>
+          Object.values(dictionary).every(
+            (term) => term.single === undefined || valid(term.single.id),
+          ),
+        )) ||
+      "Stored Root metadata ID type differs from namespace policy"
+    );
+  }),
+);
 export const StoredVectorRebuildSnapshot = VectorRebuildSnapshot.mapFields((fields) => ({
   ...fields,
   root: StoredRoot,
@@ -1049,7 +1195,7 @@ export const LegacyStoredRootV3 = LegacyInlineRoot.mapFields((fields) => ({
   ...fields,
   version: Schema.Literal(3),
   commonProjections: Schema.Array(CommonTermProjection),
-  commonTermDictionaries: Schema.Array(CommonTerms),
+  commonTermDictionaries: Schema.Array(LegacyCommonTerms),
   eligibilityModels: Schema.Array(Schema.suspend(() => EligibilityProjection)),
   segments: Schema.Array(
     fields.segments.value.mapFields((segment) => ({
@@ -1102,6 +1248,7 @@ export const RootMigrationInput = Schema.Union([
   LegacyStoredRootV3,
   LegacyStoredRootV4,
   LegacyStoredRootV5,
+  LegacyStoredRootV6,
   StoredRoot,
 ]);
 export const VectorRebuildSnapshotMigrationInput = Schema.Union([
@@ -1111,6 +1258,7 @@ export const VectorRebuildSnapshotMigrationInput = Schema.Union([
   VectorRebuildSnapshot.mapFields((fields) => ({ ...fields, root: LegacyStoredRootV3 })),
   VectorRebuildSnapshot.mapFields((fields) => ({ ...fields, root: LegacyStoredRootV4 })),
   VectorRebuildSnapshot.mapFields((fields) => ({ ...fields, root: LegacyStoredRootV5 })),
+  VectorRebuildSnapshot.mapFields((fields) => ({ ...fields, root: LegacyStoredRootV6 })),
   StoredVectorRebuildSnapshot,
 ]);
 export const VECTOR_REBUILD_CHECKPOINT_BYTES = 8 * 1024 * 1024;
@@ -1336,7 +1484,7 @@ export const SegmentTextFields = Schema.Array(SegmentTextField).check(
   }),
 );
 export const SegmentHeader = Schema.Struct({
-  version: Schema.Literals([2, 3, 4]),
+  version: Schema.Literals([2, 3, 4, 5]),
   documents: Schema.NonEmptyArray(SegmentDocument),
   terms: SegmentTerms,
   total_title_length: Schema.Int,
@@ -1352,7 +1500,7 @@ export const LocatedDocument = Schema.Struct({
 });
 export const NativeVectorLocation = Schema.Struct({
   row: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-  id: Id,
+  id: CanonicalId,
   data: DataRange,
   vectorData: DataRange,
 });
@@ -1425,7 +1573,7 @@ export const SharedTextPlanCacheHeaders = Schema.Struct({
   ),
 });
 export const SegmentHits = Schema.Array(
-  Schema.Struct({ row: Schema.Int, id: Id, score: Schema.Finite, data: DataRange }),
+  Schema.Struct({ row: Schema.Int, id: CanonicalId, score: Schema.Finite, data: DataRange }),
 );
 export const VectorSyncResult = Schema.Struct({
   submitted: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 16 })),
@@ -1537,7 +1685,7 @@ export class Rejected extends Schema.TaggedError<Rejected, { readonly brand: uni
   },
 ) {}
 
-export const NativeVectorHits = Schema.Array(Schema.Tuple([Id, Schema.Finite])).check(
+export const NativeVectorHits = Schema.Array(Schema.Tuple([CanonicalId, Schema.Finite])).check(
   Schema.isMaxLength(100),
 );
 
@@ -1565,7 +1713,11 @@ export const NamespaceRpcCommand = Schema.Union([
     operation: Schema.Literal("migrate-root"),
     input: Schema.optional(Schema.Struct({})),
   }),
-  Schema.Struct({ namespace: NamespaceName, operation: Schema.Literal("write"), input: Write }),
+  Schema.Struct({
+    namespace: NamespaceName,
+    operation: Schema.Literal("write"),
+    input: WriteCommand,
+  }),
   Schema.Struct({ namespace: NamespaceName, operation: Schema.Literal("query"), input: Query }),
   Schema.Struct({
     namespace: NamespaceName,
@@ -1619,7 +1771,7 @@ export const NamespaceCommand = Schema.Union([
   }),
 ]);
 export const RootMigrationResult = Schema.Struct({
-  version: Schema.Literal(6),
+  version: Schema.Literal(7),
   sequence: Root.fields.sequence,
   rootRewritten: Schema.Boolean,
   migratedSnapshots: Schema.Int,

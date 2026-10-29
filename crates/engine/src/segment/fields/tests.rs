@@ -1047,7 +1047,7 @@ fn shared_global_statistics_make_split_segments_bit_identical_to_one_segment() -
     for text in ["red fox", "fox", "dog red"] {
         let global = local_field_statistics(&whole, &fields, text, "any", &[])?;
         let expected = scored(&whole, &query(&fields, text, Some(&global)))?;
-        assert!(!expected.is_empty());
+        assert_ne!(expected, Vec::<(String, u64)>::new());
         assert_eq!(expected, scored(&whole, &query(&fields, text, None))?);
         let mut merged = Vec::new();
         let mut aggregated = global.clone();
@@ -1086,6 +1086,17 @@ fn shared_global_statistics_make_split_segments_bit_identical_to_one_segment() -
     Ok(())
 }
 
+fn tombstoned<'a>(
+    fields: &'a [DocumentColumnId],
+    dead: &'a [u32],
+    statistics: Option<&'a CorpusStatistics>,
+) -> FieldQuery<'a> {
+    FieldQuery {
+        dead,
+        ..query(fields, "red fox", statistics)
+    }
+}
+
 #[test]
 fn tombstones_match_physical_removal_with_explicit_and_derived_statistics() -> Result<(), String> {
     let documents = mixed_documents(40);
@@ -1099,16 +1110,7 @@ fn tombstones_match_physical_removal_with_explicit_and_derived_statistics() -> R
     let full = mixed_segment(documents)?;
     let removed = mixed_segment(kept)?;
     let fields = all_fields();
-    fn tombstoned<'a>(
-        fields: &'a [DocumentColumnId],
-        dead: &'a [u32],
-        statistics: Option<&'a CorpusStatistics>,
-    ) -> FieldQuery<'a> {
-        FieldQuery {
-            dead,
-            ..query(fields, "red fox", statistics)
-        }
-    }
+
     assert_eq!(
         scored(&full, &tombstoned(&fields, &dead, None))?,
         scored(&removed, &query(&fields, "red fox", None))?
@@ -1195,7 +1197,7 @@ fn custom_k1_and_b_follow_the_closed_form_including_the_b_extremes() -> Result<(
     let lengths = [3_u32, 1, 4, 1];
     let frequencies = [2_u32, 1, 1, 0];
     let (n, df, average) = (4.0_f64, 3.0_f64, 9.0_f64 / 4.0);
-    let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
+    let idf = ((n - df + 0.5) / (df + 0.5)).ln_1p();
     for (k1, b) in [(1.2, 0.75), (2.0, 0.0), (0.5, 1.0), (1.2, 0.3), (7.5, 0.9)] {
         let hits = rank_fields_with(
             &built,
@@ -1235,7 +1237,7 @@ fn custom_k1_and_b_follow_the_closed_form_including_the_b_extremes() -> Result<(
 }
 
 #[test]
-fn invalid_bm25_parameters_and_statistics_fail_closed() -> Result<(), String> {
+fn invalid_bm25_parameters_and_nonfinite_scores_fail_closed() -> Result<(), String> {
     for k1 in [0.0, -1.0, f64::NAN, f64::INFINITY] {
         assert_eq!(
             rejection(Bm25Parameters::new(k1, 0.5))?,
@@ -1273,6 +1275,12 @@ fn invalid_bm25_parameters_and_statistics_fail_closed() -> Result<(), String> {
         ))?,
         "Text score is not finite"
     );
+    Ok(())
+}
+
+#[test]
+fn invalid_field_statistics_fail_closed() -> Result<(), String> {
+    let field = [tags("tags")];
     let built = mixed_segment(mixed_documents(8))?;
     let good = local_field_statistics(&built, &field, "fox", "any", &[])?;
     assert!(rank_fields_with(&built, &query(&field, "fox", Some(&good))).is_ok());
@@ -1425,7 +1433,7 @@ fn statistics_are_keyed_by_exact_identity_across_native_and_attribute_names() ->
             &query(&fields, "nebula pulsar", Some(&inflated))
         )?
     );
-    let mut native_only = derived.clone();
+    let mut native_only = derived;
     native_only.fields.truncate(1);
     assert_eq!(
         rejection(rank_fields_with(

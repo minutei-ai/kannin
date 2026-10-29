@@ -123,7 +123,7 @@ test("native numeric lexeme transport runs in workerd", async () => {
     ["uint", "18446744073709551615"],
     ["string", '"18446744073709551615"'],
     ["uuid", '"00112233-4455-6677-8899-aabbccddeeff"'],
-  ]) {
+  ] as const) {
     const idResponse = await worker.dispatchFetch(
       new URL(`?id_type=${policy}`, await worker.ready),
       {

@@ -10,7 +10,7 @@ export const decodePublicId = Effect.fn("kannin.public.decodeId")(function* (
   if (idType === "uuid")
     return yield* Schema.decodeUnknownEffect(CanonicalId)({ kind: "uuid", value: input });
   const numeric = yield* Schema.decodeUnknownEffect(NativeJsonNumeric)(input);
-  return yield* Schema.decodeUnknownEffect(CanonicalId)({ kind: "uint", value: numeric.rawJSON });
+  return yield* Schema.decodeEffect(CanonicalId)({ kind: "uint", value: numeric.rawJSON });
 });
 
 export const encodePublicId = Effect.fn("kannin.public.encodeId")(function* (

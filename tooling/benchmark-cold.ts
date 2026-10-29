@@ -37,7 +37,11 @@ await ingestCleanup.disposeAsync();
 
 const reports = [];
 for (const [name, selected] of benchmarkQueries) {
-  const input = { ...selected, consistency: "strong" as const, minimumSequence: batches };
+  const input = Schema.decodeUnknownSync(Query, { onExcessProperty: "error" })({
+    ...selected,
+    consistency: "strong",
+    minimumSequence: batches,
+  });
   const samples = [];
   const baselines = new Set<string>();
   for (const repetition of Array.from({ length: repetitions }, (_, ordinal) => ordinal)) {

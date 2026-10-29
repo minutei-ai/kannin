@@ -38,7 +38,11 @@ const encodeQuery = Schema.encodeSync(Schema.fromJsonString(Query));
 
 for (const consistency of ["strong", "edge-eventual"] as const)
   for (const [name, selected] of benchmarkQueries) {
-    const query = { ...selected, consistency, minimumSequence: Math.ceil(size / 500) };
+    const query = Schema.decodeUnknownSync(Query, { onExcessProperty: "error" })({
+      ...selected,
+      consistency,
+      minimumSequence: Math.ceil(size / 500),
+    });
     for (const _warmup of Array.from({ length: 5 }, (_, ordinal) => ordinal)) {
       const response = await request(worker, "benchmark", "query", query);
       if (!response.ok) throw new Error(`Warmup failed ${response.status}`);

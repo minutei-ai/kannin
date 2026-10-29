@@ -10087,6 +10087,8 @@ mod shared_attribute_identity_tests {
                     json!(true),
                     json!(null),
                     json!([3, 5]),
+                    json!(""),
+                    json!("a"),
                     json!({"a":1}),
                 ] {
                     let filters = [Filter {

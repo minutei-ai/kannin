@@ -1,11 +1,19 @@
 import { expect, spyOn, test } from "bun:test";
-import { Effect, Schema } from "effect";
+import { Cause, Effect, Option, Schema } from "effect";
 import { Miniflare } from "miniflare";
 import { decodePublicJson, encodePublicJson } from "../src/public-json";
 import { NativeJsonNumeric } from "../src/protocol";
 
 const decode = (text: string) => Effect.runSync(decodePublicJson(text));
 const encode = (value: unknown) => Effect.runSync(encodePublicJson(value));
+
+function failureOf<A>(effect: Effect.Effect<A, Cause.UnknownError>) {
+  const exit = Effect.runSyncExit(effect);
+  if (exit._tag === "Success") throw new Error("Expected JSON transport failure");
+  const failure = Cause.findErrorOption(exit.cause);
+  if (Option.isNone(failure)) throw new Error("JSON transport lost its declared failure");
+  return failure.value;
+}
 
 test("public JSON retains integer bounds, nested structure, and every numeric lexeme", () => {
   const value = decode(
@@ -23,21 +31,23 @@ test("public JSON emits bigint exactly and does not reinterpret numeric strings"
 });
 
 test("invalid JSON preserves the native syntax error", () => {
-  const failure = Effect.runSync(Effect.flip(decodePublicJson("{")));
+  const failure = failureOf(decodePublicJson("{"));
   expect(failure.cause).toBeInstanceOf(SyntaxError);
 });
 
 test("numeric decoding rejects a runtime without native numeric source context", () => {
   const original = JSON.parse;
   using cleanup = new DisposableStack();
-  const mocked = spyOn(JSON, "parse").mockImplementation((text, reviver) =>
-    original(text, (key, value: unknown) => {
+  const mocked = spyOn(JSON, "parse").mockImplementation((text, reviver): unknown => {
+    const parsed: unknown = original(text, (key, value: unknown): unknown => {
       if (reviver === undefined) return value;
-      return reviver(key, value, {});
-    }),
-  );
+      const replaced: unknown = reviver(key, value);
+      return replaced;
+    });
+    return parsed;
+  });
   cleanup.defer(() => mocked.mockRestore());
-  const failure = Effect.runSync(Effect.flip(decodePublicJson("18446744073709551615")));
+  const failure = failureOf(decodePublicJson("18446744073709551615"));
   expect(failure.cause).toBeInstanceOf(TypeError);
 });
 
@@ -52,25 +62,23 @@ test("native raw JSON transport schema rejects forged numeric fragments", () => 
   expect(Schema.is(NativeJsonNumeric)(JSON.rawJSON("18446744073709551615"))).toBe(true);
   for (const literal of ['"text"', "null", "true", "false"]) {
     expect(Schema.is(NativeJsonNumeric)(JSON.rawJSON(literal))).toBe(false);
-    const failure = Effect.runSync(Effect.flip(encodePublicJson(JSON.rawJSON(literal))));
+    const failure = failureOf(encodePublicJson(JSON.rawJSON(literal)));
     expect(failure.cause).toBeInstanceOf(TypeError);
   }
 });
 
 test("public JSON preserves native serialization failures and rejects non-finite numbers", () => {
   const cause = new RangeError("native serialization failed");
-  const failure = Effect.runSync(
-    Effect.flip(
-      encodePublicJson({
-        toJSON: () => {
-          throw cause;
-        },
-      }),
-    ),
+  const failure = failureOf(
+    encodePublicJson({
+      toJSON: () => {
+        throw cause;
+      },
+    }),
   );
   expect(failure.cause).toBe(cause);
   for (const value of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
-    const invalid = Effect.runSync(Effect.flip(encodePublicJson({ value })));
+    const invalid = failureOf(encodePublicJson({ value }));
     expect(invalid.cause).toBeInstanceOf(TypeError);
   }
 });

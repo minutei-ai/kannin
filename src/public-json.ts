@@ -5,14 +5,18 @@ import { NativeJsonNumeric } from "./protocol";
 const isNativeJsonNumeric = Schema.is(NativeJsonNumeric);
 
 export function decodePublicJson(text: string): Effect.Effect<unknown, Cause.UnknownError> {
-  return Effect.try(() =>
-    JSON.parse(text, (_key, value: unknown, context?: { readonly source?: string }) => {
-      if (typeof value !== "number") return value;
-      const source = context?.source;
-      if (source === undefined) throw new TypeError("Native JSON numeric source unavailable");
-      return JSON.rawJSON(source);
-    }),
-  );
+  return Effect.try(() => {
+    const parsed: unknown = JSON.parse(
+      text,
+      (_key, value: unknown, context?: { readonly source?: string }) => {
+        if (typeof value !== "number") return value;
+        const source = context?.source;
+        if (source === undefined) throw new TypeError("Native JSON numeric source unavailable");
+        return JSON.rawJSON(source);
+      },
+    );
+    return parsed;
+  });
 }
 
 export function encodePublicJson(value: unknown) {

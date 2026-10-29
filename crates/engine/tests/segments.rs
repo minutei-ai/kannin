@@ -5,6 +5,16 @@ fn document(id: impl Into<String>, text: impl Into<String>) -> Document {
     Document::native(id, 0, String::new(), text, BTreeMap::new(), None)
 }
 
+fn legacy(header: &segment::Header) -> Result<segment::Header, String> {
+    segment::Header::from_parts(
+        3,
+        header.documents.clone(),
+        header.fields.clone(),
+        (header.metadata_end, header.vector_end),
+        header.vector_ranges.clone(),
+    )
+}
+
 fn role_text(
     document: &Document,
     role: segment::NativeRole,
@@ -25,10 +35,10 @@ fn role_words(document: &Document, role: segment::NativeRole) -> Vec<&str> {
 fn statistics(header: &Header) -> Statistics {
     Statistics {
         documents: header.documents.len() as u64,
-        title_length: header.total_title_length,
-        body_length: header.total_body_length,
+        title_length: header.total_title_length(),
+        body_length: header.total_body_length(),
         frequencies: header
-            .terms
+            .terms()
             .iter()
             .map(|(term, meta)| (term.to_owned(), u64::from(meta.df)))
             .collect(),
@@ -56,7 +66,7 @@ fn search(
     )?;
     let terms: BTreeSet<_> = search.words.iter().cloned().collect();
     for term in terms {
-        if let Some(meta) = header.terms.get(&term) {
+        if let Some(meta) = header.terms().get(&term) {
             for block in &meta.blocks {
                 let start = base + block.data.offset as usize;
                 let end = start + block.data.length as usize;
@@ -325,7 +335,7 @@ fn posting_directory_rejects_reordered_and_overlapping_rows()
         .collect();
     let built = segment::build(docs, None)?;
     for overlap in [false, true] {
-        let mut header: serde_json::Value = serde_json::to_value(&built.header)?;
+        let mut header: serde_json::Value = serde_json::to_value(legacy(&built.header)?)?;
         let blocks = header["terms"]["alpha"]["blocks"]
             .as_array_mut()
             .ok_or("Missing blocks")?;
@@ -409,7 +419,7 @@ fn eligible_posting_spans_preserve_scores_across_gaps_and_tombstones()
             for (term, start, end) in pages {
                 selected.add(&term, &built.bytes[start..end])?;
             }
-            for (term, metadata) in &header.terms {
+            for (term, metadata) in header.terms() {
                 for block in &metadata.blocks {
                     let start = base + block.data.offset as usize;
                     exhaustive.add(
@@ -439,7 +449,7 @@ fn posting_spans_bound_gap_overfetch() -> Result<(), Box<dyn std::error::Error>>
     let built = segment::build(docs, None)?;
     for gap in [4096, 4097] {
         let mut header = built.header.clone();
-        let metadata = header.terms.get_mut("alpha").ok_or("Missing term")?;
+        let metadata = header.terms_mut().get_mut("alpha").ok_or("Missing term")?;
         metadata.blocks[0].data.offset = 0;
         metadata.blocks[0].data.length = 10;
         metadata.blocks[2].data.offset = 10 + gap;
@@ -627,7 +637,7 @@ fn cutoff_posting_spans_preserve_gap_budgets() -> Result<(), Box<dyn std::error:
     let cutoff = segment::bm25(0, 1, 0, 1, &statistics, 384) * 0.9;
     for gap in [4096, 4097] {
         let mut header = built.header.clone();
-        let metadata = header.terms.get_mut("alpha").ok_or("Missing term")?;
+        let metadata = header.terms_mut().get_mut("alpha").ok_or("Missing term")?;
         metadata.blocks[0].data.offset = 0;
         metadata.blocks[0].data.length = 10;
         metadata.blocks[2].data.offset = 10 + gap;
@@ -755,7 +765,7 @@ fn decoded_term_maps_match_native_serde_order_and_duplicate_semantics()
         serde_json::from_str(&encoded)?;
     let entries = built
         .header
-        .terms
+        .terms()
         .iter()
         .map(|(term, meta)| {
             Ok(format!(
@@ -765,7 +775,7 @@ fn decoded_term_maps_match_native_serde_order_and_duplicate_semantics()
             ))
         })
         .collect::<Result<Vec<_>, serde_json::Error>>()?;
-    let alpha = built.header.terms.get("alpha").ok_or("Missing alpha")?;
+    let alpha = built.header.terms().get("alpha").ok_or("Missing alpha")?;
     let mut changed = alpha.clone();
     changed.df = 19;
     let changed = serde_json::to_string(&changed)?;
@@ -792,7 +802,7 @@ fn decoded_term_maps_match_native_serde_order_and_duplicate_semantics()
             serde_json::from_reader::<_, Header>(std::io::Cursor::new(encoded.as_bytes()))?,
         ] {
             assert_eq!(
-                serde_json::to_string(&decoded.terms)?,
+                serde_json::to_string(&decoded.terms())?,
                 serde_json::to_string(&expected)?
             );
             assert_eq!(decoded.documents.len(), built.header.documents.len());
@@ -879,7 +889,7 @@ fn prepared_queries_reuse_global_terms_without_retaining_segment_tombstones()
                     )?;
                     let mut shared = prepared.ranker(header.clone(), &dead)?;
                     for term in ["alpha", "beta"] {
-                        if let Some(metadata) = header.terms.get(term) {
+                        if let Some(metadata) = header.terms().get(term) {
                             for block in &metadata.blocks {
                                 let start = base + block.data.offset as usize;
                                 let bytes =
@@ -982,7 +992,8 @@ fn canonical_headers_reuse_compact_tuples_and_preserve_object_readers()
         serde_json::to_string(&compact)?,
         serde_json::to_string(&built.header)?
     );
-    let json = serde_json::to_vec(&built.header)?;
+    let object_header = legacy(&built.header)?;
+    let json = serde_json::to_vec(&object_header)?;
     assert!(base < json.len() + 16);
     let mut object = b"RAIOSEG3".to_vec();
     object.extend_from_slice(&u32::try_from(json.len())?.to_le_bytes());
@@ -992,8 +1003,9 @@ fn canonical_headers_reuse_compact_tuples_and_preserve_object_readers()
     let (original, original_base) = segment::parse_header(&object)?;
     assert_eq!(
         serde_json::to_string(&original)?,
-        serde_json::to_string(&compact)?
+        serde_json::to_string(&object_header)?
     );
+    assert_eq!(original.fields.len(), compact.fields.len());
     assert_eq!(&object[original_base..], &built.bytes[base..]);
     Ok(())
 }
@@ -1019,7 +1031,7 @@ fn unordered_unicode_query_terms_reject_unknown_pages_before_decode()
                 Err("Unrequested posting term".into())
             );
         }
-        for (term, metadata) in header.terms.iter().collect::<Vec<_>>().into_iter().rev() {
+        for (term, metadata) in header.terms().iter().collect::<Vec<_>>().into_iter().rev() {
             for block in &metadata.blocks {
                 let start = base + block.data.offset as usize;
                 ranker.add(

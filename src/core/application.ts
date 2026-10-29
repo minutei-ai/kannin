@@ -230,12 +230,12 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       if (
         decoded._tag === "Failure" ||
         directoryMiss._tag === "Failure" ||
-        (directoryMiss.value !== null && url.pathname !== "/directory-v5") ||
+        (directoryMiss.value !== null && url.pathname !== "/directory-v6") ||
         request.method !== "GET" ||
         props._tag === "Failure" ||
         props.value.bucket !== this.env.STORAGE_CACHE_SCOPE ||
-        (url.pathname !== "/range" && url.pathname !== "/directory-v5") ||
-        (url.pathname === "/directory-v5" && decoded.value.offset !== 0)
+        (url.pathname !== "/range" && url.pathname !== "/directory-v6") ||
+        (url.pathname === "/directory-v6" && decoded.value.offset !== 0)
       )
         return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });
       const input = decoded.value;
@@ -282,13 +282,13 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
                       });
                     const encoded = yield* Effect.try(() =>
                       Match.value(url.pathname).pipe(
-                        Match.when("/directory-v5", () =>
+                        Match.when("/directory-v6", () =>
                           directory_compress(new Uint8Array(bytes)).slice(),
                         ),
                         Match.orElse(() => bytes),
                       ),
                     );
-                    if (url.pathname === "/directory-v5")
+                    if (url.pathname === "/directory-v6")
                       publishDirectoryFrame(
                         input.key,
                         input.length,
@@ -309,7 +309,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
                   return Effect.tryPromise(() => object.body.cancel()).pipe(Effect.ignore);
                 },
               );
-              if (url.pathname !== "/directory-v5" || directoryMiss.value !== null)
+              if (url.pathname !== "/directory-v6" || directoryMiss.value !== null)
                 return yield* canonical;
               const reader = yield* acquireDirectoryFrame(input.key, input.length);
               const observed = yield* waitDirectoryFrame(reader);

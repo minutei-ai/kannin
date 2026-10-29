@@ -61,11 +61,11 @@ fn request(
             filters,
             statistics: Statistics {
                 documents: 300,
-                title_length: fixture.header.total_title_length,
-                body_length: fixture.header.total_body_length,
+                title_length: fixture.header.total_title_length(),
+                body_length: fixture.header.total_body_length(),
                 frequencies: fixture
                     .header
-                    .terms
+                    .terms()
                     .iter()
                     .map(|(word, meta)| (word.to_owned(), u64::from(meta.df)))
                     .collect(),
@@ -185,7 +185,7 @@ fn ranged_ranking_matches_full_segment_with_filters_tombstones_and_cutoffs() -> 
             for term in ["alpha", "beta"] {
                 for block in &fixture
                     .header
-                    .terms
+                    .terms()
                     .get(term)
                     .ok_or("Missing fixture term")?
                     .blocks

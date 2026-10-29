@@ -1220,8 +1220,44 @@ export const OverviewBatch = Schema.Array(OverviewSource)
         "Overview batch exceeds three MiB",
     ),
   );
+const SegmentTextCounts = {
+  total: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  terms: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+};
+export const SegmentTextField = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literals(["title", "text"]),
+    name: Schema.Null,
+    analysis: Schema.Null,
+    ...SegmentTextCounts,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("attribute"),
+    name: FieldName,
+    analysis: WordV4Config,
+    ...SegmentTextCounts,
+  }),
+]);
+export const SegmentTextFields = Schema.Array(SegmentTextField).check(
+  Schema.isBetweenLength(2, 66),
+  Schema.makeFilter((fields) => {
+    if (fields[0]?.kind !== "title" || fields[1]?.kind !== "text")
+      return "Native title and text fields must lead the text field table";
+    const named = fields.slice(2);
+    return (
+      named.every((field, index) => {
+        if (field.kind !== "attribute") return false;
+        const previous = named[index - 1];
+        return (
+          previous === undefined ||
+          (previous.kind === "attribute" && compareFieldNames(previous.name, field.name) < 0)
+        );
+      }) || "Named text fields must be distinct and strictly sorted"
+    );
+  }),
+);
 export const SegmentHeader = Schema.Struct({
-  version: Schema.Literals([2, 3]),
+  version: Schema.Literals([2, 3, 4]),
   documents: Schema.NonEmptyArray(SegmentDocument),
   terms: SegmentTerms,
   total_title_length: Schema.Int,

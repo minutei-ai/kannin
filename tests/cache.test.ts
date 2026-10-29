@@ -179,7 +179,7 @@ test("native Cache API retains compressed canonical directories after memory evi
   if (segment === undefined) throw new Error("Missing committed segment");
   const caches = await worker.getCaches();
   const cache = await caches.open("raio-segments-v1");
-  const key = new URL("https://raio-cache.internal/directory-v5");
+  const key = new URL("https://raio-cache.internal/directory-v6");
   key.searchParams.set("key", segment.key);
   key.searchParams.set("offset", "0");
   key.searchParams.set("length", String(segment.headerBytes));
@@ -190,7 +190,7 @@ test("native Cache API retains compressed canonical directories after memory evi
   if (cached === undefined) return;
   const encoded = new Uint8Array(await cached.arrayBuffer());
   expect(encoded.byteLength).toBeLessThan(segment.headerBytes);
-  expect(new TextDecoder().decode(encoded.subarray(0, 8))).toBe("RAIODIR5");
+  expect(new TextDecoder().decode(encoded.subarray(0, 8))).toBe("RAIODIR6");
   expect(new DataView(encoded.buffer, encoded.byteOffset).getUint32(8, true)).toBe(
     segment.headerBytes,
   );
@@ -200,7 +200,7 @@ test("native Cache API retains compressed canonical directories after memory evi
   if (canonical === null) throw new Error("Missing canonical header");
   expect(
     new TextDecoder().decode(new Uint8Array(await canonical.arrayBuffer()).subarray(0, 8)),
-  ).toBe("RAIOSEG3");
+  ).toBe("RAIOSEG4");
   await request(worker, "cached", "rebuild", {});
   expect(
     (await request(worker, "cached", "query", { ...textQuery("original cached"), match: "phrase" }))
@@ -210,6 +210,60 @@ test("native Cache API retains compressed canonical directories after memory evi
     await (await request(worker, "cached", "metadata")).json(),
   );
   expect(metadata.cache.cacheApiHits).toBeGreaterThan(0);
+});
+
+test("previous-generation derived directory objects are neither read nor replaced", async () => {
+  const namespace = "directory-generations";
+  await request(worker, namespace, "write", write([document("a", "generation isolated content")]));
+  const bucket = await worker.getR2Bucket("STORAGE");
+  const root = await bucket.get(`namespaces/${namespace}/root.json`);
+  if (root === null) throw new Error("Missing root");
+  const segment = decodeRoot(await root.text()).segments[0];
+  if (segment === undefined) throw new Error("Missing committed segment");
+  const source = JSON.stringify({ key: segment.key, headerBytes: segment.headerBytes });
+  const previous = [
+    `cache/directory-v5/${segment.key}/${segment.headerBytes}`,
+    `cache/directory-common-v3/${segment.key}/${segment.headerBytes}`,
+  ];
+  const stale = new Uint8Array(64);
+  stale.set(new TextEncoder().encode("RAIODIR5"));
+  const seeded = await Promise.all(
+    previous.map((identity) => bucket.put(identity, stale, { customMetadata: { source } })),
+  );
+  const before = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  await clearLeaderIndex(worker, namespace);
+  const queried = await request(worker, namespace, "query", {
+    ...textQuery("generation isolated"),
+    match: "phrase",
+    consistency: "edge-eventual",
+  });
+  expect(queried.status).toBe(200);
+  expect(
+    Schema.decodeUnknownSync(QueryResult)(await queried.json()).rows.map((row) => row.id),
+  ).toEqual(["a"]);
+  const current = `cache/directory-v6/${segment.key}/${segment.headerBytes}`;
+  const published = await (async () => {
+    for (const attempt of Array.from({ length: 50 }, (_, index) => index)) {
+      const object = await bucket.get(current);
+      if (object !== null) return new Uint8Array(await object.arrayBuffer());
+      await Bun.sleep(100 + attempt);
+    }
+    return undefined;
+  })();
+  if (published === undefined) throw new Error("Missing current-generation directory frame");
+  expect(new TextDecoder().decode(published.subarray(0, 8))).toBe("RAIODIR6");
+  const after = Schema.decodeUnknownSync(Health)(
+    await (await fetch(new URL("/health", await worker.ready))).json(),
+  );
+  expect(after.directoryR2CacheRejected).toBe(before.directoryR2CacheRejected);
+  for (const [index, identity] of previous.entries()) {
+    const object = await bucket.get(identity);
+    if (object === null) throw new Error(`Missing previous-generation object ${identity}`);
+    expect(object.etag).toBe(seeded[index]?.etag);
+    expect(new Uint8Array(await object.arrayBuffer())).toEqual(stale);
+  }
 });
 
 test("cached old segments cannot resurrect updated or deleted documents", async () => {
@@ -234,7 +288,7 @@ test("cached old segments cannot resurrect updated or deleted documents", async 
 });
 
 test("the authenticated gateway never exposes immutable cache entrypoints", async () => {
-  for (const path of ["/range", "/directory-v5", "/catalog-v12"]) {
+  for (const path of ["/range", "/directory-v6", "/catalog-v12"]) {
     const url = new URL(path, await worker.ready);
     const anonymous = await fetch(url);
     expect(anonymous.status).toBe(401);

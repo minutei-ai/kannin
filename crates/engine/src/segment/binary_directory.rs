@@ -1,8 +1,8 @@
 use super::{
-    BlockMeta, DocumentMeta, FILTER_CACHE_BYTES, Header, Range, TermDictionary, TermMeta, get_int,
-    put_int,
+    BlockMeta, DocumentMeta, FILTER_CACHE_BYTES, FieldMeta, FieldTable, Header, Range,
+    TermDictionary, TermMeta, get_int, put_int,
 };
-use std::cell::RefCell;
+use crate::analysis::WordV4Config;
 
 fn put_long(mut value: u64, bytes: &mut Vec<u8>) {
     while value >= 128 {
@@ -45,7 +45,7 @@ fn encode_columns(header: &Header, bytes: &mut Vec<u8>) -> Result<(), String> {
 }
 
 pub(super) fn encode(header: &Header) -> Result<Vec<u8>, String> {
-    encode_terms(header, &header.terms)
+    encode_terms(header, header.terms(), false)
 }
 
 fn plan_attributes(
@@ -95,7 +95,15 @@ fn plan_attributes(
     Ok((attributes, dictionary, unique))
 }
 
-pub(super) fn encode_terms(header: &Header, terms: &TermDictionary) -> Result<Vec<u8>, String> {
+pub(super) fn encode_terms(
+    header: &Header,
+    terms: &TermDictionary,
+    partial: bool,
+) -> Result<Vec<u8>, String> {
+    let legacy = header.version < 4;
+    if legacy && header.fields.len() != super::fields::NATIVE_FIELDS {
+        return Err("Named text requires segment version 4".into());
+    }
     let mut bytes = Vec::new();
     put_int(header.version, &mut bytes);
     put_int(
@@ -125,8 +133,10 @@ pub(super) fn encode_terms(header: &Header, terms: &TermDictionary) -> Result<Ve
     for (row, document) in header.documents.iter().enumerate() {
         put_text(document.id, &mut bytes)?;
         put_long(document.revision, &mut bytes);
-        put_int(document.title_length, &mut bytes);
-        put_int(document.body_length, &mut bytes);
+        if legacy {
+            put_int(document.title_length, &mut bytes);
+            put_int(document.body_length, &mut bytes);
+        }
         if dictionary {
             let index = match &header.documents.attributes {
                 super::AttributeColumn::Dictionary { indexes, .. } => u32::from(indexes[row]),
@@ -142,37 +152,85 @@ pub(super) fn encode_terms(header: &Header, terms: &TermDictionary) -> Result<Ve
         put_int(document.data.length, &mut bytes);
         put_int(u32::from(document.vector), &mut bytes);
     }
+    if legacy {
+        encode_dictionary(terms, &mut bytes)?;
+        put_long(header.total_title_length(), &mut bytes);
+        put_long(header.total_body_length(), &mut bytes);
+    } else {
+        encode_fields(header, terms, partial, &mut bytes)?;
+    }
+    encode_columns(header, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn encode_dictionary(terms: &TermDictionary, bytes: &mut Vec<u8>) -> Result<(), String> {
     put_int(
         u32::try_from(terms.len()).map_err(|cause| cause.to_string())?,
-        &mut bytes,
+        bytes,
     );
     for (term, metadata) in terms {
-        put_text(term, &mut bytes)?;
-        put_int(metadata.df, &mut bytes);
+        put_text(term, bytes)?;
+        put_int(metadata.df, bytes);
         put_int(
             u32::try_from(metadata.blocks.len()).map_err(|cause| cause.to_string())?,
-            &mut bytes,
+            bytes,
         );
         for block in &metadata.blocks {
             for value in [
                 block.first,
                 block.last,
                 block.count,
-                block.max_title_tf,
-                block.max_body_tf,
-                block.min_title_length,
-                block.min_body_length,
+                block.max_tf[0],
+                block.max_tf[1],
+                block.min_length[0],
+                block.min_length[1],
                 block.data.offset,
                 block.data.length,
             ] {
-                put_int(value, &mut bytes);
+                put_int(value, bytes);
             }
         }
     }
-    put_long(header.total_title_length, &mut bytes);
-    put_long(header.total_body_length, &mut bytes);
-    encode_columns(header, &mut bytes)?;
-    Ok(bytes)
+    Ok(())
+}
+
+fn encode_fields(
+    header: &Header,
+    native: &TermDictionary,
+    partial: bool,
+    bytes: &mut Vec<u8>,
+) -> Result<(), String> {
+    put_int(
+        u32::try_from(header.fields.len()).map_err(|cause| cause.to_string())?,
+        bytes,
+    );
+    for (ordinal, field) in header.fields.iter().enumerate() {
+        let (kind, name) = field.wire_id();
+        put_int(u32::from(kind), bytes);
+        put_text(name, bytes)?;
+        match field.analysis().config() {
+            None => put_int(0, bytes),
+            Some(config) => {
+                put_int(1, bytes);
+                put_text(
+                    &serde_json::to_string(&config).map_err(|cause| cause.to_string())?,
+                    bytes,
+                )?;
+            }
+        }
+        put_long(field.total(), bytes);
+        for row in 0..header.documents.len() {
+            put_int(header.documents.field_length(ordinal, row), bytes);
+        }
+    }
+    for (group, dictionary) in header.fields.dictionaries().enumerate() {
+        match (group, partial) {
+            (0, _) => encode_dictionary(native, bytes)?,
+            (_, true) => encode_dictionary(&TermDictionary::default(), bytes)?,
+            (_, false) => encode_dictionary(dictionary, bytes)?,
+        }
+    }
+    Ok(())
 }
 
 struct Decoder<'a> {
@@ -286,7 +344,7 @@ impl<'a> Decoder<'a> {
         column.push_charged(value, capacity, |bytes| self.charge(bytes))
     }
 
-    fn documents(&mut self) -> Result<super::DocumentTable, String> {
+    fn documents(&mut self, legacy: bool) -> Result<super::DocumentTable, String> {
         let count = self.integer()? as usize;
         if count > 10000 {
             return Err("Directory document limit exceeded".into());
@@ -332,8 +390,10 @@ impl<'a> Decoder<'a> {
         for _ in 0..count {
             let id = self.document_id(&mut ids)?;
             let revision = self.long()?;
-            self.scalar(&mut title_lengths, count, Self::integer)?;
-            self.scalar(&mut body_lengths, count, Self::integer)?;
+            if legacy {
+                self.scalar(&mut title_lengths, count, Self::integer)?;
+                self.scalar(&mut body_lengths, count, Self::integer)?;
+            }
             if mode == 0 {
                 values.push(super::DocumentAttributes::Owned(
                     serde_json::value::RawValue::from_string(self.text()?)
@@ -369,8 +429,11 @@ impl<'a> Decoder<'a> {
         Ok(super::DocumentTable {
             ids,
             rows: documents,
-            title_lengths,
-            body_lengths,
+            lengths: if legacy {
+                vec![title_lengths, body_lengths]
+            } else {
+                Vec::new()
+            },
             vectors,
             attributes: if mode == 0 {
                 super::AttributeColumn::Dense(values)
@@ -427,10 +490,8 @@ impl<'a> Decoder<'a> {
                     first: self.integer()?,
                     last: self.integer()?,
                     count: self.integer()?,
-                    max_title_tf: self.integer()?,
-                    max_body_tf: self.integer()?,
-                    min_title_length: self.integer()?,
-                    min_body_length: self.integer()?,
+                    max_tf: [self.integer()?, self.integer()?],
+                    min_length: [self.integer()?, self.integer()?],
                     data: self.range()?,
                 });
             }
@@ -461,6 +522,54 @@ impl<'a> Decoder<'a> {
             entries: entries.into_boxed_slice(),
         })
     }
+
+    fn fields(&mut self, documents: &mut super::DocumentTable) -> Result<FieldTable, String> {
+        let count = self.integer()? as usize;
+        if !(super::fields::NATIVE_FIELDS..=super::fields::NATIVE_FIELDS + 64).contains(&count) {
+            return Err("Named text fields exceed 64".into());
+        }
+        self.charge(
+            count
+                .checked_mul(size_of::<FieldMeta>())
+                .ok_or("Directory allocation overflow")?,
+        )?;
+        let rows = documents.len();
+        let mut metas = Vec::with_capacity(count);
+        for _ in 0..count {
+            let kind = u8::try_from(self.integer()?).map_err(|cause| cause.to_string())?;
+            let name = self.text()?;
+            let analysis = match self.integer()? {
+                0 => None,
+                1 => Some(self.config()?),
+                _ => return Err("Invalid text field analysis".into()),
+            };
+            let total = self.long()?;
+            let mut column = super::ScalarColumn::new();
+            for _ in 0..rows {
+                self.scalar(&mut column, rows, Self::integer)?;
+            }
+            documents.lengths.push(column);
+            metas.push(FieldMeta::from_wire(kind, name, analysis, total)?);
+        }
+        self.charge(
+            (count - super::fields::NATIVE_FIELDS)
+                .checked_mul(size_of::<TermDictionary>())
+                .ok_or("Directory allocation overflow")?,
+        )?;
+        let mut groups = Vec::with_capacity(count - 1);
+        for _ in 1..count {
+            groups.push(self.terms(rows)?);
+        }
+        FieldTable::from_wire(metas, groups)
+    }
+
+    fn config(&mut self) -> Result<WordV4Config, String> {
+        let text = self.text_slice()?;
+        if text.len() > 256 {
+            return Err("Text field analysis exceeds its budget".into());
+        }
+        serde_json::from_str(text).map_err(|cause| cause.to_string())
+    }
 }
 
 pub(super) fn decode(bytes: &[u8], max_heap_bytes: usize) -> Result<Header, String> {
@@ -471,10 +580,19 @@ pub(super) fn decode(bytes: &[u8], max_heap_bytes: usize) -> Result<Header, Stri
     };
     decoder.charge(size_of::<Header>() + 32 + FILTER_CACHE_BYTES)?;
     let version = decoder.integer()?;
-    let documents = decoder.documents()?;
-    let terms = decoder.terms(documents.len())?;
-    let total_title_length = decoder.long()?;
-    let total_body_length = decoder.long()?;
+    if !(2..=4).contains(&version) {
+        return Err("Invalid segment version".into());
+    }
+    let legacy = version < 4;
+    let mut documents = decoder.documents(legacy)?;
+    let fields = if legacy {
+        let terms = decoder.terms(documents.len())?;
+        let total_title_length = decoder.long()?;
+        let total_body_length = decoder.long()?;
+        FieldTable::native(total_title_length, total_body_length, terms)
+    } else {
+        decoder.fields(&mut documents)?
+    };
     let metadata_end = decoder.integer()?;
     let vector_end = decoder.integer()?;
     let count = decoder.integer()? as usize;
@@ -494,22 +612,16 @@ pub(super) fn decode(bytes: &[u8], max_heap_bytes: usize) -> Result<Header, Stri
         });
     }
     decoder.charge(documents.len().div_ceil(64) * size_of::<u32>())?;
-    let vector_prefix = super::vector_prefix(&documents)?;
     if decoder.offset != bytes.len() {
         return Err("Trailing directory bytes".into());
     }
-    Ok(Header {
-        filter_masks: RefCell::default(),
+    Header::from_parts(
         version,
         documents,
-        terms,
-        total_title_length,
-        total_body_length,
-        metadata_end,
-        vector_end,
+        fields,
+        (metadata_end, vector_end),
         vector_ranges,
-        vector_prefix,
-    })
+    )
 }
 
 #[cfg(test)]

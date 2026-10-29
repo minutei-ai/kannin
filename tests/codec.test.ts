@@ -21,6 +21,7 @@ import {
   segment_document,
   segment_migrate,
   segment_header,
+  segment_fields,
   segment_query_document,
   segment_query_documents,
   Segment,
@@ -40,6 +41,7 @@ import {
   Document,
   PostingSpans,
   SegmentHeader,
+  SegmentTextFields,
   LocatedDocument,
   Filter,
   TermCatalog,
@@ -58,6 +60,35 @@ initSync({
   module: new WebAssembly.Module(
     await Bun.file(new URL("../dist/wasm/raio_engine_bg.wasm", import.meta.url)).arrayBuffer(),
   ),
+});
+
+test("generic text field accessor exposes the native pair beside the legacy header projection", () => {
+  using segment = new Segment(
+    JSON.stringify(
+      canonicalFixtureDocuments([
+        { id: "a", title: "red fox", text: "fox", attributes: { tags: "quasar" } },
+        { id: "b", text: "fox dog", attributes: {} },
+      ]),
+    ),
+  );
+  const bytes = segment.bytes();
+  expect(new TextDecoder().decode(bytes.subarray(0, 8))).toBe("RAIOSEG4");
+  const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment_header(bytes));
+  const fields = Schema.decodeSync(Schema.fromJsonString(SegmentTextFields))(segment_fields(bytes));
+  expect(header.version).toBe(4);
+  expect(fields.map((field) => [field.kind, field.name, field.analysis])).toEqual([
+    ["title", null, null],
+    ["text", null, null],
+  ]);
+  expect(fields.map((field) => field.total)).toEqual([
+    header.total_title_length,
+    header.total_body_length,
+  ]);
+  expect(fields.map((field) => field.terms)).toEqual([
+    Object.keys(header.terms).length,
+    Object.keys(header.terms).length,
+  ]);
+  expect(Object.keys(header.terms)).not.toContain("quasar");
 });
 
 test("common directory handles retain their coverage and reject complete-dictionary operations", () => {
@@ -1422,9 +1453,9 @@ test("compact directories validate framing, checksums and header semantics", () 
   covered.set(compact, 16);
   expect(new DataView(encoded.buffer, encoded.byteOffset).getUint32(16, true)).toBe(crc32(covered));
   expect(new DataView(encoded.buffer, encoded.byteOffset).getUint32(12, true)).toBe(compact.length);
-  expect(compact[0]).toBe(3);
+  expect(compact[0]).toBe(4);
   const invalid = new Uint8Array(compact);
-  invalid[0] = 4;
+  invalid[0] = 5;
   const compressed = deflateSync(invalid);
   const forged = new Uint8Array(20 + compressed.byteLength);
   forged.set(encoded.subarray(0, 20));
@@ -2214,7 +2245,7 @@ test("cached common frames never trust rejected selection or checksum validation
   const payload = deflateSync(compact);
   const excessive = new Uint8Array(20 + payload.byteLength);
   excessive.set(complete.subarray(0, 16));
-  excessive.set(new TextEncoder().encode("RAIOCOM3"));
+  excessive.set(new TextEncoder().encode("RAIOCOM4"));
   const envelope = new DataView(excessive.buffer);
   envelope.setUint32(12, compact.byteLength, true);
   envelope.setUint32(16, crc32(compact, crc32(excessive.subarray(0, 16))), true);
@@ -2317,6 +2348,36 @@ test("query document projection preserves fields and rejects invalid vectors and
   expect(() => segment_document(present.metadata, wrongDimensions.vector)).toThrow();
 });
 
+function legacyV1Source(current: typeof SegmentHeader.Type, document: unknown) {
+  const raw = new TextEncoder().encode(JSON.stringify(document));
+  const compressed = deflateSync(raw);
+  const oldFrame = new Uint8Array(8 + compressed.byteLength);
+  const framing = new DataView(oldFrame.buffer);
+  framing.setUint32(0, raw.byteLength, true);
+  framing.setUint32(4, crc32(raw), true);
+  oldFrame.set(compressed, 8);
+  const LegacyHeader = SegmentHeader.mapFields((fields) => ({
+    ...Struct.omit(fields, ["metadata_end", "vector_end", "vector_ranges"]),
+    version: Schema.Literal(1),
+  }));
+  const json = new TextEncoder().encode(
+    Schema.encodeSync(Schema.fromJsonString(LegacyHeader))({
+      ...current,
+      version: 1,
+      documents: [{ ...current.documents[0], data: { offset: 0, length: oldFrame.byteLength } }],
+      terms: {},
+    }),
+  );
+  const source = new Uint8Array(16 + json.byteLength + oldFrame.byteLength);
+  source.set(new TextEncoder().encode("RAIOSEG1"));
+  const sourceView = new DataView(source.buffer);
+  sourceView.setUint32(8, json.byteLength, true);
+  sourceView.setUint32(12, crc32(json), true);
+  source.set(json, 16);
+  source.set(oldFrame, 16 + json.byteLength);
+  return { source, oldFrame };
+}
+
 test("native float32 extrema stay inside the stored vector contract after legacy migration", () => {
   const maximum = 3.4028234663852886e38;
   const vector = [maximum, -maximum, 0.1, 0, 2 ** -149, ...Array<number>(763).fill(0)];
@@ -2330,35 +2391,10 @@ test("native float32 extrema stay inside the stored vector contract after legacy
   };
   expect(Schema.is(StoredDocument)(document)).toBe(true);
   const current = documentFrames(document);
-  const legacy = { ...document, vector: [3.4028235e38, -3.4028235e38, ...vector.slice(2)] };
-  const raw = new TextEncoder().encode(JSON.stringify(legacy));
-  const compressed = deflateSync(raw);
-  const oldFrame = new Uint8Array(8 + compressed.byteLength);
-  const framing = new DataView(oldFrame.buffer);
-  framing.setUint32(0, raw.byteLength, true);
-  framing.setUint32(4, crc32(raw), true);
-  oldFrame.set(compressed, 8);
-  const LegacyHeader = SegmentHeader.mapFields((fields) => ({
-    ...Struct.omit(fields, ["metadata_end", "vector_end", "vector_ranges"]),
-    version: Schema.Literal(1),
-  }));
-  const json = new TextEncoder().encode(
-    Schema.encodeSync(Schema.fromJsonString(LegacyHeader))({
-      ...current.header,
-      version: 1,
-      documents: [
-        { ...current.header.documents[0], data: { offset: 0, length: oldFrame.byteLength } },
-      ],
-      terms: {},
-    }),
-  );
-  const source = new Uint8Array(16 + json.byteLength + oldFrame.byteLength);
-  source.set(new TextEncoder().encode("RAIOSEG1"));
-  const sourceView = new DataView(source.buffer);
-  sourceView.setUint32(8, json.byteLength, true);
-  sourceView.setUint32(12, crc32(json), true);
-  source.set(json, 16);
-  source.set(oldFrame, 16 + json.byteLength);
+  const { source, oldFrame } = legacyV1Source(current.header, {
+    ...document,
+    vector: [3.4028235e38, -3.4028235e38, ...vector.slice(2)],
+  });
   expect(() => new Directory(source)).toThrow();
   expect(() => segment_query_document(oldFrame)).toThrow();
   const migrated = segment_migrate(source);
@@ -2383,6 +2419,62 @@ test("native float32 extrema stay inside the stored vector contract after legacy
     const query = decodeNativeQueryFixture(segment_query_document(frames.metadata));
     expect(query.vectorSummary).toEqual([768, true, true]);
   }
+});
+
+function reframed(frame: Uint8Array, magic: string) {
+  const compact = inflateSync(frame.subarray(20));
+  const forged = frame.slice();
+  forged.set(new TextEncoder().encode(magic));
+  new DataView(forged.buffer).setUint32(16, crc32(compact, crc32(forged.subarray(0, 16))), true);
+  return forged;
+}
+
+test("legacy v3 directories keep RAIODIR5 frames and frame generations never cross versions", () => {
+  const budget = 40 * 1024 * 1024;
+  const document = {
+    id: "mixed",
+    revision: 1,
+    title: "",
+    text: Array.from({ length: 17 }, (_, index) => `term${index}`).join(" "),
+    attributes: {},
+    vector: [1, ...Array<number>(767).fill(0)],
+  };
+  const { source } = legacyV1Source(documentFrames(document).header, document);
+  const legacy = segment_migrate(source);
+  expect(new TextDecoder().decode(legacy.subarray(0, 8))).toBe("RAIOSEG3");
+  const legacyLength = 16 + new DataView(legacy.buffer, legacy.byteOffset).getUint32(8, true);
+  using generic = new Segment(JSON.stringify(canonicalFixtureDocuments([document])));
+  const current = generic.bytes();
+  const currentLength = 16 + new DataView(current.buffer, current.byteOffset).getUint32(8, true);
+  expect(new TextDecoder().decode(current.subarray(0, 8))).toBe("RAIOSEG4");
+  const oldFrame = directory_compress(legacy.subarray(0, legacyLength));
+  const newFrame = directory_compress(current.subarray(0, currentLength));
+  expect(new TextDecoder().decode(oldFrame.subarray(0, 8))).toBe("RAIODIR5");
+  expect(new TextDecoder().decode(newFrame.subarray(0, 8))).toBe("RAIODIR6");
+  expect(inflateSync(oldFrame.subarray(20))[0]).toBe(3);
+  expect(inflateSync(newFrame.subarray(20))[0]).toBe(4);
+  using oldDirectory = Directory.compressed(oldFrame, legacyLength, budget);
+  using newDirectory = Directory.compressed(newFrame, currentLength, budget);
+  using oldCanonical = new Directory(legacy.subarray(0, legacyLength));
+  using newCanonical = new Directory(current.subarray(0, currentLength));
+  expect(oldDirectory.terms('["term0"]')).toBe(oldCanonical.terms('["term0"]'));
+  expect(newDirectory.terms('["term0"]')).toBe(newCanonical.terms('["term0"]'));
+  expect(() =>
+    Directory.compressed(reframed(oldFrame, "RAIODIR6"), legacyLength, budget),
+  ).toThrow();
+  expect(() =>
+    Directory.compressed(reframed(newFrame, "RAIODIR5"), currentLength, budget),
+  ).toThrow();
+  const common = common_directory_compress(current.subarray(0, currentLength));
+  expect(new TextDecoder().decode(common.subarray(0, 8))).toBe("RAIOCOM4");
+  expect(() => Directory.compressed(common, currentLength, budget)).toThrow();
+  expect(() => new CompressedDirectory(common, currentLength)).toThrow("frame");
+  expect(() => CompressedDirectory.common(newFrame, currentLength)).toThrow("frame");
+  expect(() => CompressedDirectory.common(oldFrame, legacyLength)).toThrow("frame");
+  expect(() => {
+    using forged = CompressedDirectory.common(reframed(common, "RAIOCOM3"), currentLength);
+    forged.directory(budget);
+  }).toThrow();
 });
 
 test("native metadata batches preserve scalar projections and decline oversized decoded batches", () => {

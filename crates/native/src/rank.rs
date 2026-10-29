@@ -301,7 +301,10 @@ mod tests {
         )?;
         let mut header = built.header;
         for (term, offset) in [("alpha", 0), ("beta", 10), ("gamma", u32::MAX - 5)] {
-            let metadata = header.terms.get_mut(term).ok_or("Missing fixture term")?;
+            let metadata = header
+                .terms_mut()
+                .get_mut(term)
+                .ok_or("Missing fixture term")?;
             let block = metadata.blocks.first_mut().ok_or("Missing fixture block")?;
             block.data.offset = offset;
             block.data.length = 1;
@@ -311,7 +314,7 @@ mod tests {
             title_length: 0,
             body_length: 3,
             frequencies: header
-                .terms
+                .terms()
                 .keys()
                 .map(|term| (term.to_owned(), 1))
                 .collect(),

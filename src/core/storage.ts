@@ -505,8 +505,8 @@ export function createStorage(runtime: SearchRuntime) {
     common = false,
   ) {
     const format = Match.value(common).pipe(
-      Match.when(true, () => "directory-common-v3"),
-      Match.orElse(() => "directory-v5"),
+      Match.when(true, () => "directory-common-v4"),
+      Match.orElse(() => "directory-v6"),
     );
     const admissionIdentity = `${identity}/0/${headerBytes}/${format}`;
     const bytes = directory.heap_bytes();
@@ -570,11 +570,11 @@ export function createStorage(runtime: SearchRuntime) {
     (key: string, length: number, common: boolean = false) =>
       Effect.gen(function* () {
         const format = Match.value(common).pipe(
-          Match.when(true, () => "directory-common-v3"),
-          Match.orElse(() => "directory-v5"),
+          Match.when(true, () => "directory-common-v4"),
+          Match.orElse(() => "directory-v6"),
         );
         const identity = Match.value(common).pipe(
-          Match.when(true, () => `${env.STORAGE_CACHE_SCOPE}:${key}/common-v3`),
+          Match.when(true, () => `${env.STORAGE_CACHE_SCOPE}:${key}/common-v4`),
           Match.orElse(() => `${env.STORAGE_CACHE_SCOPE}:${key}`),
         );
         const failures = Match.value(common).pipe(
@@ -697,8 +697,8 @@ export function createStorage(runtime: SearchRuntime) {
     )
       return false;
     const format = Match.value(common).pipe(
-      Match.when(true, () => "directory-common-v3"),
-      Match.orElse(() => "directory-v5"),
+      Match.when(true, () => "directory-common-v4"),
+      Match.orElse(() => "directory-v6"),
     );
     const identity = `cache/${format}/${key}/${length}`;
     const published = publishQueryCache(
@@ -785,12 +785,12 @@ export function createStorage(runtime: SearchRuntime) {
   ) {
     signal?.throwIfAborted();
     const resource = Match.value(compressedDirectory).pipe(
-      Match.when(true, () => "directory-v5"),
+      Match.when(true, () => "directory-v6"),
       Match.orElse(() => "range"),
     );
     const rawIdentity = `${env.STORAGE_CACHE_SCOPE}:${key}/${offset}/${length}`;
     const cacheKey = Match.value(compressedDirectory).pipe(
-      Match.when(true, () => `${rawIdentity}/directory-v5`),
+      Match.when(true, () => `${rawIdentity}/directory-v6`),
       Match.orElse(() => rawIdentity),
     );
     const cached = Match.value(compressedDirectory).pipe(
@@ -1040,10 +1040,10 @@ export function createStorage(runtime: SearchRuntime) {
     ) =>
       Effect.gen(function* () {
         const commonMiss = { value: false, observed: false };
-        const commonAdmission = `${env.STORAGE_CACHE_SCOPE}:${key}/common-v3/0/${headerBytes}/directory-common-v3`;
+        const commonAdmission = `${env.STORAGE_CACHE_SCOPE}:${key}/common-v4/0/${headerBytes}/directory-common-v4`;
         const directory = yield* Effect.gen(function* () {
           const identity = `${env.STORAGE_CACHE_SCOPE}:${key}`;
-          const admissionIdentity = `${identity}/0/${headerBytes}/directory-v5`;
+          const admissionIdentity = `${identity}/0/${headerBytes}/directory-v6`;
           const cached = directories.get(identity);
           if (cached !== undefined) {
             noteDirectoryRequest(admissionIdentity);
@@ -1058,7 +1058,7 @@ export function createStorage(runtime: SearchRuntime) {
             return fullActive.retain();
           }
           if (documentLookup && query === undefined && !canonical) {
-            const commonIdentity = `${identity}/common-v3`;
+            const commonIdentity = `${identity}/common-v4`;
             const commonActive = activeDirectories.get(commonAdmission);
             const projected = directories.get(commonIdentity);
             const available = projected?.directory ?? commonActive?.directory;
@@ -1079,7 +1079,7 @@ export function createStorage(runtime: SearchRuntime) {
             headerBytes <= MAX_DIRECTORY_CACHE_LENGTH &&
             !encodedDirectories.has(admissionIdentity)
           ) {
-            const commonIdentity = `${identity}/common-v3`;
+            const commonIdentity = `${identity}/common-v4`;
             const projected = directories.get(commonIdentity);
             const commonActive = activeDirectories.get(commonAdmission);
             const available = projected?.directory ?? commonActive?.directory;
@@ -1202,7 +1202,7 @@ export function createStorage(runtime: SearchRuntime) {
                   offset: 0,
                   length: headerBytes,
                 });
-                const url = new URL("https://segments.internal/directory-v5");
+                const url = new URL("https://segments.internal/directory-v6");
                 url.searchParams.set("key", input.key);
                 url.searchParams.set("offset", String(input.offset));
                 url.searchParams.set("length", String(input.length));
@@ -1438,7 +1438,7 @@ export function createStorage(runtime: SearchRuntime) {
           }
           return yield* acquire;
         });
-        const publication = `${env.STORAGE_CACHE_SCOPE}:cache/directory-common-v3/${key}/${headerBytes}`;
+        const publication = `${env.STORAGE_CACHE_SCOPE}:cache/directory-common-v4/${key}/${headerBytes}`;
         if (
           commonMiss.value &&
           !pendingQueryPublications.has(publication) &&
@@ -1471,11 +1471,11 @@ export function createStorage(runtime: SearchRuntime) {
     ) =>
       Effect.acquireUseRelease(
         Effect.sync(() => {
-          const fullIdentity = `${env.STORAGE_CACHE_SCOPE}:${key}/0/${headerBytes}/directory-v5`;
+          const fullIdentity = `${env.STORAGE_CACHE_SCOPE}:${key}/0/${headerBytes}/directory-v6`;
           const identities = [fullIdentity];
           if (query !== undefined)
             identities.push(
-              `${env.STORAGE_CACHE_SCOPE}:${key}/common-v3/0/${headerBytes}/directory-common-v3`,
+              `${env.STORAGE_CACHE_SCOPE}:${key}/common-v4/0/${headerBytes}/directory-common-v4`,
             );
           return identities.map((identity) => {
             const existing = activeDirectories.get(identity);

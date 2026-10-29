@@ -13,6 +13,16 @@ fn frame(payload: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     Ok(encoded)
 }
 
+fn legacy(header: &segment::Header) -> Result<segment::Header, String> {
+    segment::Header::from_parts(
+        3,
+        header.documents.clone(),
+        header.fields.clone(),
+        (header.metadata_end, header.vector_end),
+        header.vector_ranges.clone(),
+    )
+}
+
 #[test]
 fn directory_budget_is_exact_and_unicode_and_u64_values_are_lossless()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -34,9 +44,9 @@ fn directory_budget_is_exact_and_unicode_and_u64_values_are_lossless()
             .collect(),
         None,
     )?;
-    let mut header = built.header;
-    header.total_title_length = u64::MAX;
-    header.total_body_length = u64::MAX;
+    let mut header = legacy(&built.header)?;
+    header.fields.set_total(0, u64::MAX);
+    header.fields.set_total(1, u64::MAX);
     let json = serde_json::to_vec(&header)?;
     let mut canonical = b"RAIOSEG3".to_vec();
     canonical.extend_from_slice(&u32::try_from(json.len())?.to_le_bytes());

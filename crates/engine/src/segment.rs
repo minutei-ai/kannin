@@ -1,5 +1,9 @@
 mod binary_directory;
+mod fields;
 
+pub use fields::{FieldAnalysis, FieldMeta, FieldTable, NamedTextField};
+
+use crate::analysis::WordV4Config;
 use crate::normalize_text;
 use bit_vec::BitVec;
 use serde::{Deserialize, Serialize};
@@ -10,12 +14,23 @@ use std::rc::Rc;
 
 const MAGIC_V2: &[u8; 8] = b"RAIOSEG2";
 const MAGIC_V3: &[u8; 8] = b"RAIOSEG3";
+const MAGIC_V4: &[u8; 8] = b"RAIOSEG4";
 const METADATA_CODEC_FACTS: u8 = 2;
 const METADATA_CODEC_CANONICAL: u8 = 3;
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 const BLOCK_SIZE: usize = 128;
 const FILTER_CACHE_BYTES: usize = 32 * 1024;
 const MAX_QUERY_TERMS: usize = 512;
+const LANES: usize = 2;
+
+fn segment_magic(version: u32) -> Result<&'static [u8; 8], String> {
+    match version {
+        2 => Ok(MAGIC_V2),
+        3 => Ok(MAGIC_V3),
+        4 => Ok(MAGIC_V4),
+        _ => Err("Invalid segment version".into()),
+    }
+}
 
 pub(crate) fn compare_document_ids(left: &str, right: &str) -> Ordering {
     if left.is_ascii() {
@@ -167,6 +182,36 @@ pub enum NativeRole {
 pub enum ColumnId<'a> {
     Role(NativeRole),
     Attribute(&'a str),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DocumentColumnId {
+    Role(NativeRole),
+    Attribute(String),
+}
+
+impl DocumentColumnId {
+    #[must_use]
+    pub fn attribute(name: impl Into<String>) -> Self {
+        Self::Attribute(name.into())
+    }
+
+    #[must_use]
+    pub fn as_column(&self) -> ColumnId<'_> {
+        match self {
+            Self::Role(role) => ColumnId::Role(*role),
+            Self::Attribute(name) => ColumnId::Attribute(name),
+        }
+    }
+}
+
+impl From<ColumnId<'_>> for DocumentColumnId {
+    fn from(id: ColumnId<'_>) -> Self {
+        match id {
+            ColumnId::Role(role) => Self::Role(role),
+            ColumnId::Attribute(name) => Self::Attribute(name.to_owned()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1044,8 +1089,7 @@ impl AttributeColumn {
 pub struct DocumentTable {
     ids: String,
     rows: Vec<DocumentMeta<std::ops::Range<usize>, (), (), ()>>,
-    title_lengths: ScalarColumn<u32>,
-    body_lengths: ScalarColumn<u32>,
+    lengths: Vec<ScalarColumn<u32>>,
     vectors: ScalarColumn<bool>,
     attributes: AttributeColumn,
 }
@@ -1069,12 +1113,25 @@ impl DocumentTable {
         DocumentMeta {
             id: &self.ids[row.id.clone()],
             revision: row.revision,
-            title_length: self.title_lengths.get(index),
-            body_length: self.body_lengths.get(index),
+            title_length: self.field_length(fields::NATIVE_TITLE, index),
+            body_length: self.field_length(fields::NATIVE_TEXT, index),
             attributes: self.attributes.get(index),
             data: row.data.clone(),
             vector: self.vectors.get(index),
         }
+    }
+    fn field_length(&self, ordinal: usize, index: usize) -> u32 {
+        self.lengths
+            .get(ordinal)
+            .map_or(0, |column| column.get(index))
+    }
+    fn push_field_lengths(&mut self, lengths: impl IntoIterator<Item = u32>) {
+        let capacity = self.rows.len();
+        let mut column = ScalarColumn::new();
+        for length in lengths {
+            column.push(length, capacity);
+        }
+        self.lengths.push(column);
     }
     #[must_use]
     fn get(&self, index: usize) -> Option<DocumentMeta<&str, &DocumentAttributes>> {
@@ -1105,22 +1162,29 @@ impl DocumentTable {
             .map(|(index, row)| DocumentMeta {
                 id: row.id.clone(),
                 revision: row.revision,
-                title_length: self.title_lengths.get(index),
-                body_length: self.body_lengths.get(index),
+                title_length: self.field_length(fields::NATIVE_TITLE, index),
+                body_length: self.field_length(fields::NATIVE_TEXT, index),
                 attributes: self.attributes.get(index),
                 data: row.data.clone(),
                 vector: self.vectors.get(index),
             })
     }
     fn lengths(&self) -> impl ExactSizeIterator<Item = (u32, u32)> + DoubleEndedIterator {
-        self.title_lengths.iter().zip(self.body_lengths.iter())
+        (0..self.len()).map(|index| {
+            (
+                self.field_length(fields::NATIVE_TITLE, index),
+                self.field_length(fields::NATIVE_TEXT, index),
+            )
+        })
     }
     fn shrink_to_fit(&mut self) {
         self.ids.shrink_to_fit();
         self.rows.shrink_to_fit();
         self.attributes.shrink_to_fit();
-        self.title_lengths.shrink_to_fit();
-        self.body_lengths.shrink_to_fit();
+        for column in &mut self.lengths {
+            column.shrink_to_fit();
+        }
+        self.lengths.shrink_to_fit();
         self.vectors.shrink_to_fit();
     }
 }
@@ -1159,8 +1223,7 @@ impl From<Vec<DocumentMeta>> for DocumentTable {
             ids,
             rows,
             attributes: AttributeColumn::Dense(attributes),
-            title_lengths,
-            body_lengths,
+            lengths: vec![title_lengths, body_lengths],
             vectors,
         }
     }
@@ -1179,15 +1242,54 @@ impl<'de> Deserialize<'de> for DocumentTable {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(from = "BlockWire", into = "BlockWire")]
 pub struct BlockMeta {
     pub first: u32,
     pub last: u32,
     pub count: u32,
-    pub max_title_tf: u32,
-    pub max_body_tf: u32,
-    pub min_title_length: u32,
-    pub min_body_length: u32,
+    pub max_tf: [u32; LANES],
+    pub min_length: [u32; LANES],
     pub data: Range,
+}
+
+#[derive(Serialize, Deserialize)]
+struct BlockWire {
+    first: u32,
+    last: u32,
+    count: u32,
+    max_title_tf: u32,
+    max_body_tf: u32,
+    min_title_length: u32,
+    min_body_length: u32,
+    data: Range,
+}
+
+impl From<BlockWire> for BlockMeta {
+    fn from(wire: BlockWire) -> Self {
+        Self {
+            first: wire.first,
+            last: wire.last,
+            count: wire.count,
+            max_tf: [wire.max_title_tf, wire.max_body_tf],
+            min_length: [wire.min_title_length, wire.min_body_length],
+            data: wire.data,
+        }
+    }
+}
+
+impl From<BlockMeta> for BlockWire {
+    fn from(block: BlockMeta) -> Self {
+        Self {
+            first: block.first,
+            last: block.last,
+            count: block.count,
+            max_title_tf: block.max_tf[0],
+            max_body_tf: block.max_tf[1],
+            min_title_length: block.min_length[0],
+            min_body_length: block.min_length[1],
+            data: block.data,
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1228,6 +1330,16 @@ impl TermDictionary {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    fn heap_bytes(&self) -> usize {
+        self.entries.len() * size_of::<(std::ops::Range<usize>, TermMeta)>()
+            + self.text.len()
+            + 16
+            + self
+                .values()
+                .map(|meta| meta.blocks.len() * size_of::<BlockMeta>())
+                .sum::<usize>()
     }
 
     #[must_use]
@@ -1301,20 +1413,65 @@ impl Serialize for TermDictionary {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct Header {
-    #[serde(skip)]
     filter_masks: RefCell<FilterMasks>,
     pub version: u32,
     pub documents: DocumentTable,
-    pub terms: TermDictionary,
-    pub total_title_length: u64,
-    pub total_body_length: u64,
+    pub fields: FieldTable,
     pub metadata_end: u32,
     pub vector_end: u32,
     pub vector_ranges: Vec<Range>,
-    #[serde(skip)]
     vector_prefix: Vec<u32>,
+}
+
+#[derive(Deserialize)]
+struct NativeHeader {
+    version: u32,
+    documents: DocumentTable,
+    terms: TermDictionary,
+    total_title_length: u64,
+    total_body_length: u64,
+    metadata_end: u32,
+    vector_end: u32,
+    vector_ranges: Vec<Range>,
+}
+
+impl<'de> Deserialize<'de> for Header {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let native = NativeHeader::deserialize(deserializer)?;
+        Self::from_parts(
+            native.version,
+            native.documents,
+            FieldTable::native(
+                native.total_title_length,
+                native.total_body_length,
+                native.terms,
+            ),
+            (native.metadata_end, native.vector_end),
+            native.vector_ranges,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+/// The only adapter from the generic field table to the legacy native wire shape.
+/// Root 6 consumers read this projection until the next public schema cut; named
+/// text fields are intentionally absent from it and are exposed through `FieldTable`.
+impl Serialize for Header {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("Header", 8)?;
+        state.serialize_field("version", &self.version)?;
+        state.serialize_field("documents", &self.documents)?;
+        state.serialize_field("terms", self.terms())?;
+        state.serialize_field("total_title_length", &self.total_title_length())?;
+        state.serialize_field("total_body_length", &self.total_body_length())?;
+        state.serialize_field("metadata_end", &self.metadata_end)?;
+        state.serialize_field("vector_end", &self.vector_end)?;
+        state.serialize_field("vector_ranges", &self.vector_ranges)?;
+        state.end()
+    }
 }
 
 impl<'de> Deserialize<'de> for TermDictionary {
@@ -1565,7 +1722,11 @@ fn validate_columns(header: &Header) -> Result<(), String> {
     if cursor != header.vector_end {
         return Err("Vector column does not match vector ranges".into());
     }
-    for term in header.terms.values() {
+    for term in header
+        .fields
+        .dictionaries()
+        .flat_map(TermDictionary::values)
+    {
         for block in &term.blocks {
             let end = block
                 .data
@@ -1648,6 +1809,45 @@ impl VectorScan {
 }
 
 impl Header {
+    #[doc = "# Errors\nRejects documents whose vector presence overflows the vector prefix index."]
+    pub fn from_parts(
+        version: u32,
+        documents: DocumentTable,
+        fields: FieldTable,
+        (metadata_end, vector_end): (u32, u32),
+        vector_ranges: Vec<Range>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            filter_masks: RefCell::default(),
+            version,
+            vector_prefix: vector_prefix(&documents)?,
+            documents,
+            fields,
+            metadata_end,
+            vector_end,
+            vector_ranges,
+        })
+    }
+
+    #[must_use]
+    pub const fn terms(&self) -> &TermDictionary {
+        self.fields.terms()
+    }
+
+    pub const fn terms_mut(&mut self) -> &mut TermDictionary {
+        self.fields.terms_mut()
+    }
+
+    #[must_use]
+    pub fn total_title_length(&self) -> u64 {
+        self.fields.total(fields::NATIVE_TITLE)
+    }
+
+    #[must_use]
+    pub fn total_body_length(&self) -> u64 {
+        self.fields.total(fields::NATIVE_TEXT)
+    }
+
     #[doc = "# Errors\nRejects missing rows or inconsistent vector references."]
     pub fn vector_range(&self, row: usize) -> Result<Option<&Range>, String> {
         self.documents.rows.get(row).ok_or("Invalid row")?;
@@ -1681,19 +1881,17 @@ impl Header {
             * size_of::<DocumentMeta<std::ops::Range<usize>, (), (), ()>>()
             + self.documents.ids.capacity()
             + self.documents.attributes.heap_bytes()
-            + self.documents.title_lengths.heap_bytes()
-            + self.documents.body_lengths.heap_bytes()
-            + self.documents.vectors.heap_bytes();
-        let terms = self.terms.entries.len() * size_of::<(std::ops::Range<usize>, TermMeta)>()
-            + self.terms.text.len()
+            + self.documents.lengths.capacity() * size_of::<ScalarColumn<u32>>()
             + 16
             + self
-                .terms
-                .values()
-                .map(|meta| meta.blocks.len() * size_of::<BlockMeta>())
-                .sum::<usize>();
+                .documents
+                .lengths
+                .iter()
+                .map(ScalarColumn::heap_bytes)
+                .sum::<usize>()
+            + self.documents.vectors.heap_bytes();
         documents
-            + terms
+            + self.fields.heap_bytes()
             + self.vector_ranges.capacity() * size_of::<Range>()
             + self.vector_prefix.capacity() * size_of::<u32>()
             + size_of::<Self>()
@@ -1701,18 +1899,34 @@ impl Header {
             + FILTER_CACHE_BYTES
     }
 
-    fn compact_json(&self) -> Result<Vec<u8>, String> {
-        serde_json::to_vec(&(
-            self.version,
-            DirectoryDocuments(&self.documents),
-            DirectoryTerms(&self.terms),
-            self.total_title_length,
-            self.total_body_length,
-            self.metadata_end,
-            self.vector_end,
-            DirectoryRanges(&self.vector_ranges),
-        ))
-        .map_err(|cause| cause.to_string())
+    #[doc = "# Errors\nRejects headers whose version cannot carry their field table, and serialization failures."]
+    pub fn compact_json(&self) -> Result<Vec<u8>, String> {
+        let encoded = if self.version < 4 {
+            if self.fields.len() != fields::NATIVE_FIELDS {
+                return Err("Named text requires segment version 4".into());
+            }
+            serde_json::to_vec(&(
+                self.version,
+                DirectoryDocuments(&self.documents),
+                DirectoryTerms(self.terms()),
+                self.total_title_length(),
+                self.total_body_length(),
+                self.metadata_end,
+                self.vector_end,
+                DirectoryRanges(&self.vector_ranges),
+            ))
+        } else {
+            serde_json::to_vec(&(
+                self.version,
+                StoredDocuments(&self.documents),
+                StoredFields(self),
+                StoredGroups(&self.fields),
+                self.metadata_end,
+                self.vector_end,
+                DirectoryRanges(&self.vector_ranges),
+            ))
+        };
+        encoded.map_err(|cause| cause.to_string())
     }
 
     fn encode(&self, payload: &[u8]) -> Result<Vec<u8>, String> {
@@ -1721,11 +1935,7 @@ impl Header {
             return Err("Segment exceeds 16 MiB".into());
         }
         let mut bytes = Vec::with_capacity(json.len() + payload.len() + 16);
-        bytes.extend_from_slice(match self.version {
-            2 => MAGIC_V2,
-            3 => MAGIC_V3,
-            _ => return Err("Invalid segment version".into()),
-        });
+        bytes.extend_from_slice(segment_magic(self.version)?);
         bytes.extend_from_slice(
             &(u32::try_from(json.len()).map_err(|cause| cause.to_string())?).to_le_bytes(),
         );
@@ -1856,10 +2066,10 @@ fn summary_bounds(blocks: &[BlockMeta]) -> Vec<TermBound> {
         .iter()
         .map(|block| {
             (
-                block.max_title_tf,
-                block.max_body_tf,
-                block.min_title_length,
-                block.min_body_length,
+                block.max_tf[0],
+                block.max_tf[1],
+                block.min_length[0],
+                block.min_length[1],
             )
         })
         .collect();
@@ -1882,7 +2092,7 @@ impl CommonTermProjection {
             .iter()
             .map(|term| {
                 header
-                    .terms
+                    .terms()
                     .get(term)
                     .map(|metadata| summary_bounds(&metadata.blocks))
                     .ok_or_else(|| "Missing common-term metadata".to_owned())
@@ -2048,7 +2258,68 @@ fn get_int(bytes: &[u8], offset: &mut usize) -> Result<u32, String> {
     Err("Overflowing varint".into())
 }
 
+#[derive(Clone, Copy)]
+struct PostingShape {
+    lanes: usize,
+    inputs: [bool; LANES],
+}
+
+impl PostingShape {
+    const NATIVE: Self = Self {
+        lanes: LANES,
+        inputs: [false; LANES],
+    };
+
+    const fn single(inputs: bool) -> Self {
+        Self {
+            lanes: 1,
+            inputs: [inputs, false],
+        }
+    }
+}
+
+trait PostingSource {
+    fn row(&self) -> u32;
+    fn lane(&self, lane: usize) -> (&[u32], &[u32]);
+}
+
+impl PostingSource for Posting {
+    fn row(&self) -> u32 {
+        self.row
+    }
+    fn lane(&self, lane: usize) -> (&[u32], &[u32]) {
+        if lane == 0 {
+            (self.title.as_slice(), &[])
+        } else {
+            (self.body.as_slice(), &[])
+        }
+    }
+}
+
+struct FieldPosting {
+    row: u32,
+    positions: Vec<u32>,
+    inputs: Vec<u32>,
+}
+
+impl PostingSource for FieldPosting {
+    fn row(&self) -> u32 {
+        self.row
+    }
+    fn lane(&self, lane: usize) -> (&[u32], &[u32]) {
+        if lane == 0 {
+            (self.positions.as_slice(), self.inputs.as_slice())
+        } else {
+            (&[], &[])
+        }
+    }
+}
+
 fn encode_postings(postings: &[Posting]) -> Result<Vec<u8>, String> {
+    encode_shaped(postings, PostingShape::NATIVE)
+}
+
+fn encode_shaped<R: PostingSource>(postings: &[R], shape: PostingShape) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     put_int(
         u32::try_from(postings.len()).map_err(|cause| cause.to_string())?,
@@ -2056,32 +2327,42 @@ fn encode_postings(postings: &[Posting]) -> Result<Vec<u8>, String> {
     );
     let mut previous = 0;
     for posting in postings {
-        put_int(posting.row - previous, &mut bytes);
-        previous = posting.row;
-        for positions in [&posting.title, &posting.body] {
+        put_int(posting.row() - previous, &mut bytes);
+        previous = posting.row();
+        for (lane, preserves_inputs) in shape.inputs.iter().take(shape.lanes).enumerate() {
+            let (positions, inputs) = posting.lane(lane);
             put_int(
                 u32::try_from(positions.len()).map_err(|cause| cause.to_string())?,
                 &mut bytes,
             );
+            if *preserves_inputs && inputs.len() != positions.len() {
+                return Err("Token inputs do not match token positions".into());
+            }
             let mut prior = 0;
-            for position in positions {
+            for (index, position) in positions.iter().enumerate() {
                 put_int(position - prior, &mut bytes);
                 prior = *position;
+                if *preserves_inputs {
+                    put_int(inputs[index], &mut bytes);
+                }
             }
         }
     }
     Ok(bytes)
 }
 
+#[derive(Default)]
 struct DecodedPositions {
     count: u32,
     last: Option<u32>,
     values: Vec<u32>,
+    inputs: Vec<u32>,
 }
 
 fn decode_positions<const POSITIONAL: bool>(
     data: &[u8],
     offset: &mut usize,
+    preserves_inputs: bool,
 ) -> Result<DecodedPositions, String> {
     let count = get_int(data, offset)?;
     let length = count as usize;
@@ -2093,13 +2374,25 @@ fn decode_positions<const POSITIONAL: bool>(
     } else {
         Vec::new()
     };
+    let mut inputs = Vec::new();
     let mut position = 0u32;
+    let mut input = 0u32;
     for index in 0..length {
         let delta = get_int(data, offset)?;
         if index > 0 && delta == 0 {
             return Err("Duplicate token position".into());
         }
         position = position.checked_add(delta).ok_or("Position overflow")?;
+        if preserves_inputs {
+            let next = get_int(data, offset)?;
+            if next < input {
+                return Err("Token input regressed".into());
+            }
+            input = next;
+            if POSITIONAL {
+                inputs.push(input);
+            }
+        }
         if POSITIONAL {
             values.push(position);
         }
@@ -2109,11 +2402,20 @@ fn decode_positions<const POSITIONAL: bool>(
         count,
         last,
         values,
+        inputs,
     })
 }
 
 fn decode_posting_rows<const POSITIONAL: bool, T>(
     bytes: &[u8],
+    make: impl Fn(u32, DecodedPositions, DecodedPositions) -> T,
+) -> Result<Vec<T>, String> {
+    decode_shaped_rows::<POSITIONAL, T>(bytes, PostingShape::NATIVE, make)
+}
+
+fn decode_shaped_rows<const POSITIONAL: bool, T>(
+    bytes: &[u8],
+    shape: PostingShape,
     make: impl Fn(u32, DecodedPositions, DecodedPositions) -> T,
 ) -> Result<Vec<T>, String> {
     let data = decode_page(bytes)?;
@@ -2130,8 +2432,12 @@ fn decode_posting_rows<const POSITIONAL: bool, T>(
             return Err("Duplicate posting row".into());
         }
         row = row.checked_add(delta).ok_or("Row overflow")?;
-        let title = decode_positions::<POSITIONAL>(&data, &mut offset)?;
-        let body = decode_positions::<POSITIONAL>(&data, &mut offset)?;
+        let title = decode_positions::<POSITIONAL>(&data, &mut offset, shape.inputs[0])?;
+        let body = if shape.lanes > 1 {
+            decode_positions::<POSITIONAL>(&data, &mut offset, shape.inputs[1])?
+        } else {
+            DecodedPositions::default()
+        };
         if body.count == 0 && title.count == 0 {
             return Err("Empty posting".into());
         }
@@ -2239,46 +2545,40 @@ fn validate_posting(
     Ok(())
 }
 
-fn encode_terms(
+fn encode_group<R: PostingSource>(
     payload: &mut Vec<u8>,
-    metadata: &DocumentTable,
-    lists: BTreeMap<String, Vec<Posting>>,
+    shape: PostingShape,
+    length: impl Fn(usize, u32) -> u32,
+    lists: BTreeMap<String, Vec<R>>,
 ) -> Result<TermDictionary, String> {
     let mut terms = Vec::with_capacity(lists.len());
     for (term, postings) in lists {
         let mut blocks = Vec::with_capacity(postings.len().div_ceil(BLOCK_SIZE));
         for chunk in postings.chunks(BLOCK_SIZE) {
-            let data = append(payload, &encode_postings(chunk)?)?;
+            let data = append(payload, &encode_shaped(chunk, shape)?)?;
+            let mut max_tf = [0; LANES];
+            let mut min_length = [0; LANES];
+            for lane in 0..shape.lanes {
+                max_tf[lane] = u32::try_from(
+                    chunk
+                        .iter()
+                        .map(|posting| posting.lane(lane).0.len())
+                        .max()
+                        .ok_or("Empty posting block")?,
+                )
+                .map_err(|cause| cause.to_string())?;
+                min_length[lane] = chunk
+                    .iter()
+                    .map(|posting| length(lane, posting.row()))
+                    .min()
+                    .ok_or("Empty posting block")?;
+            }
             blocks.push(BlockMeta {
-                first: chunk[0].row,
-                last: chunk[chunk.len() - 1].row,
+                first: chunk[0].row(),
+                last: chunk[chunk.len() - 1].row(),
                 count: u32::try_from(chunk.len()).map_err(|cause| cause.to_string())?,
-                max_title_tf: u32::try_from(
-                    chunk
-                        .iter()
-                        .map(|posting| posting.title.len())
-                        .max()
-                        .ok_or("Empty posting block")?,
-                )
-                .map_err(|cause| cause.to_string())?,
-                max_body_tf: u32::try_from(
-                    chunk
-                        .iter()
-                        .map(|posting| posting.body.len())
-                        .max()
-                        .ok_or("Empty posting block")?,
-                )
-                .map_err(|cause| cause.to_string())?,
-                min_title_length: chunk
-                    .iter()
-                    .map(|p| metadata.title_lengths.get(p.row as usize))
-                    .min()
-                    .ok_or("Empty posting block")?,
-                min_body_length: chunk
-                    .iter()
-                    .map(|p| metadata.body_lengths.get(p.row as usize))
-                    .min()
-                    .ok_or("Empty posting block")?,
+                max_tf,
+                min_length,
                 data,
             });
         }
@@ -2401,8 +2701,72 @@ fn index_document_postings(
 
 #[doc = "# Errors\nRejects empty or duplicate documents, invalid field declarations, wire-size overflow, serialization errors, and segments beyond the size budget."]
 pub fn build(
+    documents: Vec<Document>,
+    filterable: Option<&[String]>,
+) -> Result<BuiltSegment, String> {
+    build_versioned(documents, filterable, &[], 4)
+}
+
+#[doc = "# Errors\nRejects empty or duplicate documents, unsorted or invalid text field declarations, non-text attributes, wire-size overflow, and segments beyond the size budget."]
+pub fn build_text_fields(
+    documents: Vec<Document>,
+    filterable: Option<&[String]>,
+    text_fields: &[NamedTextField<'_>],
+) -> Result<BuiltSegment, String> {
+    build_versioned(documents, filterable, text_fields, 4)
+}
+
+#[doc = "# Errors\nRejects malformed bytes, unknown or duplicate fields, invalid queries, corrupt posting pages, and filters or tombstones applied before ranking."]
+pub fn rank_fields(
+    bytes: &[u8],
+    fields: &[DocumentColumnId],
+    text: &str,
+    mode: &str,
+    top_k: usize,
+    dead: &[u32],
+    filters: &[Filter],
+) -> Result<Vec<Hit>, String> {
+    let (header, base) = parse_header(bytes)?;
+    fields::rank(
+        &header,
+        bytes,
+        base,
+        &fields::FieldQuery {
+            fields,
+            text,
+            mode,
+            top_k,
+            dead,
+            filters,
+        },
+    )
+}
+
+fn attribute_json(
+    document: &Document,
+    filterable: Option<&BTreeSet<&str>>,
+) -> Result<Box<serde_json::value::RawValue>, String> {
+    let source_attributes = document.columns().attributes();
+    filterable
+        .map_or_else(
+            || serde_json::value::to_raw_value(source_attributes),
+            |fields| {
+                serde_json::value::to_raw_value(
+                    &source_attributes
+                        .iter()
+                        .filter(|(name, _)| fields.contains(name.as_str()))
+                        .collect::<BTreeMap<_, _>>(),
+                )
+            },
+        )
+        .map_err(|cause| cause.to_string())
+}
+
+fn build_versioned(
     mut documents: Vec<Document>,
     filterable: Option<&[String]>,
+    text_fields: &[NamedTextField<'_>],
+    version: u32,
 ) -> Result<BuiltSegment, String> {
     if documents.is_empty() {
         return Err("Segment must contain at least one document".into());
@@ -2410,7 +2774,14 @@ pub fn build(
     if documents.len() > 10000 {
         return Err("Segment exceeds 10000 documents".into());
     }
+    if version != 3 && version != 4 {
+        return Err("Invalid segment version".into());
+    }
+    if version < 4 && !text_fields.is_empty() {
+        return Err("Named text requires segment version 4".into());
+    }
     let filterable = filterable.map(filterable_fields).transpose()?;
+    let mut named = fields::NamedBuilder::prepare(text_fields)?;
     documents.sort_by(|a, b| compare_document_ids(&a.id, &b.id));
     if documents.windows(2).any(|pair| pair[0].id == pair[1].id) {
         return Err("Duplicate segment ids".into());
@@ -2425,6 +2796,7 @@ pub fn build(
     for (index, document) in documents.iter().enumerate() {
         let row = u32::try_from(index).map_err(|cause| cause.to_string())?;
         let (title_length, body_length) = index_document_postings(document, row, &mut lists)?;
+        named.observe(document, row)?;
         total_title_length += u64::from(title_length);
         total_body_length += u64::from(body_length);
         let data = append_document_columns(
@@ -2433,21 +2805,7 @@ pub fn build(
             &mut vector_payload,
             &mut vector_ranges,
         )?;
-        let source_attributes = document.columns().attributes();
-        let attributes = filterable
-            .as_ref()
-            .map_or_else(
-                || serde_json::value::to_raw_value(source_attributes),
-                |fields| {
-                    serde_json::value::to_raw_value(
-                        &source_attributes
-                            .iter()
-                            .filter(|(name, _)| fields.contains(name.as_str()))
-                            .collect::<BTreeMap<_, _>>(),
-                    )
-                },
-            )
-            .map_err(|cause| cause.to_string())?;
+        let attributes = attribute_json(document, filterable.as_ref())?;
         metadata.push(DocumentMeta {
             id: document.id.clone().into_boxed_str(),
             revision: document.revision,
@@ -2458,25 +2816,26 @@ pub fn build(
             vector: document.vector_values()?.is_some(),
         });
     }
-    let metadata = DocumentTable::from(metadata);
+    let mut metadata = DocumentTable::from(metadata);
     let common_projection = common_term_projection(&metadata, &lists)?;
     let (metadata_end, vector_end) =
         finish_document_columns(&mut payload, &vector_payload, &mut vector_ranges)?;
     drop(vector_payload);
-    let terms = encode_terms(&mut payload, &metadata, lists)?;
-    let vector_prefix = vector_prefix(&metadata)?;
-    let header = Header {
-        filter_masks: RefCell::default(),
-        version: 3,
-        documents: metadata,
-        terms,
-        total_title_length,
-        total_body_length,
-        metadata_end,
-        vector_end,
+    let terms = encode_group(
+        &mut payload,
+        PostingShape::NATIVE,
+        |lane, row| metadata.field_length(lane, row as usize),
+        lists,
+    )?;
+    let mut table = FieldTable::native(total_title_length, total_body_length, terms);
+    named.finish(&mut payload, &mut metadata, &mut table)?;
+    let header = Header::from_parts(
+        version,
+        metadata,
+        table,
+        (metadata_end, vector_end),
         vector_ranges,
-        vector_prefix,
-    };
+    )?;
     let common_projection = common_projection
         .map(|projection| projection.encode(&header))
         .transpose()?
@@ -2630,28 +2989,26 @@ fn migrate_v2_segment(bytes: &[u8]) -> Result<Vec<u8>, String> {
         return Err("Converted segment exceeds sixteen MiB before its header".into());
     }
     payload.extend_from_slice(tail);
-    let mut terms = header.terms.clone();
+    let mut terms = header.terms().clone();
     rebase_postings(&mut terms, old_vector_end, vector_end)?;
-    let metadata = DocumentTable::from(metadata);
-    let migrated = Header {
-        filter_masks: RefCell::default(),
-        version: 3,
-        vector_prefix: vector_prefix(&metadata)?,
-        documents: metadata,
-        terms,
-        total_title_length: header.total_title_length,
-        total_body_length: header.total_body_length,
-        metadata_end,
-        vector_end,
+    let migrated = Header::from_parts(
+        3,
+        DocumentTable::from(metadata),
+        FieldTable::native(
+            header.total_title_length(),
+            header.total_body_length(),
+            terms,
+        ),
+        (metadata_end, vector_end),
         vector_ranges,
-    };
+    )?;
     validate_header(&migrated)?;
     migrated.encode(&payload)
 }
 
 #[doc = "# Errors\nRejects invalid legacy segments, corrupt documents or postings, and converted segments above sixteen MiB."]
 pub fn migrate_segment(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    if bytes.len() >= 8 && &bytes[..8] == MAGIC_V3 {
+    if bytes.len() >= 8 && (&bytes[..8] == MAGIC_V3 || &bytes[..8] == MAGIC_V4) {
         parse_header(bytes)?;
         return Ok(bytes.to_vec());
     }
@@ -2727,19 +3084,13 @@ fn migrate_v1_segment(bytes: &[u8]) -> Result<Vec<u8>, String> {
         }
     }
     rebase_postings(&mut terms, source_end, vector_end)?;
-    let metadata = DocumentTable::from(metadata);
-    let header = Header {
-        filter_masks: RefCell::default(),
-        version: 3,
-        vector_prefix: vector_prefix(&metadata)?,
-        documents: metadata,
-        terms,
-        total_title_length: legacy.total_title_length,
-        total_body_length: legacy.total_body_length,
-        metadata_end,
-        vector_end,
+    let header = Header::from_parts(
+        3,
+        DocumentTable::from(metadata),
+        FieldTable::native(legacy.total_title_length, legacy.total_body_length, terms),
+        (metadata_end, vector_end),
         vector_ranges,
-    };
+    )?;
     validate_header(&header)?;
     header.encode(&payload)
 }
@@ -2770,6 +3121,8 @@ pub fn parse_header(bytes: &[u8]) -> Result<(Header, usize), String> {
         2
     } else if &bytes[..8] == MAGIC_V3 {
         3
+    } else if &bytes[..8] == MAGIC_V4 {
+        4
     } else {
         return Err("Invalid segment header".into());
     };
@@ -2793,23 +3146,35 @@ pub fn parse_header(bytes: &[u8]) -> Result<(Header, usize), String> {
         return Err("Header integrity check failed".into());
     }
     let text = std::str::from_utf8(json).map_err(|cause| cause.to_string())?;
-    let mut header: Header = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let found = serde_json::from_str::<StoredVersion>(text)
+        .map_err(|e| e.to_string())?
+        .0;
+    if found != expected_version {
+        return Err("Segment magic does not match its version".into());
+    }
+    let mut header = if expected_version == 4 {
+        serde_json::from_str::<StoredHeader>(text)
+            .map_err(|e| e.to_string())?
+            .into_header()?
+    } else {
+        serde_json::from_str::<Header>(text).map_err(|e| e.to_string())?
+    };
     if header.version != expected_version {
         return Err("Segment magic does not match its version".into());
     }
     validate_header(&header)?;
-    header.vector_prefix = vector_prefix(&header.documents)?;
     header.documents.shrink_to_fit();
     Ok((header, 16 + length))
 }
 
 fn validate_header(header: &Header) -> Result<(), String> {
-    if (header.version != 2 && header.version != 3)
+    if (header.version != 2 && header.version != 3 && header.version != 4)
         || header.documents.is_empty()
         || header.documents.len() > 10000
     {
         return Err("Invalid segment version or document count".into());
     }
+    header.fields.validate(&header.documents, header.version)?;
     let documents = &header.documents;
     if documents.rows.windows(2).any(|pair| {
         compare_document_ids(
@@ -2819,34 +3184,61 @@ fn validate_header(header: &Header) -> Result<(), String> {
     }) {
         return Err("Segment ids are not strictly sorted".into());
     }
-    validate_columns(header)?;
-    for term in header.terms.values() {
-        if term.df > u32::try_from(header.documents.len()).map_err(|cause| cause.to_string())? {
-            return Err("Invalid term document frequency".into());
-        }
-        if term
-            .blocks
-            .windows(2)
-            .any(|pair| pair[0].last >= pair[1].first)
-        {
-            return Err("Posting block rows are not strictly ordered".into());
-        }
-        for block in &term.blocks {
-            if block.last
-                >= u32::try_from(header.documents.len()).map_err(|cause| cause.to_string())?
-                || block.first > block.last
-                || block.count as usize > BLOCK_SIZE
-            {
-                return Err("Invalid posting block directory".into());
-            }
-        }
-    }
-    Ok(())
+    validate_columns(header)
 }
 
 const DIRECTORY_MAGIC: &[u8; 8] = b"RAIODIR5";
+const DIRECTORY_MAGIC_V6: &[u8; 8] = b"RAIODIR6";
 const COMMON_DIRECTORY_MAGIC: &[u8; 8] = b"RAIOCOM3";
+const COMMON_DIRECTORY_MAGIC_V4: &[u8; 8] = b"RAIOCOM4";
 const MAX_COMMON_POSTING_BYTES: usize = 32 * 1024;
+
+fn directory_magic(version: u32) -> Result<&'static [u8; 8], String> {
+    match version {
+        2 | 3 => Ok(DIRECTORY_MAGIC),
+        4 => Ok(DIRECTORY_MAGIC_V6),
+        _ => Err("Invalid segment version".into()),
+    }
+}
+
+fn common_directory_magic_for(version: u32) -> Result<&'static [u8; 8], String> {
+    match version {
+        2 | 3 => Ok(COMMON_DIRECTORY_MAGIC),
+        4 => Ok(COMMON_DIRECTORY_MAGIC_V4),
+        _ => Err("Invalid segment version".into()),
+    }
+}
+
+fn is_common_directory_magic(magic: &[u8; 8]) -> bool {
+    magic == COMMON_DIRECTORY_MAGIC || magic == COMMON_DIRECTORY_MAGIC_V4
+}
+
+fn frame_magic_matches(magic: &[u8; 8], version: u32) -> bool {
+    match version {
+        2 | 3 => magic == DIRECTORY_MAGIC || magic == COMMON_DIRECTORY_MAGIC,
+        4 => magic == DIRECTORY_MAGIC_V6 || magic == COMMON_DIRECTORY_MAGIC_V4,
+        _ => false,
+    }
+}
+
+fn directory_frame_magic(bytes: &[u8], partial: bool) -> Result<[u8; 8], String> {
+    let Some(prefix) = bytes.get(..8) else {
+        return Err("Invalid compressed directory frame".into());
+    };
+    let magic: [u8; 8] = prefix
+        .try_into()
+        .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?;
+    let accepted = if partial {
+        is_common_directory_magic(&magic)
+    } else {
+        &magic == DIRECTORY_MAGIC || &magic == DIRECTORY_MAGIC_V6
+    };
+    if accepted {
+        Ok(magic)
+    } else {
+        Err("Invalid compressed directory frame".into())
+    }
+}
 const MAX_COMMON_FRAME_BYTES: usize = 64 * 1024;
 const MAX_COMMON_DECODED_POSTING_BYTES: usize = 64 * 1024;
 
@@ -2924,13 +3316,179 @@ impl Serialize for DirectoryBlocks<'_> {
                 block.first,
                 block.last,
                 block.count,
-                block.max_title_tf,
-                block.max_body_tf,
-                block.min_title_length,
-                block.min_body_length,
+                block.max_tf[0],
+                block.max_tf[1],
+                block.min_length[0],
+                block.min_length[1],
                 (block.data.offset, block.data.length),
             )
         }))
+    }
+}
+
+struct StoredDocuments<'a>(&'a DocumentTable);
+
+impl Serialize for StoredDocuments<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(|document| {
+            (
+                document.id,
+                document.revision,
+                document.attributes,
+                (document.data.offset, document.data.length),
+                document.vector,
+            )
+        }))
+    }
+}
+
+struct StoredFieldLengths<'a>(&'a DocumentTable, usize);
+
+impl Serialize for StoredFieldLengths<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq((0..self.0.len()).map(|row| self.0.field_length(self.1, row)))
+    }
+}
+
+struct StoredFields<'a>(&'a Header);
+
+impl Serialize for StoredFields<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.fields.iter().enumerate().map(|(ordinal, field)| {
+            let (kind, name) = field.wire_id();
+            (
+                kind,
+                name,
+                field.analysis().config(),
+                field.total(),
+                StoredFieldLengths(&self.0.documents, ordinal),
+            )
+        }))
+    }
+}
+
+struct StoredGroups<'a>(&'a FieldTable);
+
+impl Serialize for StoredGroups<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.dictionaries().map(DirectoryTerms))
+    }
+}
+
+struct StoredVersion(u32);
+
+impl<'de> Deserialize<'de> for StoredVersion {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Probe;
+
+        impl<'de> serde::de::Visitor<'de> for Probe {
+            type Value = StoredVersion;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a stored segment header")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                let version = sequence
+                    .next_element::<u32>()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                while sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(StoredVersion(version))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut version = None;
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    if key == "version" {
+                        version = Some(map.next_value::<u32>()?);
+                    } else {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                version
+                    .map(StoredVersion)
+                    .ok_or_else(|| serde::de::Error::missing_field("version"))
+            }
+        }
+
+        deserializer.deserialize_any(Probe)
+    }
+}
+
+#[derive(Deserialize)]
+struct StoredRow {
+    id: Box<str>,
+    revision: u64,
+    attributes: DocumentAttributes,
+    data: Range,
+    vector: bool,
+}
+
+#[derive(Deserialize)]
+struct StoredField {
+    kind: u8,
+    name: String,
+    analysis: Option<WordV4Config>,
+    total: u64,
+    lengths: Vec<u32>,
+}
+
+#[derive(Deserialize)]
+struct StoredHeader {
+    version: u32,
+    documents: Vec<StoredRow>,
+    fields: Vec<StoredField>,
+    groups: Vec<TermDictionary>,
+    metadata_end: u32,
+    vector_end: u32,
+    vector_ranges: Vec<Range>,
+}
+
+impl StoredHeader {
+    fn into_header(self) -> Result<Header, String> {
+        let count = self.documents.len();
+        let mut documents = DocumentTable::from(
+            self.documents
+                .into_iter()
+                .map(|row| DocumentMeta {
+                    id: row.id,
+                    revision: row.revision,
+                    title_length: 0,
+                    body_length: 0,
+                    attributes: row.attributes,
+                    data: row.data,
+                    vector: row.vector,
+                })
+                .collect::<Vec<_>>(),
+        );
+        documents.lengths.clear();
+        let mut metas = Vec::with_capacity(self.fields.len());
+        for field in self.fields {
+            if field.lengths.len() != count {
+                return Err("Field lengths do not match the document count".into());
+            }
+            metas.push(FieldMeta::from_wire(
+                field.kind,
+                field.name,
+                field.analysis,
+                field.total,
+            )?);
+            documents.push_field_lengths(field.lengths);
+        }
+        let fields = FieldTable::from_wire(metas, self.groups)?;
+        Header::from_parts(
+            self.version,
+            documents,
+            fields,
+            (self.metadata_end, self.vector_end),
+            self.vector_ranges,
+        )
     }
 }
 
@@ -2957,7 +3515,7 @@ fn compress_directory_header(header: &Header, length: usize) -> Result<Vec<u8>, 
         return Err("Invalid directory length".into());
     }
     let compact = binary_directory::encode(header)?;
-    compress_directory_payload(&compact, length, *DIRECTORY_MAGIC)
+    compress_directory_payload(&compact, length, *directory_magic(header.version)?)
 }
 
 fn compress_directory_payload(
@@ -2966,7 +3524,7 @@ fn compress_directory_payload(
     magic: [u8; 8],
 ) -> Result<Vec<u8>, String> {
     let maximum_compact = length
-        + (if magic == *COMMON_DIRECTORY_MAGIC {
+        + (if is_common_directory_magic(&magic) {
             MAX_COMMON_FRAME_BYTES + 4
         } else {
             0
@@ -3013,7 +3571,8 @@ pub fn parse_compressed_directory(
     expected: usize,
     max_heap_bytes: usize,
 ) -> Result<Header, String> {
-    decode_directory_payload(bytes, expected, max_heap_bytes, None, *DIRECTORY_MAGIC)
+    let magic = directory_frame_magic(bytes, false)?;
+    decode_directory_payload(bytes, expected, max_heap_bytes, None, magic)
 }
 
 fn decode_directory_payload(
@@ -3052,7 +3611,7 @@ fn decode_directory_contents(
             .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
     ) as usize;
     let maximum_compact = expected
-        + (if magic == *COMMON_DIRECTORY_MAGIC {
+        + (if is_common_directory_magic(&magic) {
             MAX_COMMON_FRAME_BYTES + 4
         } else {
             0
@@ -3085,7 +3644,7 @@ fn decode_directory_contents(
             return Err("Compressed directory integrity check failed".into());
         }
     }
-    let (header_bytes, hot_bytes) = if magic == *COMMON_DIRECTORY_MAGIC {
+    let (header_bytes, hot_bytes) = if is_common_directory_magic(&magic) {
         let (header, hot) = common_directory_parts(&decoded, expected)?;
         (header, Some(hot))
     } else {
@@ -3099,13 +3658,19 @@ fn decode_directory_contents(
         return Err("Common posting payload exceeds memory budget".into());
     }
     let header = binary_directory::decode(header_bytes, max_heap_bytes.saturating_sub(reserved))?;
+    if !frame_magic_matches(&magic, header.version) {
+        return Err("Directory magic does not match its version".into());
+    }
     header.documents.attributes.validate_expansion(expected)?;
     if !previously_validated {
         validate_header(&header)?;
-        if magic == *COMMON_DIRECTORY_MAGIC
-            && (header.terms.len() > 16
+        if is_common_directory_magic(&magic) && header.fields.has_named_terms() {
+            return Err("Common directory cannot carry named postings".into());
+        }
+        if is_common_directory_magic(&magic)
+            && (header.terms().len() > 16
                 || header
-                    .terms
+                    .terms()
                     .iter()
                     .any(|(term, metadata)| term.len() > 64 || metadata.df <= 1))
         {
@@ -3176,17 +3741,17 @@ fn compress_common_directory_header(
     }
     let names = common_term_names(
         header
-            .terms
+            .terms()
             .iter()
             .map(|(term, meta)| (term, meta.df as usize)),
     );
     let terms = TermDictionary::from_entries(
         names
             .into_iter()
-            .filter_map(|term| header.terms.get(term).map(|meta| (term, meta.clone())))
+            .filter_map(|term| header.terms().get(term).map(|meta| (term, meta.clone())))
             .collect(),
     );
-    let compact_header = binary_directory::encode_terms(header, &terms)?;
+    let compact_header = binary_directory::encode_terms(header, &terms, true)?;
     let hot = match source {
         Some(bytes) => encode_hot_postings(header, &terms, bytes, expected)?,
         None => vec![0, 0],
@@ -3205,7 +3770,11 @@ fn compress_common_directory_header(
     {
         return Err("Common-directory payload exceeds size budget".into());
     }
-    compress_directory_payload(&compact, expected, *COMMON_DIRECTORY_MAGIC)
+    compress_directory_payload(
+        &compact,
+        expected,
+        *common_directory_magic_for(header.version)?,
+    )
 }
 
 fn encode_hot_postings(
@@ -3386,13 +3955,13 @@ fn decode_hot_postings(bytes: &[u8], header: &Header) -> Result<HotPostings, Str
             .terms
             .last_key_value()
             .is_some_and(|(prior, _)| prior >= &term)
-            || header.terms.get(&term).is_none()
+            || header.terms().get(&term).is_none()
         {
             return Err("Invalid common posting term".into());
         }
         let block_count = read_u16(&mut cursor)? as usize;
         let metadata = header
-            .terms
+            .terms()
             .get(&term)
             .ok_or("Missing common posting term")?;
         if block_count == 0 || block_count != metadata.blocks.len() {
@@ -3540,7 +4109,7 @@ impl CommonDirectory {
             expected,
             max_heap_bytes,
             None,
-            *COMMON_DIRECTORY_MAGIC,
+            directory_frame_magic(bytes, true)?,
         )?;
         Ok(Self {
             header: Rc::new(contents.header),
@@ -3554,7 +4123,7 @@ impl CommonDirectory {
             .terms
             .words
             .iter()
-            .all(|term| self.header.terms.get(term).is_some())
+            .all(|term| self.header.terms().get(term).is_some())
     }
 
     #[must_use]
@@ -4065,12 +4634,12 @@ impl Search {
         let maximum_bytes = u32::try_from(MAX_BYTES).ok()?;
         let mut frequencies = Vec::with_capacity(self.terms.order.len());
         for term in &self.terms.order {
-            let metadata = self.header.terms.get(self.words[*term].as_str())?;
+            let metadata = self.header.terms().get(self.words[*term].as_str())?;
             if metadata.df != count || metadata.blocks.is_empty() {
                 return None;
             }
             let first = metadata.blocks.first()?;
-            let frequency = (first.max_title_tf, first.max_body_tf);
+            let frequency = (first.max_tf[0], first.max_tf[1]);
             if frequency != (0, 1) && frequency != (1, 0) {
                 return None;
             }
@@ -4082,7 +4651,7 @@ impl Search {
                     || block.count == 0
                     || block.count > u32::try_from(BLOCK_SIZE).ok()?
                     || block.last.checked_sub(block.first)?.checked_add(1)? != block.count
-                    || (block.max_title_tf, block.max_body_tf) != frequency
+                    || (block.max_tf[0], block.max_tf[1]) != frequency
                     || block.data.length == 0
                     || block.data.offset < previous_end
                     || end > maximum_bytes
@@ -4170,7 +4739,7 @@ impl Search {
             .enumerate()
             .filter(|(_, term)| {
                 self.header
-                    .terms
+                    .terms()
                     .get(self.words[**term].as_str())
                     .is_some_and(|metadata| {
                         usize::try_from(metadata.df).ok() == Some(self.header.documents.len())
@@ -4302,7 +4871,7 @@ impl Search {
         let mut spans: Vec<PostingSpan<'_>> = Vec::new();
         for index in &self.terms.order {
             let term = &self.words[*index];
-            let Some(metadata) = self.header.terms.get(term) else {
+            let Some(metadata) = self.header.terms().get(term) else {
                 continue;
             };
             let mut blocks: Vec<&BlockMeta> = Vec::new();
@@ -4397,7 +4966,7 @@ impl Search {
             .map(|span| {
                 let metadata = self
                     .header
-                    .terms
+                    .terms()
                     .get(span.term)
                     .ok_or("Missing selected term")?;
                 let indices = span
@@ -4437,7 +5006,7 @@ impl Search {
                 continue;
             };
             let metadata = header
-                .terms
+                .terms()
                 .get(&selected.term)
                 .ok_or("Missing selected term")?;
             for index in &selected.indices {
@@ -4523,7 +5092,7 @@ impl Search {
             .map(|term| {
                 let metadata = self
                     .header
-                    .terms
+                    .terms()
                     .get(term)
                     .ok_or("Missing hot posting term")?;
                 Ok(SelectedPostingBlocks {
@@ -4545,7 +5114,11 @@ impl Search {
                 .terms
                 .word(&selected.term)
                 .ok_or("Missing selected query term")?;
-            let metadata = self.header.terms.get(term).ok_or("Missing selected term")?;
+            let metadata = self
+                .header
+                .terms()
+                .get(term)
+                .ok_or("Missing selected term")?;
             let blocks = selected
                 .indices
                 .iter()
@@ -4691,13 +5264,13 @@ impl Search {
             .enumerate()
             .map(|(index, term)| {
                 self.header
-                    .terms
+                    .terms()
                     .get(self.words[*term].as_str())
                     .into_iter()
                     .flat_map(|meta| meta.blocks.iter())
                     .map(|block| {
                         let minimum = if unrestricted {
-                            Some((block.min_title_length, block.min_body_length))
+                            Some((block.min_length[0], block.min_length[1]))
                         } else {
                             let rows = block.first as usize..=block.last as usize;
                             rows.filter(|row| self.allowed[*row])
@@ -4712,10 +5285,10 @@ impl Search {
                         };
                         let score = minimum.map_or(0.0, |(title, body)| {
                             self.terms.scorers[index].score(
-                                block.max_title_tf,
-                                block.max_body_tf,
-                                block.min_title_length.max(title),
-                                block.min_body_length.max(body),
+                                block.max_tf[0],
+                                block.max_tf[1],
+                                block.min_length[0].max(title),
+                                block.min_length[1].max(body),
                             )
                         });
                         (block, score)
@@ -5195,14 +5768,13 @@ pub mod wasm {
         for field in ["title", "body"] {
             let title = field == "title";
             let terms: Vec<_> = header
-                .terms
+                .terms()
                 .iter()
                 .filter(|(term, metadata)| count > 1 && metadata.df == count && term.len() <= 64)
                 .take(16)
                 .filter(|(_, metadata)| {
                     metadata.blocks.iter().all(|block| {
-                        (block.max_title_tf, block.max_body_tf)
-                            == if title { (1, 0) } else { (0, 1) }
+                        (block.max_tf[0], block.max_tf[1]) == if title { (1, 0) } else { (0, 1) }
                     })
                 })
                 .map(|(term, _)| term.to_owned())
@@ -5340,14 +5912,14 @@ pub mod wasm {
     fn common_terms(header: &Header) -> Result<String, String> {
         let dictionary: BTreeMap<_, _> = super::common_term_names(
             header
-                .terms
+                .terms()
                 .iter()
                 .map(|(term, metadata)| (term, metadata.df as usize)),
         )
         .into_iter()
         .map(|term| {
             let metadata = header
-                .terms
+                .terms()
                 .get(term)
                 .ok_or("Common term metadata disappeared")?;
             let first = metadata
@@ -5356,17 +5928,17 @@ pub mod wasm {
                 .ok_or("Common term has no posting blocks")?;
             let bounds = metadata.blocks.iter().skip(1).fold(
                 (
-                    first.max_title_tf,
-                    first.max_body_tf,
-                    first.min_title_length,
-                    first.min_body_length,
+                    first.max_tf[0],
+                    first.max_tf[1],
+                    first.min_length[0],
+                    first.min_length[1],
                 ),
                 |(title, body, title_length, body_length), block| {
                     (
-                        title.max(block.max_title_tf),
-                        body.max(block.max_body_tf),
-                        title_length.min(block.min_title_length),
-                        body_length.min(block.min_body_length),
+                        title.max(block.max_tf[0]),
+                        body.max(block.max_tf[1]),
+                        title_length.min(block.min_length[0]),
+                        body_length.min(block.min_length[1]),
                     )
                 },
             );
@@ -5943,7 +6515,7 @@ pub mod wasm {
             let pool = RefCell::new(SummaryPool::default());
             let mut tuple = serializer.serialize_tuple(5)?;
             tuple.serialize_element(&OverviewDictionary {
-                terms: &self.header.terms,
+                terms: self.header.terms(),
                 pool: &pool,
             })?;
             tuple.serialize_element(&self.eligibility)?;
@@ -6926,9 +7498,9 @@ pub mod wasm {
         };
         super::validate_posting(header, row.posting.row, row.title_last, row.body_last, None)?;
         if row.posting.row != block.first
-            || (row.posting.title, row.posting.body) != (block.max_title_tf, block.max_body_tf)
+            || (row.posting.title, row.posting.body) != (block.max_tf[0], block.max_tf[1])
             || (document.title_length, document.body_length)
-                != (block.min_title_length, block.min_body_length)
+                != (block.min_length[0], block.min_length[1])
         {
             return Ok(None);
         }
@@ -6961,8 +7533,8 @@ pub mod wasm {
         let mut entries = 0;
         let mut singletons = BTreeMap::new();
         let mut singleton_budget = 4 * 1024 * 1024;
-        let entry_budget = (header.terms.len() / 4).clamp(512, 65536);
-        for (term, metadata) in &header.terms {
+        let entry_budget = (header.terms().len() / 4).clamp(512, 65536);
+        for (term, metadata) in header.terms() {
             if metadata.df == 1 {
                 if let Some(document) =
                     singleton_document(bytes, base, &header, term, metadata, &mut singleton_budget)?
@@ -7109,11 +7681,6 @@ pub mod wasm {
 
     impl CachedDirectoryFrame {
         fn new(bytes: Vec<u8>, expected: usize, partial: bool) -> Result<Self, String> {
-            let magic = if partial {
-                super::COMMON_DIRECTORY_MAGIC
-            } else {
-                super::DIRECTORY_MAGIC
-            };
             let maximum = MAX_BYTES
                 + (if partial {
                     super::MAX_COMMON_FRAME_BYTES
@@ -7123,7 +7690,7 @@ pub mod wasm {
                 + 8192;
             if bytes.len() < 20
                 || bytes.len() > maximum
-                || &bytes[..8] != magic
+                || super::directory_frame_magic(&bytes, partial).is_err()
                 || !(16..=MAX_BYTES).contains(&expected)
             {
                 return Err("Invalid compressed directory frame".into());
@@ -7182,11 +7749,8 @@ pub mod wasm {
 
         #[doc = "# Errors\nRejects corruption, invalid headers and decoded-memory budget violations."]
         pub fn directory(&self, max_heap_bytes: u32) -> Result<Directory, JsValue> {
-            let magic = if self.frame.partial {
-                *super::COMMON_DIRECTORY_MAGIC
-            } else {
-                *super::DIRECTORY_MAGIC
-            };
+            let magic = super::directory_frame_magic(&self.frame.bytes, self.frame.partial)
+                .map_err(|cause| JsValue::from_str(&cause))?;
             let contents = super::decode_directory_contents(
                 &self.frame.bytes,
                 self.frame.expected,
@@ -7396,7 +7960,7 @@ pub mod wasm {
                     .terms
                     .words
                     .iter()
-                    .all(|term| self.header.terms.get(term).is_some())
+                    .all(|term| self.header.terms().get(term).is_some())
         }
 
         #[doc = "# Errors\nRejects invalid expected lengths and compact directory size limits."]
@@ -7467,7 +8031,7 @@ pub mod wasm {
                 serde_json::from_str(terms).map_err(|e| JsValue::from_str(&e.to_string()))?;
             let selected: BTreeMap<_, _> = terms
                 .iter()
-                .filter_map(|term| self.header.terms.get(term).map(|meta| (term, meta)))
+                .filter_map(|term| self.header.terms().get(term).map(|meta| (term, meta)))
                 .collect();
             serde_json::to_string(&selected).map_err(|e| JsValue::from_str(&e.to_string()))
         }
@@ -7483,7 +8047,7 @@ pub mod wasm {
                 .iter()
                 .filter_map(|term| {
                     self.header
-                        .terms
+                        .terms()
                         .get(term)
                         .map(|meta| (term, TermSummary::from(meta)))
                 })
@@ -7516,7 +8080,7 @@ pub mod wasm {
                     .iter()
                     .filter_map(|term| {
                         self.header
-                            .terms
+                            .terms()
                             .get(term)
                             .map(|meta| (term.clone(), TermSummary::from(meta)))
                     })
@@ -7762,6 +8326,13 @@ pub mod wasm {
     pub fn segment_header(bytes: &[u8]) -> Result<String, JsValue> {
         let (header, _) = parse_header(bytes).map_err(|cause| JsValue::from_str(&cause))?;
         serde_json::to_string(&header).map_err(|cause| JsValue::from_str(&cause.to_string()))
+    }
+
+    #[wasm_bindgen]
+    #[doc = "# Errors\nRejects invalid v2, v3 or v4 canonical header framing or field serialization."]
+    pub fn segment_fields(bytes: &[u8]) -> Result<String, JsValue> {
+        let (header, _) = parse_header(bytes).map_err(|cause| JsValue::from_str(&cause))?;
+        serde_json::to_string(&header.fields).map_err(|cause| JsValue::from_str(&cause.to_string()))
     }
 
     #[wasm_bindgen]
@@ -9194,7 +9765,7 @@ mod frequency_tests {
                         }],
                     )?;
                     search.mode = mode.into();
-                    for (term, metadata) in &header.terms {
+                    for (term, metadata) in header.terms() {
                         for block in &metadata.blocks {
                             let start = base + block.data.offset as usize;
                             search.add(
@@ -9366,7 +9937,7 @@ mod frequency_tests {
                 if full {
                     search.allowed.fill(true);
                 }
-                for (term, metadata) in &header.terms {
+                for (term, metadata) in header.terms() {
                     for block in &metadata.blocks {
                         let start = base + block.data.offset as usize;
                         search.add(
@@ -9553,7 +10124,7 @@ mod candidate_tests {
             };
             let mut search =
                 Search::new(header.clone(), statistics, text, "phrase", 10, &dead, &[])?;
-            for (term, meta) in &header.terms {
+            for (term, meta) in header.terms() {
                 if !search.words.iter().any(|word| word == term) {
                     continue;
                 }
@@ -9714,10 +10285,10 @@ mod dense_cutoff_tests {
             let header = std::rc::Rc::new(built.header);
             let statistics = Statistics {
                 documents: u64::try_from(header.documents.len())?,
-                title_length: header.total_title_length,
-                body_length: header.total_body_length,
+                title_length: header.total_title_length(),
+                body_length: header.total_body_length(),
                 frequencies: header
-                    .terms
+                    .terms()
                     .iter()
                     .map(|(term, meta)| (term.to_owned(), u64::from(meta.df)))
                     .collect(),
@@ -9819,10 +10390,10 @@ mod eligible_bound_tests {
         let (header, base) = parse_header(&built.bytes)?;
         let statistics = Statistics {
             documents: u64::try_from(header.documents.len())?,
-            title_length: header.total_title_length,
-            body_length: header.total_body_length,
+            title_length: header.total_title_length(),
+            body_length: header.total_body_length(),
             frequencies: header
-                .terms
+                .terms()
                 .iter()
                 .map(|(term, meta)| (term.to_owned(), u64::from(meta.df)))
                 .collect(),
@@ -9845,7 +10416,7 @@ mod eligible_bound_tests {
                     &dead,
                     &filters,
                 )?;
-                for (term, metadata) in &header.terms {
+                for (term, metadata) in header.terms() {
                     if search.words.iter().any(|word| word == term) {
                         for block in &metadata.blocks {
                             let start = base + block.data.offset as usize;
@@ -9868,10 +10439,10 @@ mod eligible_bound_tests {
                 for (index, term) in terms.iter().enumerate() {
                     for (block, bound) in &bounds[index] {
                         let physical = scorers[index].score(
-                            block.max_title_tf,
-                            block.max_body_tf,
-                            block.min_title_length,
-                            block.min_body_length,
+                            block.max_tf[0],
+                            block.max_tf[1],
+                            block.min_length[0],
+                            block.min_length[1],
                         );
                         assert!(*bound <= physical + 1e-12);
                         if !(block.first as usize..=block.last as usize)
@@ -10034,10 +10605,10 @@ mod cutoff_certificate_tests {
         let base = super::parse_header(&built.bytes)?.1;
         let statistics = Statistics {
             documents: u64::try_from(header.documents.len())?,
-            title_length: header.total_title_length,
-            body_length: header.total_body_length,
+            title_length: header.total_title_length(),
+            body_length: header.total_body_length(),
             frequencies: header
-                .terms
+                .terms()
                 .iter()
                 .map(|(word, meta)| (word.to_owned(), u64::from(meta.df)))
                 .collect(),
@@ -10061,7 +10632,7 @@ mod cutoff_certificate_tests {
                         &dead,
                         &filters,
                     )?;
-                    for (word, metadata) in &header.terms {
+                    for (word, metadata) in header.terms() {
                         if word == "alpha" || word == "beta" {
                             for block in &metadata.blocks {
                                 let start = base + usize::try_from(block.data.offset)?;
@@ -10182,10 +10753,10 @@ mod required_term_tests {
         let (header, base) = parse_header(&built.bytes)?;
         let statistics = Statistics {
             documents: u64::try_from(header.documents.len())?,
-            title_length: header.total_title_length,
-            body_length: header.total_body_length,
+            title_length: header.total_title_length(),
+            body_length: header.total_body_length(),
             frequencies: header
-                .terms
+                .terms()
                 .iter()
                 .map(|(term, meta)| (term.to_owned(), u64::from(meta.df)))
                 .collect(),
@@ -10202,7 +10773,7 @@ mod required_term_tests {
         let calls = Rc::new(Cell::new(0));
         let mut lists = BTreeMap::new();
         for term in ["alpha", "beta", "gamma", "needle"] {
-            let metadata = header.terms.get(term).ok_or("Missing term")?;
+            let metadata = header.terms().get(term).ok_or("Missing term")?;
             let mut postings = Vec::new();
             for block in &metadata.blocks {
                 let start = base + block.data.offset as usize;
@@ -10261,7 +10832,7 @@ mod required_term_tests {
         let mut lists = BTreeMap::new();
         for term in ["alpha", "beta", "gamma", "needle", "scarce"] {
             let mut postings = Vec::new();
-            for block in &header.terms.get(term).ok_or("Missing term")?.blocks {
+            for block in &header.terms().get(term).ok_or("Missing term")?.blocks {
                 let start = base + block.data.offset as usize;
                 postings.extend(
                     decode_postings(&built.bytes[start..start + block.data.length as usize])?
@@ -10277,10 +10848,10 @@ mod required_term_tests {
         for factor in [1, 3] {
             let statistics = Statistics {
                 documents: u64::try_from(header.documents.len())? * factor,
-                title_length: header.total_title_length * factor + 1000,
-                body_length: header.total_body_length * factor + 1234,
+                title_length: header.total_title_length() * factor + 1000,
+                body_length: header.total_body_length() * factor + 1234,
                 frequencies: header
-                    .terms
+                    .terms()
                     .iter()
                     .map(|(term, meta)| (term.to_owned(), u64::from(meta.df) * factor))
                     .collect(),
@@ -10398,7 +10969,7 @@ mod uniform_hits_tests {
                                 )?;
                                 let uniform =
                                     search.uniform_hits().ok_or("Expected uniform proof")?;
-                                for (term, metadata) in &header.terms {
+                                for (term, metadata) in header.terms() {
                                     if !search.words.iter().any(|word| word == term) {
                                         continue;
                                     }
@@ -10447,13 +11018,13 @@ mod uniform_hits_tests {
                 built.header.clone()
             };
             if defect == "zero-title-length" {
-                header.documents.title_lengths.set(0, 0);
+                header.documents.lengths[0].set(0, 0);
             } else if defect == "zero-body-length" {
-                header.documents.body_lengths.set(0, 0);
+                header.documents.lengths[1].set(0, 0);
             } else if defect == "empty-documents" {
                 header.documents = super::DocumentTable::from(Vec::new());
             } else {
-                let term = header.terms.get_mut("alpha").ok_or("Missing alpha")?;
+                let term = header.terms_mut().get_mut("alpha").ok_or("Missing alpha")?;
                 match defect {
                     "empty-blocks" => term.blocks = Box::new([]),
                     "sparse-df" => term.df -= 1,
@@ -10464,11 +11035,11 @@ mod uniform_hits_tests {
                     "zero-range" => term.blocks[0].data.length = 0,
                     "overflow-range" => term.blocks[0].data.offset = u32::MAX,
                     "range-order" => term.blocks[1].data.offset = 0,
-                    "body-tf" => term.blocks[0].max_body_tf = 2,
-                    "both-fields" => term.blocks[0].max_title_tf = 1,
+                    "body-tf" => term.blocks[0].max_tf[1] = 2,
+                    "both-fields" => term.blocks[0].max_tf[0] = 1,
                     "mixed-field" => {
-                        term.blocks[1].max_title_tf = 1;
-                        term.blocks[1].max_body_tf = 0;
+                        term.blocks[1].max_tf[0] = 1;
+                        term.blocks[1].max_tf[1] = 0;
                     }
                     _ => return Err("Unknown metadata defect".into()),
                 }
@@ -10674,9 +11245,9 @@ mod shared_attribute_identity_tests {
 #[cfg(test)]
 mod common_frame_validation_tests {
     use super::{
-        COMMON_DIRECTORY_MAGIC, Document, build, compress_common_directory_segment,
-        compress_directory, compress_directory_payload, decode_directory_contents,
-        decode_directory_payload, parse_header,
+        COMMON_DIRECTORY_MAGIC, COMMON_DIRECTORY_MAGIC_V4, Document, build,
+        compress_common_directory_segment, compress_directory, compress_directory_payload,
+        decode_directory_contents, decode_directory_payload, parse_header,
     };
     use std::{cell::Cell, collections::BTreeMap};
 
@@ -10761,7 +11332,7 @@ mod common_frame_validation_tests {
         compact.extend_from_slice(&u32::try_from(header_compact.len())?.to_le_bytes());
         compact.extend_from_slice(&header_compact);
         compact.extend_from_slice(&[0, 0]);
-        let frame = compress_directory_payload(&compact, length, *COMMON_DIRECTORY_MAGIC)?;
+        let frame = compress_directory_payload(&compact, length, *COMMON_DIRECTORY_MAGIC_V4)?;
         let validated = Cell::new(false);
         for _ in 0..2 {
             let result = decode_directory_payload(
@@ -10769,7 +11340,7 @@ mod common_frame_validation_tests {
                 length,
                 40 * 1024 * 1024,
                 Some(&validated),
-                *COMMON_DIRECTORY_MAGIC,
+                *COMMON_DIRECTORY_MAGIC_V4,
             );
             assert_eq!(
                 result.err().ok_or("Invalid selection accepted")?,
@@ -10831,14 +11402,14 @@ mod common_frame_validation_tests {
             u16::from_le_bytes(compact[hot_start + 2..hot_start + 4].try_into()?) as usize;
         let inner_crc = hot_start + 18 + term_length;
         compact[inner_crc] ^= 1;
-        let damaged = compress_directory_payload(&compact, length, *COMMON_DIRECTORY_MAGIC)?;
+        let damaged = compress_directory_payload(&compact, length, *COMMON_DIRECTORY_MAGIC_V4)?;
         let validated = Cell::new(false);
         let error = decode_directory_contents(
             &damaged,
             length,
             40 * 1024 * 1024,
             Some(&validated),
-            *COMMON_DIRECTORY_MAGIC,
+            *COMMON_DIRECTORY_MAGIC_V4,
         )
         .err()
         .ok_or("Corrupt common posting block was accepted")?;
@@ -10917,15 +11488,15 @@ mod selected_hot_posting_tests {
                 .as_ref()
                 .is_some_and(|hot| hot.terms.contains_key("common"))
         );
-        let metadata = header.terms.get("common").ok_or("Missing common term")?;
+        let metadata = header.terms().get("common").ok_or("Missing common term")?;
         for mode in ["any", "all", "phrase"] {
             let query = PreparedQuery::new(
                 Statistics {
                     documents: 256,
-                    title_length: header.total_title_length,
-                    body_length: header.total_body_length,
+                    title_length: header.total_title_length(),
+                    body_length: header.total_body_length(),
                     frequencies: header
-                        .terms
+                        .terms()
                         .iter()
                         .map(|(term, value)| (term.to_owned(), u64::from(value.df)))
                         .collect(),
@@ -11009,10 +11580,10 @@ mod selected_hot_posting_tests {
         let query = PreparedQuery::new(
             Statistics {
                 documents: 512,
-                title_length: header.total_title_length,
-                body_length: header.total_body_length,
+                title_length: header.total_title_length(),
+                body_length: header.total_body_length(),
                 frequencies: header
-                    .terms
+                    .terms()
                     .iter()
                     .map(|(term, metadata)| (term.to_owned(), u64::from(metadata.df)))
                     .collect(),
@@ -11115,7 +11686,7 @@ mod columnar_v2_tests {
             row.data = append(&mut payload, &document.to_native_vec()?)?;
         }
         let document_end = u32::try_from(payload.len()).map_err(|cause| cause.to_string())?;
-        let mut terms = built.header.terms;
+        let mut terms = built.header.terms().clone();
         for (_, term) in &mut terms.entries {
             for block in &mut term.blocks {
                 block.data.offset = document_end + block.data.offset - built.header.vector_end;
@@ -11129,8 +11700,8 @@ mod columnar_v2_tests {
             )
             .map_err(|cause| cause.to_string())?,
             terms,
-            total_title_length: built.header.total_title_length,
-            total_body_length: built.header.total_body_length,
+            total_title_length: built.header.total_title_length(),
+            total_body_length: built.header.total_body_length(),
         };
         let json = serde_json::to_vec(&header).map_err(|cause| cause.to_string())?;
         let mut bytes = b"RAIOSEG1".to_vec();
@@ -11151,7 +11722,7 @@ mod columnar_v2_tests {
         let original = documents();
         let built = build(original.clone(), None)?;
         let (header, base) = parse_header(&built.bytes)?;
-        assert_eq!(header.version, 3);
+        assert_eq!(header.version, 4);
         assert_eq!(header.vector_ranges.len(), 3);
         assert!(parse_header(&built.bytes[..base]).is_ok());
         let payload = &built.bytes[base..];
@@ -11200,8 +11771,8 @@ mod columnar_v2_tests {
             + old.documents.last().ok_or("Missing row")?.data.length;
         let migrated = migrate_segment(&source)?;
         let (header, base) = parse_header(&migrated)?;
-        assert_eq!(header.total_title_length, old.total_title_length);
-        assert_eq!(header.total_body_length, old.total_body_length);
+        assert_eq!(header.total_title_length(), old.total_title_length);
+        assert_eq!(header.total_body_length(), old.total_body_length);
         assert_eq!(
             &migrated[base + header.vector_end as usize..],
             &old_payload[old_end as usize..]
@@ -11245,7 +11816,7 @@ mod columnar_v2_tests {
             );
         }
         for ((before_name, before), (after_name, after)) in
-            old.terms.iter().zip(header.terms.iter())
+            old.terms.iter().zip(header.terms().iter())
         {
             assert_eq!(before_name, after_name);
             assert_eq!(before.df, after.df);
@@ -11482,22 +12053,19 @@ mod canonical_column_tests {
             .get(header.vector_end as usize..)
             .ok_or("Missing posting tail")?;
         metadata.extend_from_slice(tail);
-        let mut terms = header.terms.clone();
+        let mut terms = header.terms().clone();
         rebase_postings(&mut terms, header.vector_end, vector_end)?;
-        let documents = DocumentTable::from(rows);
-        let prefix = vector_prefix(&documents)?;
-        let legacy = Header {
-            filter_masks: std::cell::RefCell::default(),
-            version: 2,
-            documents,
-            terms,
-            total_title_length: header.total_title_length,
-            total_body_length: header.total_body_length,
-            metadata_end,
-            vector_end,
+        let legacy = Header::from_parts(
+            2,
+            DocumentTable::from(rows),
+            FieldTable::native(
+                header.total_title_length(),
+                header.total_body_length(),
+                terms,
+            ),
+            (metadata_end, vector_end),
             vector_ranges,
-            vector_prefix: prefix,
-        };
+        )?;
         legacy.encode(&metadata)
     }
 
@@ -11527,10 +12095,10 @@ mod canonical_column_tests {
         let (header, base) = parse_header(bytes)?;
         let statistics = Statistics {
             documents: u64::try_from(header.documents.len()).map_err(|cause| cause.to_string())?,
-            title_length: header.total_title_length,
-            body_length: header.total_body_length,
+            title_length: header.total_title_length(),
+            body_length: header.total_body_length(),
             frequencies: header
-                .terms
+                .terms()
                 .iter()
                 .map(|(term, metadata)| (term.to_owned(), u64::from(metadata.df)))
                 .collect(),
@@ -11538,7 +12106,7 @@ mod canonical_column_tests {
         let mut search = Search::new(header.clone(), statistics, text, mode, 10, dead, filters)?;
         let words = crate::normalize_text(text);
         for term in words.split_whitespace() {
-            if let Some(metadata) = header.terms.get(term) {
+            if let Some(metadata) = header.terms().get(term) {
                 for block in &metadata.blocks {
                     let start = base
                         .checked_add(block.data.offset as usize)
@@ -11616,17 +12184,17 @@ mod canonical_column_tests {
     fn term_shapes(bytes: &[u8]) -> Result<Vec<(String, u32, Vec<BlockShape>)>, String> {
         let (header, _) = parse_header(bytes)?;
         let mut shapes = Vec::new();
-        for (term, metadata) in header.terms.iter() {
+        for (term, metadata) in header.terms().iter() {
             let mut blocks = Vec::new();
             for block in &metadata.blocks {
                 blocks.push((
                     block.first,
                     block.last,
                     block.count,
-                    block.max_title_tf,
-                    block.max_body_tf,
-                    block.min_title_length,
-                    block.min_body_length,
+                    block.max_tf[0],
+                    block.max_tf[1],
+                    block.min_length[0],
+                    block.min_length[1],
                     block
                         .data
                         .offset
@@ -11739,10 +12307,10 @@ mod canonical_column_tests {
             assert_eq!(&projected, document.columns().attributes());
         }
         for term in ["alpha", "beta", "gamma", "shared", "unique"] {
-            assert!(header.terms.get(term).is_some(), "missing {term}");
+            assert!(header.terms().get(term).is_some(), "missing {term}");
         }
         for term in ["attr", "id", "revision", "title", "text", "vector"] {
-            assert!(header.terms.get(term).is_none(), "indexed {term}");
+            assert!(header.terms().get(term).is_none(), "indexed {term}");
         }
         assert_eq!(
             allowed_rows(&built.bytes, "title", serde_json::json!("attr-title"))?,
@@ -11874,10 +12442,14 @@ mod canonical_column_tests {
             let first = rows.first_mut().ok_or("Missing migration fixture row")?;
             if title {
                 first.title_length += 1;
-                header.total_title_length += 1;
+                header
+                    .fields
+                    .set_total(fields::NATIVE_TITLE, header.total_title_length() + 1);
             } else {
                 first.body_length += 1;
-                header.total_body_length += 1;
+                header
+                    .fields
+                    .set_total(fields::NATIVE_TEXT, header.total_body_length() + 1);
             }
             header.documents = DocumentTable::from(rows);
             let changed = header.encode(legacy.get(base..).ok_or("Missing migration payload")?)?;
@@ -11962,9 +12534,9 @@ mod canonical_column_tests {
     fn query_metadata_keeps_vector_bytes_in_a_separate_frame() -> Result<(), String> {
         let documents = collision_documents();
         let built = build(documents.clone(), None)?;
-        assert_eq!(&built.bytes[..8], b"RAIOSEG3");
+        assert_eq!(&built.bytes[..8], b"RAIOSEG4");
         let (header, base) = parse_header(&built.bytes)?;
-        assert_eq!(header.version, 3);
+        assert_eq!(header.version, 4);
         let payload = built.bytes.get(base..).ok_or("Truncated segment payload")?;
         for (index, row) in header.documents.iter().enumerate() {
             let metadata = frame(payload, &row.data)?;
@@ -12322,8 +12894,8 @@ mod scalar_column_tests {
             .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
         let expected = serde_json::to_vec(&documents)?;
         let table = DocumentTable::from(documents);
-        assert_eq!(table.title_lengths.heap_bytes(), 0);
-        assert_eq!(table.body_lengths.heap_bytes(), 20 * size_of::<u32>());
+        assert_eq!(table.lengths[0].heap_bytes(), 0);
+        assert_eq!(table.lengths[1].heap_bytes(), 20 * size_of::<u32>());
         assert_eq!(table.vectors.heap_bytes(), 20 * size_of::<bool>());
         assert_eq!(serde_json::to_vec(&table)?, expected);
         let restored: DocumentTable = serde_json::from_slice(&expected)?;

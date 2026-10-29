@@ -3320,6 +3320,10 @@ impl Filter {
                     .as_array()
                     .is_some_and(|items| items.contains(value))
             }),
+            "notIn" => {
+                let items = self.value.as_array().ok_or("Invalid notIn filter")?;
+                !actual.is_some_and(|value| items.contains(value))
+            }
             "contains" => actual
                 .and_then(serde_json::Value::as_array)
                 .is_some_and(|values| values.contains(&self.value)),
@@ -7964,7 +7968,9 @@ mod filter_cache_tests {
             let stored: Document = serde_json::from_slice(&payload)?;
             assert_eq!(stored.attributes, document.attributes);
         }
-        for op in ["eq", "ne", "gt", "gte", "lt", "lte", "in", "exists"] {
+        for op in [
+            "eq", "ne", "gt", "gte", "lt", "lte", "in", "notIn", "exists",
+        ] {
             for value in [json!(2024), json!([2024]), json!(true)] {
                 let filters = [Filter {
                     field: "year".into(),
@@ -8074,7 +8080,9 @@ mod filter_cache_tests {
         {
             *document = serde_json::value::RawValue::from_string(input.into())?.into();
         }
-        for op in ["eq", "ne", "exists", "in", "gt", "gte", "lt", "lte"] {
+        for op in [
+            "eq", "ne", "exists", "in", "notIn", "gt", "gte", "lt", "lte",
+        ] {
             for value in [
                 json!(2),
                 json!(true),
@@ -8152,7 +8160,9 @@ mod filter_cache_tests {
         {
             *document = serde_json::value::RawValue::from_string(input.into())?.into();
         }
-        for op in ["eq", "ne", "exists", "in", "gt", "gte", "lt", "lte"] {
+        for op in [
+            "eq", "ne", "exists", "in", "notIn", "gt", "gte", "lt", "lte",
+        ] {
             for value in [
                 json!(2),
                 json!(true),
@@ -10065,7 +10075,7 @@ mod shared_attribute_identity_tests {
         }
         for field in ["group", "year", "flag", "missing", "nested"] {
             for op in [
-                "eq", "ne", "in", "exists", "gt", "gte", "lt", "lte", "invalid",
+                "eq", "ne", "in", "notIn", "exists", "gt", "gte", "lt", "lte", "invalid",
             ] {
                 for value in [
                     json!(3),
@@ -11007,6 +11017,47 @@ mod scalar_column_tests {
 mod array_filter_tests {
     use super::{Filter, matches};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn scalar_exclusion_is_exact_and_preserves_missing_values() -> Result<(), String> {
+        let attributes: BTreeMap<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "string": "ação",
+                "number": 1,
+                "boolean": true,
+                "null": null
+            }))
+            .map_err(|cause| cause.to_string())?;
+        for (field, value, expected) in [
+            ("string", serde_json::json!(["ação"]), false),
+            ("string", serde_json::json!(["AÇÃO"]), true),
+            ("number", serde_json::json!([1]), false),
+            ("number", serde_json::json!(["1"]), true),
+            ("boolean", serde_json::json!([true]), false),
+            ("boolean", serde_json::json!([1]), true),
+            ("null", serde_json::json!([null]), false),
+            ("missing", serde_json::json!([null]), true),
+            ("null", serde_json::json!([]), true),
+            ("missing", serde_json::json!([]), true),
+        ] {
+            let filter = Filter {
+                field: field.to_owned(),
+                op: "notIn".to_owned(),
+                value,
+            };
+            assert_eq!(matches(&attributes, &[filter])?, expected);
+        }
+        let invalid = Filter {
+            field: "missing".to_owned(),
+            op: "notIn".to_owned(),
+            value: serde_json::Value::Null,
+        };
+        assert_eq!(
+            matches(&attributes, &[invalid]),
+            Err("Invalid notIn filter".into())
+        );
+        Ok(())
+    }
 
     #[test]
     fn membership_preserves_types_empty_intersections_and_negation() -> Result<(), String> {

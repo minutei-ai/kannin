@@ -132,6 +132,11 @@ export const Filter = Schema.Union([
   }),
   Schema.Struct({
     field: FieldName,
+    op: Schema.Literal("notIn"),
+    value: Schema.Array(Scalar).check(Schema.isMaxLength(32)),
+  }),
+  Schema.Struct({
+    field: FieldName,
     op: Schema.Literals(["containsAny", "notContainsAny"]),
     value: Schema.Array(Scalar).check(Schema.isMaxLength(32)),
   }),

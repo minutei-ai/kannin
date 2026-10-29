@@ -354,6 +354,8 @@ test("scalar arrays survive queries, replacement and canonical maintenance", asy
       [{ field: "tags", op: "exists", value: true }, ["a", "b"]],
       [{ field: "tags", op: "eq", value: null }, ["b"]],
       [{ field: "tags", op: "ne", value: null }, ["a", "c"]],
+      [{ field: "tags", op: "notIn", value: [null] }, ["a", "c"]],
+      [{ field: "tags", op: "notIn", value: [] }, ["a", "b", "c"]],
       [{ field: "tags", op: "contains", value: "ação" }, ["a"]],
       [{ field: "tags", op: "notContains", value: "ação" }, ["b", "c"]],
       [{ field: "tags", op: "containsAny", value: ["absent", "😀"] }, ["a"]],
@@ -370,6 +372,8 @@ test("scalar arrays survive queries, replacement and canonical maintenance", asy
   }
   for (const filter of [
     { field: "tags", op: "containsAny", value: Array.from({ length: 33 }, () => "ação") },
+    { field: "tags", op: "notIn", value: Array.from({ length: 33 }, () => null) },
+    { field: "tags", op: "notIn", value: null },
     { field: "tags", op: "contains", value: [] },
     { field: "tags", op: "in", value: [] },
   ])

@@ -271,6 +271,7 @@ test("portable vector, hybrid, schema filters and maintenance share the canonica
             topK: 10,
             filters: [
               { field: "group", op: "eq", value: "a" },
+              { field: "group", op: "notIn", value: ["b", null] },
               { field: "tags", op: "contains", value: "selected" },
             ],
             ...(kind === "hybrid" && { text: "lexical" }),

@@ -1710,3 +1710,8 @@ export const PortableServerConfig = Schema.Struct({
   objectStore: S3StoreConfig,
   cache: Schema.optional(CacheClientConfig),
 });
+
+export const NativeJsonNumeric = Schema.declare<ReturnType<typeof JSON.rawJSON>>(
+  (value): value is ReturnType<typeof JSON.rawJSON> =>
+    JSON.isRawJSON(value) && /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(value.rawJSON),
+);

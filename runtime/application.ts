@@ -2,6 +2,7 @@ import { Cause, Effect, Schema, Schedule, Semaphore } from "effect";
 import { timingSafeEqual } from "node:crypto";
 import { ObjectStore } from "../src/object-store";
 import { ObjectBucket } from "./object-bucket";
+import { NamespaceCoordinators } from "./namespace-coordinators";
 import { createApplication } from "../src/core/application";
 import { createStorage } from "../src/core/storage";
 import { decodeRoot } from "../src/manifest";
@@ -104,21 +105,10 @@ export const portableApplication = Effect.fn("kannin.portableApplication")(funct
     VECTOR_JOBS: { send },
     INDEX_JOBS: { send },
   };
-  const actors = new Map<
-    string,
-    InstanceType<ReturnType<typeof createApplication>["SearchNamespace"]>
-  >();
-  function actor(name: string) {
-    const existing = actors.get(name);
-    if (existing !== undefined) return existing;
-    const created = new app.SearchNamespace({ waitUntil }, env);
-    if (actors.size >= 1024) {
-      const first = actors.keys().next();
-      if (first.done === false) actors.delete(first.value);
-    }
-    actors.set(name, created);
-    return created;
-  }
+  const actors = new NamespaceCoordinators(
+    (ownedWaitUntil) => new app.SearchNamespace({ waitUntil: ownedWaitUntil }, env),
+    waitUntil,
+  );
   const runtime: SearchRuntime = {
     env,
     cache: options.cache ?? disabledCache,
@@ -140,12 +130,14 @@ export const portableApplication = Effect.fn("kannin.portableApplication")(funct
         const request = new Request(input, init);
         const body = await request.arrayBuffer();
         for (const attempt of [0, 1, 2, 3, 4, 5]) {
-          const response = await actor(name).fetch(
-            new Request(request.url, {
-              method: request.method,
-              headers: request.headers,
-              ...(body.byteLength > 0 && { body }),
-            }),
+          const response = await actors.run(name, (actor) =>
+            actor.fetch(
+              new Request(request.url, {
+                method: request.method,
+                headers: request.headers,
+                ...(body.byteLength > 0 && { body }),
+              }),
+            ),
           );
           if (response.status !== 409 || attempt === 5) return response;
           const error = Schema.decodeUnknownSync(ErrorBody)(await response.clone().json());
@@ -157,7 +149,7 @@ export const portableApplication = Effect.fn("kannin.portableApplication")(funct
       },
       async execute(command: typeof RpcCommand.Encoded) {
         for (const attempt of [0, 1, 2, 3, 4, 5]) {
-          const reply = await actor(name).execute(command);
+          const reply = await actors.run(name, (actor) => actor.execute(command));
           if (
             reply._tag !== "Failure" ||
             reply.error.status !== 409 ||
@@ -167,7 +159,7 @@ export const portableApplication = Effect.fn("kannin.portableApplication")(funct
             return reply;
           await run(Effect.sleep(`${(attempt + 1) * 10} millis`));
         }
-        return actor(name).execute(command);
+        return actors.run(name, (actor) => actor.execute(command));
       },
     }),
     segments: (input) => ({

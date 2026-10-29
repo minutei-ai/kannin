@@ -196,9 +196,10 @@ export const Vector = Schema.Array(
       "A cosine vector must have nonzero float32 magnitude",
   ),
 );
+const NativeTitle = Unicode.check(Schema.isMaxLength(8192));
 export const Document = Schema.Struct({
   id: Id,
-  title: Schema.optional(Unicode.check(Schema.isMaxLength(8192))),
+  title: Schema.optional(NativeTitle),
   text: Unicode.check(Schema.isMaxLength(262144)),
   attributes: Attributes,
   vector: Schema.optional(Vector),
@@ -223,6 +224,72 @@ export const QueryDocument = StoredDocument.mapFields((fields) => ({
     ]),
   ),
 }));
+export const DocumentColumnId = Schema.Union([
+  Schema.Struct({
+    source: Schema.Literal("native"),
+    role: Schema.Literals(["title", "text", "vector"]),
+  }),
+  Schema.Struct({ source: Schema.Literal("attribute"), name: FieldName }),
+]);
+export const CanonicalDocument = Schema.Struct({
+  id: StoredDocument.fields.id,
+  revision: StoredDocument.fields.revision,
+  roles: Schema.Struct({ title: NativeTitle, text: Document.fields.text }),
+  attributes: Attributes,
+  vector: Document.fields.vector,
+});
+export const CanonicalDocumentMetadata = CanonicalDocument.mapFields((fields) =>
+  Struct.omit(fields, ["vector"]),
+);
+export const CanonicalQueryDocument = CanonicalDocumentMetadata.mapFields((fields) => ({
+  ...fields,
+  vectorSummary: QueryDocument.fields.vectorSummary,
+}));
+export function nativeToCanonicalDocument(
+  document: typeof Document.Type,
+  revision: number,
+): typeof CanonicalDocument.Type {
+  return {
+    id: document.id,
+    revision,
+    roles: { title: document.title ?? "", text: document.text },
+    attributes: document.attributes,
+    ...(document.vector !== undefined && { vector: document.vector }),
+  };
+}
+export function canonicalToNativeDocument(
+  document: typeof CanonicalDocument.Type,
+): typeof StoredDocument.Type {
+  return {
+    id: document.id,
+    revision: document.revision,
+    title: document.roles.title,
+    text: document.roles.text,
+    attributes: document.attributes,
+    ...(document.vector !== undefined && { vector: document.vector }),
+  };
+}
+export function canonicalToQueryRow(
+  document: typeof CanonicalQueryDocument.Type,
+  score: number,
+): typeof Row.Type {
+  return {
+    id: document.id,
+    revision: document.revision,
+    title: document.roles.title,
+    text: document.roles.text,
+    attributes: document.attributes,
+    score,
+  };
+}
+export function readCanonicalColumn(
+  document: typeof CanonicalDocument.Type,
+  column: typeof DocumentColumnId.Type,
+) {
+  if (column.source === "attribute") return document.attributes[column.name];
+  if (column.role === "vector") return document.vector;
+  return document.roles[column.role];
+}
 export const Filter = Schema.Union([
   Schema.Struct({
     field: FieldName,

@@ -5775,9 +5775,10 @@ pub mod wasm {
                 .filter(|(term, metadata)| count > 1 && metadata.df == count && term.len() <= 64)
                 .take(16)
                 .filter(|(_, metadata)| {
-                    metadata.blocks.iter().all(|block| {
-                        (block.max_tf[0], block.max_tf[1]) == if title { (1, 0) } else { (0, 1) }
-                    })
+                    metadata
+                        .blocks
+                        .iter()
+                        .all(|block| block.max_tf == if title { [1, 0] } else { [0, 1] })
                 })
                 .map(|(term, _)| term.to_owned())
                 .collect();
@@ -7500,9 +7501,8 @@ pub mod wasm {
         };
         super::validate_posting(header, row.posting.row, row.title_last, row.body_last, None)?;
         if row.posting.row != block.first
-            || (row.posting.title, row.posting.body) != (block.max_tf[0], block.max_tf[1])
-            || (document.title_length, document.body_length)
-                != (block.min_length[0], block.min_length[1])
+            || (row.posting.title, row.posting.body) != <(u32, u32)>::from(block.max_tf)
+            || (document.title_length, document.body_length) != <(u32, u32)>::from(block.min_length)
         {
             return Ok(None);
         }

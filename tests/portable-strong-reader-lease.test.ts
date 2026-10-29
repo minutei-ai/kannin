@@ -283,6 +283,38 @@ test("strong reader leases bound stalled reads without dropping a live captured 
     );
     expect(collected.pinned).toBe(2);
     expect(collected.deleted).toBe(0);
+    gates.rootEntered = yield* Deferred.make<void>();
+    gates.rootRelease = yield* Deferred.make<void>();
+    block.root = true;
+    const caller = new AbortController();
+    const cancelled = track(
+      reader.fetch(
+        new Request(
+          request("query", {
+            kind: "text",
+            text: "final",
+            topK: 10,
+            filters: [],
+            consistency: "strong",
+          }),
+          { signal: caller.signal },
+        ),
+      ),
+    ).then(
+      () => "resolved",
+      () => "rejected",
+    );
+    const cancelledEntered = gates.rootEntered;
+    if (cancelledEntered === undefined) return yield* Effect.die("missing cancelled root gate");
+    yield* TestClock.withLive(Deferred.await(cancelledEntered).pipe(Effect.timeout("5 seconds")));
+    caller.abort();
+    const cancellation = yield* TestClock.withLive(
+      Effect.promise(() => cancelled).pipe(Effect.timeout("5 seconds")),
+    );
+    expect(cancellation).toBe("rejected");
+    const cancelledRelease = gates.rootRelease;
+    if (cancelledRelease === undefined) return yield* Effect.die("missing cancelled root release");
+    yield* Deferred.succeed(cancelledRelease, undefined);
     return undefined;
   });
   await Effect.runPromise(

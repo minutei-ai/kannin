@@ -3584,7 +3584,9 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       const operation = parts.at(-1);
       const namespace = parts[3];
       const queryTimings = new Headers();
-      return Effect.runPromise(
+      const querySignal: { value: AbortSignal | undefined } = { value: undefined };
+      if (operation === "query") querySignal.value = request.signal;
+      return runQueryEffect(
         Effect.gen({ self: this }, function* () {
           const started = yield* Clock.currentTimeNanos;
           if (!isNamespaceName(namespace))
@@ -3650,6 +3652,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
             );
           }),
         ),
+        querySignal.value,
       );
     }
   }
@@ -4368,7 +4371,9 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       const snapshotTimings = new Headers();
       const queryTimings = new Headers();
       const started = Effect.runSync(Clock.currentTimeNanos);
-      const response = await Effect.runPromise(
+      const querySignal: { value: AbortSignal | undefined } = { value: undefined };
+      if (operation === "query") querySignal.value = request.signal;
+      const response = await runQueryEffect(
         Effect.gen(function* () {
           if (operation === "query") {
             const body = yield* readBody(request.clone());
@@ -4450,6 +4455,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
             );
           }),
         ),
+        querySignal.value,
       );
       const ended = Effect.runSync(Clock.currentTimeNanos);
       const outgoing = new Response(response.body, response);

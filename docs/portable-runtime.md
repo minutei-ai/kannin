@@ -28,6 +28,8 @@ The Rust/WASM engine performs exact cosine search over the canonical vector fram
 
 Reader leases are not shared across replicas. Strong queries now have a 30-second core deadline, captured before reading the Root and measured with both wall and monotonic clocks. Expiry returns HTTP 504 and releases the process-local pin; a late Root response cannot repopulate the coordinator's manifest cache. The portable adapter propagates cancellation into object acquisition and body streaming. Native R2 can leave one physical read in flight after cancellation, so the core also rejects late results before using them. Collection retains unreferenced segments for at least 24 hours. The bounded-reader changes still require the complete gate and do not establish hosted multi-replica conformance.
 
+HTTP query cancellation propagates through the gateway and portable coordinator to the query fiber, including while the Root is loading or the query is waiting for admission. It does not wait for the 30-second deadline. The portable strong-reader regression includes a caller abort while the backend deliberately ignores cancellation; this case still requires the complete gate.
+
 An immutable cache fill has its own 30-second origin budget and can finish in background after the caller's shorter cache lookup expires. This permits a slow successful origin read to populate the shared cache. Cache publication has a separate five-second budget. Query cancellation cancels its own range waiters; it cancels a coalesced producer only when no other waiter or non-cancellable caller still needs it.
 
 Run the built server with the external variables already loaded:

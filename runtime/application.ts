@@ -137,6 +137,7 @@ export const portableApplication = Effect.fn("kannin.portableApplication")(funct
               new Request(request.url, {
                 method: request.method,
                 headers: request.headers,
+                signal: request.signal,
                 ...(body.byteLength > 0 && { body }),
               }),
             ),

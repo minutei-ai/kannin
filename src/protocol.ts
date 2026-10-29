@@ -33,15 +33,15 @@ export const FieldName = Unicode.check(
   ),
 );
 export function compareFieldNames(left: string, right: string): number {
-  let offset = 0;
+  const cursor = { offset: 0 };
   const length = Math.min(left.length, right.length);
-  while (offset < length) {
-    const a = left.codePointAt(offset);
-    const b = right.codePointAt(offset);
+  while (cursor.offset < length) {
+    const a = left.codePointAt(cursor.offset);
+    const b = right.codePointAt(cursor.offset);
     if (a === undefined || b === undefined) break;
     if (a !== b) return a - b;
-    offset += 1;
-    if (a > 0xffff) offset += 1;
+    cursor.offset += 1;
+    if (a > 0xffff) cursor.offset += 1;
   }
   return left.length - right.length;
 }

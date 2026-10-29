@@ -14,6 +14,8 @@ RAIO_BENCH_DOCUMENTS=10000 RAIO_BENCH_COLD_SAMPLES=5 /home/yorizel/.local/bin/re
 
 The existing `Check` workflow also accepts the explicit `measure_workerd` dispatch input. After its complete gate passes, it runs process-cold and warm drivers serially on 1,000 documents with three cold samples per query, with a ten-minute measurement timeout and one-day report retention. It is disabled for ordinary PR checks. This path avoids using the shared development host for measurements; its new workflow steps still require validation.
 
+The separate `Measure validated runtime` workflow accepts a successful `Check` run ID for the exact selected commit. It verifies the run conclusion and workflow path, downloads that gate's generated artifacts on the isolated runner, installs the frozen Bun dependencies, and runs retained-cache cold, empty-cache cold and warm measurements serially. It does not rebuild Rust or download artifacts to the development host. Reports and gate provenance expire after one day. This workflow has not yet executed; Docker/CDN integration and matched resource limits for cross-backend comparison remain pending.
+
 `RAIO_BENCH_COLD_SAMPLES` accepts 1–20. The corpus size matches the warm driver. Comparable Docker/workerd cold and warm measurements and hosted Railway validation remain delivery gates.
 
 ## Historical deployed BM25 comparison

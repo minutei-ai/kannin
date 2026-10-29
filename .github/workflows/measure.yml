@@ -1,0 +1,57 @@
+name: Measure validated runtime
+on:
+  workflow_dispatch:
+    inputs:
+      gate_run:
+        description: Successful Check run for this exact commit
+        type: string
+        required: true
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: measure-${{ github.ref_name }}
+  cancel-in-progress: false
+jobs:
+  workerd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.4
+      - name: Require the complete gate on this exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GATE_RUN: ${{ inputs.gate_run }}
+        run: |
+          [[ "$GATE_RUN" =~ ^[0-9]+$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GATE_RUN" > "$RUNNER_TEMP/gate.json"
+          jq --exit-status --arg sha "$GITHUB_SHA" \
+            '.head_sha == $sha and .conclusion == "success" and .status == "completed" and .path == ".github/workflows/check.yml"' \
+            "$RUNNER_TEMP/gate.json"
+          gh run download "$GATE_RUN" --name worker --dir dist
+          test -s dist/worker/worker.js
+          test -s dist/worker/raio_engine_bg.wasm
+      - run: bun install --frozen-lockfile
+      - name: Measure cold processes with retained and empty Cache API, then warm reads
+        timeout-minutes: 10
+        env:
+          RAIO_BENCH_DOCUMENTS: "1000"
+          RAIO_BENCH_COLD_SAMPLES: "3"
+        run: |
+          RAIO_BENCH_CACHE_MODE=retained bun tooling/benchmark-cold.ts > "$RUNNER_TEMP/process-cold.json"
+          RAIO_BENCH_CACHE_MODE=empty bun tooling/benchmark-cold.ts > "$RUNNER_TEMP/cache-cold.json"
+          bun tooling/benchmark.ts > "$RUNNER_TEMP/warm.json"
+      - name: Retain successful measurement reports and gate provenance
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: workerd-measurements
+          path: |
+            ${{ runner.temp }}/process-cold.json
+            ${{ runner.temp }}/cache-cold.json
+            ${{ runner.temp }}/warm.json
+            ${{ runner.temp }}/gate.json
+          if-no-files-found: error
+          retention-days: 1

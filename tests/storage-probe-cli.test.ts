@@ -80,7 +80,9 @@ async function interruptedProbe(failDelete: boolean) {
     new Response(child.stderr).text(),
   ]);
   expect(observed.metadata).toBeDefined();
-  expect(observed.deletes).toEqual([observed.key]);
+  const key = observed.key;
+  if (key === undefined) throw new Error("Probe did not establish its fixture key");
+  expect(observed.deletes).toEqual([key]);
   expect(code).not.toBe(0);
   expect(stdout).not.toContain('"integrity":"verified"');
   if (failDelete) expect(stderr).toContain("ProbeDeleteFailure");

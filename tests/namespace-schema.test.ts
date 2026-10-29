@@ -314,6 +314,47 @@ test("namespace-local canonical filters are immediately visible after schema-onl
   expect(after).toEqual(before);
 });
 
+test("native document fields remain distinct from attributes with the same names", async () => {
+  const namespace = "native-column-identities";
+  const vector = [1, 0];
+  const schema = {
+    filterable: ["vector", "title", "text"],
+    vectorFilterFields: ["text", "vector"],
+    vectorDimensions: 2,
+  };
+  const attributes = { vector: "metadata-vector", title: "metadata-title", text: "metadata-text" };
+  expect(
+    (
+      await request(worker, namespace, "write", {
+        requestId: "seed",
+        schema,
+        upserts: [{ id: "one", title: "native heading", text: "native body", attributes, vector }],
+        deletes: [],
+      })
+    ).status,
+  ).toBe(200);
+  expect((await request(worker, namespace, "vector-sync", {})).status).toBe(200);
+  for (const input of [
+    textQuery("native"),
+    { kind: "vector", vector, topK: 10, filters: [] },
+    { kind: "hybrid", text: "native", vector, topK: 10, filters: [] },
+  ]) {
+    const response = await request(worker, namespace, "query", {
+      ...input,
+      filters: Object.entries(attributes).map(([field, value]) => ({ field, op: "eq", value })),
+    });
+    expect(response.status).toBe(200);
+    const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+    expect(result.rows.map((row) => row.id)).toEqual(["one"]);
+    expect(result.rows[0]?.title).toBe("native heading");
+    expect(result.rows[0]?.text).toBe("native body");
+    expect(result.rows[0]?.attributes).toEqual(attributes);
+  }
+  const response = await request(worker, namespace, "metadata");
+  expect(response.status).toBe(200);
+  expect(Schema.decodeUnknownSync(Metadata)(await response.json()).schema).toEqual(schema);
+});
+
 test("attribute names enforce UTF-8 byte bounds and native field ordering", () => {
   for (const name of [
     "1year",

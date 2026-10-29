@@ -131,7 +131,24 @@ pub(super) fn encode_terms(
         }
     }
     for (row, document) in header.documents.iter().enumerate() {
-        put_text(document.id, &mut bytes)?;
+        if header.version >= 5 {
+            match document.id {
+                super::DocumentId::String(value) => {
+                    put_int(0, &mut bytes);
+                    put_text(value, &mut bytes)?;
+                }
+                super::DocumentId::Uint(value) => {
+                    put_int(1, &mut bytes);
+                    put_long(value, &mut bytes);
+                }
+                super::DocumentId::Uuid(value) => {
+                    put_int(2, &mut bytes);
+                    bytes.extend_from_slice(&value);
+                }
+            }
+        } else {
+            put_text(document.id.native_str()?, &mut bytes)?;
+        }
         put_long(document.revision, &mut bytes);
         if legacy {
             put_int(document.title_length, &mut bytes);
@@ -344,12 +361,12 @@ impl<'a> Decoder<'a> {
         column.push_charged(value, capacity, |bytes| self.charge(bytes))
     }
 
-    fn documents(&mut self, legacy: bool) -> Result<super::DocumentTable, String> {
+    fn documents(&mut self, legacy: bool, typed: bool) -> Result<super::DocumentTable, String> {
         let count = self.integer()? as usize;
         if count > 10000 {
             return Err("Directory document limit exceeded".into());
         }
-        if count > self.bytes.len().saturating_sub(self.offset) / 9 {
+        if count > self.bytes.len().saturating_sub(self.offset) / (if typed { 7 } else { 9 }) {
             return Err("Truncated directory documents".into());
         }
         self.charge(
@@ -387,8 +404,36 @@ impl<'a> Decoder<'a> {
         let mut body_lengths = super::ScalarColumn::new();
         let mut vectors = super::ScalarColumn::new();
         let mut ids = String::new();
-        for _ in 0..count {
-            let id = self.document_id(&mut ids)?;
+        let mut typed_ids = Vec::new();
+        if typed {
+            self.charge(count * size_of::<(usize, super::FixedId)>())?;
+            typed_ids.reserve_exact(count);
+        }
+        for row in 0..count {
+            let tag = if typed { self.integer()? } else { 0 };
+            let id = match tag {
+                0 => self.document_id(&mut ids)?,
+                1 => {
+                    typed_ids.push((row, super::FixedId::Uint(self.long()?)));
+                    ids.len()..ids.len()
+                }
+                2 => {
+                    let end = self
+                        .offset
+                        .checked_add(16)
+                        .ok_or("UUID directory offset overflow")?;
+                    let value: [u8; 16] = self
+                        .bytes
+                        .get(self.offset..end)
+                        .ok_or("Truncated UUID id")?
+                        .try_into()
+                        .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?;
+                    self.offset = end;
+                    typed_ids.push((row, super::FixedId::Uuid(value)));
+                    ids.len()..ids.len()
+                }
+                _ => return Err("Invalid directory document id tag".into()),
+            };
             let revision = self.long()?;
             if legacy {
                 self.scalar(&mut title_lengths, count, Self::integer)?;
@@ -428,6 +473,7 @@ impl<'a> Decoder<'a> {
         }
         Ok(super::DocumentTable {
             ids,
+            typed_ids: typed_ids.into_boxed_slice(),
             rows: documents,
             lengths: if legacy {
                 vec![title_lengths, body_lengths]
@@ -580,11 +626,11 @@ pub(super) fn decode(bytes: &[u8], max_heap_bytes: usize) -> Result<Header, Stri
     };
     decoder.charge(size_of::<Header>() + 32 + FILTER_CACHE_BYTES)?;
     let version = decoder.integer()?;
-    if !(2..=4).contains(&version) {
+    if !(2..=5).contains(&version) {
         return Err("Invalid segment version".into());
     }
     let legacy = version < 4;
-    let mut documents = decoder.documents(legacy)?;
+    let mut documents = decoder.documents(legacy, version >= 5)?;
     let fields = if legacy {
         let terms = decoder.terms(documents.len())?;
         let total_title_length = decoder.long()?;

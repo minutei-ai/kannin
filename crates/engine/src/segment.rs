@@ -1,6 +1,8 @@
 mod binary_directory;
 mod fields;
+mod ids;
 mod numbers;
+pub use ids::{DocumentId, DocumentIdRef};
 
 pub use fields::{
     Bm25Parameters, CorpusStatistics, FieldAnalysis, FieldMeta, FieldQuery, FieldStatistics,
@@ -19,6 +21,7 @@ use std::rc::Rc;
 const MAGIC_V2: &[u8; 8] = b"RAIOSEG2";
 const MAGIC_V3: &[u8; 8] = b"RAIOSEG3";
 const MAGIC_V4: &[u8; 8] = b"RAIOSEG4";
+const MAGIC_V5: &[u8; 8] = b"RAIOSEG5";
 const METADATA_CODEC_FACTS: u8 = 2;
 const METADATA_CODEC_CANONICAL: u8 = 3;
 const MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -32,16 +35,16 @@ fn segment_magic(version: u32) -> Result<&'static [u8; 8], String> {
         2 => Ok(MAGIC_V2),
         3 => Ok(MAGIC_V3),
         4 => Ok(MAGIC_V4),
+        5 => Ok(MAGIC_V5),
         _ => Err("Invalid segment version".into()),
     }
 }
 
-pub(crate) fn compare_document_ids(left: &str, right: &str) -> Ordering {
-    if left.is_ascii() {
-        left.cmp(right)
-    } else {
-        left.encode_utf16().cmp(right.encode_utf16())
-    }
+pub(crate) fn compare_document_ids<'a, 'b>(
+    left: impl Into<DocumentIdRef<'a>>,
+    right: impl Into<DocumentIdRef<'b>>,
+) -> Ordering {
+    ids::compare(left.into(), right.into())
 }
 
 #[derive(Clone, Default)]
@@ -290,7 +293,7 @@ impl Columns {
 
 #[derive(Clone)]
 pub struct Document {
-    pub id: String,
+    pub id: DocumentId,
     pub revision: u64,
     columns: Columns,
 }
@@ -310,7 +313,7 @@ struct CanonicalRoles {
 
 #[derive(Serialize)]
 struct CanonicalDocumentRef<'a> {
-    id: &'a str,
+    id: DocumentIdRef<'a>,
     revision: u64,
     roles: CanonicalRolesRef<'a>,
     attributes: &'a BTreeMap<String, serde_json::Value>,
@@ -321,7 +324,7 @@ struct CanonicalDocumentRef<'a> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CanonicalDocumentDto {
-    id: String,
+    id: DocumentId,
     revision: u64,
     roles: CanonicalRoles,
     attributes: BTreeMap<String, serde_json::Value>,
@@ -331,7 +334,7 @@ struct CanonicalDocumentDto {
 
 #[derive(Serialize)]
 struct StoredCanonicalRef<'a> {
-    id: &'a str,
+    id: DocumentIdRef<'a>,
     revision: u64,
     roles: CanonicalRolesRef<'a>,
     attributes: &'a BTreeMap<String, serde_json::Value>,
@@ -340,7 +343,7 @@ struct StoredCanonicalRef<'a> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredCanonicalDocument {
-    id: String,
+    id: DocumentId,
     revision: u64,
     roles: CanonicalRoles,
     attributes: BTreeMap<String, serde_json::Value>,
@@ -373,7 +376,7 @@ struct NativeDocumentDto {
 
 #[derive(Serialize)]
 struct CanonicalQueryRef<'a> {
-    id: &'a str,
+    id: DocumentIdRef<'a>,
     revision: u64,
     roles: CanonicalRolesRef<'a>,
     attributes: &'a BTreeMap<String, serde_json::Value>,
@@ -471,7 +474,7 @@ impl Document {
         vector: Option<Vec<f32>>,
     ) -> Self {
         Self {
-            id: id.into(),
+            id: DocumentId::String(id.into()),
             revision,
             columns: Columns::new(title.into(), text.into(), attributes, vector),
         }
@@ -520,19 +523,23 @@ impl Document {
     }
 
     fn from_parts(
-        id: String,
+        id: DocumentId,
         revision: u64,
         title: String,
         text: String,
         attributes: BTreeMap<String, serde_json::Value>,
         vector: Option<Vec<f32>>,
     ) -> Self {
-        Self::native(id, revision, title, text, attributes, vector)
+        Self {
+            id,
+            revision,
+            columns: Columns::new(title, text, attributes, vector),
+        }
     }
 
     fn from_native_dto(dto: NativeDocumentDto) -> Self {
         Self::from_parts(
-            dto.id,
+            dto.id.into(),
             dto.revision,
             dto.title,
             dto.text,
@@ -593,7 +600,7 @@ impl Document {
     #[cfg(test)]
     fn to_native_metadata_vec(&self) -> Result<Vec<u8>, String> {
         serde_json::to_vec(&NativeDocumentRef {
-            id: &self.id,
+            id: self.id.native_str()?,
             revision: self.revision,
             title: self.role_text(NativeRole::Title)?,
             text: self.role_text(NativeRole::Text)?,
@@ -605,7 +612,7 @@ impl Document {
 
     fn native_ref(&self) -> Result<NativeDocumentRef<'_>, String> {
         Ok(NativeDocumentRef {
-            id: &self.id,
+            id: self.id.native_str()?,
             revision: self.revision,
             title: self.role_text(NativeRole::Title)?,
             text: self.role_text(NativeRole::Text)?,
@@ -638,7 +645,7 @@ impl Document {
 
     fn canonical_ref(&self) -> Result<CanonicalDocumentRef<'_>, String> {
         Ok(CanonicalDocumentRef {
-            id: &self.id,
+            id: self.id.borrowed(),
             revision: self.revision,
             roles: self.roles_ref()?,
             attributes: self.columns.attributes(),
@@ -648,7 +655,7 @@ impl Document {
 
     fn to_stored_canonical_vec(&self) -> Result<Vec<u8>, String> {
         serde_json::to_vec(&StoredCanonicalRef {
-            id: &self.id,
+            id: self.id.borrowed(),
             revision: self.revision,
             roles: self.roles_ref()?,
             attributes: self.columns.attributes(),
@@ -658,7 +665,7 @@ impl Document {
 
     fn query_ref(&self, facts: VectorFacts) -> Result<CanonicalQueryRef<'_>, String> {
         Ok(CanonicalQueryRef {
-            id: &self.id,
+            id: self.id.borrowed(),
             revision: self.revision,
             roles: self.roles_ref()?,
             attributes: self.columns.attributes(),
@@ -901,8 +908,12 @@ impl From<Box<serde_json::value::RawValue>> for DocumentAttributes {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct DocumentMeta<Id = Box<str>, Attributes = DocumentAttributes, Length = u32, Vector = bool>
-{
+pub struct DocumentMeta<
+    Id = DocumentId<Box<str>>,
+    Attributes = DocumentAttributes,
+    Length = u32,
+    Vector = bool,
+> {
     pub id: Id,
     pub revision: u64,
     pub title_length: Length,
@@ -1089,9 +1100,16 @@ impl AttributeColumn {
     }
 }
 
+#[derive(Clone, Copy)]
+enum FixedId {
+    Uint(u64),
+    Uuid([u8; 16]),
+}
+
 #[derive(Clone)]
 pub struct DocumentTable {
     ids: String,
+    typed_ids: Box<[(usize, FixedId)]>,
     rows: Vec<DocumentMeta<std::ops::Range<usize>, (), (), ()>>,
     lengths: Vec<ScalarColumn<u32>>,
     vectors: ScalarColumn<bool>,
@@ -1112,10 +1130,10 @@ impl DocumentTable {
         self.rows.is_empty()
     }
     #[must_use]
-    pub fn row(&self, index: usize) -> DocumentMeta<&str, &DocumentAttributes> {
+    pub fn row(&self, index: usize) -> DocumentMeta<DocumentIdRef<'_>, &DocumentAttributes> {
         let row = &self.rows[index];
         DocumentMeta {
-            id: &self.ids[row.id.clone()],
+            id: self.id(index),
             revision: row.revision,
             title_length: self.field_length(fields::NATIVE_TITLE, index),
             body_length: self.field_length(fields::NATIVE_TEXT, index),
@@ -1124,6 +1142,16 @@ impl DocumentTable {
             vector: self.vectors.get(index),
         }
     }
+    fn id(&self, index: usize) -> DocumentIdRef<'_> {
+        if let Ok(position) = self.typed_ids.binary_search_by_key(&index, |(row, _)| *row) {
+            return match self.typed_ids[position].1 {
+                FixedId::Uint(value) => DocumentId::Uint(value),
+                FixedId::Uuid(value) => DocumentId::Uuid(value),
+            };
+        }
+        DocumentId::String(&self.ids[self.rows[index].id.clone()])
+    }
+
     fn field_length(&self, ordinal: usize, index: usize) -> u32 {
         self.lengths
             .get(ordinal)
@@ -1138,23 +1166,33 @@ impl DocumentTable {
         self.lengths.push(column);
     }
     #[must_use]
-    fn get(&self, index: usize) -> Option<DocumentMeta<&str, &DocumentAttributes>> {
+    fn get(&self, index: usize) -> Option<DocumentMeta<DocumentIdRef<'_>, &DocumentAttributes>> {
         self.rows.get(index).map(|_| self.row(index))
     }
     #[cfg(any(test, target_arch = "wasm32"))]
-    fn first(&self) -> Option<DocumentMeta<&str, &DocumentAttributes>> {
+    fn first(&self) -> Option<DocumentMeta<DocumentIdRef<'_>, &DocumentAttributes>> {
         self.get(0)
     }
     pub fn iter(
         &self,
-    ) -> impl ExactSizeIterator<Item = DocumentMeta<&str, &DocumentAttributes>> + DoubleEndedIterator
-    {
+    ) -> impl ExactSizeIterator<Item = DocumentMeta<DocumentIdRef<'_>, &DocumentAttributes>>
+    + DoubleEndedIterator {
         (0..self.len()).map(|index| self.row(index))
     }
-    #[cfg(target_arch = "wasm32")]
-    fn find_id(&self, id: &str) -> Result<usize, usize> {
-        self.rows
-            .binary_search_by(|row| compare_document_ids(&self.ids[row.id.clone()], id))
+    #[doc = "# Errors\nReturns the insertion position when the canonical identity is absent."]
+    pub fn find_id<'a>(&self, id: impl Into<DocumentIdRef<'a>>) -> Result<usize, usize> {
+        let id = id.into();
+        let mut low = 0;
+        let mut high = self.len();
+        while low < high {
+            let middle = low + (high - low) / 2;
+            match compare_document_ids(self.id(middle), id) {
+                Ordering::Less => low = middle + 1,
+                Ordering::Equal => return Ok(middle),
+                Ordering::Greater => high = middle,
+            }
+        }
+        Err(low)
     }
     fn metadata(
         &self,
@@ -1195,8 +1233,16 @@ impl DocumentTable {
 
 impl From<Vec<DocumentMeta>> for DocumentTable {
     fn from(documents: Vec<DocumentMeta>) -> Self {
-        let mut ids =
-            String::with_capacity(documents.iter().map(|document| document.id.len()).sum());
+        let mut ids = String::with_capacity(
+            documents
+                .iter()
+                .map(|document| match &document.id {
+                    DocumentId::String(value) => value.len(),
+                    DocumentId::Uint(_) | DocumentId::Uuid(_) => 0,
+                })
+                .sum(),
+        );
+        let mut typed_ids = Vec::new();
         let mut attributes = Vec::with_capacity(documents.len());
         let count = documents.len();
         let mut title_lengths = ScalarColumn::new();
@@ -1204,9 +1250,14 @@ impl From<Vec<DocumentMeta>> for DocumentTable {
         let mut vectors = ScalarColumn::new();
         let rows = documents
             .into_iter()
-            .map(|document| {
+            .enumerate()
+            .map(|(index, document)| {
                 let start = ids.len();
-                ids.push_str(&document.id);
+                match &document.id {
+                    DocumentId::String(value) => ids.push_str(value),
+                    DocumentId::Uint(value) => typed_ids.push((index, FixedId::Uint(*value))),
+                    DocumentId::Uuid(value) => typed_ids.push((index, FixedId::Uuid(*value))),
+                }
                 let end = ids.len();
                 attributes.push(document.attributes);
                 title_lengths.push(document.title_length, count);
@@ -1225,6 +1276,7 @@ impl From<Vec<DocumentMeta>> for DocumentTable {
             .collect();
         Self {
             ids,
+            typed_ids: typed_ids.into_boxed_slice(),
             rows,
             attributes: AttributeColumn::Dense(attributes),
             lengths: vec![title_lengths, body_lengths],
@@ -1761,7 +1813,7 @@ struct VectorScan {
 #[derive(Serialize)]
 struct VectorLocation<'a> {
     row: u32,
-    id: &'a str,
+    id: DocumentIdRef<'a>,
     data: Range,
     #[serde(rename = "vectorData")]
     vector_data: Range,
@@ -1884,6 +1936,7 @@ impl Header {
         let documents = self.documents.rows.capacity()
             * size_of::<DocumentMeta<std::ops::Range<usize>, (), (), ()>>()
             + self.documents.ids.capacity()
+            + std::mem::size_of_val(self.documents.typed_ids.as_ref())
             + self.documents.attributes.heap_bytes()
             + self.documents.lengths.capacity() * size_of::<ScalarColumn<u32>>()
             + 16
@@ -2791,11 +2844,18 @@ fn build_versioned(
     if documents.len() > 10000 {
         return Err("Segment exceeds 10000 documents".into());
     }
-    if version != 3 && version != 4 {
+    let typed = documents
+        .iter()
+        .any(|document| !matches!(document.id, DocumentId::String(_)));
+    let version = if typed { 5 } else { version };
+    if version != 3 && version != 4 && version != 5 {
         return Err("Invalid segment version".into());
     }
     if version < 4 && !text_fields.is_empty() {
         return Err("Named text requires segment version 4".into());
+    }
+    if documents.iter().any(|document| !document.id.is_valid()) {
+        return Err("Invalid document id".into());
     }
     let filterable = filterable.map(filterable_fields).transpose()?;
     let mut named = fields::NamedBuilder::prepare(text_fields)?;
@@ -2824,7 +2884,7 @@ fn build_versioned(
         )?;
         let attributes = attribute_json(document, filterable.as_ref())?;
         metadata.push(DocumentMeta {
-            id: document.id.clone().into_boxed_str(),
+            id: document.id.borrowed().into_boxed(),
             revision: document.revision,
             title_length,
             body_length,
@@ -2902,9 +2962,12 @@ fn parse_legacy_segment(bytes: &[u8]) -> Result<(LegacySegmentHeader, usize), St
     Ok((legacy, 16 + length))
 }
 
-fn owned_directory_row(row: &DocumentMeta<&str, &DocumentAttributes>, data: Range) -> DocumentMeta {
+fn owned_directory_row(
+    row: &DocumentMeta<DocumentIdRef<'_>, &DocumentAttributes>,
+    data: Range,
+) -> DocumentMeta {
     DocumentMeta {
-        id: row.id.to_owned().into_boxed_str(),
+        id: row.id.into_boxed(),
         revision: row.revision,
         title_length: row.title_length,
         body_length: row.body_length,
@@ -3025,7 +3088,9 @@ fn migrate_v2_segment(bytes: &[u8]) -> Result<Vec<u8>, String> {
 
 #[doc = "# Errors\nRejects invalid legacy segments, corrupt documents or postings, and converted segments above sixteen MiB."]
 pub fn migrate_segment(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    if bytes.len() >= 8 && (&bytes[..8] == MAGIC_V3 || &bytes[..8] == MAGIC_V4) {
+    if bytes.len() >= 8
+        && (&bytes[..8] == MAGIC_V3 || &bytes[..8] == MAGIC_V4 || &bytes[..8] == MAGIC_V5)
+    {
         parse_header(bytes)?;
         return Ok(bytes.to_vec());
     }
@@ -3056,7 +3121,7 @@ fn migrate_v1_segment(bytes: &[u8]) -> Result<Vec<u8>, String> {
         let decoded = decode_page(frame)?;
         let document = Document::from_native_slice(&decoded)?;
         let values = document.vector_values()?;
-        if document.id.as_bytes() != row.id.as_bytes()
+        if document.id != row.id
             || document.revision != row.revision
             || values.is_some() != row.vector
         {
@@ -3140,6 +3205,8 @@ pub fn parse_header(bytes: &[u8]) -> Result<(Header, usize), String> {
         3
     } else if &bytes[..8] == MAGIC_V4 {
         4
+    } else if &bytes[..8] == MAGIC_V5 {
+        5
     } else {
         return Err("Invalid segment header".into());
     };
@@ -3169,7 +3236,7 @@ pub fn parse_header(bytes: &[u8]) -> Result<(Header, usize), String> {
     if found != expected_version {
         return Err("Segment magic does not match its version".into());
     }
-    let mut header = if expected_version == 4 {
+    let mut header = if expected_version >= 4 {
         serde_json::from_str::<StoredHeader>(text)
             .map_err(|e| e.to_string())?
             .into_header()?
@@ -3185,7 +3252,7 @@ pub fn parse_header(bytes: &[u8]) -> Result<(Header, usize), String> {
 }
 
 fn validate_header(header: &Header) -> Result<(), String> {
-    if (header.version != 2 && header.version != 3 && header.version != 4)
+    if !(2..=5).contains(&header.version)
         || header.documents.is_empty()
         || header.documents.len() > 10000
     {
@@ -3193,12 +3260,14 @@ fn validate_header(header: &Header) -> Result<(), String> {
     }
     header.fields.validate(&header.documents, header.version)?;
     let documents = &header.documents;
-    if documents.rows.windows(2).any(|pair| {
-        compare_document_ids(
-            &documents.ids[pair[0].id.clone()],
-            &documents.ids[pair[1].id.clone()],
-        ) != Ordering::Less
+    if documents.iter().any(|row| {
+        !row.id.is_valid() || (header.version < 5 && !matches!(row.id, DocumentId::String(_)))
     }) {
+        return Err("Document id does not match segment version".into());
+    }
+    if (1..documents.len())
+        .any(|row| compare_document_ids(documents.id(row - 1), documents.id(row)) != Ordering::Less)
+    {
         return Err("Segment ids are not strictly sorted".into());
     }
     validate_columns(header)
@@ -3206,14 +3275,17 @@ fn validate_header(header: &Header) -> Result<(), String> {
 
 const DIRECTORY_MAGIC: &[u8; 8] = b"RAIODIR5";
 const DIRECTORY_MAGIC_V6: &[u8; 8] = b"RAIODIR6";
+const DIRECTORY_MAGIC_V7: &[u8; 8] = b"RAIODIR7";
 const COMMON_DIRECTORY_MAGIC: &[u8; 8] = b"RAIOCOM3";
 const COMMON_DIRECTORY_MAGIC_V4: &[u8; 8] = b"RAIOCOM4";
+const COMMON_DIRECTORY_MAGIC_V5: &[u8; 8] = b"RAIOCOM5";
 const MAX_COMMON_POSTING_BYTES: usize = 32 * 1024;
 
 fn directory_magic(version: u32) -> Result<&'static [u8; 8], String> {
     match version {
         2 | 3 => Ok(DIRECTORY_MAGIC),
         4 => Ok(DIRECTORY_MAGIC_V6),
+        5 => Ok(DIRECTORY_MAGIC_V7),
         _ => Err("Invalid segment version".into()),
     }
 }
@@ -3222,18 +3294,22 @@ fn common_directory_magic_for(version: u32) -> Result<&'static [u8; 8], String> 
     match version {
         2 | 3 => Ok(COMMON_DIRECTORY_MAGIC),
         4 => Ok(COMMON_DIRECTORY_MAGIC_V4),
+        5 => Ok(COMMON_DIRECTORY_MAGIC_V5),
         _ => Err("Invalid segment version".into()),
     }
 }
 
 fn is_common_directory_magic(magic: [u8; 8]) -> bool {
-    magic == *COMMON_DIRECTORY_MAGIC || magic == *COMMON_DIRECTORY_MAGIC_V4
+    magic == *COMMON_DIRECTORY_MAGIC
+        || magic == *COMMON_DIRECTORY_MAGIC_V4
+        || magic == *COMMON_DIRECTORY_MAGIC_V5
 }
 
 fn frame_magic_matches(magic: [u8; 8], version: u32) -> bool {
     match version {
         2 | 3 => magic == *DIRECTORY_MAGIC || magic == *COMMON_DIRECTORY_MAGIC,
         4 => magic == *DIRECTORY_MAGIC_V6 || magic == *COMMON_DIRECTORY_MAGIC_V4,
+        5 => magic == *DIRECTORY_MAGIC_V7 || magic == *COMMON_DIRECTORY_MAGIC_V5,
         _ => false,
     }
 }
@@ -3248,7 +3324,7 @@ fn directory_frame_magic(bytes: &[u8], partial: bool) -> Result<[u8; 8], String>
     let accepted = if partial {
         is_common_directory_magic(magic)
     } else {
-        &magic == DIRECTORY_MAGIC || &magic == DIRECTORY_MAGIC_V6
+        &magic == DIRECTORY_MAGIC || &magic == DIRECTORY_MAGIC_V6 || &magic == DIRECTORY_MAGIC_V7
     };
     if accepted {
         Ok(magic)
@@ -3440,7 +3516,7 @@ impl<'de> Deserialize<'de> for StoredVersion {
 
 #[derive(Deserialize)]
 struct StoredRow {
-    id: Box<str>,
+    id: DocumentId<Box<str>>,
     revision: u64,
     attributes: DocumentAttributes,
     data: Range,
@@ -4745,7 +4821,7 @@ impl Search {
         score: f64,
         id: &str,
     ) -> Result<Vec<PostingSpan<'_>>, String> {
-        self.posting_spans_cutoff(score, id, false)
+        self.posting_spans_cutoff(score, DocumentId::String(id), false)
     }
 
     fn dense_cutoff(&self) -> Option<Hit> {
@@ -4852,7 +4928,7 @@ impl Search {
     fn posting_spans_cutoff(
         &self,
         score: f64,
-        id: &str,
+        id: DocumentIdRef<'_>,
         inclusive: bool,
     ) -> Result<Vec<PostingSpan<'_>>, String> {
         if !score.is_finite() || score <= 0.0 {
@@ -5517,12 +5593,32 @@ fn bloom_hashes(text: &str) -> (u64, u64) {
 
 #[doc = "# Errors\nRejects values beyond the bloom size budget or an unrepresentable bit index."]
 pub fn bloom_build(values: &[String]) -> Result<Vec<u8>, String> {
-    if values.len() > MAX_BYTES / 2 {
+    bloom_build_hashes(values.iter().map(|value| Ok(bloom_hashes(value))))
+}
+
+fn bloom_id_hashes(value: DocumentIdRef<'_>) -> Result<(u64, u64), String> {
+    match value {
+        DocumentId::String(text) => Ok(bloom_hashes(text)),
+        DocumentId::Uint(_) | DocumentId::Uuid(_) => serde_json::to_string(&value)
+            .map(|wire| bloom_hashes(&wire))
+            .map_err(|cause| cause.to_string()),
+    }
+}
+
+#[doc = "# Errors\nRejects canonical ID serialization failures, bloom size budgets or unrepresentable bit indexes."]
+pub fn bloom_build_ids(values: &[DocumentId]) -> Result<Vec<u8>, String> {
+    bloom_build_hashes(values.iter().map(|value| bloom_id_hashes(value.borrowed())))
+}
+
+fn bloom_build_hashes(
+    hashes: impl ExactSizeIterator<Item = Result<(u64, u64), String>>,
+) -> Result<Vec<u8>, String> {
+    if hashes.len() > MAX_BYTES / 2 {
         return Err("Bloom exceeds size budget".into());
     }
-    let mut bytes = vec![0u8; (values.len() * 2).max(8)];
-    for value in values {
-        let (a, b) = bloom_hashes(value);
+    let mut bytes = vec![0u8; (hashes.len() * 2).max(8)];
+    for hashes in hashes {
+        let (a, b) = hashes?;
         for index in 0u64..7 {
             let bit = usize::try_from(
                 a.wrapping_add(index.wrapping_mul(b))
@@ -5570,6 +5666,32 @@ pub fn bloom_filter_many<'a>(
     offsets: &[u32],
     values: &'a [String],
 ) -> Result<Vec<Vec<&'a str>>, String> {
+    let hashes = values.iter().map(|value| {
+        let (a, b) = bloom_hashes(value);
+        Ok((value.as_str(), a, b))
+    });
+    bloom_filter_hashes(bytes, offsets, hashes)
+}
+
+#[doc = "# Errors\nRejects canonical ID serialization failures, oversized batches or invalid offset framing."]
+pub fn bloom_filter_ids<'a>(
+    bytes: &[u8],
+    offsets: &[u32],
+    values: &'a [DocumentId],
+) -> Result<Vec<Vec<DocumentIdRef<'a>>>, String> {
+    let hashes = values.iter().map(|value| {
+        let value = value.borrowed();
+        let (a, b) = bloom_id_hashes(value)?;
+        Ok((value, a, b))
+    });
+    bloom_filter_hashes(bytes, offsets, hashes)
+}
+
+fn bloom_filter_hashes<T: Copy>(
+    bytes: &[u8],
+    offsets: &[u32],
+    hashes: impl Iterator<Item = Result<(T, u64, u64), String>>,
+) -> Result<Vec<Vec<T>>, String> {
     if bytes.len() > MAX_BYTES || offsets.len() > 65 {
         return Err("Bloom batch exceeds size budget".into());
     }
@@ -5584,13 +5706,7 @@ pub fn bloom_filter_many<'a>(
     {
         return Err("Invalid bloom offsets".into());
     }
-    let hashes: Vec<_> = values
-        .iter()
-        .map(|value| {
-            let (a, b) = bloom_hashes(value);
-            (value.as_str(), a, b)
-        })
-        .collect();
+    let hashes = hashes.collect::<Result<Vec<_>, _>>()?;
     let mut cached_positions: Option<(usize, Vec<[usize; 7]>)> = None;
     offsets
         .windows(2)
@@ -5655,11 +5771,12 @@ pub fn bloom_filter_many<'a>(
 pub mod wasm {
     use super::{
         Bm25Parameters, BuiltSegment, CanonicalDocumentDto, CorpusStatistics, Document,
-        DocumentAttributes, DocumentColumnId, DocumentMeta, FieldQuery, FieldStatistics, Filter,
-        Header, MAX_BYTES, MAX_QUERY_TERMS, NamedTextField, NativeRole, Range, Search,
-        SelectedAttributes, Statistics, TermDictionary, TermMeta, TermScorer, append, bloom_build,
-        bloom_filter_many, build, build_text_fields, compare_document_ids, decode_page,
-        document_terms, local_field_statistics, matches, parse_header, rank_fields_with,
+        DocumentAttributes, DocumentColumnId, DocumentId, DocumentIdRef, DocumentMeta, FieldQuery,
+        FieldStatistics, Filter, Header, MAX_BYTES, MAX_QUERY_TERMS, NamedTextField, NativeRole,
+        Range, Search, SelectedAttributes, Statistics, TermDictionary, TermMeta, TermScorer,
+        append, bloom_build_ids, bloom_filter_ids, build, build_text_fields, compare_document_ids,
+        decode_page, document_terms, local_field_statistics, matches, parse_header,
+        rank_fields_with,
     };
     use serde::{Deserialize, Serialize};
     use std::cell::RefCell;
@@ -6119,15 +6236,14 @@ pub mod wasm {
     #[serde(deny_unknown_fields)]
     struct TermDocument {
         row: u32,
-        id: String,
+        id: DocumentId,
         data: Range,
     }
 
     impl TermDocument {
         fn is_bounded(&self, count: u32) -> bool {
             self.row < count
-                && !self.id.is_empty()
-                && self.id.encode_utf16().count() <= 128
+                && self.id.is_valid()
                 && self.data.length >= 8
                 && self
                     .data
@@ -6202,7 +6318,7 @@ pub mod wasm {
                 .take(required)
                 .map(|document| Ranked {
                     row: document.row,
-                    id: &document.id,
+                    id: document.id.borrowed(),
                     score,
                     data: document.data.clone(),
                 })
@@ -6235,7 +6351,7 @@ pub mod wasm {
             if terms.is_empty() {
                 continue;
             }
-            let length = |document: &DocumentMeta<&str, &DocumentAttributes>| {
+            let length = |document: &DocumentMeta<DocumentIdRef<'_>, &DocumentAttributes>| {
                 if title {
                     document.title_length
                 } else {
@@ -6256,14 +6372,14 @@ pub mod wasm {
                 if length(&document) != minimum {
                     continue;
                 }
-                let charge = document.id.len() * 6 + 128;
+                let charge = document.id.encoded_len() * 6 + 128;
                 if documents.len() == 16 || bytes + charge > 4096 {
                     break;
                 }
                 bytes += charge;
                 documents.push(TermDocument {
                     row: u32::try_from(row).map_err(|cause| cause.to_string())?,
-                    id: document.id.to_string(),
+                    id: document.id.to_owned(),
                     data: document.data.clone(),
                 });
             }
@@ -6869,7 +6985,7 @@ pub mod wasm {
                 + summary
                     .single
                     .as_ref()
-                    .map_or(0, |document| document.id.capacity())
+                    .map_or(0, |document| document.id.heap_bytes())
                 + 192;
             if charge > SUMMARY_POOL_BYTES.saturating_sub(self.bytes) {
                 return None;
@@ -7484,7 +7600,8 @@ pub mod wasm {
             let mut selected = BTreeMap::new();
             while let Some(term) = map.next_key_seed(SelectedTerm(self.0))? {
                 if let Some(term) = term {
-                    let (row, id, offset, length) = map.next_value::<(u32, String, u32, u32)>()?;
+                    let (row, id, offset, length) =
+                        map.next_value::<(u32, DocumentId, u32, u32)>()?;
                     let document = TermDocument {
                         row,
                         id,
@@ -7922,7 +8039,7 @@ pub mod wasm {
             return Ok(None);
         }
         let document = header.documents.row(block.first as usize);
-        let charge = term.len() + document.id.len() + size_of::<TermDocument>() + 256;
+        let charge = term.len() + document.id.encoded_len() + size_of::<TermDocument>() + 256;
         if charge > *remaining {
             return Ok(None);
         }
@@ -8606,7 +8723,7 @@ pub mod wasm {
         #[doc = "# Errors\nRejects invalid ids or tombstones, row overflow, or result serialization errors."]
         pub fn lookup(&self, ids: &str, dead: &str) -> Result<String, JsValue> {
             let header = &self.header;
-            let ids: Vec<String> =
+            let ids: Vec<DocumentId> =
                 serde_json::from_str(ids).map_err(|e| JsValue::from_str(&e.to_string()))?;
             let dead: BTreeSet<u32> =
                 serde_json::from_str(dead).map_err(|e| JsValue::from_str(&e.to_string()))?;
@@ -8734,7 +8851,7 @@ pub mod wasm {
     #[derive(Serialize)]
     struct Located<'a> {
         row: u32,
-        document: DocumentMeta<&'a str, &'a DocumentAttributes>,
+        document: DocumentMeta<DocumentIdRef<'a>, &'a DocumentAttributes>,
         #[serde(rename = "vectorData")]
         vector_data: Option<&'a Range>,
     }
@@ -8839,9 +8956,9 @@ pub mod wasm {
     #[wasm_bindgen]
     #[doc = "# Errors\nRejects invalid values or bloom size/index budgets."]
     pub fn segment_bloom(values: &str) -> Result<Vec<u8>, JsValue> {
-        let values: Vec<String> =
+        let values: Vec<DocumentId> =
             serde_json::from_str(values).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        bloom_build(&values).map_err(|cause| JsValue::from_str(&cause))
+        bloom_build_ids(&values).map_err(|cause| JsValue::from_str(&cause))
     }
 
     #[wasm_bindgen]
@@ -8851,10 +8968,10 @@ pub mod wasm {
         offsets: &[u32],
         values: &str,
     ) -> Result<String, JsValue> {
-        let values: Vec<String> =
+        let values: Vec<DocumentId> =
             serde_json::from_str(values).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let selected = bloom_filter_many(bytes, offsets, &values)
-            .map_err(|cause| JsValue::from_str(&cause))?;
+        let selected =
+            bloom_filter_ids(bytes, offsets, &values).map_err(|cause| JsValue::from_str(&cause))?;
         serde_json::to_string(&selected).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
@@ -8869,7 +8986,7 @@ pub mod wasm {
         #[wasm_bindgen(constructor)]
         #[doc = "# Errors\nRejects oversized batches or invalid offset framing."]
         pub fn new(bytes: Vec<u8>, offsets: Vec<u32>) -> Result<Self, JsValue> {
-            bloom_filter_many(&bytes, &offsets, &[]).map_err(|cause| JsValue::from_str(&cause))?;
+            bloom_filter_ids(&bytes, &offsets, &[]).map_err(|cause| JsValue::from_str(&cause))?;
             Ok(Self {
                 bytes: bytes.into_boxed_slice(),
                 offsets: offsets.into_boxed_slice(),
@@ -8883,9 +9000,9 @@ pub mod wasm {
 
         #[doc = "# Errors\nRejects invalid values or result serialization errors."]
         pub fn filter(&self, values: &str) -> Result<String, JsValue> {
-            let values: Vec<String> = serde_json::from_str(values)
+            let values: Vec<DocumentId> = serde_json::from_str(values)
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
-            let selected = bloom_filter_many(&self.bytes, &self.offsets, &values)
+            let selected = bloom_filter_ids(&self.bytes, &self.offsets, &values)
                 .map_err(|cause| JsValue::from_str(&cause))?;
             serde_json::to_string(&selected).map_err(|cause| JsValue::from_str(&cause.to_string()))
         }
@@ -9040,7 +9157,7 @@ pub mod wasm {
                 }
                 ranked.push(Ranked {
                     row: document.row,
-                    id: &document.id,
+                    id: document.id.borrowed(),
                     score,
                     data: document.data.clone(),
                 });
@@ -9101,11 +9218,10 @@ pub mod wasm {
                         .iter()
                         .any(|term| term.is_empty() || term.len() > 64)
                     || leader.documents.len() > 16
-                    || leader.documents.iter().any(|document| {
-                        document.row >= count
-                            || document.id.is_empty()
-                            || document.id.encode_utf16().count() > 128
-                    })
+                    || leader
+                        .documents
+                        .iter()
+                        .any(|document| document.row >= count || !document.id.is_valid())
                     || leader.documents.windows(2).any(|pair| {
                         pair[0].row >= pair[1].row
                             || compare_document_ids(&pair[0].id, &pair[1].id).is_ge()
@@ -9287,7 +9403,7 @@ pub mod wasm {
     #[derive(Serialize)]
     struct Ranked<'a> {
         row: u32,
-        id: &'a str,
+        id: DocumentIdRef<'a>,
         score: f64,
         data: Range,
     }
@@ -11023,8 +11139,8 @@ mod cutoff_certificate_tests {
         }
         let mut upper = score;
         let mut minimum_id = header.documents.first().ok_or("Missing source minimum")?.id;
-        if minimum_id.encode_utf16().cmp(id.encode_utf16()) == Ordering::Less {
-            minimum_id = id;
+        if compare_document_ids(minimum_id, id) == Ordering::Less {
+            minimum_id = super::DocumentId::String(id);
         }
         for hit in search.finish()? {
             let hit_id = header.documents.row(hit.row as usize).id;
@@ -11034,7 +11150,7 @@ mod cutoff_certificate_tests {
                     minimum_id = hit_id;
                 }
                 Ordering::Equal => {
-                    if hit_id.encode_utf16().cmp(minimum_id.encode_utf16()) == Ordering::Less {
+                    if compare_document_ids(hit_id, minimum_id) == Ordering::Less {
                         minimum_id = hit_id;
                     }
                 }
@@ -11044,7 +11160,7 @@ mod cutoff_certificate_tests {
         assert!(
             best.score < upper
                 || (best.score.total_cmp(&upper) == Ordering::Equal
-                    && best_id.encode_utf16().cmp(minimum_id.encode_utf16()) != Ordering::Less)
+                    && compare_document_ids(best_id, minimum_id) != Ordering::Less)
         );
         Ok(())
     }
@@ -11100,7 +11216,13 @@ mod cutoff_certificate_tests {
                     let best = all.first().ok_or("Missing complete hit")?;
                     let best_id = header.documents.row(best.row as usize).id;
                     for score in [best.score - 1e-13, best.score, best.score + 1e-13] {
-                        for id in ["", "row-150", "\u{10000}", "\u{e000}", best_id] {
+                        for id in [
+                            "",
+                            "row-150",
+                            "\u{10000}",
+                            "\u{e000}",
+                            best_id.native_str()?,
+                        ] {
                             for top_k in [1, 10, 100] {
                                 let partial = Search::new(
                                     header.clone(),
@@ -12235,7 +12357,7 @@ mod columnar_v2_tests {
             .zip(header.documents.iter())
             .enumerate()
         {
-            assert_eq!(before.id.as_ref(), after.id);
+            assert_eq!(before.id.borrowed(), after.id);
             assert_eq!(before.revision, after.revision);
             assert_eq!(before.attributes.get(), after.attributes.get());
             let source_attributes: BTreeMap<String, serde_json::Value> =
@@ -12590,14 +12712,17 @@ mod canonical_column_tests {
                 .unwrap_or_default();
             let full = full_document_from_frames(metadata, vector)?;
             let query = query_document_from_metadata(metadata)?;
-            if rows.insert(row.id.to_owned(), (full, query)).is_some() {
+            if rows
+                .insert(row.id.native_str()?.to_owned(), (full, query))
+                .is_some()
+            {
                 return Err("Duplicate row id".into());
             }
         }
         Ok(rows)
     }
 
-    type DirectoryRow = (String, u64, u32, u32, String, bool);
+    type DirectoryRow = (super::DocumentId, u64, u32, u32, String, bool);
 
     fn directory(bytes: &[u8]) -> Result<Vec<DirectoryRow>, String> {
         let (header, _) = parse_header(bytes)?;
@@ -13018,7 +13143,7 @@ mod canonical_column_tests {
             if let Some(range) = header.vector_range(index)? {
                 assert!(range.offset >= header.metadata_end);
             }
-            let source = source_for(&documents, row.id)?;
+            let source = source_for(&documents, row.id.native_str()?)?;
             assert_eq!(
                 full_document_from_frames(metadata, vector)?,
                 source.to_canonical_json()?
@@ -13329,7 +13454,7 @@ mod scalar_column_tests {
         let documents = (0..20)
             .map(|row| {
                 Ok(DocumentMeta {
-                    id: format!("id-{row:02}").into_boxed_str(),
+                    id: format!("id-{row:02}").into(),
                     revision: u64::MAX - row,
                     title_length: 7,
                     body_length: u32::try_from(row % 3)?,
@@ -13548,6 +13673,303 @@ mod array_filter_tests {
             };
             assert_eq!(matches(&attributes, &[filter])?, expected);
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod typed_id_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn document(id: Value) -> Result<Document, String> {
+        Document::from_canonical_json(
+            &json!({
+                "id":id,"revision":1,"roles":{"title":"","text":"shared"},
+                "attributes":{"keep":true},"vector":[1.0,0.0]
+            })
+            .to_string(),
+        )
+    }
+
+    #[test]
+    fn typed_id_columns_roundtrip_frames_directories_and_rebuild()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ids = [
+            json!("1"),
+            json!("00112233-4455-6677-8899-aabbccddeeff"),
+            json!({"kind":"uint","value":"2"}),
+            json!({"kind":"uint","value":"10"}),
+            json!({"kind":"uint","value":"18446744073709551615"}),
+            json!({"kind":"uuid","value":"00112233-4455-6677-8899-aabbccddeeff"}),
+        ];
+        let documents = ids
+            .iter()
+            .cloned()
+            .map(document)
+            .collect::<Result<Vec<_>, _>>()?;
+        let built = build(documents.clone(), None)?;
+        assert_eq!(&built.bytes[..8], b"RAIOSEG5");
+        let (header, base) = parse_header(&built.bytes)?;
+        assert_eq!(header.version, 5);
+        assert_eq!(header.documents.typed_ids.len(), 4);
+        assert_eq!(
+            header.documents.ids,
+            "00112233-4455-6677-8899-aabbccddeeff1"
+        );
+        let mut restored = Vec::new();
+        for (index, row) in header.documents.iter().enumerate() {
+            assert_eq!(header.documents.find_id(row.id), Ok(index));
+            let metadata = &built.bytes[base + row.data.offset as usize
+                ..base + row.data.offset as usize + row.data.length as usize];
+            let vector = header.vector_range(index)?.ok_or("Missing typed vector")?;
+            let vector = &built.bytes[base + vector.offset as usize
+                ..base + vector.offset as usize + vector.length as usize];
+            let full = full_document_from_frames(metadata, vector)?;
+            let query: Value = serde_json::from_str(&query_document_from_metadata(metadata)?)?;
+            let full_value: Value = serde_json::from_str(&full)?;
+            assert_eq!(query["id"], full_value["id"]);
+            assert_eq!(serde_json::to_value(row.id)?, full_value["id"]);
+            restored.push(Document::from_canonical_json(&full)?);
+        }
+        assert_eq!(build(restored, None)?.bytes, built.bytes);
+        assert_eq!(migrate_segment(&built.bytes)?, built.bytes);
+        let frame = compress_directory(&built.bytes[..base])?;
+        assert_eq!(&frame[..8], b"RAIODIR7");
+        let decoded = parse_compressed_directory(&frame, base, MAX_BYTES)?;
+        assert_eq!(decoded.compact_json()?, header.compact_json()?);
+        let common = compress_common_directory_segment(&built.bytes)?;
+        assert_eq!(&common[..8], b"RAIOCOM5");
+        let decoded_common =
+            decode_directory_contents(&common, base, MAX_BYTES, None, *COMMON_DIRECTORY_MAGIC_V5)?;
+        assert_eq!(
+            serde_json::to_value(&decoded_common.header.documents)?,
+            serde_json::to_value(&header.documents)?
+        );
+        let mut bad = built.bytes.clone();
+        bad[..8].copy_from_slice(MAGIC_V4);
+        assert!(parse_header(&bad).is_err());
+        let mut bad = frame;
+        bad[..8].copy_from_slice(DIRECTORY_MAGIC_V6);
+        assert!(parse_compressed_directory(&bad, base, MAX_BYTES).is_err());
+        for version in [2, 3, 4] {
+            let mut bad = header.clone();
+            bad.version = version;
+            assert!(validate_header(&bad).is_err());
+            let forged = bad.encode(&built.bytes[base..])?;
+            assert!(parse_header(&forged).is_err());
+        }
+        let mut compact = binary_directory::encode(&header)?;
+        compact[0] = 4;
+        let forged = compress_directory_payload(&compact, base, *DIRECTORY_MAGIC_V6)?;
+        assert!(parse_compressed_directory(&forged, base, MAX_BYTES).is_err());
+        for document in documents
+            .iter()
+            .filter(|document| !matches!(document.id, DocumentId::String(_)))
+        {
+            assert!(document.to_native_json().is_err());
+            assert!(document.to_native_vec().is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_string_identity_keeps_version_four_bytes_and_packed_storage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let native = Document::native(
+            "row",
+            1,
+            "",
+            "shared",
+            BTreeMap::from([("keep".into(), json!(true))]),
+            Some(vec![1.0, 0.0]),
+        );
+        let canonical = document(json!("row"))?;
+        let built = build(vec![native], None)?;
+        assert_eq!(build(vec![canonical], None)?.bytes, built.bytes);
+        assert_eq!(&built.bytes[..8], b"RAIOSEG4");
+        assert!(built.header.documents.typed_ids.is_empty());
+        assert_eq!(built.header.documents.ids, "row");
+        let (_, base) = parse_header(&built.bytes)?;
+        let mut compact = binary_directory::encode(&built.header)?;
+        compact[0] = 5;
+        let forged = compress_directory_payload(&compact, base, *DIRECTORY_MAGIC_V7)?;
+        assert!(parse_compressed_directory(&forged, base, MAX_BYTES).is_err());
+        assert_eq!(migrate_segment(&built.bytes)?, built.bytes);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod typed_id_filter_tests {
+    use super::*;
+
+    #[test]
+    fn typed_ids_keep_filters_and_tombstones_before_text_and_vector_limits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut documents = Vec::new();
+        for value in [2, 10, 20, 30] {
+            let mut document = Document::native(
+                "placeholder",
+                1,
+                "",
+                "shared",
+                BTreeMap::new(),
+                Some(vec![1.0]),
+            );
+            document.id = DocumentId::Uint(value);
+            document
+                .columns_mut()
+                .attributes_mut()
+                .insert("keep".into(), serde_json::json!(value != 2));
+            documents.push(document);
+        }
+        let built = build(documents, None)?;
+        let (header, base) = parse_header(&built.bytes)?;
+        assert_eq!(header.documents.row(0).id, DocumentId::<String>::Uint(2));
+        assert_eq!(header.documents.row(1).id, DocumentId::<String>::Uint(10));
+        let filters = [Filter {
+            field: "keep".into(),
+            op: "eq".into(),
+            value: serde_json::json!(true),
+        }];
+        let dead = [1];
+        assert_eq!(header.vector_rows(&filters, &dead)?, vec![2, 3]);
+        let statistics = Statistics {
+            documents: 4,
+            title_length: 0,
+            body_length: 4,
+            frequencies: BTreeMap::from([("shared".into(), 4)]),
+        };
+        let mut search = Search::new(
+            header.clone(),
+            statistics,
+            "shared",
+            "any",
+            1,
+            &dead,
+            &filters,
+        )?;
+        for block in &header
+            .terms()
+            .get("shared")
+            .ok_or("Missing shared posting")?
+            .blocks
+        {
+            let start = base + usize::try_from(block.data.offset)?;
+            search.add(
+                "shared",
+                &built.bytes[start..start + usize::try_from(block.data.length)?],
+            )?;
+        }
+        let hits = search.finish()?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            header.documents.row(usize::try_from(hits[0].row)?).id,
+            DocumentId::<String>::Uint(20)
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod typed_id_bloom_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn canonical_blooms_preserve_legacy_string_hashes_and_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let strings = [
+            "",
+            "1",
+            "ação",
+            "😀",
+            "00112233-4455-6677-8899-aabbccddeeff",
+            "{\"kind\":\"uint\",\"value\":\"1\"}",
+        ]
+        .map(str::to_owned);
+        let ids = strings
+            .iter()
+            .cloned()
+            .map(DocumentId::String)
+            .collect::<Vec<_>>();
+        assert_eq!(bloom_build_ids(&ids)?, bloom_build(&strings)?);
+        assert_eq!(bloom_build_ids(&[])?, bloom_build(&[])?);
+        for (id, string) in ids.iter().zip(&strings) {
+            assert_eq!(bloom_id_hashes(id.borrowed())?, bloom_hashes(string));
+        }
+        let bytes = bloom_build(&strings)?;
+        let offsets = [0, u32::try_from(bytes.len())?];
+        let selected = bloom_filter_ids(&bytes, &offsets, &ids)?;
+        let strings_selected = bloom_filter_many(&bytes, &offsets, &strings)?;
+        assert_eq!(
+            serde_json::to_value(selected)?,
+            serde_json::to_value(strings_selected)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_bloom_membership_retains_tags_and_exact_lookup_does_not_alias()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let uuid = "00112233-4455-6677-8899-aabbccddeeff";
+        let ids = [
+            json!("1"),
+            json!({"kind":"uint","value":"1"}),
+            json!({"kind":"uint","value":"18446744073709551615"}),
+            json!(uuid),
+            json!({"kind":"uuid","value":uuid}),
+            json!("{\"kind\":\"uint\",\"value\":\"1\"}"),
+        ]
+        .into_iter()
+        .map(serde_json::from_value::<DocumentId>)
+        .collect::<Result<Vec<_>, _>>()?;
+        let bytes = bloom_build_ids(&ids)?;
+        let mut batch = bytes.clone();
+        batch.extend_from_slice(&bytes);
+        let offsets = [0, u32::try_from(bytes.len())?, u32::try_from(batch.len())?];
+        let selected = bloom_filter_ids(&batch, &offsets, &ids)?;
+        for selected in selected {
+            assert_eq!(serde_json::to_value(selected)?, serde_json::to_value(&ids)?);
+        }
+        let documents = ids
+            .iter()
+            .cloned()
+            .map(|id| {
+                let mut document =
+                    Document::native("placeholder", 1, "", "shared", BTreeMap::new(), None);
+                document.id = id;
+                document
+            })
+            .collect();
+        let built = build(documents, None)?;
+        let strings = [
+            DocumentId::<String>::String("1".into()),
+            DocumentId::String(uuid.into()),
+        ];
+        let numbers = [DocumentId::<String>::Uint(1), DocumentId::Uint(u64::MAX)];
+        for id in strings.iter().chain(&numbers).chain(&ids) {
+            let index = built
+                .header
+                .documents
+                .find_id(id)
+                .map_err(|_| "Missing canonical ID after bloom")?;
+            assert_eq!(built.header.documents.row(index).id, id.borrowed());
+        }
+        assert_ne!(
+            built.header.documents.find_id(&strings[0]),
+            built.header.documents.find_id(&numbers[0])
+        );
+        let tagged_wire = DocumentId::<String>::String(serde_json::to_string(&numbers[0])?);
+        assert_eq!(
+            bloom_id_hashes(tagged_wire.borrowed())?,
+            bloom_id_hashes(numbers[0].borrowed())?
+        );
+        assert_ne!(
+            built.header.documents.find_id(&tagged_wire),
+            built.header.documents.find_id(&numbers[0])
+        );
         Ok(())
     }
 }

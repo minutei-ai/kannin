@@ -74,16 +74,21 @@ fn search(
             }
         }
     }
-    Ok(search
+    search
         .finish()?
         .into_iter()
         .map(|hit| {
-            (
-                header.documents.row(hit.row as usize).id.to_string(),
+            Ok((
+                header
+                    .documents
+                    .row(hit.row as usize)
+                    .id
+                    .native_str()?
+                    .to_owned(),
                 hit.score,
-            )
+            ))
         })
-        .collect())
+        .collect()
 }
 
 #[test]
@@ -187,7 +192,7 @@ fn object_ranges_are_self_contained_and_crc_checked() -> Result<(), Box<dyn std:
         let mut page = built.bytes[start..start + metadata.data.length as usize].to_vec();
         let query: serde_json::Value =
             serde_json::from_str(&segment::query_document_from_metadata(&page)?)?;
-        assert_eq!(query["id"].as_str(), Some(metadata.id));
+        assert_eq!(query["id"].as_str(), Some(metadata.id.native_str()?));
         page[4] ^= 1;
         assert!(segment::decode_page(&page).is_err());
     }
@@ -375,7 +380,7 @@ fn block_pruning_matches_exhaustive_bm25_on_varied_documents()
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let score = scores.into_iter().sum::<f64>();
-            Ok::<_, Box<dyn std::error::Error>>((doc.id.clone(), score))
+            Ok::<_, Box<dyn std::error::Error>>((doc.id.native_str()?.to_owned(), score))
         })
         .collect::<Result<Vec<_>, _>>()?;
     expected.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));

@@ -85,16 +85,21 @@ fn native_hits(
             }
         }
     }
-    Ok(search
+    search
         .finish()?
         .into_iter()
         .map(|hit| {
-            (
-                header.documents.row(hit.row as usize).id.to_owned(),
+            Ok((
+                header
+                    .documents
+                    .row(hit.row as usize)
+                    .id
+                    .native_str()?
+                    .to_owned(),
                 hit.score.to_bits(),
-            )
+            ))
         })
-        .collect())
+        .collect()
 }
 
 fn selected_pages(
@@ -933,15 +938,20 @@ fn query<'a>(
 
 fn scored(bytes: &[u8], query: &FieldQuery<'_>) -> Result<Vec<(String, u64)>, String> {
     let (header, _) = parse_header(bytes)?;
-    Ok(rank_fields_with(bytes, query)?
+    rank_fields_with(bytes, query)?
         .into_iter()
         .map(|hit| {
-            (
-                header.documents.row(hit.row as usize).id.to_owned(),
+            Ok((
+                header
+                    .documents
+                    .row(hit.row as usize)
+                    .id
+                    .native_str()?
+                    .to_owned(),
                 hit.score.to_bits(),
-            )
+            ))
         })
-        .collect())
+        .collect()
 }
 
 fn assert_close(actual: f64, expected: f64) {

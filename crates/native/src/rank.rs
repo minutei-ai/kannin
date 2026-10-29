@@ -205,6 +205,12 @@ impl Ranker {
                 .map_err(|error| Rc::new(Error::Acquire(error)))?;
             let started = Instant::now();
             let header = self.reader.header(bucket, segment, &metrics).await?;
+            for document in header.documents.iter() {
+                document
+                    .id
+                    .native_str()
+                    .map_err(|cause| Rc::new(Error::Invalid(cause)))?;
+            }
             let mut search = query
                 .ranker(header.clone(), &segment.dead)
                 .map_err(|error| Rc::new(Error::Invalid(error)))?;
@@ -259,14 +265,18 @@ impl Ranker {
                 .into_iter()
                 .map(|hit| {
                     let document = header.documents.row(hit.row as usize);
-                    Hit {
+                    Ok(Hit {
                         row: hit.row,
-                        id: document.id.to_string(),
+                        id: document
+                            .id
+                            .native_str()
+                            .map_err(|cause| Rc::new(Error::Invalid(cause)))?
+                            .to_owned(),
                         score: hit.score,
                         data: document.data,
-                    }
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>, Rc<Error>>>()?;
             {
                 let mut measured = metrics.borrow_mut();
                 measured.score_ms = started

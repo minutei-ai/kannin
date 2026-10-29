@@ -285,7 +285,7 @@ impl FieldTable {
             return Err("Field lengths do not match the document count".into());
         }
         self.validate_declarations()?;
-        if version == 4 {
+        if version >= 4 {
             for (ordinal, field) in self.fields.iter().take(NATIVE_FIELDS).enumerate() {
                 validate_total(documents, ordinal, field.total)?;
             }

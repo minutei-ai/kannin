@@ -299,8 +299,22 @@ export const DocumentColumnId = Schema.Union([
   }),
   Schema.Struct({ source: Schema.Literal("attribute"), name: FieldName }),
 ]);
+const CanonicalUintIdValue = Schema.String.check(
+  Schema.isPattern(/^(0|[1-9][0-9]{0,19})(?![\s\S])/),
+  Schema.makeFilter(
+    (value) => value.length < 20 || value <= "18446744073709551615" || "ID exceeds uint64 range",
+  ),
+);
+const CanonicalUuidIdValue = Schema.String.check(
+  Schema.isPattern(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\s\S])/),
+);
+export const CanonicalId = Schema.Union([
+  Id,
+  Schema.Struct({ kind: Schema.Literal("uint"), value: CanonicalUintIdValue }),
+  Schema.Struct({ kind: Schema.Literal("uuid"), value: CanonicalUuidIdValue }),
+]);
 export const CanonicalDocument = Schema.Struct({
-  id: StoredDocument.fields.id,
+  id: CanonicalId,
   revision: StoredDocument.fields.revision,
   roles: Schema.Struct({ title: NativeTitle, text: Document.fields.text }),
   attributes: Attributes,
@@ -329,7 +343,7 @@ export function canonicalToNativeDocument(
   document: typeof CanonicalDocument.Type,
 ): typeof StoredDocument.Type {
   return {
-    id: document.id,
+    id: nativeProjectionId(document.id),
     revision: document.revision,
     title: document.roles.title,
     text: document.roles.text,
@@ -342,13 +356,18 @@ export function canonicalToQueryRow(
   score: number,
 ): typeof Row.Type {
   return {
-    id: document.id,
+    id: nativeProjectionId(document.id),
     revision: document.revision,
     title: document.roles.title,
     text: document.roles.text,
     attributes: document.attributes,
     score,
   };
+}
+function nativeProjectionId(id: typeof CanonicalId.Type): typeof Id.Type {
+  if (typeof id !== "string")
+    throw new TypeError("Native document projection requires a string ID");
+  return id;
 }
 export function readCanonicalColumn(
   document: typeof CanonicalDocument.Type,

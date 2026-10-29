@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       measure_workerd:
-        description: Measure bounded process-cold and warm workerd samples after the full gate
+        description: Measure bounded workerd and Docker cold/warm workloads after the full gate
         type: boolean
         default: false
 permissions:
@@ -63,22 +63,28 @@ jobs:
             dist/cache/
             dist/validation.json
           retention-days: 1
-      - name: Measure local workerd after the passing gate
+      - name: Measure local workerd and Docker after the passing gate
         if: github.event_name == 'workflow_dispatch' && inputs.measure_workerd
         timeout-minutes: 10
         env:
           RAIO_BENCH_DOCUMENTS: "1000"
           RAIO_BENCH_COLD_SAMPLES: "3"
         run: |
-          bun tooling/benchmark-cold.ts > "$RUNNER_TEMP/kannin-process-cold.json"
+          RAIO_BENCH_CACHE_MODE=retained bun tooling/benchmark-cold.ts > "$RUNNER_TEMP/kannin-process-cold.json"
+          RAIO_BENCH_CACHE_MODE=empty bun tooling/benchmark-cold.ts > "$RUNNER_TEMP/kannin-cache-cold.json"
           bun tooling/benchmark.ts > "$RUNNER_TEMP/kannin-warm.json"
-      - name: Retain bounded workerd measurement reports
+          RAIO_BENCH_CACHE_MODE=retained bun tooling/benchmark-container.ts > "$RUNNER_TEMP/kannin-docker.json"
+          bun tooling/verify-benchmarks.ts "$RUNNER_TEMP/kannin-process-cold.json" "$RUNNER_TEMP/kannin-cache-cold.json" "$RUNNER_TEMP/kannin-warm.json" "$RUNNER_TEMP/kannin-docker.json"
+      - name: Retain bounded local backend measurement reports
         if: github.event_name == 'workflow_dispatch' && inputs.measure_workerd
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: workerd-measurements
+          name: local-backend-measurements
           path: |
             ${{ runner.temp }}/kannin-process-cold.json
             ${{ runner.temp }}/kannin-warm.json
+            ${{ runner.temp }}/kannin-cache-cold.json
+            ${{ runner.temp }}/kannin-docker.json
+            dist/validation.json
           if-no-files-found: error
           retention-days: 1

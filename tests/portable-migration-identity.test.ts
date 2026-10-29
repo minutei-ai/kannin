@@ -56,7 +56,6 @@ test("a migration retry never republishes a portable segment captured by an earl
         const legacyText = yield* Schema.encodeEffect(Schema.fromJsonString(LegacyStoredRootV4))(
           legacy,
         );
-        yield* objects.write(rootKey, new TextEncoder().encode(legacyText));
         const abandoned: string[] = [];
         const blocked = ObjectStore.of({
           ...objects,
@@ -75,6 +74,10 @@ test("a migration retry never republishes a portable segment captured by an earl
           Effect.provideService(ObjectStore, blocked),
           Effect.provideContext(context),
         );
+        const replica = yield* portableApplication({ token, scope: namespace, module }).pipe(
+          Effect.provideContext(context),
+        );
+        yield* objects.write(rootKey, new TextEncoder().encode(legacyText));
         const rejected = yield* Effect.tryPromise(() =>
           interrupted.fetch(request("migrate-root", {})),
         );
@@ -82,9 +85,6 @@ test("a migration retry never republishes a portable segment captured by an earl
         yield* Effect.tryPromise(() => rejected.arrayBuffer());
         yield* Effect.promise(interrupted.dispose);
         expect(abandoned).toHaveLength(1);
-        const replica = yield* portableApplication({ token, scope: namespace, module }).pipe(
-          Effect.provideContext(context),
-        );
         const migrated = yield* Effect.tryPromise(() => replica.fetch(request("migrate-root", {})));
         expect(migrated.status).toBe(200);
         yield* Effect.tryPromise(() => migrated.arrayBuffer());

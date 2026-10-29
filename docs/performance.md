@@ -16,6 +16,8 @@ The existing `Check` workflow also accepts the explicit `measure_workerd` dispat
 
 The separate `Measure validated runtime` workflow accepts a successful `Check` run ID for the exact selected commit. It verifies the run conclusion and workflow path, downloads that gate's generated artifacts on the isolated runner, installs the frozen Bun dependencies, and runs retained-cache cold, empty-cache cold and warm measurements serially. It does not rebuild Rust or download artifacts to the development host. Reports and gate provenance expire after one day. This workflow has not yet executed; Docker/CDN integration and matched resource limits for cross-backend comparison remain pending.
 
+`tooling/verify-benchmarks.ts` rejects reports with different corpus, engine WASM, acknowledged sequence, query hashes or exact row/score hashes. It requires every strong benchmark query exactly once; duplicated or omitted cases fail. The measurement workflow runs this integrity check before retaining successful reports. Matching these fields establishes workload/result integrity only; equivalent resource budgets and cache phases must still be checked separately before comparing timings.
+
 `RAIO_BENCH_COLD_SAMPLES` accepts 1–20. The corpus size matches the warm driver. Comparable Docker/workerd cold and warm measurements and hosted Railway validation remain delivery gates.
 
 ## Historical deployed BM25 comparison

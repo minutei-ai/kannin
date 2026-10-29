@@ -112,6 +112,7 @@ console.log(
       availableParallelism: availableParallelism(),
       bun: Bun.version,
       documents: size,
+      sequence: Math.ceil(size / 500),
       corpusSha256: corpusHash.digest("hex"),
       bundleSha256,
       wasmSha256,

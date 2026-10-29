@@ -96,6 +96,7 @@ console.log(
       bundleSha256,
       wasmSha256,
       documents: size,
+      sequence: Math.ceil(size / 500),
       corpusSha256: corpusHash.digest("hex"),
       resultCheck:
         "identical rows and scores across requests and consistency modes; acknowledged sequence verified",

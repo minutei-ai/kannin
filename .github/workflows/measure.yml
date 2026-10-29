@@ -44,6 +44,7 @@ jobs:
           RAIO_BENCH_CACHE_MODE=retained bun tooling/benchmark-cold.ts > "$RUNNER_TEMP/process-cold.json"
           RAIO_BENCH_CACHE_MODE=empty bun tooling/benchmark-cold.ts > "$RUNNER_TEMP/cache-cold.json"
           bun tooling/benchmark.ts > "$RUNNER_TEMP/warm.json"
+          bun tooling/verify-benchmarks.ts "$RUNNER_TEMP/process-cold.json" "$RUNNER_TEMP/cache-cold.json" "$RUNNER_TEMP/warm.json"
       - name: Retain successful measurement reports and gate provenance
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:

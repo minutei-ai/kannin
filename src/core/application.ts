@@ -1928,6 +1928,20 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         }
       | undefined;
 
+    private withRootPermit<A, E, R>(operation: Effect.Effect<A, E, R>) {
+      if (!runtime.freshRoots) return this.semaphore.withPermit(operation);
+      return this.semaphore.withPermit(
+        operation.pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              this.current = undefined;
+              this.acknowledgedReceipt = undefined;
+            }),
+          ),
+        ),
+      );
+    }
+
     private get prefix() {
       if (this.namespace === undefined) throw new Error("Namespace must be bound before R2 access");
       return `namespaces/${this.namespace}`;
@@ -3082,7 +3096,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
           const queued = yield* Clock.currentTimeNanos;
           result.value = yield* this.querySlots.withPermit(
             Effect.acquireUseRelease(
-              this.semaphore.withPermit(
+              this.withRootPermit(
                 Effect.gen({ self: this }, function* () {
                   const admitted = yield* Clock.currentTimeNanos;
                   if (runtime.freshRoots) {
@@ -3135,7 +3149,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
             ),
           );
         } else
-          result.value = yield* this.semaphore.withPermit(
+          result.value = yield* this.withRootPermit(
             Effect.gen({ self: this }, function* () {
               if (runtime.freshRoots) {
                 this.current = undefined;

@@ -181,6 +181,27 @@ test("WASM named phrases preserve WordV4 stopword positions and array boundaries
   expect(rows("red the fox")).toEqual([1]);
 });
 
+test("field filters preserve the native finite-number contract independently of safe corpus counters", () => {
+  const bytes = segment_build_text_fields(
+    encodeBuild({
+      documents: canonicalFixtureDocuments([
+        { id: "a", text: "native", attributes: { tags: "red fox", amount: 1e20 } },
+        { id: "b", text: "native", attributes: { tags: "red fox", amount: 1 } },
+      ]),
+      text_fields: [{ name: "tags" }],
+    }),
+  );
+  const hits = decodeHits(
+    segment_rank_fields(
+      bytes,
+      query([tags], {
+        filters: [{ field: "amount", op: "gte", value: 1e20 }],
+      }),
+    ),
+  );
+  expect(hits.map(({ row }) => row)).toEqual([0]);
+});
+
 test("field JSON rejects unknown contract keys and unsafe global counts", () => {
   const bytes = build(documents);
   expect(() =>
@@ -203,7 +224,7 @@ test("field JSON rejects unknown contract keys and unsafe global counts", () => 
   expect(() =>
     segment_rank_fields(
       bytes,
-      '{"fields":[{"source":"attribute","name":"tags"}],"text":"fox","mode":"any","filters":[{"field":"tags","op":"eq","value":9007199254740993}]}',
+      '{"fields":[{"source":"attribute","name":"tags"}],"text":"fox","mode":"any","filters":[{"field":"tags","op":"eq","value":{"invalid":1}}]}',
     ),
   ).toThrow();
 });

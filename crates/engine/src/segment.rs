@@ -1,5 +1,6 @@
 mod binary_directory;
 mod fields;
+mod numbers;
 
 pub use fields::{
     Bm25Parameters, CorpusStatistics, FieldAnalysis, FieldMeta, FieldQuery, FieldStatistics,
@@ -4346,10 +4347,7 @@ pub struct Filter {
 fn compare_scalar(value: &serde_json::Value, expected: &serde_json::Value, op: &str) -> bool {
     let ordering = match (value, expected) {
         (serde_json::Value::String(a), serde_json::Value::String(b)) => Some(a.cmp(b)),
-        (serde_json::Value::Number(a), serde_json::Value::Number(b)) => a
-            .as_f64()
-            .zip(b.as_f64())
-            .and_then(|(left, right)| left.partial_cmp(&right)),
+        (serde_json::Value::Number(a), serde_json::Value::Number(b)) => numbers::compare(a, b),
         _ => None,
     };
     ordering.is_some_and(|order| match op {
@@ -5914,10 +5912,7 @@ pub mod wasm {
                 serde_json::Value::Null
                 | serde_json::Value::Bool(_)
                 | serde_json::Value::String(_) => true,
-                serde_json::Value::Number(number) => number.as_f64().is_some_and(|number| {
-                    number.is_finite()
-                        && (number.fract() != 0.0 || number.abs() <= 9_007_199_254_740_991.0)
-                }),
+                serde_json::Value::Number(number) => number.as_f64().is_some_and(f64::is_finite),
                 serde_json::Value::Array(_) | serde_json::Value::Object(_) => false,
             };
             let valid = match self.op.as_str() {

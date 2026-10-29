@@ -87,6 +87,94 @@ fn search(
 }
 
 #[test]
+fn wide_numeric_range_filters_run_before_text_top_k() -> Result<(), Box<dyn std::error::Error>> {
+    let rows = [
+        ("a", serde_json::Value::from(i64::MIN)),
+        ("b", serde_json::Value::from(i64::MIN + 1)),
+        ("c", serde_json::Value::from(9_007_199_254_740_992_u64)),
+        ("d", serde_json::Value::from(9_007_199_254_740_993_u64)),
+        ("e", serde_json::Value::from(u64::MAX - 1)),
+        ("f", serde_json::Value::from(u64::MAX)),
+        ("g", serde_json::Value::from(0.5)),
+        ("h", serde_json::Value::from(-0.5)),
+    ];
+    let documents = rows
+        .into_iter()
+        .map(|(id, value)| {
+            Document::native(
+                id,
+                1,
+                "",
+                "needle",
+                BTreeMap::from([("number".into(), value)]),
+                None,
+            )
+        })
+        .collect::<Vec<_>>();
+    let cases = [
+        (
+            "gt",
+            serde_json::Value::from(9_007_199_254_740_992_u64),
+            "d",
+        ),
+        ("gt", serde_json::Value::from(u64::MAX - 1), "f"),
+        ("lt", serde_json::Value::from(i64::MIN + 1), "a"),
+        ("gte", serde_json::Value::from(u64::MAX), "f"),
+        ("lte", serde_json::Value::from(i64::MIN), "a"),
+        (
+            "gt",
+            serde_json::Value::from(18_446_744_073_709_551_616.0_f64.next_down()),
+            "e",
+        ),
+    ];
+    for (op, value, expected) in cases {
+        let hits = search(
+            documents.clone(),
+            "needle",
+            "any",
+            &[],
+            &[Filter {
+                field: "number".into(),
+                op: op.into(),
+                value,
+            }],
+            1,
+        )?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, expected);
+    }
+    for (lower, upper, expected) in [(0, 1, "g"), (-1, 0, "h")] {
+        let hits = search(
+            documents.clone(),
+            "needle",
+            "any",
+            &[],
+            &[
+                Filter {
+                    field: "number".into(),
+                    op: "gt".into(),
+                    value: lower.into(),
+                },
+                Filter {
+                    field: "number".into(),
+                    op: "lt".into(),
+                    value: upper.into(),
+                },
+            ],
+            1,
+        )?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, expected);
+    }
+    let built = segment::build(documents, None)?;
+    let (header, _) = segment::parse_header(&built.bytes)?;
+    let serialized = serde_json::to_string(&header)?;
+    assert!(serialized.contains("18446744073709551615"));
+    assert!(serialized.contains("-9223372036854775808"));
+    Ok(())
+}
+
+#[test]
 fn object_ranges_are_self_contained_and_crc_checked() -> Result<(), Box<dyn std::error::Error>> {
     let built = segment::build(
         vec![document("b", "ação cloudflare"), document("a", "rust rust")],

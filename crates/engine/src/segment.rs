@@ -549,6 +549,7 @@ impl Document {
         serde_json::to_string(&self.native_ref()?).map_err(|cause| cause.to_string())
     }
 
+    #[cfg(test)]
     fn to_native_metadata_vec(&self) -> Result<Vec<u8>, String> {
         serde_json::to_vec(&NativeDocumentRef {
             id: &self.id,

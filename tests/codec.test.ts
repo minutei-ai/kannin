@@ -2234,7 +2234,7 @@ test("cached common frames never trust rejected selection or checksum validation
 const VectorFrameFixture = Document.mapFields((fields) => ({
   ...fields,
   revision: Schema.optional(Schema.Int),
-  vector: Schema.optional(Schema.Array(Schema.Number)),
+  vector: Schema.optional(Schema.Array(Schema.Finite)),
 }));
 function documentFrames(document: unknown) {
   const input = Schema.decodeUnknownSync(VectorFrameFixture)(document);

@@ -14,7 +14,7 @@ const decodeDocument = Schema.decodeSync(Schema.fromJsonString(CanonicalDocument
 const decodeQuery = Schema.decodeSync(Schema.fromJsonString(CanonicalQueryDocument), {
   onExcessProperty: "error",
 });
-type FixtureDocument = typeof Document.Type & { readonly revision?: number };
+type FixtureDocument = typeof Document.Type & { readonly revision?: number | undefined };
 
 export function canonicalFixtureDocuments(documents: readonly FixtureDocument[]) {
   return documents.map((document) => nativeToCanonicalDocument(document, document.revision ?? 0));

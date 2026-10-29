@@ -10,6 +10,7 @@ import {
   PostingSpans,
   SegmentHits,
   QueryResult,
+  Id,
 } from "../src/protocol";
 import { clearLeaderIndex, document, request, startWorker, textQuery, write } from "./harness";
 
@@ -268,7 +269,9 @@ test("leader ranking survives mutations and compaction with exact filtered contr
   const deleted = await request(worker, name, "query", textQuery("rust cloudflare"));
   expect(deleted.headers.get("server-timing")).toContain('text_common_leaders;desc="segments=0"');
   const before = Schema.decodeUnknownSync(QueryResult)(await deleted.json());
-  expect(before.rows.every((row) => !deletes.includes(row.id))).toBe(true);
+  expect(before.rows.every((row) => !deletes.includes(Schema.decodeUnknownSync(Id)(row.id)))).toBe(
+    true,
+  );
   const control = await request(
     worker,
     name,

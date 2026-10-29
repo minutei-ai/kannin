@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { Schema } from "effect";
+import type { CanonicalId } from "../src/protocol";
 import {
   Directory,
   Segment,
@@ -8,12 +9,7 @@ import {
   segment_migrate,
   segment_query_document,
 } from "../dist/wasm/raio_engine";
-import {
-  CanonicalDocument,
-  CanonicalId,
-  CanonicalQueryDocument,
-  LocatedDocument,
-} from "../src/protocol";
+import { CanonicalDocument, CanonicalQueryDocument, LocatedDocument } from "../src/protocol";
 
 initSync({
   module: new WebAssembly.Module(

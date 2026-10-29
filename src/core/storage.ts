@@ -78,6 +78,10 @@ import {
 
 import type { BackgroundContext, ObjectCondition, SearchRuntime } from "../platform";
 
+function bloom(values: ReadonlyArray<typeof CanonicalId.Type>) {
+  return segment_bloom(Schema.encodeSync(Schema.fromJsonString(Schema.Array(CanonicalId)))(values));
+}
+
 function bloomOffsets(rows: ReadonlyArray<Uint8Array>) {
   const offsets = new Uint32Array(rows.length + 1);
   const layout = { offset: 0 };
@@ -2841,12 +2845,6 @@ export function createStorage(runtime: SearchRuntime) {
       }),
   );
 
-  function bloom(values: ReadonlyArray<typeof CanonicalId.Type>) {
-    return segment_bloom(
-      Schema.encodeSync(Schema.fromJsonString(Schema.Array(CanonicalId)))(values),
-    );
-  }
-
   const readBloomPack = Effect.fn("kannin.readBloomPack")(function* (
     descriptor: typeof BloomPack.Type,
   ) {
@@ -3376,7 +3374,9 @@ export function createStorage(runtime: SearchRuntime) {
     start: number = 0,
     count: number = root.segments.length,
   ) {
-    const input = Schema.encodeSync(Schema.fromJsonString(Schema.Array(CanonicalId)))(values);
+    const input = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Array(CanonicalId)))(
+      values,
+    );
     const selectedSegments = root.segments.slice(start, start + count);
     const selected: Array<ReadonlyArray<typeof CanonicalId.Type> | undefined> = Array.from(
       { length: selectedSegments.length },

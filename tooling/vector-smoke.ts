@@ -1,5 +1,5 @@
 import { Config, Effect, Redacted, Schema } from "effect";
-import { Query, QueryResult, Write, WriteResult } from "../src/protocol";
+import { Id, Query, QueryResult, Write, WriteResult } from "../src/protocol";
 
 const url = new URL(Effect.runSync(Config.String("RAIO_URL")));
 const token = Effect.runSync(Config.Redacted("RAIO_API_TOKEN"));
@@ -55,7 +55,7 @@ for (const attempt of Array.from({ length: 60 }, (_, index) => index)) {
   });
   if (!response.ok) throw new Error(`Native filtered ANN query failed: ${response.status}`);
   const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
-  const ids = result.rows.map((row) => row.id);
+  const ids = result.rows.map((row) => Schema.decodeUnknownSync(Id)(row.id));
   observed.samples += 1;
   observed.recall10 = ids.filter((id) => expected.includes(id)).length / expected.length;
   if (observed.recall10 === 1) {

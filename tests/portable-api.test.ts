@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { Effect, Layer, Schema } from "effect";
 import { portableApplication } from "../runtime/application";
-import { Metadata, QueryResult, WriteResult } from "../src/protocol";
+import { Metadata, QueryResult, WriteResult, compareCanonicalIds } from "../src/protocol";
 import { objectStoreFixtureLive } from "./object-store-fixture";
 
 const module = await WebAssembly.compile(
@@ -182,7 +182,7 @@ test("two portable replicas fence concurrent writes and expose fresh strong read
             Effect.flatMap(Schema.decodeUnknownEffect(QueryResult)),
           );
           expect(result.sequence).toBe(4);
-          expect(result.rows.map((row) => row.id).toSorted()).toEqual([
+          expect(result.rows.map((row) => row.id).toSorted(compareCanonicalIds)).toEqual([
             "row-0",
             "row-1",
             "row-2",

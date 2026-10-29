@@ -5,7 +5,13 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Directory, initSync } from "../dist/wasm/raio_engine";
-import { SegmentRange, QueryResult, Metadata, LocatedDocument } from "../src/protocol";
+import {
+  SegmentRange,
+  QueryResult,
+  Metadata,
+  LocatedDocument,
+  compareCanonicalIds,
+} from "../src/protocol";
 import { document, request, startWorker, textQuery, write } from "./harness";
 
 initSync({
@@ -126,7 +132,7 @@ for (const kind of ["text", "vector"])
       expect(response.status).toBe(200);
       const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
       expect(result.sequence).toBe(8);
-      expect(result.rows.map((row) => row.id).toSorted()).toEqual(
+      expect(result.rows.map((row) => row.id).toSorted(compareCanonicalIds)).toEqual(
         Array.from({ length: 8 }, (_, index) => String(index)),
       );
       expect(

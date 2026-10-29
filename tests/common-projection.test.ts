@@ -18,6 +18,7 @@ import {
   SegmentHeader,
   TermCatalog,
   SearchStatistics,
+  Id,
 } from "../src/protocol";
 import { document, request, startWorker, textQuery, write, evictWrittenOverviews } from "./harness";
 
@@ -330,7 +331,9 @@ test("Worker joint proofs preserve adversarial multi-block phrase ranking", asyn
   expect(compact.headers.get("server-timing")).toContain("catalog_root_joint");
   const expected = Schema.decodeUnknownSync(QueryResult)(await compact.json());
   expect(expected.rows).toHaveLength(10);
-  expect(expected.rows.every((row) => row.id.includes("-b"))).toBe(true);
+  expect(expected.rows.every((row) => Schema.decodeUnknownSync(Id)(row.id).includes("-b"))).toBe(
+    true,
+  );
   const bucket = await worker.getR2Bucket("STORAGE");
   const key = `namespaces/${namespace}/root.json`;
   const object = await bucket.get(key);
@@ -605,8 +608,14 @@ test("joint bounds retain tombstones, selective filters and compaction semantics
         namespace,
         "write",
         write(
-          [document(replaced.id, "replacement without the original phrase", { group: 0 })],
-          [deleted.id],
+          [
+            document(
+              Schema.decodeUnknownSync(Id)(replaced.id),
+              "replacement without the original phrase",
+              { group: 0 },
+            ),
+          ],
+          [Schema.decodeUnknownSync(Id)(deleted.id)],
         ),
       )
     ).status,

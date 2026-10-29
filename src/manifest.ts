@@ -6,6 +6,8 @@ import {
   CommonTerms,
   EligibilityProjection,
   RootMigrationInput,
+  LegacyInlineRoot,
+  LegacyPackedRoot,
   StoredRoot,
   StoredVectorRebuildSnapshot,
   VectorRebuildSnapshotMigrationInput,
@@ -14,12 +16,10 @@ import {
 import type {
   Root,
   VectorRebuildSnapshot,
-  LegacyInlineRoot,
   LegacyStoredRoot,
   LegacyStoredRootV3,
   LegacyStoredRootV4,
   LegacyStoredRootV5,
-  LegacyPackedRoot,
 } from "./protocol";
 
 const projectionJson = Schema.fromJsonString(CommonTermProjection);
@@ -104,7 +104,6 @@ const poolRoot = (root: typeof Root.Type) => {
 };
 
 const expandSharedSegments = <
-  Dictionary extends typeof CommonTerms.Type,
   Segment extends
     | (typeof StoredRoot.Type.segments)[number]
     | (typeof LegacyStoredRootV3.Type.segments)[number]
@@ -112,7 +111,7 @@ const expandSharedSegments = <
 >(
   segments: ReadonlyArray<Segment>,
   commonProjections: ReadonlyArray<typeof CommonTermProjection.Type>,
-  commonTermDictionaries: ReadonlyArray<Dictionary>,
+  commonTermDictionaries: ReadonlyArray<typeof CommonTerms.Type>,
   eligibilityModels: ReadonlyArray<typeof EligibilityProjection.Type>,
 ) =>
   segments.map((segment) => {
@@ -176,7 +175,7 @@ const expandStoredSchema = (root: typeof LegacyStoredRootV5.Type): typeof Root.T
 
 const expandPackedRoot = (root: typeof LegacyStoredRootV4.Type): typeof LegacyPackedRoot.Type => {
   const { commonProjections, commonTermDictionaries, eligibilityModels, ...fields } = root;
-  return {
+  return Schema.decodeUnknownSync(LegacyPackedRoot)({
     ...fields,
     version: 1 as const,
     segments: expandSharedSegments(
@@ -185,7 +184,7 @@ const expandPackedRoot = (root: typeof LegacyStoredRootV4.Type): typeof LegacyPa
       commonTermDictionaries,
       eligibilityModels,
     ),
-  };
+  });
 };
 
 const poolSnapshot = (snapshot: typeof VectorRebuildSnapshot.Type) => ({
@@ -226,7 +225,7 @@ const expandLegacyStoredRoot = (
       })),
     });
   const { commonProjections, commonTermDictionaries, eligibilityModels, ...fields } = stored;
-  return {
+  return Schema.decodeUnknownSync(LegacyInlineRoot)({
     ...fields,
     version: 1,
     segments: expandSharedSegments(
@@ -235,7 +234,7 @@ const expandLegacyStoredRoot = (
       commonTermDictionaries,
       eligibilityModels,
     ),
-  };
+  });
 };
 
 const migrationRoot = (stored: typeof RootMigrationInput.Type) => {

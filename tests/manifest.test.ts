@@ -3,7 +3,6 @@ import { Effect, Schema, Struct } from "effect";
 import {
   BloomPack,
   CommonTermProjection,
-  CommonTerms,
   EligibilityProjection,
   LegacyInlineRoot,
   LegacyRoot,
@@ -42,9 +41,11 @@ const projection = Schema.decodeSync(CommonTermProjection)({
   partitions: [[[1, 1, 0, 0]]],
   independent: [[[1, 1, 0, 0]]],
 });
-const dictionary = Schema.decodeSync(CommonTerms)({
-  alpha: { df: 2, bounds: [[1, 1, 0, 0]] },
-});
+const dictionary = Schema.decodeUnknownSync(LegacyStoredRootV6.fields.commonTermDictionaries.value)(
+  {
+    alpha: { df: 2, bounds: [[1, 1, 0, 0]] },
+  },
+);
 const eligibility = Schema.decodeSync(EligibilityProjection)({
   fields: ["group"],
   data: {
@@ -226,8 +227,8 @@ test("migration decoder distinguishes current v7 from legacy v1, v2, v3, packed 
   const wire = encodeRoot(root);
   expect(decodeRootForMigration(wire)).toEqual({ kind: "current", root });
   const storedCurrent = Schema.decodeSync(Schema.fromJsonString(StoredRoot))(wire);
-  const storedV4 = Schema.decodeSync(LegacyStoredRootV4)({
-    ...Struct.omit(storedCurrent, ["schema"]),
+  const storedV4 = Schema.decodeUnknownSync(LegacyStoredRootV4)({
+    ...Struct.omit(storedCurrent, ["schema", "idType"]),
     version: 4,
   });
   const packedV4 = Schema.encodeSync(Schema.fromJsonString(LegacyStoredRootV4))(storedV4);
@@ -235,7 +236,7 @@ test("migration decoder distinguishes current v7 from legacy v1, v2, v3, packed 
   expect(decodeRootForMigration(packedV4)).toEqual({
     kind: "packed",
     sourceVersion: 4,
-    root: Schema.decodeSync(LegacyPackedRoot)(Struct.omit(root, ["schema"])),
+    root: Schema.decodeUnknownSync(LegacyPackedRoot)(Struct.omit(root, ["schema", "idType"])),
   });
   const legacyV1 = Schema.encodeSync(Schema.fromJsonString(LegacyRoot))(legacyRoot);
   expect(decodeRootForMigration(legacyV1)).toEqual({
@@ -295,9 +296,10 @@ test("rebuild snapshots retain their envelope and use the same migration classif
     kind: "current",
     snapshot,
   });
-  const storedV4 = Schema.decodeSync(LegacyStoredRootV4)({
+  const storedV4 = Schema.decodeUnknownSync(LegacyStoredRootV4)({
     ...Struct.omit(Schema.decodeSync(Schema.fromJsonString(StoredRoot))(encodeRoot(root)), [
       "schema",
+      "idType",
     ]),
     version: 4,
   });
@@ -311,7 +313,7 @@ test("rebuild snapshots retain their envelope and use the same migration classif
     kind: "packed",
     sourceVersion: 4,
     snapshot: {
-      root: Schema.decodeSync(LegacyPackedRoot)(Struct.omit(root, ["schema"])),
+      root: Schema.decodeUnknownSync(LegacyPackedRoot)(Struct.omit(root, ["schema", "idType"])),
       fields: [],
     },
   });
@@ -369,8 +371,8 @@ test("column declarations keep both native orders and do not invent attribute ty
   expect(wire).not.toContain('"filterable"');
   expect(encodeRoot(explicitRoot)).toContain('"dimensions":768');
   const stored = Schema.decodeSync(Schema.fromJsonString(StoredRoot))(wire);
-  const legacyV5 = Schema.decodeSync(LegacyStoredRootV5)({
-    ...stored,
+  const legacyV5 = Schema.decodeUnknownSync(LegacyStoredRootV5)({
+    ...Struct.omit(stored, ["schema", "idType"]),
     version: 5,
     schema: omitted,
   });
@@ -417,7 +419,10 @@ test("stored column readers reject unsupported declaration properties", () => {
 
 test("Root 6 migration changes only its envelope and preserves checkpoint Roots", () => {
   const current = Schema.decodeSync(Schema.fromJsonString(StoredRoot))(encodeRoot(root));
-  const legacy = Schema.decodeSync(LegacyStoredRootV6)({ ...current, version: 6 });
+  const legacy = Schema.decodeUnknownSync(LegacyStoredRootV6)({
+    ...Struct.omit(current, ["idType"]),
+    version: 6,
+  });
   const wire = Schema.encodeSync(Schema.fromJsonString(LegacyStoredRootV6))(legacy);
   expect(() => decodeRoot(wire)).toThrow();
   expect(decodeRootForMigration(wire)).toEqual({ kind: "schema", sourceVersion: 6, root });
@@ -454,10 +459,11 @@ test("canonical identity keys and ordering preserve the full uint64 domain witho
   const canonical = Schema.decodeSync(Root)({
     ...root,
     idType: "uint",
-    segments: root.segments.map((segment) => ({
-      ...Struct.omit(segment, ["commonLeaders", "commonTerms"]),
-      minimumId: { kind: "uint", value: "18446744073709551615" },
-    })),
+    segments: root.segments.map((segment) =>
+      Object.assign({}, Struct.omit(segment, ["commonLeaders", "commonTerms"]), {
+        minimumId: { kind: "uint" as const, value: "18446744073709551615" },
+      }),
+    ),
   });
   expect(decodeRoot(encodeRoot(canonical))).toEqual(canonical);
   expect(() => Schema.decodeSync(Root)({ ...canonical, idType: "string" })).toThrow();

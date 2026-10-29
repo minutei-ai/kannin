@@ -49,8 +49,8 @@ test("a migration retry never republishes a portable segment captured by an earl
         if (original === null) throw new Error("Missing seeded Root");
         const encoded = yield* Effect.tryPromise(() => original.text());
         const stored = yield* Schema.decodeEffect(Schema.fromJsonString(StoredRoot))(encoded);
-        const legacy = yield* Schema.decodeEffect(LegacyStoredRootV4)({
-          ...Struct.omit(stored, ["schema"]),
+        const legacy = yield* Schema.decodeUnknownEffect(LegacyStoredRootV4)({
+          ...Struct.omit(stored, ["schema", "idType"]),
           version: 4,
         });
         const legacyText = yield* Schema.encodeEffect(Schema.fromJsonString(LegacyStoredRootV4))(

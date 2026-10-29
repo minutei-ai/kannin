@@ -19,6 +19,7 @@ import {
   QueryResult,
   Attributes,
   Filter,
+  Id,
 } from "../src/protocol";
 import { document, request, startWorker, textQuery, write } from "./harness";
 
@@ -470,7 +471,7 @@ test("manifest proofs preserve filtered reads through fallback, tombstones, rebu
         "write",
         write(
           [],
-          original.rows.map((row) => row.id),
+          original.rows.map((row) => Schema.decodeUnknownSync(Id)(row.id)),
         ),
       )
     ).status,

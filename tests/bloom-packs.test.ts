@@ -6,6 +6,7 @@ import { join } from "node:path";
 import type { Miniflare } from "miniflare";
 import { decodeRoot, decodeVectorRebuildSnapshot } from "../src/manifest";
 import {
+  compareCanonicalIds,
   Metadata,
   QueryResult,
   RootMigrationResult,
@@ -187,7 +188,7 @@ test("covered common text skips Bloom R2 and rare terms reuse the cached term co
   expect(
     Schema.decodeUnknownSync(QueryResult)(await commonResponse.json())
       .rows.map((row) => row.id)
-      .toSorted(),
+      .toSorted(compareCanonicalIds),
   ).toEqual(["a", "b"]);
   expect((await fixtureHttp(worker.worker, "stats", namespace))?.bloomPackGets).toBe(0);
 

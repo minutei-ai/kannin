@@ -5,6 +5,7 @@ import type { Miniflare } from "miniflare";
 import { Directory, initSync, segment_document, segment_header } from "../dist/wasm/raio_engine";
 import {
   type DataRange,
+  Id,
   LegacyInlineRoot,
   LegacyPackedRoot,
   LegacyRoot,
@@ -42,6 +43,9 @@ const encodeNativeDocument = Schema.encodeSync(Schema.fromJsonString(StoredDocum
 const LegacyHeader = SegmentHeader.mapFields((fields) => ({
   ...Struct.omit(fields, ["metadata_end", "vector_end", "vector_ranges"]),
   version: Schema.Literal(1),
+  documents: Schema.NonEmptyArray(
+    fields.documents.value.mapFields((document) => ({ ...document, id: Id })),
+  ),
 }));
 
 async function physicalLegacyRoot(bucket: Bucket, root: typeof Root.Type) {
@@ -145,21 +149,23 @@ async function physicalLegacyRoot(bucket: Bucket, root: typeof Root.Type) {
       documents: leader.documents.map((document) => {
         const data = ranges[document.row];
         if (data === undefined) throw new Error("Missing legacy leader range");
-        return { ...document, data };
+        return { ...document, id: Schema.decodeUnknownSync(Id)(document.id), data };
       }),
     }));
-    segments.push({
-      ...segment,
-      key,
-      headerBytes: 16 + encoded.byteLength,
-      bytes: legacy.byteLength,
-      commonLeaders,
-    });
+    segments.push(
+      Schema.decodeUnknownSync(LegacyPackedRoot.fields.segments.value)({
+        ...segment,
+        key,
+        headerBytes: 16 + encoded.byteLength,
+        bytes: legacy.byteLength,
+        commonLeaders,
+      }),
+    );
   }
   const keys = new Map(root.segments.map((segment, row) => [segment.key, segments[row]?.key]));
   const schema = legacyNativeSchema(root);
-  const { schema: _schema, ...fields } = root;
-  return Schema.decodeSync(LegacyPackedRoot)({
+  const fields = Struct.omit(root, ["schema", "idType"]);
+  return Schema.decodeUnknownSync(LegacyPackedRoot)({
     ...fields,
     ...Option.match(Option.fromUndefinedOr(schema), {
       onNone: () => ({}),
@@ -216,9 +222,11 @@ async function inlineRoot(bucket: Bucket, root: typeof LegacyPackedRoot.Type) {
 }
 
 async function legacyRootValue(bucket: Bucket, root: typeof Root.Type, version: Version) {
+  if (root.idType !== undefined && root.idType !== "string")
+    throw new Error("Legacy fixtures require native string IDs");
   const stored = Schema.decodeSync(Schema.fromJsonString(StoredRoot))(encodeRoot(root));
   const schema = legacyNativeSchema(root);
-  const { schema: _schema, ...storedFields } = stored;
+  const storedFields = Struct.omit(stored, ["schema", "idType"]);
   const legacyStored = {
     ...storedFields,
     ...Option.match(Option.fromUndefinedOr(schema), {
@@ -226,10 +234,11 @@ async function legacyRootValue(bucket: Bucket, root: typeof Root.Type, version: 
       onSome: (native) => ({ schema: native }),
     }),
   };
-  if (version === 5) return Schema.decodeSync(LegacyStoredRootV5)({ ...legacyStored, version: 5 });
+  if (version === 5)
+    return Schema.decodeUnknownSync(LegacyStoredRootV5)({ ...legacyStored, version: 5 });
   const physical = await physicalLegacyRoot(bucket, root);
   if (version === 4)
-    return Schema.decodeSync(LegacyStoredRootV4)({
+    return Schema.decodeUnknownSync(LegacyStoredRootV4)({
       ...legacyStored,
       version: 4,
       bloomPacks: physical.bloomPacks,
@@ -241,7 +250,7 @@ async function legacyRootValue(bucket: Bucket, root: typeof Root.Type, version: 
     });
   const inline = await inlineRoot(bucket, physical);
   if (version === 1) return Schema.decodeSync(LegacyRoot)(inline);
-  const pooled = Schema.decodeSync(LegacyStoredRootV3)({
+  const pooled = Schema.decodeUnknownSync(LegacyStoredRootV3)({
     ...legacyStored,
     version: 3,
     segments: stored.segments.map((segment, row) => {

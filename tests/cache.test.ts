@@ -6,6 +6,7 @@ import { Array as EffectArray, Effect, Schema } from "effect";
 import { Response } from "miniflare";
 import { createHash } from "node:crypto";
 import {
+  compareCanonicalIds,
   QueryResult,
   Metadata,
   Health,
@@ -1131,7 +1132,7 @@ test("document Bloom windows preserve newest revisions across partial sixty-four
       seeded.segments
         .slice(index * 64, index * 64 + window.length)
         .map((segment) => segment.minimumId)
-        .toSorted(),
+        .toSorted(compareCanonicalIds),
     ).toEqual(window.map((id) => String(id).padStart(3, "0")));
   await request(
     worker,

@@ -9,6 +9,13 @@ import type { SearchRuntime } from "../src/platform";
 const module = await WebAssembly.compile(
   await Bun.file(new URL("../dist/wasm/raio_engine_bg.wasm", import.meta.url)).arrayBuffer(),
 );
+const uploaded = new Date(0);
+
+function cacheIdentity(input: Request | URL | string) {
+  if (typeof input === "string") return input;
+  if ("url" in input) return input.url;
+  return input.href;
+}
 
 test("an immutable origin fill survives cancellation of its cache lookup caller", async () => {
   const entered = Deferred.makeUnsafe<void>();
@@ -34,7 +41,7 @@ test("an immutable origin fill survives cancellation of its cache lookup caller"
               key,
               etag: "fixture",
               size: bytes.length,
-              uploaded: new Date(0),
+              uploaded,
               customMetadata: {},
             },
             body: Stream.make(bytes),
@@ -61,11 +68,11 @@ test("an immutable origin fill survives cancellation of its cache lookup caller"
     },
     cache: {
       open: async () => ({
-        match: async (input) => retained.get(input.toString())?.clone(),
+        match: async (input) => retained.get(cacheIdentity(input))?.clone(),
         put: async (input, response) => {
-          retained.set(input.toString(), response.clone());
+          retained.set(cacheIdentity(input), response.clone());
         },
-        delete: async (input) => retained.delete(input.toString()),
+        delete: async (input) => retained.delete(cacheIdentity(input)),
       }),
     },
     engineModule: module,

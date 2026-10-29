@@ -103,6 +103,6 @@ test("native object-store failures preserve their identity at the bucket boundar
   const cause = new DOMException("backend transport aborted", "AbortError");
   const failure = new ObjectStoreFailure({ operation: "read", key: "fixture", cause });
   const bucket = new ObjectBucket(storeWith(() => Effect.fail(failure)));
-  expect(await bucket.get("fixture").catch((cause: unknown) => cause)).toBe(failure);
+  expect(await bucket.get("fixture").catch((failureCause: unknown) => failureCause)).toBe(failure);
   expect(failure.cause).toBe(cause);
 });

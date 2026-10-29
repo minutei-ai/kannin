@@ -1,9 +1,11 @@
 import { expect, test } from "bun:test";
-import { Cause, Effect, Layer, Option, Stream } from "effect";
+import { Cause, Deferred, Effect, Layer, Option, Stream } from "effect";
+import type { Scope } from "effect";
+import { ObjectBucket } from "../runtime/object-bucket";
 import { ObjectStore } from "../src/object-store";
 import { objectStoreFixtureLive } from "./object-store-fixture";
 
-const runStore = <A, E>(scenario: Effect.Effect<A, E, ObjectStore>) =>
+const runStore = <A, E>(scenario: Effect.Effect<A, E, ObjectStore | Scope.Scope>) =>
   Effect.runPromise(
     Effect.scoped(
       Effect.gen(function* () {
@@ -12,6 +14,78 @@ const runStore = <A, E>(scenario: Effect.Effect<A, E, ObjectStore>) =>
       }),
     ),
   );
+
+test("portable cancellation releases a live S3 body without returning partial bytes", async () => {
+  await runStore(
+    Effect.gen(function* () {
+      const store = yield* ObjectStore;
+      const key = "cancellation/stream";
+      const bytes = new Uint8Array(4 * 1024 * 1024).fill(65);
+      const committed = yield* store.write(key, bytes);
+      if (Option.isNone(committed))
+        return yield* new Cause.UnknownError(new Error("Cancellation fixture did not commit"));
+      const entered = yield* Deferred.make<void>();
+      const released = yield* Deferred.make<void>();
+      const stopped = yield* Deferred.make<void>();
+      const observed = { bytes: 0 };
+      const throttled = ObjectStore.of({
+        ...store,
+        read: (objectKey, options) =>
+          store.read(objectKey, options).pipe(
+            Effect.map(
+              Option.map((object) => ({
+                ...object,
+                body: object.body.pipe(
+                  Stream.tap((chunk) =>
+                    Effect.gen(function* () {
+                      observed.bytes += chunk.byteLength;
+                      yield* Deferred.succeed(entered, undefined);
+                      yield* Deferred.await(released);
+                    }),
+                  ),
+                  Stream.ensuring(Deferred.succeed(stopped, undefined)),
+                ),
+              })),
+            ),
+          ),
+      });
+      const controller = yield* Effect.acquireRelease(
+        Effect.sync(() => new AbortController()),
+        (owned) => Effect.sync(() => owned.abort()),
+      );
+      const bucket = new ObjectBucket(throttled);
+      const object = yield* Effect.tryPromise(() => bucket.get(key, { signal: controller.signal }));
+      if (object === null)
+        return yield* new Cause.UnknownError(new Error("Cancellation fixture disappeared"));
+      const pending = object.arrayBuffer().then(
+        (value) => ({ value }),
+        (cause: unknown) => ({ cause }),
+      );
+      yield* Effect.addFinalizer(() =>
+        Deferred.succeed(released, undefined).pipe(
+          Effect.andThen(Effect.promise(() => pending)),
+          Effect.asVoid,
+        ),
+      );
+      yield* Deferred.await(entered).pipe(Effect.timeout("5 seconds"));
+      const reason = new Error("S3 reader cancelled");
+      controller.abort(reason);
+      const outcome = yield* Effect.promise(() => pending);
+      expect(outcome).toEqual({ cause: reason });
+      yield* Deferred.await(stopped).pipe(Effect.timeout("5 seconds"));
+      expect(observed.bytes).toBeGreaterThan(0);
+      const metadata = yield* store.head(key);
+      if (Option.isNone(metadata))
+        return yield* new Cause.UnknownError(new Error("Cancellation deleted canonical state"));
+      expect(metadata.value.size).toBe(bytes.length);
+      const range = yield* store.read(key, { range: { offset: 1, length: 3 } });
+      if (Option.isNone(range))
+        return yield* new Cause.UnknownError(new Error("S3 unavailable after cancellation"));
+      expect(yield* Stream.mkString(Stream.decodeText(range.value.body))).toBe("AAA");
+      return undefined;
+    }),
+  );
+}, 30000);
 
 test("native object storage fences concurrent versions and preserves canonical bytes", async () => {
   await runStore(

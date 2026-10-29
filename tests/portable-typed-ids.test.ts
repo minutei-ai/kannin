@@ -203,6 +203,27 @@ test("typed identities survive the real object-store writer, restart, ranking an
         expect(rows.rows.map((row) => [row.id, row.revision])).toEqual([
           [{ kind: "uint", value: "10" }, 2],
         ]);
+        const vectorsAfterMaintenance = yield* Effect.tryPromise(() =>
+          restarted.fetch(
+            request(namespace, "query", {
+              kind: "vector",
+              vector: [1, 0],
+              topK: 10,
+              filters: [],
+              minimumSequence: 2,
+            }),
+          ),
+        );
+        expect(vectorsAfterMaintenance.status).toBe(200);
+        const rankedVectors = yield* Effect.tryPromise(() => vectorsAfterMaintenance.json()).pipe(
+          Effect.flatMap(Schema.decodeUnknownEffect(QueryResult)),
+        );
+        expect(
+          rankedVectors.rows.map(({ id, score, revision }) => ({ id, score, revision })),
+        ).toEqual([
+          { id: { kind: "uint" as const, value: "18446744073709551615" }, score: 1, revision: 1 },
+          { id: { kind: "uint" as const, value: "10" }, score: 0, revision: 2 },
+        ]);
         for (const invalid of [
           { ...mutation, requestId: "mixed", upserts: [], deletes: ["10"] },
           {

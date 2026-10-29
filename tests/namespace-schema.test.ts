@@ -311,3 +311,99 @@ test("namespace-local canonical filters are immediately visible after schema-onl
   );
   expect(after).toEqual(before);
 });
+
+test("scalar arrays survive queries, replacement and canonical maintenance", async () => {
+  const namespace = "array-attributes";
+  const vector = [1, 0];
+  const attributes = {
+    tags: ["ação", "😀"],
+    scores: [0, 1.5, -2],
+    empty: [],
+    mixed: [null, true, "x", 1],
+  };
+  expect(
+    (
+      await request(worker, namespace, "write", {
+        requestId: "seed",
+        schema: {
+          filterable: ["tags", "scores", "empty", "mixed"],
+          vectorFilterFields: [],
+          vectorDimensions: 2,
+        },
+        upserts: [
+          { id: "a", text: "arrays record", attributes, vector },
+          { id: "b", text: "arrays record", attributes: { tags: null }, vector },
+          { id: "c", text: "arrays record", attributes: {}, vector },
+        ],
+        deletes: [],
+      })
+    ).status,
+  ).toBe(200);
+  const inputs = [
+    textQuery("arrays"),
+    { kind: "vector", vector, topK: 10, filters: [] },
+    { kind: "hybrid", text: "arrays", vector, topK: 10, filters: [] },
+  ];
+  for (const input of inputs) {
+    const response = await request(worker, namespace, "query", input);
+    expect(response.status).toBe(200);
+    const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+    expect(result.rows.map((row) => row.id)).toEqual(["a", "b", "c"]);
+    expect(result.rows[0]?.attributes).toEqual(attributes);
+    for (const [filter, ids] of [
+      [{ field: "tags", op: "exists", value: true }, ["a", "b"]],
+      [{ field: "tags", op: "eq", value: null }, ["b"]],
+      [{ field: "tags", op: "ne", value: null }, ["a", "c"]],
+    ] as const) {
+      const filtered = await request(worker, namespace, "query", { ...input, filters: [filter] });
+      expect(filtered.status).toBe(200);
+      expect(
+        Schema.decodeUnknownSync(QueryResult)(await filtered.json()).rows.map((row) => row.id),
+      ).toEqual(ids);
+    }
+  }
+  expect(
+    (
+      await request(worker, namespace, "write", {
+        requestId: "replace",
+        upserts: [
+          {
+            id: "a",
+            text: "arrays record",
+            attributes: { tags: ["changed"], scores: [8, 9] },
+            vector,
+          },
+        ],
+        deletes: ["b"],
+      })
+    ).status,
+  ).toBe(200);
+  const before = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", textQuery("arrays"))).json(),
+  );
+  expect(before.rows.map((row) => row.id)).toEqual(["a", "c"]);
+  expect(before.rows[0]?.attributes).toEqual({ tags: ["changed"], scores: [8, 9] });
+  for (const operation of ["compact", "rebuild", "vector-sync", "vector-rebuild"])
+    expect((await request(worker, namespace, operation, {})).status).toBe(200);
+  const after = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", textQuery("arrays"))).json(),
+  );
+  expect(after.rows).toEqual(before.rows);
+  expect(after.sequence).toBe(2);
+});
+
+test("oversized, nested and object-valued arrays fail before persistence", async () => {
+  const namespace = "invalid-array-attributes";
+  for (const values of [Array.from({ length: 4097 }, () => 1), [[1]], [{}]])
+    expect(
+      (
+        await request(worker, namespace, "write", {
+          requestId: crypto.randomUUID(),
+          upserts: [{ id: "a", text: "arrays", attributes: { values } }],
+          deletes: [],
+        })
+      ).status,
+    ).toBe(400);
+  const bucket = await worker.getR2Bucket("STORAGE");
+  expect(await bucket.head(`namespaces/${namespace}/root.json`)).toBeNull();
+});

@@ -166,7 +166,12 @@ test("same OCI API image runs on Podman and Docker Engine with canonical state a
                   body: JSON.stringify({
                     requestId: "container-write",
                     upserts: [
-                      { id: "one", text: "container durable state", attributes: {}, vector },
+                      {
+                        id: "one",
+                        text: "container durable state",
+                        attributes: { tags: ["oci", engine] },
+                        vector,
+                      },
                     ],
                     deletes: [],
                   }),
@@ -195,6 +200,7 @@ test("same OCI API image runs on Podman and Docker Engine with canonical state a
               );
               expect(result.rows.map((row) => row.id)).toEqual(["one"]);
               expect(result.sequence).toBe(1);
+              expect(result.rows[0]?.attributes.tags).toEqual(["oci", engine]);
               const vectorResponse = yield* Effect.tryPromise(() =>
                 fetch(`${baseURL}/v1/namespaces/${namespace}/query`, {
                   method: "POST",

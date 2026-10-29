@@ -40,7 +40,12 @@ test("portable API persists native writes and strong queries across application 
               requestId: "first",
               schema: { filterable: [], vectorFilterFields: [], vectorDimensions: 2 },
               upserts: [
-                { id: "one", text: "portable search", attributes: { group: "a" }, vector: [1, 0] },
+                {
+                  id: "one",
+                  text: "portable search",
+                  attributes: { group: "a", tags: ["ação", "😀"] },
+                  vector: [1, 0],
+                },
               ],
               deletes: [],
             }),
@@ -72,6 +77,7 @@ test("portable API persists native writes and strong queries across application 
           Effect.flatMap(Schema.decodeUnknownEffect(QueryResult)),
         );
         expect(query.rows.map((hit) => hit.id)).toEqual(["one"]);
+        expect(query.rows[0]?.attributes.tags).toEqual(["ação", "😀"]);
         const vectorResponse = yield* Effect.tryPromise(() =>
           restarted.fetch(
             request(`/v1/namespaces/${namespace}/query`, {

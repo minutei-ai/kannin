@@ -24,12 +24,16 @@ export const Operation = Schema.Literals([
 ]);
 export const Scalar = Schema.Union([Unicode, Schema.Finite, Schema.Boolean, Schema.Null]);
 export const FieldName = Schema.String.check(Schema.isPattern(/^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/));
-export const Attributes = Schema.Record(FieldName, Scalar);
+export const AttributeValue = Schema.Union([
+  Scalar,
+  Schema.Array(Scalar).check(Schema.isMaxLength(4096)),
+]);
+export const Attributes = Schema.Record(FieldName, AttributeValue);
 const textEncoder = new TextEncoder();
 const encodeAttributes = Schema.encodeSync(Schema.fromJsonString(Attributes), {
   disableChecks: true,
 });
-export const ConstantAttributes = Attributes.check(
+export const ConstantAttributes = Schema.Record(FieldName, Scalar).check(
   Schema.makeFilter(
     (attributes) =>
       Object.values(attributes).every(

@@ -2175,7 +2175,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       if (header.documents.length !== segment.count || header.documents[0].id !== segment.minimumId)
         throw new Rejected({ status: 503, message: "Migration changed segment row identity" });
       const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)).toHex();
-      const key = `${this.prefix}/segments/${digest}-${await sha256(segment.key)}.rsix`;
+      const key = `${this.prefix}/segments/${runtime.immutableIdentity(`${digest}-${await sha256(segment.key)}`)}.rsix`;
       const stored = await this.env.STORAGE.put(key, bytes, { onlyIf: { etagDoesNotMatch: "*" } });
       if (stored === null) {
         const existing = await this.env.STORAGE.get(key);

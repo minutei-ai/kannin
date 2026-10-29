@@ -11,7 +11,7 @@ bun run build
 
 Supply configuration from an external environment file or secret manager. Never commit a deployment environment file. The bucket must already exist; startup checks existing canonical Roots and fails on unavailable or invalid storage.
 
-The current S3 adapter forces path-style addressing. Railway documents virtual-hosted addressing for new buckets and path-style addressing for some older buckets; see [Railway URL styles](https://docs.railway.com/storage-buckets#url-style). Configurable URL style and native Railway bucket wiring remain implementation/hosted-validation gates. Passing the local path-style RustFS contract does not establish compatibility with a new Railway bucket.
+The S3 adapter selects addressing through `KANNIN_STORAGE_URL_STYLE`: `path` preserves the existing default, while `virtual` selects virtual-hosted addressing. Railway documents virtual-hosted addressing for new buckets and path-style addressing for some older buckets; see [Railway URL styles](https://docs.railway.com/storage-buckets#url-style). The new configuration tests and adapter change await the full gate. Native Railway bucket wiring and hosted conditional-write conformance remain open; local path-style RustFS checks do not validate a new Railway bucket.
 
 | Variable                           | Purpose                                                          |
 | ---------------------------------- | ---------------------------------------------------------------- |

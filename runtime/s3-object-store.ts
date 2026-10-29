@@ -65,7 +65,7 @@ export const s3ObjectStore = (config: typeof S3StoreConfig.Type) =>
             new S3Client({
               region: checked.region,
               endpoint: checked.endpoint,
-              forcePathStyle: true,
+              forcePathStyle: checked.urlStyle !== "virtual",
               maxAttempts: 1,
               credentials: {
                 accessKeyId: Redacted.value(checked.accessKeyId),

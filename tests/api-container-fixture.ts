@@ -135,6 +135,8 @@ export const startPortableApiContainer = Effect.fn("kannin.portableApi.container
       "--env",
       `KANNIN_STORAGE_REGION=${storage.region}`,
       "--env",
+      `KANNIN_STORAGE_URL_STYLE=${storage.urlStyle ?? "path"}`,
+      "--env",
       `KANNIN_STORAGE_ACCESS_KEY_ID=${Redacted.value(storage.accessKeyId)}`,
       "--env",
       `KANNIN_STORAGE_SECRET_ACCESS_KEY=${Redacted.value(storage.secretAccessKey)}`,

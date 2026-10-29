@@ -1328,6 +1328,7 @@ export const S3StoreConfig = Schema.Struct({
   region: Schema.String.check(Schema.isMinLength(1)),
   accessKeyId: Schema.Redacted(Schema.String),
   secretAccessKey: Schema.Redacted(Schema.String),
+  urlStyle: Schema.optional(Schema.Literals(["path", "virtual"])),
 });
 
 export const ObjectReadOptions = Schema.Struct({

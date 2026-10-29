@@ -1,9 +1,10 @@
 import { expect, test } from "bun:test";
-import { Cause, Deferred, Effect, Layer, Option, Stream } from "effect";
+import { Cause, Deferred, Effect, Exit, Layer, Option, Stream } from "effect";
 import type { Scope } from "effect";
 import { ObjectBucket } from "../runtime/object-bucket";
 import { ObjectStore } from "../src/object-store";
 import { objectStoreFixtureLive } from "./object-store-fixture";
+import { checkObjectStore } from "../tooling/object-store-conformance";
 
 const runStore = <A, E>(scenario: Effect.Effect<A, E, ObjectStore | Scope.Scope>) =>
   Effect.runPromise(
@@ -217,6 +218,28 @@ test("opaque object keys and UTF-8 metadata roundtrip without namespace aliasing
       const listed = yield* store.list({ prefix: "namespaces/a/" });
       expect(listed.objects.map((object) => object.key)).toEqual([opaqueKey]);
       return undefined;
+    }),
+  );
+}, 30000);
+
+test("shared storage probe checks real S3 semantics and cleans up after a rejected contract", async () => {
+  await runStore(
+    Effect.gen(function* () {
+      const report = yield* checkObjectStore();
+      expect(report).toMatchObject({ conditionalWriters: 1, keys: 3, cleanup: "complete" });
+      const store = yield* ObjectStore;
+      const unguarded = ObjectStore.of({
+        ...store,
+        write: (key, bytes) => store.write(key, bytes),
+      });
+      const failed = yield* checkObjectStore().pipe(
+        Effect.provideService(ObjectStore, unguarded),
+        Effect.exit,
+      );
+      expect(Exit.isFailure(failed)).toBe(true);
+      const remaining = yield* store.list({ prefix: "kannin-conformance/" });
+      expect(remaining.objects).toEqual([]);
+      expect(remaining.truncated).toBe(false);
     }),
   );
 }, 30000);

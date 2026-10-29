@@ -2,6 +2,7 @@ import { Config, Effect, Layer, Option, Redacted, Schedule, Schema } from "effec
 import { PortableServerConfig } from "../src/protocol";
 import { sha256 } from "../src/hash";
 import { s3ObjectStore } from "./s3-object-store";
+import { storageConfig } from "./storage-config";
 import { portableApplication } from "./application";
 import { cdnCache, disabledCache } from "./cache/client";
 
@@ -12,16 +13,7 @@ export const serverConfig = Config.all({
   wasmPath: Config.String("KANNIN_WASM_PATH").pipe(
     Config.withDefault("./dist/wasm/raio_engine_bg.wasm"),
   ),
-  objectStore: Config.all({
-    bucket: Config.String("KANNIN_STORAGE_BUCKET"),
-    endpoint: Config.String("KANNIN_STORAGE_ENDPOINT"),
-    region: Config.String("KANNIN_STORAGE_REGION").pipe(Config.withDefault("us-east-1")),
-    urlStyle: Config.Literals(["path", "virtual"], "KANNIN_STORAGE_URL_STYLE").pipe(
-      Config.withDefault("path"),
-    ),
-    accessKeyId: Config.Redacted("KANNIN_STORAGE_ACCESS_KEY_ID"),
-    secretAccessKey: Config.Redacted("KANNIN_STORAGE_SECRET_ACCESS_KEY"),
-  }),
+  objectStore: storageConfig,
   cache: Config.option(Config.String("KANNIN_CACHE_ENDPOINT")).pipe(
     Config.flatMap((endpoint) => {
       if (Option.isNone(endpoint)) return Config.succeed(undefined);

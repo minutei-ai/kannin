@@ -10,7 +10,10 @@ test("container commands preserve successful output and report nonzero exits", a
     Bun.version,
   );
   const failed = await Effect.runPromiseExit(
-    containerCommand([process.execPath, "--kannin-invalid-command-option"]),
+    containerCommand([
+      process.execPath,
+      new URL("./container-command-child.ts", import.meta.url).pathname,
+    ]),
   );
   expect(Exit.isFailure(failed)).toBe(true);
 });

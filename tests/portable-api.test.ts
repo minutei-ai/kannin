@@ -241,14 +241,21 @@ test("portable vector, hybrid, schema filters and maintenance share the canonica
         );
         const vector = [1, 0];
         const schema = {
-          filterable: ["group"],
+          filterable: ["group", "tags"],
           vectorFilterFields: ["group"],
           vectorDimensions: 2,
         };
         const initial = {
           requestId: "vector-first",
           schema,
-          upserts: [{ id: "one", text: "lexical portable", attributes: { group: "a" }, vector }],
+          upserts: [
+            {
+              id: "one",
+              text: "lexical portable",
+              attributes: { group: "a", tags: ["selected"] },
+              vector,
+            },
+          ],
           deletes: [],
         };
         expect(
@@ -262,7 +269,10 @@ test("portable vector, hybrid, schema filters and maintenance share the canonica
             kind,
             vector,
             topK: 10,
-            filters: [{ field: "group", op: "eq", value: "a" }],
+            filters: [
+              { field: "group", op: "eq", value: "a" },
+              { field: "tags", op: "contains", value: "selected" },
+            ],
             ...(kind === "hybrid" && { text: "lexical" }),
           };
           const response = yield* Effect.tryPromise(() =>

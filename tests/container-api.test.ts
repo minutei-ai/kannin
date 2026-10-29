@@ -165,6 +165,7 @@ test("same OCI API image runs on Podman and Docker Engine with canonical state a
                   headers,
                   body: JSON.stringify({
                     requestId: "container-write",
+                    schema: { filterable: ["tags"], vectorFilterFields: [] },
                     upserts: [
                       {
                         id: "one",
@@ -209,7 +210,7 @@ test("same OCI API image runs on Podman and Docker Engine with canonical state a
                     kind: "vector",
                     vector,
                     topK: 1,
-                    filters: [],
+                    filters: [{ field: "tags", op: "containsAny", value: [engine] }],
                     minimumSequence: 1,
                   }),
                 }),

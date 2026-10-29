@@ -394,6 +394,29 @@ impl<'a> Decoder<'a> {
         }
     }
 
+    fn append_document_attributes(
+        &mut self,
+        mode: u32,
+        values: &mut Vec<super::DocumentAttributes>,
+        counts: &mut [u16],
+        indexes: &mut Vec<u16>,
+    ) -> Result<(), String> {
+        if mode == 0 {
+            values.push(super::DocumentAttributes::Owned(
+                serde_json::value::RawValue::from_string(self.text()?)
+                    .map_err(|cause| cause.to_string())?,
+            ));
+        } else {
+            let index = self.integer()? as usize;
+            let frequency = counts
+                .get_mut(index)
+                .ok_or("Invalid directory attribute index")?;
+            *frequency += 1;
+            indexes.push(u16::try_from(index).map_err(|cause| cause.to_string())?);
+        }
+        Ok(())
+    }
+
     fn documents(&mut self, legacy: bool, typed: bool) -> Result<super::DocumentTable, String> {
         let count = self.integer()? as usize;
         if count > 10000 {
@@ -449,19 +472,7 @@ impl<'a> Decoder<'a> {
                 self.scalar(&mut title_lengths, count, Self::integer)?;
                 self.scalar(&mut body_lengths, count, Self::integer)?;
             }
-            if mode == 0 {
-                values.push(super::DocumentAttributes::Owned(
-                    serde_json::value::RawValue::from_string(self.text()?)
-                        .map_err(|cause| cause.to_string())?,
-                ));
-            } else {
-                let index = self.integer()? as usize;
-                let frequency = counts
-                    .get_mut(index)
-                    .ok_or("Invalid directory attribute index")?;
-                *frequency += 1;
-                indexes.push(u16::try_from(index).map_err(|cause| cause.to_string())?);
-            }
+            self.append_document_attributes(mode, &mut values, &mut counts, &mut indexes)?;
             let data = self.range()?;
             self.scalar(&mut vectors, count, |decoder| match decoder.integer()? {
                 0 => Ok(false),

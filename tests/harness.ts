@@ -85,7 +85,13 @@ export async function startWorker(
     resourcePersistencePath: persistence,
     unsafeInspectDurableObjects: true,
   });
+  const readiness = { handedOff: false };
+  await using cleanup = new AsyncDisposableStack();
+  cleanup.defer(async () => {
+    if (!readiness.handedOff) await worker.dispose();
+  });
   await worker.ready;
+  readiness.handedOff = true;
   return worker;
 }
 

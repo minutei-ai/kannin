@@ -531,7 +531,7 @@ impl Document {
         })
     }
 
-    fn from_parts(
+    const fn from_parts(
         id: DocumentId,
         revision: u64,
         title: String,
@@ -13720,7 +13720,7 @@ mod typed_id_tests {
     use super::*;
     use serde_json::{Value, json};
 
-    fn document(id: Value) -> Result<Document, String> {
+    fn document(id: &Value) -> Result<Document, String> {
         Document::from_canonical_json(
             &json!({
                 "id":id,"revision":1,"roles":{"title":"","text":"shared"},
@@ -13741,11 +13741,7 @@ mod typed_id_tests {
             json!({"kind":"uint","value":"18446744073709551615"}),
             json!({"kind":"uuid","value":"00112233-4455-6677-8899-aabbccddeeff"}),
         ];
-        let documents = ids
-            .iter()
-            .cloned()
-            .map(document)
-            .collect::<Result<Vec<_>, _>>()?;
+        let documents = ids.iter().map(document).collect::<Result<Vec<_>, _>>()?;
         let built = build(documents.clone(), None)?;
         assert_eq!(&built.bytes[..8], b"RAIOSEG5");
         let (header, base) = parse_header(&built.bytes)?;
@@ -13822,7 +13818,7 @@ mod typed_id_tests {
             BTreeMap::from([("keep".into(), json!(true))]),
             Some(vec![1.0, 0.0]),
         );
-        let canonical = document(json!("row"))?;
+        let canonical = document(&json!("row"))?;
         let built = build(vec![native], None)?;
         assert_eq!(build(vec![canonical], None)?.bytes, built.bytes);
         assert_eq!(&built.bytes[..8], b"RAIOSEG4");
@@ -13992,7 +13988,7 @@ mod typed_id_bloom_tests {
                 .header
                 .documents
                 .find_id(id)
-                .map_err(|_| "Missing canonical ID after bloom")?;
+                .map_err(|cause| format!("Missing canonical ID after bloom: {cause}"))?;
             assert_eq!(built.header.documents.row(index).id, id.borrowed());
         }
         assert_ne!(

@@ -361,6 +361,39 @@ impl<'a> Decoder<'a> {
         column.push_charged(value, capacity, |bytes| self.charge(bytes))
     }
 
+    fn table_document_id(
+        &mut self,
+        typed: bool,
+        row: usize,
+        ids: &mut String,
+        typed_ids: &mut Vec<(usize, super::FixedId)>,
+    ) -> Result<std::ops::Range<usize>, String> {
+        let tag = if typed { self.integer()? } else { 0 };
+        match tag {
+            0 => self.document_id(ids),
+            1 => {
+                typed_ids.push((row, super::FixedId::Uint(self.long()?)));
+                Ok(ids.len()..ids.len())
+            }
+            2 => {
+                let end = self
+                    .offset
+                    .checked_add(16)
+                    .ok_or("UUID directory offset overflow")?;
+                let value: [u8; 16] = self
+                    .bytes
+                    .get(self.offset..end)
+                    .ok_or("Truncated UUID id")?
+                    .try_into()
+                    .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?;
+                self.offset = end;
+                typed_ids.push((row, super::FixedId::Uuid(value)));
+                Ok(ids.len()..ids.len())
+            }
+            _ => Err("Invalid directory document id tag".into()),
+        }
+    }
+
     fn documents(&mut self, legacy: bool, typed: bool) -> Result<super::DocumentTable, String> {
         let count = self.integer()? as usize;
         if count > 10000 {
@@ -410,30 +443,7 @@ impl<'a> Decoder<'a> {
             typed_ids.reserve_exact(count);
         }
         for row in 0..count {
-            let tag = if typed { self.integer()? } else { 0 };
-            let id = match tag {
-                0 => self.document_id(&mut ids)?,
-                1 => {
-                    typed_ids.push((row, super::FixedId::Uint(self.long()?)));
-                    ids.len()..ids.len()
-                }
-                2 => {
-                    let end = self
-                        .offset
-                        .checked_add(16)
-                        .ok_or("UUID directory offset overflow")?;
-                    let value: [u8; 16] = self
-                        .bytes
-                        .get(self.offset..end)
-                        .ok_or("Truncated UUID id")?
-                        .try_into()
-                        .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?;
-                    self.offset = end;
-                    typed_ids.push((row, super::FixedId::Uuid(value)));
-                    ids.len()..ids.len()
-                }
-                _ => return Err("Invalid directory document id tag".into()),
-            };
+            let id = self.table_document_id(typed, row, &mut ids, &mut typed_ids)?;
             let revision = self.long()?;
             if legacy {
                 self.scalar(&mut title_lengths, count, Self::integer)?;

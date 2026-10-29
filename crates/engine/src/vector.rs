@@ -189,7 +189,7 @@ impl VectorRanker {
         }
     }
 
-    #[doc = "Returns retained canonical identities and scores in ranking order. Historical string-only callers can use native_results for a checked projection."]
+    #[doc = "Returns retained canonical identities and scores in ranking order. Historical string-only callers can use `native_results` for a checked projection."]
     #[must_use]
     pub fn results(&self) -> &[(DocumentId, f64)] {
         &self.hits

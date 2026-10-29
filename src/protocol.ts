@@ -322,6 +322,12 @@ export const Uint64Text = Schema.String.check(
     (value) => value.length < 20 || value <= "18446744073709551615" || "ID exceeds uint64 range",
   ),
 );
+export const Float64BitsText = Schema.String.check(
+  Schema.makeFilter((value) => {
+    if (!/^[0-9a-f]{16}(?![\s\S])/.test(value)) return "Expected 16 lowercase hexadecimal digits";
+    return ((BigInt(`0x${value}`) >> 52n) & 0x7ffn) !== 0x7ffn || "Typed float must be finite";
+  }),
+);
 export const UuidText = Schema.String.check(
   Schema.isPattern(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\s\S])/),
 );

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { Cause, Clock, Deferred, Duration, Effect, Schema } from "effect";
+import { Cause, Clock, Deferred, Duration, Effect } from "effect";
 import {
   STRONG_QUERY_READER_MS,
   finishStrongRead,
@@ -28,7 +28,7 @@ test("a failed read branch cancels its still-running sibling before returning th
       ]),
     ),
   );
-  await expect(pending).rejects.toBe(failure);
+  expect(await pending.catch((cause: unknown) => cause)).toBe(failure);
   await Effect.runPromise(Deferred.await(stopped).pipe(Effect.timeout("1 second")));
 });
 
@@ -61,8 +61,8 @@ test("backend abort failures retain their native causes instead of becoming leas
 });
 
 type ManualClock = {
-  readonly wall: bigint;
-  readonly monotonic: bigint;
+  wall: bigint;
+  monotonic: bigint;
   readonly slept: { count: number };
   release: (() => void) | undefined;
 };
@@ -99,16 +99,14 @@ function freshClock() {
   return { state, clock: clockFor(state) };
 }
 
-async function observe(effect: Effect.Effect<string, Rejected, Clock.Clock>, clock: Clock.Clock) {
+async function observe(effect: Effect.Effect<string, Rejected>, clock: Clock.Clock) {
   return Effect.runPromise(
     Effect.provideService(
       effect.pipe(
         Effect.map((value) => ({ failed: false, message: "", value })),
-        Effect.catch((error) => {
-          if (Schema.is(Rejected)(error))
-            return Effect.succeed({ failed: true, message: error.message, value: "" });
-          return Effect.fail(error);
-        }),
+        Effect.catch((error) =>
+          Effect.succeed({ failed: true, message: error.message, value: "" }),
+        ),
       ),
       Clock.Clock,
       clock,
@@ -159,7 +157,7 @@ test("a late success is discarded when the timeout sleep never wins", async () =
       started,
       Effect.callback((resume, signal) => {
         manual.state.release = () => {
-          if (signal.aborted === true) return;
+          if (signal.aborted) return;
           manual.state.wall = limit;
           manual.state.monotonic = limit;
           resume(Effect.succeed("late"));
@@ -181,7 +179,7 @@ test("wall movement during suspension expires the lease while monotonic time sta
       started,
       Effect.callback((resume, signal) => {
         manual.state.release = () => {
-          if (signal.aborted === true) return;
+          if (signal.aborted) return;
           manual.state.wall = limit;
           resume(Effect.succeed("suspended"));
         };
@@ -200,7 +198,7 @@ test("a backwards wall clock and a backwards monotonic clock reject the read", a
       started,
       Effect.callback((resume, signal) => {
         backwardsWall.state.release = () => {
-          if (signal.aborted === true) return;
+          if (signal.aborted) return;
           backwardsWall.state.wall = -1n;
           resume(Effect.succeed("backwards"));
         };
@@ -216,7 +214,7 @@ test("a backwards wall clock and a backwards monotonic clock reject the read", a
       started,
       Effect.callback((resume, signal) => {
         backwardsMonotonic.state.release = () => {
-          if (signal.aborted === true) return;
+          if (signal.aborted) return;
           backwardsMonotonic.state.monotonic = -1n;
           resume(Effect.succeed("backwards"));
         };

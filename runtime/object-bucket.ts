@@ -101,7 +101,7 @@ export class ObjectBucket implements Bucket {
       return null;
     }
     const result = objectBody(object.value, options.signal);
-    if (options.signal?.aborted) {
+    if (options.signal?.aborted === true) {
       await result.body.cancel();
       options.signal.throwIfAborted();
     }

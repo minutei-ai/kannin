@@ -21,12 +21,11 @@ function leaveTextWaiter(
   onAbort: () => void,
   abort: boolean,
 ) {
-  if (participation.active === false) return;
+  if (!participation.active) return;
   participation.active = false;
   signal.removeEventListener("abort", onAbort);
   shared.waiters.count -= 1;
-  if (abort === true && shared.waiters.count === 0 && shared.anchored.value === false)
-    shared.controller.abort();
+  if (abort && shared.waiters.count === 0 && !shared.anchored.value) shared.controller.abort();
 }
 
 function joinTextExecution(shared: SharedTextExecution, callerSignal?: AbortSignal) {
@@ -111,8 +110,8 @@ export class TextExecutions {
     const selected = { shared: pending };
     if (
       selected.shared !== undefined &&
-      selected.shared.controller.signal.aborted === true &&
-      selected.shared.settled.value === false
+      selected.shared.controller.signal.aborted &&
+      !selected.shared.settled.value
     ) {
       queries.delete(identity);
       if (queries.size === 0) this.roots.delete(root);

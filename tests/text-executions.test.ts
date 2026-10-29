@@ -185,18 +185,20 @@ test("an already aborted caller never starts a text producer", async () => {
   const reason = new Error("cancelled before ranking");
   const observed = { calls: 0 };
   caller.abort(reason);
-  await expect(
-    executions.evaluate(
-      root,
-      input,
-      new Headers(),
-      () => {
-        observed.calls += 1;
-        return Promise.resolve(rows);
-      },
-      caller.signal,
-    ),
-  ).rejects.toBe(reason);
+  expect(
+    await executions
+      .evaluate(
+        root,
+        input,
+        new Headers(),
+        () => {
+          observed.calls += 1;
+          return Promise.resolve(rows);
+        },
+        caller.signal,
+      )
+      .catch((cause: unknown) => cause),
+  ).toBe(reason);
   expect(observed.calls).toBe(0);
 });
 
@@ -204,18 +206,20 @@ test("a producer aborting its caller during startup is observed without an unhan
   const executions = new TextExecutions();
   const caller = new AbortController();
   const reason = new Error("caller aborted during startup");
-  await expect(
-    executions.evaluate(
-      root,
-      input,
-      new Headers(),
-      () => {
-        caller.abort(reason);
-        return Promise.reject(new Error("producer stopped"));
-      },
-      caller.signal,
-    ),
-  ).rejects.toBe(reason);
+  expect(
+    await executions
+      .evaluate(
+        root,
+        input,
+        new Headers(),
+        () => {
+          caller.abort(reason);
+          return Promise.reject(new Error("producer stopped"));
+        },
+        caller.signal,
+      )
+      .catch((cause: unknown) => cause),
+  ).toBe(reason);
 });
 
 test("one of two waiters aborting leaves the shared ranking running", async () => {
@@ -254,7 +258,7 @@ test("aborting the last waiter interrupts a nested Effect runtime", async () => 
         yield* Effect.sync(() => {
           entered.resolve();
         });
-        yield* Effect.never.pipe(
+        return yield* Effect.never.pipe(
           Effect.ensuring(
             Effect.sync(() => {
               interrupted.value = true;

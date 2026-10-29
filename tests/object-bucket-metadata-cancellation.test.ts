@@ -23,7 +23,7 @@ test("head, list and conditional reads cancel blocked metadata work", async () =
         remove: () => Effect.die("Unexpected remove"),
       }),
     );
-    const pending = {
+    const operations = {
       head: () => bucket.head("fixture", controller.signal),
       list: () => bucket.list({ signal: controller.signal }),
       conditional: () =>
@@ -31,12 +31,11 @@ test("head, list and conditional reads cancel blocked metadata work", async () =
           onlyIf: { etagMatches: "fixture-etag" },
           signal: controller.signal,
         }),
-    }
-      [operation]()
-      .then(
-        () => "resolved",
-        () => "rejected",
-      );
+    };
+    const pending = operations[operation]().then(
+      () => "resolved",
+      () => "rejected",
+    );
     await Effect.runPromise(Deferred.await(entered).pipe(Effect.timeout("1 second")));
     controller.abort();
     expect(await pending).toBe("rejected");
@@ -62,13 +61,19 @@ test("pre-aborted metadata operations never enter the backend", async () => {
       remove: unexpected,
     }),
   );
-  await expect(bucket.head("fixture", controller.signal)).rejects.toBe(reason);
-  await expect(bucket.list({ signal: controller.signal })).rejects.toBe(reason);
-  await expect(
-    bucket.get("fixture", {
-      onlyIf: { etagMatches: "fixture-etag" },
-      signal: controller.signal,
-    }),
-  ).rejects.toBe(reason);
+  expect(await bucket.head("fixture", controller.signal).catch((cause: unknown) => cause)).toBe(
+    reason,
+  );
+  expect(await bucket.list({ signal: controller.signal }).catch((cause: unknown) => cause)).toBe(
+    reason,
+  );
+  expect(
+    await bucket
+      .get("fixture", {
+        onlyIf: { etagMatches: "fixture-etag" },
+        signal: controller.signal,
+      })
+      .catch((cause: unknown) => cause),
+  ).toBe(reason);
   expect(calls.count).toBe(0);
 });

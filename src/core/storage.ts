@@ -115,6 +115,11 @@ function documentReadConcurrency(pages: ReadonlyArray<typeof DataRange.Type>) {
   return 4;
 }
 
+function rangeSignal(outer: AbortSignal | undefined, fiber: AbortSignal) {
+  if (outer === undefined) return fiber;
+  return AbortSignal.any([outer, fiber]);
+}
+
 export function createStorage(runtime: SearchRuntime) {
   const env = runtime.env;
   const caches = runtime.cache;
@@ -725,11 +730,6 @@ export function createStorage(runtime: SearchRuntime) {
     return published;
   }
 
-  function rangeSignal(outer: AbortSignal | undefined, fiber: AbortSignal) {
-    if (outer === undefined) return fiber;
-    return AbortSignal.any([outer, fiber]);
-  }
-
   function leaveRangeWaiter(
     shared: RangeAcquisition,
     signal: AbortSignal,
@@ -737,12 +737,11 @@ export function createStorage(runtime: SearchRuntime) {
     onAbort: () => void,
     abort: boolean,
   ) {
-    if (participation.active === false) return;
+    if (!participation.active) return;
     participation.active = false;
     signal.removeEventListener("abort", onAbort);
     shared.waiters.count -= 1;
-    if (abort === true && shared.waiters.count === 0 && shared.anchored.value === false)
-      shared.controller.abort();
+    if (abort && shared.waiters.count === 0 && !shared.anchored.value) shared.controller.abort();
   }
 
   function bindRangeWaiter(shared: RangeAcquisition, signal: AbortSignal | undefined) {
@@ -806,7 +805,7 @@ export function createStorage(runtime: SearchRuntime) {
     if (compressedDirectory) noteDirectoryRequest(cacheKey);
     const pendingKey = `${cacheKey}/${retain}`;
     const pending = pendingRanges.get(pendingKey);
-    if (pending !== undefined && pending.controller.signal.aborted === false)
+    if (pending !== undefined && !pending.controller.signal.aborted)
       return bindRangeWaiter(pending, signal);
     if (pending !== undefined) pendingRanges.delete(pendingKey);
     const shared: RangeAcquisition = {
@@ -833,8 +832,10 @@ export function createStorage(runtime: SearchRuntime) {
         );
       reads.rangeReads += 1;
       const cachedRead = Effect.tryPromise({
-        try: async (signal) => {
-          const response = await runtime.segments({ props }).fetch(url, { signal, headers });
+        try: async (cacheSignal) => {
+          const response = await runtime
+            .segments({ props })
+            .fetch(url, { signal: cacheSignal, headers });
           const status = response.headers.get("cf-cache-status");
           if (status === "HIT") reads.workerCacheHits += 1;
           else if (status === "MISS") reads.workerCacheMisses += 1;
@@ -850,10 +851,10 @@ export function createStorage(runtime: SearchRuntime) {
               upstreamRay: response.headers.get("cf-ray"),
             });
           const bytes = new Uint8Array(await response.arrayBuffer());
-          signal.throwIfAborted();
+          cacheSignal.throwIfAborted();
           if (compressedDirectory) {
             const fingerprint = await crypto.subtle.digest("SHA-256", bytes);
-            signal.throwIfAborted();
+            cacheSignal.throwIfAborted();
             const active = activeDirectories.get(cacheKey);
             const known = active?.fingerprint;
             const digest = new Uint8Array(fingerprint);
@@ -2485,9 +2486,8 @@ export function createStorage(runtime: SearchRuntime) {
                 const bodyAt = yield* Clock.currentTimeNanos;
                 const text = yield* Effect.tryPromise({
                   try: (fiberSignal) => {
-                    const selected = rangeSignal(signal, fiberSignal);
-                    if (selected.aborted === true)
-                      return Promise.reject(new Error("All fibers interrupted without error"));
+                    const bodySignal = rangeSignal(signal, fiberSignal);
+                    bodySignal.throwIfAborted();
                     return response.text();
                   },
                   catch: (cause) => {

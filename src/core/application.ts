@@ -164,6 +164,18 @@ function excludesPhrase(
   return false;
 }
 
+function queryRangeSignal(outer: AbortSignal | undefined, fiber: AbortSignal) {
+  if (outer === undefined) return fiber;
+  return AbortSignal.any([outer, fiber]);
+}
+
+function runQueryEffect<A, E>(effect: Effect.Effect<A, E>, signal?: AbortSignal) {
+  signal?.throwIfAborted();
+  const options: { value: { readonly signal: AbortSignal } | undefined } = { value: undefined };
+  if (signal !== undefined) options.value = { signal };
+  return Effect.runPromise(effect, options.value);
+}
+
 export function createApplication(runtime: SearchRuntime, searchStorage: Storage) {
   const workerEnv = runtime.env;
   const caches = runtime.cache;
@@ -773,18 +785,6 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
     if (encodedFilters.length <= 512)
       rootEligibilityMinimums.set(model, new Map([[encodedFilters, minimum]]));
     return minimum;
-  }
-
-  function queryRangeSignal(outer: AbortSignal | undefined, fiber: AbortSignal) {
-    if (outer === undefined) return fiber;
-    return AbortSignal.any([outer, fiber]);
-  }
-
-  function runQueryEffect<A, E>(effect: Effect.Effect<A, E>, signal?: AbortSignal) {
-    signal?.throwIfAborted();
-    const options: { value: { readonly signal: AbortSignal } | undefined } = { value: undefined };
-    if (signal !== undefined) options.value = { signal };
-    return Effect.runPromise(effect, options.value);
   }
 
   async function rankText(

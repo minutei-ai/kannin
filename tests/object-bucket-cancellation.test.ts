@@ -20,6 +20,7 @@ const metadata: StoredObject["metadata"] = {
   etag: "fixture-etag",
   size: 1,
   uploaded: new Date(0),
+  customMetadata: {},
 };
 function observe(pending: Promise<unknown>) {
   return pending.then(
@@ -64,9 +65,7 @@ test("bucket cancellation stops streaming bodies and rejects partial text and by
       ),
       Stream.ensuring(Deferred.succeed(stopped, undefined)),
     );
-    const bucket = new ObjectBucket(
-      storeWith(() => Effect.succeed(Option.some({ metadata, body }))),
-    );
+    const bucket = new ObjectBucket(storeWith(() => Effect.succeedSome({ metadata, body })));
     const object = await bucket.get("fixture", { signal: controller.signal });
     if (object === null) throw new Error("Missing body fixture");
     const pending = observe(object[method]());
@@ -94,7 +93,9 @@ test("already cancelled bucket reads perform no backend work", async () => {
   const controller = new AbortController();
   const reason = new Error("cancelled before admission");
   controller.abort(reason);
-  await expect(bucket.get("fixture", { signal: controller.signal })).rejects.toBe(reason);
+  expect(
+    await bucket.get("fixture", { signal: controller.signal }).catch((cause: unknown) => cause),
+  ).toBe(reason);
   expect(reads.count).toBe(0);
 });
 
@@ -102,6 +103,6 @@ test("native object-store failures preserve their identity at the bucket boundar
   const cause = new DOMException("backend transport aborted", "AbortError");
   const failure = new ObjectStoreFailure({ operation: "read", key: "fixture", cause });
   const bucket = new ObjectBucket(storeWith(() => Effect.fail(failure)));
-  await expect(bucket.get("fixture")).rejects.toBe(failure);
+  expect(await bucket.get("fixture").catch((cause: unknown) => cause)).toBe(failure);
   expect(failure.cause).toBe(cause);
 });

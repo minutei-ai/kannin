@@ -63,6 +63,31 @@ test("same OCI API image runs on Podman and Docker Engine with canonical state a
               );
               expect(written.status).toBe(200);
               yield* Effect.tryPromise(() => written.arrayBuffer());
+              const typedIds = ["2", "10", "18446744073709551615"].map((value) => ({
+                kind: "uint" as const,
+                value,
+              }));
+              const typedWritten = yield* Effect.tryPromise(() =>
+                fetch(`${api.endpoint}/v1/namespaces/${namespace}-typed/write`, {
+                  method: "POST",
+                  headers,
+                  body: JSON.stringify({
+                    kind: "canonical",
+                    idType: "uint",
+                    requestId: "typed-container-write",
+                    schema: { filterable: [], vectorFilterFields: [], vectorDimensions: 2 },
+                    upserts: typedIds.toReversed().map((id) => ({
+                      id,
+                      roles: { title: "", text: "typed durable identity" },
+                      attributes: {},
+                      vector: [1, 0],
+                    })),
+                    deletes: [],
+                  }),
+                }),
+              );
+              expect(typedWritten.status).toBe(200);
+              yield* Effect.tryPromise(() => typedWritten.arrayBuffer());
               yield* api.restart;
               const response = yield* Effect.tryPromise(() =>
                 fetch(`${api.endpoint}/v1/namespaces/${namespace}/query`, {
@@ -104,6 +129,25 @@ test("same OCI API image runs on Podman and Docker Engine with canonical state a
               expect(vectors.consistency).toBe("strong");
               expect(vectors.rows.map((row) => row.id)).toEqual(["one"]);
               expect(vectors.rows[0]?.score).toBeCloseTo(1);
+              for (const query of [
+                { kind: "text", text: "identity" },
+                { kind: "vector", vector: [1, 0] },
+              ]) {
+                const typedResponse = yield* Effect.tryPromise(() =>
+                  fetch(`${api.endpoint}/v1/namespaces/${namespace}-typed/query`, {
+                    method: "POST",
+                    headers,
+                    body: JSON.stringify({ ...query, topK: 3, filters: [], minimumSequence: 1 }),
+                  }),
+                );
+                expect(typedResponse.status).toBe(200);
+                const typedRows = yield* Effect.tryPromise(() => typedResponse.json()).pipe(
+                  Effect.flatMap(Schema.decodeUnknownEffect(QueryResult)),
+                );
+                expect(typedRows.consistency).toBe("strong");
+                expect(typedRows.sequence).toBe(1);
+                expect(typedRows.rows.map((row) => row.id)).toEqual(typedIds);
+              }
             }),
           );
         }

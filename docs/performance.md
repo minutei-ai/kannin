@@ -28,19 +28,19 @@ The prepared Docker driver reuses the OCI API image, S3 fixture and Varnish fixt
 
 Cold numbers are medians of three first-query samples, excluding startup/shutdown. Warm numbers are p50/p95 of fifty reads after five warmups. There is no cold-tail claim.
 
-| Query | workerd cold ms | workerd empty Cache API ms | Docker cold ms | workerd warm p50/p95 ms | Docker warm p50/p95 ms |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| rare | 68.57 | 80.94 | 70.20 | 2.60 / 3.51 | 4.57 / 50.63 |
-| selective | 101.42 | 127.61 | 114.48 | 3.16 / 4.40 | 4.82 / 60.58 |
-| common | 45.48 | 55.43 | 41.89 | 2.47 / 3.01 | 5.20 / 65.16 |
-| filtered | 73.37 | 82.79 | 70.57 | 3.27 / 4.71 | 5.26 / 66.36 |
-| common-all | 45.94 | 54.59 | 42.29 | 2.21 / 3.14 | 4.75 / 58.79 |
-| common-phrase | 68.71 | 75.08 | 63.52 | 2.58 / 3.82 | 5.12 / 62.15 |
-| filtered-all | 79.84 | 88.42 | 66.50 | 3.15 / 4.49 | 4.89 / 62.49 |
-| filtered-phrase | 78.78 | 92.93 | 114.26 | 3.60 / 5.08 | 5.79 / 61.23 |
-| rare-64-terms | 79.75 | 97.45 | 84.96 | 3.29 / 4.86 | 5.72 / 68.01 |
-| rare-256-terms | 103.22 | 113.74 | 102.46 | 5.16 / 6.44 | 7.47 / 59.78 |
-| rare-512-terms | 123.92 | 142.75 | 211.15 | 8.67 / 11.61 | 11.85 / 48.59 |
+| Query           | workerd cold ms | workerd empty Cache API ms | Docker cold ms | workerd warm p50/p95 ms | Docker warm p50/p95 ms |
+| --------------- | --------------: | -------------------------: | -------------: | ----------------------: | ---------------------: |
+| rare            |           68.57 |                      80.94 |          70.20 |             2.60 / 3.51 |           4.57 / 50.63 |
+| selective       |          101.42 |                     127.61 |         114.48 |             3.16 / 4.40 |           4.82 / 60.58 |
+| common          |           45.48 |                      55.43 |          41.89 |             2.47 / 3.01 |           5.20 / 65.16 |
+| filtered        |           73.37 |                      82.79 |          70.57 |             3.27 / 4.71 |           5.26 / 66.36 |
+| common-all      |           45.94 |                      54.59 |          42.29 |             2.21 / 3.14 |           4.75 / 58.79 |
+| common-phrase   |           68.71 |                      75.08 |          63.52 |             2.58 / 3.82 |           5.12 / 62.15 |
+| filtered-all    |           79.84 |                      88.42 |          66.50 |             3.15 / 4.49 |           4.89 / 62.49 |
+| filtered-phrase |           78.78 |                      92.93 |         114.26 |             3.60 / 5.08 |           5.79 / 61.23 |
+| rare-64-terms   |           79.75 |                      97.45 |          84.96 |             3.29 / 4.86 |           5.72 / 68.01 |
+| rare-256-terms  |          103.22 |                     113.74 |         102.46 |             5.16 / 6.44 |           7.47 / 59.78 |
+| rare-512-terms  |          123.92 |                     142.75 |         211.15 |            8.67 / 11.61 |          11.85 / 48.59 |
 
 The runner reported AMD EPYC 7763 and four available logical CPUs. workerd inherited runner limits; the Docker API had 1 CPU/512 MiB, RustFS 1 CPU/512 MiB and Varnish 0.5 CPU/512 MiB, all without swap. Resource budgets are unequal. These are descriptive observations of two local arrangements, not a platform ranking or performance-parity proof. The cause of the Docker warm-tail observations has not been established.
 

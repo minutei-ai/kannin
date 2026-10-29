@@ -1,6 +1,7 @@
 import * as Alchemy from "alchemy";
 import * as Railway from "@alchemy.run/railway";
 import * as Output from "alchemy/Output";
+import * as RemovalPolicy from "alchemy/RemovalPolicy";
 import { Config, Effect, Schema } from "effect";
 import { join } from "node:path";
 import { S3StoreConfig } from "../src/protocol";
@@ -20,14 +21,16 @@ export default () =>
     "KanninRailway",
     { providers: Railway.providers(), state: Alchemy.localState() },
     Effect.gen(function* () {
-      const project = yield* Railway.Project("PortableProject");
+      const project = yield* Railway.Project("PortableProject").pipe(RemovalPolicy.retain());
       const storage = yield* Config.Literals(
         ["external", "managed"],
         "KANNIN_RAILWAY_STORAGE",
       ).pipe(Config.withDefault("external"));
       const environment = yield* Effect.gen(function* () {
         if (storage === "external") return yield* portableEnvironment;
-        const bucket = yield* Railway.Bucket("CanonicalStorage", { project });
+        const bucket = yield* Railway.Bucket("CanonicalStorage", { project }).pipe(
+          RemovalPolicy.retain(),
+        );
         const serviceEnvironment = yield* portableServiceEnvironment;
         return Output.map(Output.of(bucket), (ready) => {
           const configured = decodeManagedStorage({

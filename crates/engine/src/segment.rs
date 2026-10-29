@@ -5722,7 +5722,7 @@ pub mod wasm {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct FieldBuildDto {
-        documents: Vec<super::CanonicalDocumentDto>,
+        documents: Vec<CanonicalDocumentDto>,
         text_fields: Vec<NamedFieldDto>,
         #[serde(default)]
         #[serde(deserialize_with = "deserialize_nonnull_option")]

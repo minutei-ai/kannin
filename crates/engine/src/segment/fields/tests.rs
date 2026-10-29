@@ -1373,6 +1373,13 @@ fn invalid_field_statistics_fail_closed() -> Result<(), String> {
         fail(&vector)?,
         "Statistics do not match the selected text fields"
     );
+    Ok(())
+}
+
+#[test]
+fn invalid_local_statistics_queries_fail_closed() -> Result<(), String> {
+    let field = [tags("tags")];
+    let built = mixed_segment(mixed_documents(8))?;
     assert_eq!(
         rejection(local_field_statistics(&built, &field, "fox", "nope", &[]))?,
         "Unknown match mode"

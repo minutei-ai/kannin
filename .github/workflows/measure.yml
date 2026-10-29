@@ -32,6 +32,9 @@ jobs:
             '.head_sha == $sha and .conclusion == "success" and .status == "completed" and .path == ".github/workflows/check.yml"' \
             "$RUNNER_TEMP/gate.json"
           gh run download "$GATE_RUN" --name worker --dir dist
+          jq --exit-status --arg sha "$GITHUB_SHA" \
+            --arg tree "$(git rev-parse 'HEAD^{tree}')" --arg run "$GATE_RUN" \
+            '.commit == $sha and .tree == $tree and .run == $run' dist/validation.json
           test -s dist/worker/worker.js
           test -s dist/worker/raio_engine_bg.wasm
           test -s dist/server/main.js
@@ -61,5 +64,6 @@ jobs:
             ${{ runner.temp }}/warm.json
             ${{ runner.temp }}/docker.json
             ${{ runner.temp }}/gate.json
+            dist/validation.json
           if-no-files-found: error
           retention-days: 1

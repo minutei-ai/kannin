@@ -41,6 +41,7 @@ import type {
 import {
   compareFieldNames,
   CanonicalId,
+  BloomValue,
   canonicalIdKey,
   compareCanonicalIds,
   canonicalToQueryRow,
@@ -80,6 +81,12 @@ import type { BackgroundContext, ObjectCondition, SearchRuntime } from "../platf
 
 function bloom(values: ReadonlyArray<typeof CanonicalId.Type>) {
   return segment_bloom(Schema.encodeSync(Schema.fromJsonString(Schema.Array(CanonicalId)))(values));
+}
+
+function termBloom(values: readonly string[]) {
+  return segment_bloom(
+    Schema.encodeSync(Schema.fromJsonString(Schema.Array(Schema.String)))(values),
+  );
 }
 
 function bloomOffsets(rows: ReadonlyArray<Uint8Array>) {
@@ -3185,7 +3192,7 @@ export function createStorage(runtime: SearchRuntime) {
   });
 
   const bloomFilterResult = Schema.decodeSync(
-    Schema.fromJsonString(Schema.Array(Schema.Array(CanonicalId))),
+    Schema.fromJsonString(Schema.Array(Schema.Array(BloomValue))),
   );
 
   const bloomColumnCacheKey = (descriptor: typeof BloomPack.Type, field: "document" | "term") => {
@@ -3374,9 +3381,13 @@ export function createStorage(runtime: SearchRuntime) {
     start: number = 0,
     count: number = root.segments.length,
   ) {
-    const input = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Array(CanonicalId)))(
-      values,
-    );
+    const input = yield* Effect.gen(function* () {
+      if (field === "document")
+        return yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Array(CanonicalId)))(values);
+      const terms = yield* Schema.decodeUnknownEffect(Schema.Array(Schema.String))(values);
+      return yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Array(Schema.String)))(terms);
+    });
+    const originals = new Map(values.map((value) => [canonicalIdKey(value), value]));
     const selectedSegments = root.segments.slice(start, start + count);
     const selected: Array<ReadonlyArray<typeof CanonicalId.Type> | undefined> = Array.from(
       { length: selectedSegments.length },
@@ -3435,7 +3446,7 @@ export function createStorage(runtime: SearchRuntime) {
       if (rows === undefined)
         return Effect.fail(new Rejected({ status: 503, message: "Bloom batch omitted a segment" }));
       return Effect.forEach(rows, (id) => {
-        const original = values.find((value) => canonicalIdKey(value) === canonicalIdKey(id));
+        const original = originals.get(canonicalIdKey(id));
         if (original === undefined)
           return Effect.fail(
             new Rejected({ status: 503, message: "Bloom returned an unrequested identity" }),
@@ -4153,6 +4164,7 @@ export function createStorage(runtime: SearchRuntime) {
     rebuildEligibility,
     rebuildCommonProjection,
     bloom,
+    termBloom,
     pruneBloomPacks,
     packBloomRoot,
     appendBloomSegment,

@@ -204,6 +204,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
     storeSegmentCaches,
     warmTermBatch,
     bloom,
+    termBloom,
     bloomCandidates,
     appendBloomSegment,
     packBloomRoot,
@@ -2603,6 +2604,14 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       if ((current.manifest.idType ?? "string") !== idType && current.manifest.sequence > 0)
         throw new Rejected({ status: 409, message: "Namespace ID type cannot change" });
       if (
+        canonical &&
+        current.manifest.sequence > 0 &&
+        ids.length === 0 &&
+        input.schema === undefined &&
+        input.reset !== true
+      )
+        throw new Rejected({ status: 400, message: "Empty write" });
+      if (
         input.schema !== undefined &&
         current.manifest.schema !== undefined &&
         input.reset !== true
@@ -2753,7 +2762,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
               projected.manifest,
               metadata,
               bloom(built.header.documents.map((document) => document.id)),
-              bloom(Object.keys(built.header.terms)),
+              termBloom(Object.keys(built.header.terms)),
             ),
           );
           return stored;
@@ -3246,7 +3255,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
               removedFrequencies: {},
             },
             bloom(built.header.documents.map((document) => document.id)),
-            bloom(Object.keys(built.header.terms)),
+            termBloom(Object.keys(built.header.terms)),
           ),
         );
       }

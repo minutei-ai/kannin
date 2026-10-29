@@ -62,6 +62,22 @@ test("typed identities survive the real object-store writer, restart, ranking an
           documents: 0,
           segments: [],
         });
+        const emptyRetry = yield* Effect.tryPromise(() =>
+          first.fetch(request("typed-empty-policy", "write", emptyPolicy)),
+        );
+        expect(emptyRetry.status).toBe(200);
+        yield* Effect.tryPromise(() => emptyRetry.arrayBuffer());
+        const repeatedEmpty = yield* Effect.tryPromise(() =>
+          first.fetch(
+            request("typed-empty-policy", "write", { ...emptyPolicy, requestId: "no-op" }),
+          ),
+        );
+        expect(repeatedEmpty.status).toBe(400);
+        yield* Effect.tryPromise(() => repeatedEmpty.arrayBuffer());
+        const unchangedEmpty = yield* Effect.tryPromise(() =>
+          bucket.get("namespaces/typed-empty-policy/root.json"),
+        );
+        expect(unchangedEmpty?.etag).toBe(emptyObject.etag);
         const changedPolicy = yield* Effect.tryPromise(() =>
           first.fetch(
             request("typed-empty-policy", "write", {

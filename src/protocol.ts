@@ -318,6 +318,7 @@ export const CanonicalId = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("uint"), value: CanonicalUintIdValue }),
   Schema.Struct({ kind: Schema.Literal("uuid"), value: CanonicalUuidIdValue }),
 ]);
+export const BloomValue = Schema.Union([Schema.String, CanonicalId]);
 export const IdType = Schema.Literals(["string", "uint", "uuid"]);
 export function canonicalIdType(id: typeof CanonicalId.Type): typeof IdType.Type {
   if (typeof id === "string") return "string";
@@ -1157,11 +1158,13 @@ export const StoredRoot = LegacyStoredRootV6.mapFields((fields) => ({
   idType: Schema.optional(IdType),
   commonTermDictionaries: Schema.Array(CommonTerms),
   segments: Schema.Array(
-    fields.segments.value.mapFields((segment) => ({
-      ...segment,
-      minimumId: CanonicalId,
-      commonLeaders: Schema.optional(CommonLeaders),
-    })),
+    fields.segments.value
+      .mapFields((segment) => ({
+        ...segment,
+        minimumId: CanonicalId,
+        commonLeaders: Schema.optional(CommonLeaders),
+      }))
+      .check(Schema.makeFilter(validMetadataBoundary)),
   ),
 })).check(
   Schema.makeFilter(validStoredRootMetadata),

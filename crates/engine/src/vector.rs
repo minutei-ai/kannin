@@ -1,3 +1,5 @@
+use crate::segment::{DocumentId, DocumentIdRef, decode_document_id};
+
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
@@ -35,7 +37,7 @@ pub struct VectorRanker {
     query: VectorQuery,
     scoring: Scoring,
     limit: usize,
-    hits: Vec<(String, f64)>,
+    hits: Vec<(DocumentId, f64)>,
 }
 
 impl VectorRanker {
@@ -76,6 +78,16 @@ impl VectorRanker {
         if key.is_empty() || key.len() > 512 {
             return Err("Vector candidate key exceeds its byte budget".into());
         }
+        self.offer_identity(DocumentId::String(key), values)
+    }
+
+    #[doc = "# Errors\nRejects malformed canonical ID JSON, invalid native ID bounds, candidate vectors or duplicate retained identities."]
+    pub fn try_push_id(&mut self, encoded_id: &str, values: &[f32]) -> Result<bool, String> {
+        let id = decode_document_id(encoded_id)?;
+        self.offer_identity(id.borrowed(), values)
+    }
+
+    fn offer_identity(&mut self, key: DocumentIdRef<'_>, values: &[f32]) -> Result<bool, String> {
         let score = match self.scoring {
             Scoring::NativeCosineSimilarity => self.query.cosine(values)?,
             Scoring::Distance(DistanceMetric::CosineDistance) => 1.0 - self.query.cosine(values)?,
@@ -83,7 +95,11 @@ impl VectorRanker {
                 self.query.squared_euclidean(values)?
             }
         };
-        if self.hits.iter().any(|(existing, _)| existing == key) {
+        if self
+            .hits
+            .iter()
+            .any(|(existing, _)| existing.borrowed() == key)
+        {
             return Err("Vector candidate key is already retained".into());
         }
         let position = self.hits.partition_point(|(existing_key, existing_score)| {
@@ -107,6 +123,39 @@ impl VectorRanker {
 
     #[doc = "# Errors\nRejects corrupt frames, wrong dimensions, invalid vectors or duplicate retained keys. Returns the key the caller should discard, if any."]
     pub fn offer_frame(&mut self, key: &str, frame: &[u8]) -> Result<Option<String>, String> {
+        if key.is_empty() || key.len() > 512 {
+            return Err("Vector candidate key exceeds its byte budget".into());
+        }
+        for (id, _) in &self.hits {
+            id.native_str()?;
+        }
+        self.offer_frame_identity(DocumentId::String(key), frame)?
+            .map(|id| id.native_str().map(str::to_owned))
+            .transpose()
+    }
+
+    #[doc = "# Errors\nRejects malformed canonical ID JSON, invalid native ID bounds, corrupt frames, invalid vectors or duplicate retained identities. Discarded IDs use canonical JSON."]
+    pub fn try_push_frame_id(
+        &mut self,
+        encoded_id: &str,
+        frame: &[u8],
+    ) -> Result<Option<String>, String> {
+        let id = decode_document_id(encoded_id)?;
+        if self.hits.iter().any(|(id, _)| !id.is_valid()) {
+            return Err(
+                "Retained opaque keys cannot be projected as canonical document IDs".into(),
+            );
+        }
+        self.offer_frame_identity(id.borrowed(), frame)?
+            .map(|id| serde_json::to_string(&id).map_err(|cause| cause.to_string()))
+            .transpose()
+    }
+
+    fn offer_frame_identity(
+        &mut self,
+        key: DocumentIdRef<'_>,
+        frame: &[u8],
+    ) -> Result<Option<DocumentId>, String> {
         let expected = self.query.values.len() * size_of::<f32>();
         let declared = frame.get(..4).ok_or("Truncated vector frame")?;
         let declared = u32::from_le_bytes(
@@ -133,16 +182,35 @@ impl VectorRanker {
         } else {
             None
         };
-        if self.offer(key, &values)? {
+        if self.offer_identity(key, &values)? {
             Ok(discarded)
         } else {
             Ok(Some(key.to_owned()))
         }
     }
 
+    #[doc = "Returns retained canonical identities and scores in ranking order. Historical string-only callers can use native_results for a checked projection."]
     #[must_use]
-    pub fn results(&self) -> &[(String, f64)] {
+    pub fn results(&self) -> &[(DocumentId, f64)] {
         &self.hits
+    }
+
+    #[doc = "# Errors\nRejects typed identities at the historical opaque-string result adapter."]
+    pub fn native_results(&self) -> Result<Vec<(String, f64)>, String> {
+        self.hits
+            .iter()
+            .map(|(id, score)| Ok((id.native_str()?.to_owned(), *score)))
+            .collect()
+    }
+
+    #[doc = "# Errors\nRejects opaque string keys outside canonical ID bounds or result serialization failures."]
+    pub fn try_finish_ids(&self) -> Result<String, String> {
+        if self.hits.iter().any(|(id, _)| !id.is_valid()) {
+            return Err(
+                "Retained opaque keys cannot be projected as canonical document IDs".into(),
+            );
+        }
+        serde_json::to_string(self.results()).map_err(|cause| cause.to_string())
     }
 }
 
@@ -167,9 +235,28 @@ impl VectorRanker {
             .map_err(|cause| JsValue::from_str(&cause))
     }
 
-    #[doc = "# Errors\nRejects result serialization failures."]
+    #[doc = "# Errors\nRejects malformed canonical IDs, invalid ID bounds, corrupt frames, invalid vectors or duplicate retained identities. Discarded IDs are canonical JSON."]
+    pub fn push_frame_id(
+        &mut self,
+        encoded_id: &str,
+        frame: &[u8],
+    ) -> Result<Option<String>, JsValue> {
+        self.try_push_frame_id(encoded_id, frame)
+            .map_err(|cause| JsValue::from_str(&cause))
+    }
+
+    #[doc = "# Errors\nRejects opaque string keys outside canonical ID bounds or result serialization failures."]
+    pub fn finish_ids(&self) -> Result<String, JsValue> {
+        self.try_finish_ids()
+            .map_err(|cause| JsValue::from_str(&cause))
+    }
+
+    #[doc = "# Errors\nRejects typed identities or result serialization failures at the historical string adapter."]
     pub fn finish(&self) -> Result<String, JsValue> {
-        serde_json::to_string(self.results()).map_err(|cause| JsValue::from_str(&cause.to_string()))
+        let results = self
+            .native_results()
+            .map_err(|cause| JsValue::from_str(&cause))?;
+        serde_json::to_string(&results).map_err(|cause| JsValue::from_str(&cause.to_string()))
     }
 }
 
@@ -295,7 +382,7 @@ mod tests {
             ranker.offer_frame("c", &frame(&[1.0, 0.0])?)?,
             Some("c".into())
         );
-        let original = ranker.results().to_vec();
+        let original = ranker.native_results()?;
         let mut corrupt = frame(&[1.0, 0.0])?;
         corrupt[4] ^= 1;
         for invalid in [
@@ -305,7 +392,7 @@ mod tests {
             vec![255; 4],
         ] {
             assert!(ranker.offer_frame("invalid", &invalid).is_err());
-            assert_eq!(ranker.results(), original);
+            assert_eq!(ranker.native_results()?, original);
         }
         Ok(())
     }
@@ -320,7 +407,7 @@ mod tests {
         assert!(ranker.offer("3", &[1.0, 0.0])?);
         assert_eq!(
             ranker
-                .results()
+                .native_results()?
                 .iter()
                 .map(|(key, _)| key.as_str())
                 .collect::<Vec<_>>(),
@@ -328,7 +415,7 @@ mod tests {
         );
         assert!(
             ranker
-                .results()
+                .native_results()?
                 .iter()
                 .all(|(_, score)| (*score - 1.0).abs() < 1.0e-12)
         );
@@ -346,7 +433,7 @@ mod tests {
         }
         assert_eq!(
             ranker
-                .results()
+                .native_results()?
                 .iter()
                 .map(|(key, _)| key.as_str())
                 .collect::<Vec<_>>(),
@@ -412,7 +499,7 @@ mod tests {
             native.offer(key, &vector)?;
         }
         assert_eq!(
-            distance.results(),
+            distance.native_results()?,
             [
                 ("parallel".into(), 0.0),
                 ("orthogonal".into(), 1.0),
@@ -420,7 +507,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            native.results(),
+            native.native_results()?,
             [
                 ("parallel".into(), 1.0),
                 ("orthogonal".into(), 0.0),
@@ -442,7 +529,7 @@ mod tests {
             ranker.offer_frame(key, &frame(&vector)?)?;
         }
         assert_eq!(
-            ranker.results(),
+            ranker.native_results()?,
             [
                 ("same".into(), 0.0),
                 ("origin".into(), 25.0),
@@ -452,7 +539,7 @@ mod tests {
         let mut origin =
             VectorRanker::try_new_for_distance(&[0.0, 0.0], 1, DistanceMetric::EuclideanSquared)?;
         origin.offer_frame("zero", &frame(&[0.0, 0.0])?)?;
-        assert_eq!(origin.results(), [("zero".into(), 0.0)]);
+        assert_eq!(origin.native_results()?, [("zero".into(), 0.0)]);
         assert!(
             VectorRanker::try_new_for_distance(&[0.0], 1, DistanceMetric::CosineDistance).is_err()
         );
@@ -511,8 +598,8 @@ mod tests {
             for (id, vector) in documents.iter().rev() {
                 reversed.offer_frame(id, &frame(vector)?)?;
             }
-            assert_eq!(forward.results(), &expected[..limit]);
-            assert_eq!(reversed.results(), &expected[..limit]);
+            assert_eq!(forward.native_results()?, &expected[..limit]);
+            assert_eq!(reversed.native_results()?, &expected[..limit]);
         }
         Ok(())
     }
@@ -525,7 +612,7 @@ mod tests {
         ] {
             let mut ranker = VectorRanker::try_new_for_distance(&[1.0, 0.0], 1, metric)?;
             ranker.offer_frame("retained", &frame(&[1.0, 0.0])?)?;
-            let expected = ranker.results().to_vec();
+            let expected = ranker.native_results()?;
             let mut corrupt = frame(&[1.0, 0.0])?;
             corrupt[4] ^= 1;
             for invalid in [
@@ -535,10 +622,10 @@ mod tests {
                 vec![255; 4],
             ] {
                 assert!(ranker.offer_frame("invalid", &invalid).is_err());
-                assert_eq!(ranker.results(), expected);
+                assert_eq!(ranker.native_results()?, expected);
             }
             assert!(ranker.offer("retained", &[1.0, 0.0]).is_err());
-            assert_eq!(ranker.results(), expected);
+            assert_eq!(ranker.native_results()?, expected);
             assert!(VectorRanker::try_new_for_distance(&[], 1, metric).is_err());
             assert!(VectorRanker::try_new_for_distance(&[f32::INFINITY], 1, metric).is_err());
             assert!(VectorRanker::try_new_for_distance(&[1.0], 0, metric).is_err());
@@ -562,12 +649,115 @@ mod tests {
             )?;
             ranker.offer("opposite", &[-value, -value])?;
             ranker.offer("same", &[value, value])?;
-            let results = ranker.results();
+            let results = ranker.native_results()?;
             assert_eq!(results[0], ("same".into(), 0.0));
             assert_eq!(results[1].0, "opposite");
             assert!(results[1].1.is_finite());
             assert!(results[1].1 > 0.0);
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod typed_id_tests {
+    use super::{DistanceMetric, VectorRanker};
+    use crate::segment::{DocumentId, append};
+    use serde_json::{Value, json};
+
+    fn frame() -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        append(&mut bytes, &1.0_f32.to_le_bytes())?;
+        Ok(bytes)
+    }
+
+    #[test]
+    fn canonical_vector_ties_use_exact_identity_order_for_every_metric()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let uuid = "00112233-4455-6677-8899-aabbccddeeff";
+        let values = [
+            json!({"kind":"uuid","value":uuid}),
+            json!({"kind":"uint","value":"10"}),
+            json!({"kind":"uint","value":"2"}),
+            json!(uuid),
+            json!("{\"kind\":\"uint\",\"value\":\"2\"}"),
+        ];
+        let expected = [
+            values[3].clone(),
+            values[4].clone(),
+            values[2].clone(),
+            values[1].clone(),
+            values[0].clone(),
+        ];
+        let mut rankers = [
+            VectorRanker::try_new(&[1.0], 5)?,
+            VectorRanker::try_new_for_distance(&[1.0], 5, DistanceMetric::CosineDistance)?,
+            VectorRanker::try_new_for_distance(&[1.0], 5, DistanceMetric::EuclideanSquared)?,
+        ];
+        for ranker in &mut rankers {
+            for id in &values {
+                assert!(ranker.try_push_id(&id.to_string(), &[1.0])?);
+            }
+            let results: Vec<(Value, f64)> = serde_json::from_str(&ranker.try_finish_ids()?)?;
+            assert_eq!(
+                results.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+                expected
+            );
+            assert!(ranker.native_results().is_err());
+            assert!(ranker.offer_frame("legacy", &frame()?).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_vector_frames_return_tagged_evictions_and_do_not_alias_raw_keys()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let two = json!({"kind":"uint","value":"2"}).to_string();
+        let ten = json!({"kind":"uint","value":"10"}).to_string();
+        let mut ranker = VectorRanker::try_new(&[1.0], 1)?;
+        assert_eq!(ranker.try_push_frame_id(&ten, &frame()?)?, None);
+        let discarded = ranker
+            .try_push_frame_id(&two, &frame()?)?
+            .ok_or("Missing typed eviction")?;
+        assert_eq!(
+            serde_json::from_str::<Value>(&discarded)?,
+            serde_json::from_str::<Value>(&ten)?
+        );
+        let discarded = ranker
+            .try_push_frame_id(&ten, &frame()?)?
+            .ok_or("Missing typed rejection")?;
+        assert_eq!(
+            serde_json::from_str::<Value>(&discarded)?,
+            serde_json::from_str::<Value>(&ten)?
+        );
+        assert_eq!(ranker.results()[0].0, DocumentId::<String>::Uint(2));
+        let mut mixed = VectorRanker::try_new(&[1.0], 3)?;
+        mixed.offer(&two, &[1.0])?;
+        mixed.try_push_frame_id(&two, &frame()?)?;
+        mixed.try_push_id(r#""2""#, &[1.0])?;
+        assert_eq!(mixed.results().len(), 3);
+        assert_eq!(mixed.results()[2].0, DocumentId::<String>::Uint(2));
+        let original = mixed.try_finish_ids()?;
+        for invalid in [
+            "2",
+            "not json",
+            r#"{"kind":"uint","value":"02"}"#,
+            r#"{"kind":"uint","value":2}"#,
+            r#"{"kind":"uuid","value":"invalid"}"#,
+            "\"\"",
+        ] {
+            assert!(mixed.try_push_frame_id(invalid, &frame()?).is_err());
+            assert_eq!(mixed.try_finish_ids()?, original);
+        }
+        let mut raw = VectorRanker::try_new(&[1.0], 1)?;
+        raw.offer(&"x".repeat(512), &[1.0])?;
+        assert!(raw.native_results().is_ok());
+        assert!(raw.try_finish_ids().is_err());
+        assert!(
+            raw.try_push_id(&serde_json::to_string(&"x".repeat(129))?, &[1.0])
+                .is_err()
+        );
+        assert!(raw.offer(&"x".repeat(513), &[1.0]).is_err());
         Ok(())
     }
 }

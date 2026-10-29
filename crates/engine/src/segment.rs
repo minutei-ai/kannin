@@ -47,6 +47,15 @@ pub(crate) fn compare_document_ids<'a, 'b>(
     ids::compare(left.into(), right.into())
 }
 
+#[doc = "# Errors\nRejects malformed canonical ID JSON, noncanonical integer/UUID tags or native string IDs outside 1..=128 UTF-16 code units."]
+pub(crate) fn decode_document_id(encoded: &str) -> Result<DocumentId, String> {
+    let id: DocumentId = serde_json::from_str(encoded).map_err(|cause| cause.to_string())?;
+    if !id.is_valid() {
+        return Err("Invalid canonical document ID".into());
+    }
+    Ok(id)
+}
+
 #[derive(Clone, Default)]
 struct FilterMasks {
     representatives: Option<(String, Box<[u16]>)>,
@@ -4824,6 +4833,16 @@ impl Search {
         self.posting_spans_cutoff(score, DocumentId::String(id), false)
     }
 
+    #[doc = "# Errors\nRejects malformed canonical IDs, invalid ID bounds or non-positive/non-finite cutoff scores."]
+    pub fn posting_spans_after_id(
+        &self,
+        score: f64,
+        encoded_id: &str,
+    ) -> Result<Vec<PostingSpan<'_>>, String> {
+        let id = decode_document_id(encoded_id)?;
+        self.posting_spans_cutoff(score, id.borrowed(), false)
+    }
+
     fn dense_cutoff(&self) -> Option<Hit> {
         if self.mode == "phrase" {
             return None;
@@ -9309,26 +9328,18 @@ pub mod wasm {
 
         #[doc = "# Errors\nRejects invalid cutoffs or posting span serialization errors."]
         pub fn posting_spans_after(&mut self, score: f64, id: &str) -> Result<String, JsValue> {
-            let spans = self
-                .search
-                .posting_spans_after(score, id)
-                .map_err(|cause| JsValue::from_str(&cause))?;
-            if !self.search.has_hot_selection(&spans) {
-                return serde_json::to_string(&spans)
-                    .map_err(|cause| JsValue::from_str(&cause.to_string()));
-            }
-            let selection = self
-                .search
-                .own_posting_selection(&spans)
-                .map_err(|cause| JsValue::from_str(&cause))?;
-            drop(spans);
-            let remaining = self
-                .search
-                .satisfy_hot_selection(selection)
-                .map_err(|cause| JsValue::from_str(&cause))?;
-            self.search
-                .encode_posting_selection(&remaining)
-                .map_err(|cause| JsValue::from_str(&cause))
+            self.encode_cutoff_spans(score, DocumentId::String(id))
+        }
+
+        #[doc = "# Errors\nRejects malformed canonical IDs, invalid ID bounds, invalid cutoffs or posting span serialization errors."]
+        pub fn posting_spans_after_id(
+            &mut self,
+            score: f64,
+            encoded_id: &str,
+        ) -> Result<String, JsValue> {
+            let id =
+                super::decode_document_id(encoded_id).map_err(|cause| JsValue::from_str(&cause))?;
+            self.encode_cutoff_spans(score, id.borrowed())
         }
 
         #[doc = "# Errors\nRejects unrequested terms, positional mode, invalid rows/positions, or unordered blocks."]
@@ -9383,6 +9394,33 @@ pub mod wasm {
     }
 
     impl Ranker {
+        fn encode_cutoff_spans(
+            &mut self,
+            score: f64,
+            id: DocumentIdRef<'_>,
+        ) -> Result<String, JsValue> {
+            let spans = self
+                .search
+                .posting_spans_cutoff(score, id, false)
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            if !self.search.has_hot_selection(&spans) {
+                return serde_json::to_string(&spans)
+                    .map_err(|cause| JsValue::from_str(&cause.to_string()));
+            }
+            let selection = self
+                .search
+                .own_posting_selection(&spans)
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            drop(spans);
+            let remaining = self
+                .search
+                .satisfy_hot_selection(selection)
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            self.search
+                .encode_posting_selection(&remaining)
+                .map_err(|cause| JsValue::from_str(&cause))
+        }
+
         fn encode_hits(&self, hits: &[super::Hit]) -> Result<String, JsValue> {
             let ranked: Vec<_> = hits
                 .iter()
@@ -13970,6 +14008,99 @@ mod typed_id_bloom_tests {
             built.header.documents.find_id(&tagged_wire),
             built.header.documents.find_id(&numbers[0])
         );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod typed_cutoff_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_cutoffs_share_exhaustive_ranking_and_never_alias_raw_json_strings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cutoff = serde_json::json!({"kind":"uint","value":"10"}).to_string();
+        let ids = [
+            DocumentId::<String>::String(cutoff.clone()),
+            DocumentId::Uint(2),
+            DocumentId::Uint(10),
+        ];
+        let documents = ids
+            .into_iter()
+            .map(|id| {
+                let mut document =
+                    Document::native("placeholder", 1, "", "shared", BTreeMap::new(), None);
+                document.id = id;
+                document
+            })
+            .collect();
+        let built = build(documents, None)?;
+        let (header, base) = parse_header(&built.bytes)?;
+        let statistics = Statistics {
+            documents: 3,
+            title_length: 0,
+            body_length: 3,
+            frequencies: BTreeMap::from([("shared".into(), 3)]),
+        };
+        let mut exhaustive = Search::new(
+            header.clone(),
+            statistics.clone(),
+            "shared",
+            "any",
+            1,
+            &[],
+            &[],
+        )?;
+        let metadata = header
+            .terms()
+            .get("shared")
+            .ok_or("Missing cutoff posting")?;
+        for block in &metadata.blocks {
+            let start = base + usize::try_from(block.data.offset)?;
+            exhaustive.add(
+                "shared",
+                &built.bytes[start..start + usize::try_from(block.data.length)?],
+            )?;
+        }
+        let score = exhaustive
+            .block_bounds()
+            .first()
+            .and_then(|bounds| bounds.first())
+            .ok_or("Missing cutoff bound")?
+            .1;
+        let mut selected = Search::new(header, statistics, "shared", "any", 1, &[], &[])?;
+        assert!(selected.posting_spans_after(score, &cutoff)?.is_empty());
+        let spans = selected.posting_spans_after_id(score, &cutoff)?;
+        assert!(!spans.is_empty());
+        let ranges = spans
+            .iter()
+            .flat_map(|span| span.blocks.iter().map(|block| block.data.clone()))
+            .collect::<Vec<_>>();
+        drop(spans);
+        for range in ranges {
+            let start = base + usize::try_from(range.offset)?;
+            selected.add(
+                "shared",
+                &built.bytes[start..start + usize::try_from(range.length)?],
+            )?;
+        }
+        let expected = exhaustive.finish()?;
+        let actual = selected.finish()?;
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(&expected) {
+            assert_eq!(actual.row, expected.row);
+            assert_eq!(actual.score.to_bits(), expected.score.to_bits());
+        }
+        for invalid in [
+            "10",
+            r#"{"kind":"uint","value":"01"}"#,
+            r#"{"kind":"uint","value":10}"#,
+            r#"{"kind":"uuid","value":"INVALID"}"#,
+            "\"\"",
+        ] {
+            assert!(selected.posting_spans_after_id(score, invalid).is_err());
+        }
+        assert!(selected.posting_spans_after_id(f64::NAN, &cutoff).is_err());
         Ok(())
     }
 }

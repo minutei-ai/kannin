@@ -1,3 +1,4 @@
+import { nativeQueryFixture } from "./segment-fixture";
 import type { Env } from "../alchemy.run";
 import { Effect, Match, Schema, Semaphore } from "effect";
 import {
@@ -180,7 +181,9 @@ export default {
             onFailure: () => new Response(null, { status: 503 }),
             onSuccess: (rows) =>
               new Response(
-                Schema.encodeSync(Schema.fromJsonString(MetadataAcquisitionPageResult))(rows),
+                Schema.encodeSync(Schema.fromJsonString(MetadataAcquisitionPageResult))(
+                  rows.map(nativeQueryFixture),
+                ),
                 { headers: { "content-type": "application/json" } },
               ),
           }),

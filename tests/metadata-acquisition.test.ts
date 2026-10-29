@@ -1,3 +1,4 @@
+import { decodeNativeQueryFixture, encodeCanonicalDocuments } from "./segment-fixture";
 import { expect, test } from "bun:test";
 import { Effect, Match, Schema } from "effect";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -9,13 +10,7 @@ import {
   segment_query_document,
   segment_query_documents,
 } from "../dist/wasm/raio_engine";
-import {
-  SegmentHeader,
-  StoredDocument,
-  QueryDocument,
-  Metadata,
-  QueryResult,
-} from "../src/protocol";
+import { SegmentHeader, Metadata, QueryResult } from "../src/protocol";
 import {
   MetadataAcquisitionHitProbe,
   MetadataAcquisitionPageProbe,
@@ -113,9 +108,7 @@ test("wide metadata acquisition preserves native batches, validation, admission 
       ),
       attributes: { group: index % 3, flag: index % 2 === 0 },
     }));
-    using segment = new Segment(
-      Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(documents),
-    );
+    using segment = new Segment(encodeCanonicalDocuments(documents));
     const bytes = segment.bytes();
     const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
     const headerBytes = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
@@ -128,7 +121,7 @@ test("wide metadata acquisition preserves native batches, validation, admission 
     await bucket.put(source.key, bytes);
     const pages = header.documents.map((doc) => doc.data);
     const scalar = pages.map((page) =>
-      Schema.decodeSync(Schema.fromJsonString(QueryDocument))(
+      decodeNativeQueryFixture(
         segment_query_document(
           bytes.subarray(headerBytes + page.offset, headerBytes + page.offset + page.length),
         ),

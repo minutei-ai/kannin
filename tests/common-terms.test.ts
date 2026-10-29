@@ -1,3 +1,4 @@
+import { encodeCanonicalDocuments } from "./segment-fixture";
 import { decodeRoot, encodeRoot } from "../src/manifest";
 import { afterAll, expect, test } from "bun:test";
 import { Schema, Struct } from "effect";
@@ -9,7 +10,6 @@ import {
   CommonTerms,
   QueryResult,
   SegmentHeader,
-  StoredDocument,
   RankingInput,
   PostingSpans,
   SegmentHits,
@@ -48,9 +48,7 @@ test("common-term prefixes are bounded, deterministic and conservative for compl
     ].join(" "),
     attributes: {},
   }));
-  using segment = new Segment(
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(documents),
-  );
+  using segment = new Segment(encodeCanonicalDocuments(documents));
   const bytes = segment.bytes();
   const base = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
   using directory = Directory.canonical(bytes.subarray(0, base), base);
@@ -426,7 +424,7 @@ test("phrase term-frequency bounds skip impossible segments and preserve exact g
   ];
   const sources = [impossibleDocuments, phraseDocuments, splitDocuments];
   const encodeDocuments = (documents: typeof impossibleDocuments) =>
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(
+    encodeCanonicalDocuments(
       documents.map((doc) => ({
         ...doc,
         revision: 0,

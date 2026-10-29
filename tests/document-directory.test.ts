@@ -1,3 +1,4 @@
+import { encodeCanonicalDocuments } from "./segment-fixture";
 import { expect, test } from "bun:test";
 import { Effect, Match, Schema } from "effect";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -8,7 +9,6 @@ import {
   LocatedDocument,
   SegmentDocument,
   SegmentHeader,
-  StoredDocument,
   TermProjectionRange,
 } from "../src/protocol";
 import { startWorker } from "./harness";
@@ -88,7 +88,7 @@ test("document-only common reuse preserves projections, misses, active lifetimes
     return Schema.decodeUnknownSync(DocumentDirectoryState)(await response.json());
   };
   using segment = new Segment(
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))([
+    encodeCanonicalDocuments([
       {
         id: "a",
         revision: 3,

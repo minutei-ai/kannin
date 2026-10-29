@@ -40,8 +40,9 @@ import type {
 } from "../protocol";
 import {
   compareFieldNames,
-  StoredDocument,
-  QueryDocument,
+  canonicalToQueryRow,
+  CanonicalDocument,
+  CanonicalQueryDocument,
   SegmentHeader,
   CommonTerms,
   CommonTermProjection,
@@ -312,13 +313,20 @@ export function createStorage(runtime: SearchRuntime) {
     Schema.fromJsonString(EligibilityProjection.fields.fields),
   );
   const decodeEligibilityMinimum = Schema.decodeSync(Schema.fromJsonString(EligibleMinimum));
-  const storedDocumentJson = Schema.fromJsonString(StoredDocument);
-  const decodeStoredDocument = Schema.decodeSync(storedDocumentJson);
-  const queryDocumentJson = Schema.fromJsonString(QueryDocument);
-  const decodeQueryDocument = Schema.decodeSync(queryDocumentJson);
-  const decodeQueryDocumentEffect = Schema.decodeEffect(queryDocumentJson);
-  const decodeQueryDocumentsEffect = Schema.decodeEffect(
-    Schema.fromJsonString(Schema.Array(QueryDocument)),
+  const canonicalDocumentJson = Schema.fromJsonString(CanonicalDocument);
+  const decodeCanonicalDocument = Schema.decodeSync(canonicalDocumentJson, {
+    onExcessProperty: "error",
+  });
+  const canonicalQueryDocumentJson = Schema.fromJsonString(CanonicalQueryDocument);
+  const decodeCanonicalQueryDocument = Schema.decodeSync(canonicalQueryDocumentJson, {
+    onExcessProperty: "error",
+  });
+  const decodeCanonicalQueryDocumentEffect = Schema.decodeEffect(canonicalQueryDocumentJson, {
+    onExcessProperty: "error",
+  });
+  const decodeCanonicalQueryDocumentsEffect = Schema.decodeEffect(
+    Schema.fromJsonString(Schema.Array(CanonicalQueryDocument)),
+    { onExcessProperty: "error" },
   );
 
   function evictFor(bytes: number) {
@@ -2553,12 +2561,12 @@ export function createStorage(runtime: SearchRuntime) {
 
   const buildSegment = Effect.fn("raio.buildSegment")(
     (
-      documents: ReadonlyArray<typeof StoredDocument.Type>,
+      documents: ReadonlyArray<typeof CanonicalDocument.Type>,
       filterable: (typeof NamespaceSchema.Type)["filterable"] | undefined,
     ) =>
       Effect.acquireUseRelease(
         Effect.all([
-          Schema.encodeEffect(Schema.fromJsonString(Schema.Array(StoredDocument)))(documents),
+          Schema.encodeEffect(Schema.fromJsonString(Schema.Array(CanonicalDocument)))(documents),
           Schema.encodeEffect(
             Schema.UndefinedOr(Schema.fromJsonString(NamespaceSchema.fields.filterable)),
           )(filterable),
@@ -3390,9 +3398,9 @@ export function createStorage(runtime: SearchRuntime) {
       payload,
     );
     if (vectorData === null)
-      return decodeStoredDocument(segment_document(await metadata, new Uint8Array()));
+      return decodeCanonicalDocument(segment_document(await metadata, new Uint8Array()));
     if (payload !== undefined) {
-      return decodeStoredDocument(
+      return decodeCanonicalDocument(
         segment_document(
           await metadata,
           payload.subarray(vectorData.offset, vectorData.offset + vectorData.length),
@@ -3403,7 +3411,7 @@ export function createStorage(runtime: SearchRuntime) {
       metadata,
       range(key, headerBytes + vectorData.offset, vectorData.length),
     ]);
-    return decodeStoredDocument(segment_document(frame, vector));
+    return decodeCanonicalDocument(segment_document(frame, vector));
   }
 
   const MAX_DOCUMENT_BATCH_PAGES = 16;
@@ -3609,17 +3617,7 @@ export function createStorage(runtime: SearchRuntime) {
                   status: 503,
                   message: "Document batch omitted its hit",
                 });
-              result.push([
-                hit[0],
-                {
-                  id: document.id,
-                  title: document.title ?? "",
-                  text: document.text,
-                  attributes: document.attributes,
-                  revision: document.revision,
-                  score: hit[1][2],
-                },
-              ] as const);
+              result.push([hit[0], canonicalToQueryRow(document, hit[1][2])] as const);
             }
           }
           return result;
@@ -3719,7 +3717,7 @@ export function createStorage(runtime: SearchRuntime) {
           catch: (cause) => new Cause.UnknownError(cause),
         });
         if (encoded !== undefined)
-          return yield* decodeQueryDocumentsEffect(encoded).pipe(
+          return yield* decodeCanonicalQueryDocumentsEffect(encoded).pipe(
             Effect.mapError((cause) => new Cause.UnknownError(cause)),
           );
       }
@@ -3729,7 +3727,7 @@ export function createStorage(runtime: SearchRuntime) {
             try: () => segment_query_document(frame),
             catch: (cause) => new Cause.UnknownError(cause),
           });
-          return yield* decodeQueryDocumentEffect(encoded).pipe(
+          return yield* decodeCanonicalQueryDocumentEffect(encoded).pipe(
             Effect.mapError((cause) => new Cause.UnknownError(cause)),
           );
         }),
@@ -3752,7 +3750,7 @@ export function createStorage(runtime: SearchRuntime) {
               const start = page.offset - payloadOffset;
               const frame = cachedFrame ?? payload.subarray(start, start + page.length);
               const document = yield* Effect.try({
-                try: () => decodeQueryDocument(segment_query_document(frame)),
+                try: () => decodeCanonicalQueryDocument(segment_query_document(frame)),
                 catch: (cause) => {
                   if (Schema.is(Rejected)(cause)) return cause;
                   return new Cause.UnknownError(cause);
@@ -3764,7 +3762,7 @@ export function createStorage(runtime: SearchRuntime) {
             return yield* permits.withPermit(
               Effect.tryPromise({
                 try: async () =>
-                  decodeQueryDocument(
+                  decodeCanonicalQueryDocument(
                     segment_query_document(
                       await readDocumentFrame(key, headerBytes, page, objectBytes, metadataEnd),
                     ),
@@ -3810,7 +3808,7 @@ export function createStorage(runtime: SearchRuntime) {
       catch: (cause) => new Cause.UnknownError(cause),
     });
     if (batchEncoded !== undefined) {
-      const documents = yield* decodeQueryDocumentsEffect(batchEncoded);
+      const documents = yield* decodeCanonicalQueryDocumentsEffect(batchEncoded);
       for (const page of pages) {
         const start = page.offset - first.offset;
         remember(
@@ -3828,7 +3826,7 @@ export function createStorage(runtime: SearchRuntime) {
           try: () => segment_query_document(frame),
           catch: (cause) => new Cause.UnknownError(cause),
         });
-        const document = yield* decodeQueryDocumentEffect(encoded);
+        const document = yield* decodeCanonicalQueryDocumentEffect(encoded);
         remember(
           `${env.STORAGE_CACHE_SCOPE}:${key}/${headerBytes + page.offset}/${page.length}`,
           frame,

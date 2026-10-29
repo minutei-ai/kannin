@@ -6,16 +6,18 @@ fn common_directory_matches_full_positional_search_and_rejects_uncovered_terms()
 -> Result<(), Box<dyn std::error::Error>> {
     let built = segment::build(
         (0_u32..512)
-            .map(|index| Document {
-                id: format!("row{index:04}"),
-                revision: u64::from(index),
-                title: "cloudflare rust".into(),
-                text: format!(
-                    "{} unique{index}",
-                    "rust cloudflare rust ".repeat(1 + (index % 5) as usize)
-                ),
-                attributes: BTreeMap::from([("group".into(), serde_json::json!(index % 3))]),
-                vector: None,
+            .map(|index| {
+                Document::native(
+                    format!("row{index:04}"),
+                    u64::from(index),
+                    "cloudflare rust".into(),
+                    format!(
+                        "{} unique{index}",
+                        "rust cloudflare rust ".repeat(1 + (index % 5) as usize)
+                    ),
+                    BTreeMap::from([("group".into(), serde_json::json!(index % 3))]),
+                    None,
+                )
             })
             .collect(),
         None,
@@ -97,13 +99,15 @@ fn covering_common_headers_keep_uncached_terms_in_remaining_spans()
 -> Result<(), Box<dyn std::error::Error>> {
     let built = segment::build(
         (0_u32..256)
-            .map(|index| Document {
-                id: format!("row{index:04}"),
-                revision: 1,
-                title: "common dense".into(),
-                text: "dense ".repeat(512),
-                attributes: BTreeMap::from([("group".into(), serde_json::json!(index % 2))]),
-                vector: None,
+            .map(|index| {
+                Document::native(
+                    format!("row{index:04}"),
+                    1,
+                    "common dense".into(),
+                    "dense ".repeat(512),
+                    BTreeMap::from([("group".into(), serde_json::json!(index % 2))]),
+                    None,
+                )
             })
             .collect(),
         None,

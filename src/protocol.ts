@@ -1153,7 +1153,7 @@ export const OverviewBatch = Schema.Array(OverviewSource)
     ),
   );
 export const SegmentHeader = Schema.Struct({
-  version: Schema.Literal(2),
+  version: Schema.Literals([2, 3]),
   documents: Schema.NonEmptyArray(SegmentDocument),
   terms: SegmentTerms,
   total_title_length: Schema.Int,

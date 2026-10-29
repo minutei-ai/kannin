@@ -1,3 +1,4 @@
+import { decodeNativeDocumentFixture } from "./segment-fixture";
 import { Option, Schema, Struct } from "effect";
 import { crc32, deflateSync } from "node:zlib";
 import type { Miniflare } from "miniflare";
@@ -15,6 +16,7 @@ import {
   RootMigrationInput,
   SegmentHeader,
   StoredRoot,
+  StoredDocument,
   VectorRebuildSnapshot,
   nativeSchemaFromColumns,
   type Root,
@@ -34,6 +36,8 @@ initSync({
     await Bun.file(new URL("../dist/wasm/raio_engine_bg.wasm", import.meta.url)).arrayBuffer(),
   ),
 });
+
+const encodeNativeDocument = Schema.encodeSync(Schema.fromJsonString(StoredDocument));
 
 const LegacyHeader = SegmentHeader.mapFields((fields) => ({
   ...Struct.omit(fields, ["metadata_end", "vector_end", "vector_ranges"]),
@@ -66,7 +70,9 @@ async function physicalLegacyRoot(bucket: Bucket, root: typeof Root.Type) {
           segment.headerBytes + row.vectorData.offset + row.vectorData.length,
         );
       })();
-      const json = new TextEncoder().encode(segment_document(metadata, vector));
+      const json = new TextEncoder().encode(
+        encodeNativeDocument(decodeNativeDocumentFixture(segment_document(metadata, vector))),
+      );
       const compressed = deflateSync(json, { level: 3 });
       const frame = new Uint8Array(8 + compressed.byteLength);
       const view = new DataView(frame.buffer);

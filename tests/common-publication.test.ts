@@ -1,10 +1,11 @@
+import { encodeCanonicalDocuments } from "./segment-fixture";
 import { expect, test } from "bun:test";
 import { Effect, Schema } from "effect";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Directory, initSync, Segment } from "../dist/wasm/raio_engine";
-import { RankingInput, SegmentHeader, StoredDocument, TermProjectionRange } from "../src/protocol";
+import { RankingInput, SegmentHeader, TermProjectionRange } from "../src/protocol";
 import { startWorker } from "./harness";
 
 initSync({
@@ -74,7 +75,7 @@ test("create-only common fallback preserves existing generations and concurrent 
     expect((await call("/release")).status).toBe(204);
   });
   using segment = new Segment(
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(
+    encodeCanonicalDocuments(
       Array.from({ length: 96 }, (_, index) => ({
         id: String(index).padStart(3, "0"),
         revision: 1,

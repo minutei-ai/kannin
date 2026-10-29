@@ -27,17 +27,19 @@ fn run(test: impl Future<Output = Result<(), Failure>>) -> Result<(), Failure> {
 
 fn fixture() -> Result<BuiltSegment, Failure> {
     let documents = (0..300)
-        .map(|index| Document {
-            id: format!("document-{index:03}"),
-            revision: 1,
-            title: String::new(),
-            text: if index % 2 == 0 {
-                String::from("café alpha beta")
-            } else {
-                String::from("beta alpha alpha")
-            },
-            attributes: BTreeMap::from([(String::from("group"), serde_json::json!(index % 3))]),
-            vector: None,
+        .map(|index| {
+            Document::native(
+                format!("document-{index:03}"),
+                1,
+                String::new(),
+                if index % 2 == 0 {
+                    String::from("café alpha beta")
+                } else {
+                    String::from("beta alpha alpha")
+                },
+                BTreeMap::from([(String::from("group"), serde_json::json!(index % 3))]),
+                None,
+            )
         })
         .collect();
     Ok(segment::build(documents, None)?)

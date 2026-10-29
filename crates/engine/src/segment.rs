@@ -8,7 +8,10 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::rc::Rc;
 
-const MAGIC: &[u8; 8] = b"RAIOSEG2";
+const MAGIC_V2: &[u8; 8] = b"RAIOSEG2";
+const MAGIC_V3: &[u8; 8] = b"RAIOSEG3";
+const METADATA_CODEC_FACTS: u8 = 2;
+const METADATA_CODEC_CANONICAL: u8 = 3;
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 const BLOCK_SIZE: usize = 128;
 const FILTER_CACHE_BYTES: usize = 32 * 1024;
@@ -153,65 +156,219 @@ impl FilterMasks {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Document {
-    pub id: String,
-    #[serde(default)]
-    pub revision: u64,
-    #[serde(default)]
-    pub title: String,
-    pub text: String,
-    pub attributes: BTreeMap<String, serde_json::Value>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "DocumentVectorSerialization::serialize_document_vector"
-    )]
-    pub vector: Option<Vec<f32>>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeRole {
+    Title,
+    Text,
+    Vector,
 }
 
-trait DocumentVectorSerialization {
-    fn serialize_document_vector<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColumnId<'a> {
+    Role(NativeRole),
+    Attribute(&'a str),
 }
 
-impl DocumentVectorSerialization for Option<Vec<f32>> {
-    fn serialize_document_vector<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeSeq as _;
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ColumnValue<'a> {
+    Text(&'a str),
+    Vector(&'a [f32]),
+    Attribute(&'a serde_json::Value),
+}
 
-        let Some(values) = self else {
-            return serializer.serialize_none();
-        };
-        if !values
-            .iter()
-            .any(|value| value.abs().to_bits() == f32::MAX.to_bits())
-        {
-            return values.serialize(serializer);
+#[derive(Clone)]
+pub struct Columns {
+    title: String,
+    text: String,
+    vector: Option<Vec<f32>>,
+    attributes: BTreeMap<String, serde_json::Value>,
+}
+
+impl Columns {
+    fn new(
+        title: String,
+        text: String,
+        attributes: BTreeMap<String, serde_json::Value>,
+        vector: Option<Vec<f32>>,
+    ) -> Self {
+        Self {
+            title,
+            text,
+            vector,
+            attributes,
         }
-        let mut sequence = serializer.serialize_seq(Some(values.len()))?;
-        for value in values {
-            if value.abs().to_bits() == f32::MAX.to_bits() {
-                sequence.serialize_element(&f64::from(*value))?;
-            } else {
-                sequence.serialize_element(value)?;
+    }
+
+    #[must_use]
+    pub fn get(&self, id: ColumnId<'_>) -> Option<ColumnValue<'_>> {
+        match id {
+            ColumnId::Role(NativeRole::Title) => Some(ColumnValue::Text(&self.title)),
+            ColumnId::Role(NativeRole::Text) => Some(ColumnValue::Text(&self.text)),
+            ColumnId::Role(NativeRole::Vector) => self.vector.as_deref().map(ColumnValue::Vector),
+            ColumnId::Attribute(name) => self.attributes.get(name).map(ColumnValue::Attribute),
+        }
+    }
+
+    #[must_use]
+    pub fn attributes(&self) -> &BTreeMap<String, serde_json::Value> {
+        &self.attributes
+    }
+
+    #[must_use]
+    pub fn attributes_mut(&mut self) -> &mut BTreeMap<String, serde_json::Value> {
+        &mut self.attributes
+    }
+
+    #[doc = "# Errors\nRejects the native vector role because it is not stored as text."]
+    pub fn set_text(&mut self, role: NativeRole, value: String) -> Result<(), String> {
+        match role {
+            NativeRole::Title => {
+                self.title = value;
+                Ok(())
             }
+            NativeRole::Text => {
+                self.text = value;
+                Ok(())
+            }
+            NativeRole::Vector => Err("Native vector role is not text".into()),
         }
-        sequence.end()
+    }
+
+    pub fn set_vector(&mut self, vector: Option<Vec<f32>>) {
+        self.vector = vector;
     }
 }
 
+#[derive(Clone)]
+pub struct Document {
+    pub id: String,
+    pub revision: u64,
+    columns: Columns,
+}
+
 #[derive(Serialize)]
-struct QueryDocument<'a> {
-    #[serde(flatten)]
-    document: &'a Document,
+struct CanonicalRolesRef<'a> {
+    title: &'a str,
+    text: &'a str,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalRoles {
+    title: String,
+    text: String,
+}
+
+#[derive(Serialize)]
+struct CanonicalDocumentRef<'a> {
+    id: &'a str,
+    revision: u64,
+    roles: CanonicalRolesRef<'a>,
+    attributes: &'a BTreeMap<String, serde_json::Value>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_f32_slice"
+    )]
+    vector: Option<&'a [f32]>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalDocumentDto {
+    id: String,
+    revision: u64,
+    roles: CanonicalRoles,
+    attributes: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    vector: Option<Vec<f32>>,
+}
+
+#[derive(Serialize)]
+struct StoredCanonicalRef<'a> {
+    id: &'a str,
+    revision: u64,
+    roles: CanonicalRolesRef<'a>,
+    attributes: &'a BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredCanonicalDocument {
+    id: String,
+    revision: u64,
+    roles: CanonicalRoles,
+    attributes: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct NativeDocumentRef<'a> {
+    id: &'a str,
+    revision: u64,
+    title: &'a str,
+    text: &'a str,
+    attributes: &'a BTreeMap<String, serde_json::Value>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_f32_slice"
+    )]
+    vector: Option<&'a [f32]>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeDocumentDto {
+    id: String,
+    #[serde(default)]
+    revision: u64,
+    #[serde(default)]
+    title: String,
+    text: String,
+    attributes: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    vector: Option<Vec<f32>>,
+}
+
+#[derive(Serialize)]
+struct CanonicalQueryRef<'a> {
+    id: &'a str,
+    revision: u64,
+    roles: CanonicalRolesRef<'a>,
+    attributes: &'a BTreeMap<String, serde_json::Value>,
     #[serde(rename = "vectorSummary")]
     vector_summary: Option<(usize, bool, bool)>,
+}
+
+fn serialize_f32_slice<S: serde::Serializer>(
+    values: &[f32],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq as _;
+
+    if !values
+        .iter()
+        .any(|value| value.abs().to_bits() == f32::MAX.to_bits())
+    {
+        return values.serialize(serializer);
+    }
+    let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+    for value in values {
+        if value.abs().to_bits() == f32::MAX.to_bits() {
+            sequence.serialize_element(&f64::from(*value))?;
+        } else {
+            sequence.serialize_element(value)?;
+        }
+    }
+    sequence.end()
+}
+
+fn serialize_optional_f32_slice<S: serde::Serializer>(
+    vector: &Option<&[f32]>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match vector {
+        Some(values) => serialize_f32_slice(values, serializer),
+        None => serializer.serialize_none(),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -239,12 +396,12 @@ fn vector_facts(vector: Option<&[f32]>) -> Result<VectorFacts, String> {
 }
 
 fn write_vector_facts(facts: VectorFacts, output: &mut Vec<u8>) {
-    output.extend_from_slice(&[2, facts.flags]);
+    output.extend_from_slice(&[METADATA_CODEC_FACTS, facts.flags]);
     output.extend_from_slice(&facts.dimensions.to_le_bytes());
 }
 
 fn read_vector_facts(bytes: &[u8]) -> Result<(VectorFacts, &[u8]), String> {
-    if bytes.len() < 6 || bytes[0] != 2 {
+    if bytes.len() < 6 || bytes[0] != METADATA_CODEC_FACTS {
         return Err("Invalid separated document metadata prefix".into());
     }
     let flags = bytes[1];
@@ -262,16 +419,213 @@ fn read_vector_facts(bytes: &[u8]) -> Result<(VectorFacts, &[u8]), String> {
     Ok((VectorFacts { flags, dimensions }, &bytes[6..]))
 }
 
-impl<'a> QueryDocument<'a> {
-    fn with_facts(document: &'a Document, facts: VectorFacts) -> Self {
+impl Document {
+    #[must_use]
+    pub fn native(
+        id: impl Into<String>,
+        revision: u64,
+        title: impl Into<String>,
+        text: impl Into<String>,
+        attributes: BTreeMap<String, serde_json::Value>,
+        vector: Option<Vec<f32>>,
+    ) -> Self {
         Self {
-            document,
+            id: id.into(),
+            revision,
+            columns: Columns::new(title.into(), text.into(), attributes, vector),
+        }
+    }
+
+    #[must_use]
+    pub fn columns(&self) -> &Columns {
+        &self.columns
+    }
+
+    #[must_use]
+    pub fn columns_mut(&mut self) -> &mut Columns {
+        &mut self.columns
+    }
+
+    #[must_use]
+    pub fn column(&self, id: ColumnId<'_>) -> Option<ColumnValue<'_>> {
+        self.columns.get(id)
+    }
+
+    fn role_text(&self, role: NativeRole) -> Result<&str, String> {
+        match self.column(ColumnId::Role(role)) {
+            Some(ColumnValue::Text(text)) => Ok(text),
+            Some(ColumnValue::Vector(_) | ColumnValue::Attribute(_)) => {
+                Err("Native text role is not text".into())
+            }
+            None => Err("Missing native text role".into()),
+        }
+    }
+
+    fn vector_values(&self) -> Result<Option<&[f32]>, String> {
+        match self.column(ColumnId::Role(NativeRole::Vector)) {
+            Some(ColumnValue::Vector(values)) => Ok(Some(values)),
+            None => Ok(None),
+            Some(ColumnValue::Text(_) | ColumnValue::Attribute(_)) => {
+                Err("Native vector role is not a vector".into())
+            }
+        }
+    }
+
+    fn roles_ref(&self) -> Result<CanonicalRolesRef<'_>, String> {
+        Ok(CanonicalRolesRef {
+            title: self.role_text(NativeRole::Title)?,
+            text: self.role_text(NativeRole::Text)?,
+        })
+    }
+
+    fn from_parts(
+        id: String,
+        revision: u64,
+        title: String,
+        text: String,
+        attributes: BTreeMap<String, serde_json::Value>,
+        vector: Option<Vec<f32>>,
+    ) -> Self {
+        Self::native(id, revision, title, text, attributes, vector)
+    }
+
+    fn from_native_dto(dto: NativeDocumentDto) -> Self {
+        Self::from_parts(
+            dto.id,
+            dto.revision,
+            dto.title,
+            dto.text,
+            dto.attributes,
+            dto.vector,
+        )
+    }
+
+    fn from_canonical_dto(dto: CanonicalDocumentDto) -> Self {
+        Self::from_parts(
+            dto.id,
+            dto.revision,
+            dto.roles.title,
+            dto.roles.text,
+            dto.attributes,
+            dto.vector,
+        )
+    }
+
+    fn from_stored_dto(dto: StoredCanonicalDocument) -> Self {
+        Self::from_parts(
+            dto.id,
+            dto.revision,
+            dto.roles.title,
+            dto.roles.text,
+            dto.attributes,
+            None,
+        )
+    }
+
+    #[doc = "# Errors\nRejects JSON that is not the historical native document wire."]
+    pub fn from_native_slice(bytes: &[u8]) -> Result<Self, String> {
+        let dto: NativeDocumentDto =
+            serde_json::from_slice(bytes).map_err(|cause| cause.to_string())?;
+        Ok(Self::from_native_dto(dto))
+    }
+
+    #[doc = "# Errors\nRejects JSON that is not the historical native document wire."]
+    pub fn from_native_json(json: &str) -> Result<Self, String> {
+        Self::from_native_slice(json.as_bytes())
+    }
+
+    #[doc = "# Errors\nRejects JSON that is not the historical native document wire."]
+    pub fn from_native_value(value: serde_json::Value) -> Result<Self, serde_json::Error> {
+        Ok(Self::from_native_dto(serde_json::from_value(value)?))
+    }
+
+    #[doc = "# Errors\nRejects a document that cannot be encoded on the historical native wire."]
+    pub fn to_native_vec(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(&self.native_ref()?).map_err(|cause| cause.to_string())
+    }
+
+    #[doc = "# Errors\nRejects a document that cannot be encoded on the historical native wire."]
+    pub fn to_native_json(&self) -> Result<String, String> {
+        serde_json::to_string(&self.native_ref()?).map_err(|cause| cause.to_string())
+    }
+
+    fn to_native_metadata_vec(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(&NativeDocumentRef {
+            id: &self.id,
+            revision: self.revision,
+            title: self.role_text(NativeRole::Title)?,
+            text: self.role_text(NativeRole::Text)?,
+            attributes: self.columns.attributes(),
+            vector: None,
+        })
+        .map_err(|cause| cause.to_string())
+    }
+
+    fn native_ref(&self) -> Result<NativeDocumentRef<'_>, String> {
+        Ok(NativeDocumentRef {
+            id: &self.id,
+            revision: self.revision,
+            title: self.role_text(NativeRole::Title)?,
+            text: self.role_text(NativeRole::Text)?,
+            attributes: self.columns.attributes(),
+            vector: self.vector_values()?,
+        })
+    }
+
+    #[doc = "# Errors\nRejects JSON that is not the canonical document interchange."]
+    pub fn from_canonical_slice(bytes: &[u8]) -> Result<Self, String> {
+        let dto: CanonicalDocumentDto =
+            serde_json::from_slice(bytes).map_err(|cause| cause.to_string())?;
+        Ok(Self::from_canonical_dto(dto))
+    }
+
+    #[doc = "# Errors\nRejects JSON that is not the canonical document interchange."]
+    pub fn from_canonical_json(json: &str) -> Result<Self, String> {
+        Self::from_canonical_slice(json.as_bytes())
+    }
+
+    #[doc = "# Errors\nRejects a document that cannot be encoded as canonical interchange."]
+    pub fn to_canonical_json(&self) -> Result<String, String> {
+        serde_json::to_string(&self.canonical_ref()?).map_err(|cause| cause.to_string())
+    }
+
+    #[doc = "# Errors\nRejects a document that cannot be encoded as canonical interchange."]
+    pub fn to_canonical_vec(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(&self.canonical_ref()?).map_err(|cause| cause.to_string())
+    }
+
+    fn canonical_ref(&self) -> Result<CanonicalDocumentRef<'_>, String> {
+        Ok(CanonicalDocumentRef {
+            id: &self.id,
+            revision: self.revision,
+            roles: self.roles_ref()?,
+            attributes: self.columns.attributes(),
+            vector: self.vector_values()?,
+        })
+    }
+
+    fn to_stored_canonical_vec(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(&StoredCanonicalRef {
+            id: &self.id,
+            revision: self.revision,
+            roles: self.roles_ref()?,
+            attributes: self.columns.attributes(),
+        })
+        .map_err(|cause| cause.to_string())
+    }
+
+    fn query_ref(&self, facts: VectorFacts) -> Result<CanonicalQueryRef<'_>, String> {
+        Ok(CanonicalQueryRef {
+            id: &self.id,
+            revision: self.revision,
+            roles: self.roles_ref()?,
+            attributes: self.columns.attributes(),
             vector_summary: (facts.flags & 1 != 0).then_some((
                 facts.dimensions as usize,
                 facts.flags & 2 != 0,
                 facts.flags & 4 != 0,
             )),
-        }
+        })
     }
 }
 
@@ -279,90 +633,89 @@ fn serialize_query_document_with_facts(
     document: &Document,
     facts: VectorFacts,
 ) -> Result<String, String> {
-    serde_json::to_string(&QueryDocument::with_facts(document, facts))
-        .map_err(|cause| cause.to_string())
+    serde_json::to_string(&document.query_ref(facts)?).map_err(|cause| cause.to_string())
 }
 
 #[cfg(test)]
-fn serialize_query_document(document: &mut Document) -> Result<String, String> {
-    let facts = vector_facts(document.vector.as_deref())?;
-    drop(document.vector.take());
+fn serialize_query_document(document: &Document) -> Result<String, String> {
+    let facts = vector_facts(document.vector_values()?)?;
     serialize_query_document_with_facts(document, facts)
 }
 
-struct SeparatedDocumentFrameBytes {
-    metadata: Vec<u8>,
-    vector: Option<Vec<u8>>,
+fn vector_frame_bytes(values: &[f32]) -> Result<Vec<u8>, String> {
+    let capacity = values
+        .len()
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| "Vector frame size overflow".to_owned())?;
+    let mut raw = Vec::with_capacity(capacity);
+    for value in values {
+        raw.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(raw)
 }
 
-fn split_document_frame_parts(
+fn f32_values(decoded: &[u8]) -> Result<Vec<f32>, String> {
+    let (chunks, remainder) = decoded.as_chunks::<4>();
+    if !remainder.is_empty() {
+        return Err("Vector frame length is not divisible by four".into());
+    }
+    Ok(chunks
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
+        .collect())
+}
+
+fn attach_vector_frame(
+    document: &mut Document,
+    vector_bytes: &[u8],
+    facts: VectorFacts,
+) -> Result<(), String> {
+    let vector = if vector_bytes.is_empty() {
+        None
+    } else {
+        Some(f32_values(&decode_page(vector_bytes)?)?)
+    };
+    let actual = vector_facts(vector.as_deref())?;
+    if actual != facts {
+        return Err("Vector frame does not match metadata vector summary".into());
+    }
+    document.columns_mut().set_vector(vector);
+    Ok(())
+}
+
+fn parse_native_metadata(
     bytes: &[u8],
-    decoded: &[u8],
-    mut document: Document,
-) -> Result<SeparatedDocumentFrameBytes, String> {
-    if document.vector.is_none() {
-        drop(document);
-        return Ok(SeparatedDocumentFrameBytes {
-            metadata: bytes.to_vec(),
-            vector: None,
-        });
+    facts: VectorFacts,
+) -> Result<(VectorFacts, Document), String> {
+    let dto: NativeDocumentDto =
+        serde_json::from_slice(bytes).map_err(|cause| cause.to_string())?;
+    if dto.vector.is_some() {
+        return Err("Separated document metadata contains a vector".into());
     }
-    let vector_frame = document
-        .vector
-        .as_ref()
-        .map(|vector| -> Result<Vec<u8>, String> {
-            let capacity = vector
-                .len()
-                .checked_mul(size_of::<f32>())
-                .ok_or_else(|| "Vector frame size overflow".to_owned())?;
-            let mut raw = Vec::with_capacity(capacity);
-            for value in vector {
-                raw.extend_from_slice(&value.to_le_bytes());
-            }
-            let mut frame = Vec::new();
-            append(&mut frame, &raw)?;
-            Ok(frame)
-        })
-        .transpose()?;
-    let vector = document.vector.take();
-    let facts = vector_facts(vector.as_deref())?;
-    drop(vector);
-    drop(document);
-    let mut fields: BTreeMap<String, &serde_json::value::RawValue> =
-        serde_json::from_slice(decoded).map_err(|cause| cause.to_string())?;
-    if fields.remove("vector").is_none() {
-        return Err("Vector field disappeared after document validation".into());
-    }
-    let document_json = serde_json::to_vec(&fields).map_err(|cause| cause.to_string())?;
-    let mut metadata_bytes = Vec::with_capacity(6 + document_json.len());
-    write_vector_facts(facts, &mut metadata_bytes);
-    metadata_bytes.extend_from_slice(&document_json);
-    let mut metadata_frame = Vec::new();
-    append(&mut metadata_frame, &metadata_bytes)?;
-    Ok(SeparatedDocumentFrameBytes {
-        metadata: metadata_frame,
-        vector: vector_frame,
-    })
+    Ok((facts, Document::from_native_dto(dto)))
 }
 
 fn parse_document_metadata(decoded: &[u8]) -> Result<(VectorFacts, Document), String> {
-    let (facts, document_bytes) = if decoded.first() == Some(&b'{') {
-        (
+    match decoded.first().copied() {
+        Some(b'{') => parse_native_metadata(
+            decoded,
             VectorFacts {
                 flags: 0,
                 dimensions: 0,
             },
-            decoded,
-        )
-    } else {
-        read_vector_facts(decoded)?
-    };
-    let document: Document =
-        serde_json::from_slice(document_bytes).map_err(|cause| cause.to_string())?;
-    if document.vector.is_some() {
-        return Err("Separated document metadata contains a vector".into());
+        ),
+        Some(METADATA_CODEC_FACTS) => {
+            let (facts, document_bytes) = read_vector_facts(decoded)?;
+            parse_native_metadata(document_bytes, facts)
+        }
+        Some(METADATA_CODEC_CANONICAL) => {
+            let (facts, document_bytes) = read_vector_facts(decoded.get(1..).unwrap_or(&[]))?;
+            let dto: StoredCanonicalDocument =
+                serde_json::from_slice(document_bytes).map_err(|cause| cause.to_string())?;
+            Ok((facts, Document::from_stored_dto(dto)))
+        }
+        _ => Err("Unknown document metadata codec".into()),
     }
-    Ok((facts, document))
 }
 
 #[doc = "# Errors\nRejects invalid metadata framing, vector summaries, or document JSON."]
@@ -436,7 +789,7 @@ pub fn query_documents_from_metadata(
         }
         let (facts, document) = parse_document_metadata(&decoded[..length])?;
         sequence
-            .serialize_element(&QueryDocument::with_facts(&document, facts))
+            .serialize_element(&document.query_ref(facts)?)
             .map_err(|cause| cause.to_string())?;
     }
     sequence.end().map_err(|cause| cause.to_string())?;
@@ -453,30 +806,8 @@ pub fn full_document_from_frames(
     let decoded = decode_page(metadata_bytes)?;
     let (facts, mut document) = parse_document_metadata(&decoded)?;
     drop(decoded);
-    let vector = if vector_bytes.is_empty() {
-        None
-    } else {
-        let decoded = decode_page(vector_bytes)?;
-        let (chunks, remainder) = decoded.as_chunks::<4>();
-        if !remainder.is_empty() {
-            return Err("Vector frame length is not divisible by four".into());
-        }
-        if chunks.len() != facts.dimensions as usize {
-            return Err("Vector frame dimension mismatch".into());
-        }
-        Some(
-            chunks
-                .iter()
-                .map(|chunk| f32::from_le_bytes(*chunk))
-                .collect(),
-        )
-    };
-    let actual_facts = vector_facts(vector.as_deref())?;
-    if actual_facts != facts {
-        return Err("Vector frame does not match metadata vector summary".into());
-    }
-    document.vector = vector;
-    serde_json::to_string(&document).map_err(|cause| cause.to_string())
+    attach_vector_frame(&mut document, vector_bytes, facts)?;
+    document.to_canonical_json()
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1397,7 +1728,11 @@ impl Header {
             return Err("Segment exceeds 16 MiB".into());
         }
         let mut bytes = Vec::with_capacity(json.len() + payload.len() + 16);
-        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(match self.version {
+            2 => MAGIC_V2,
+            3 => MAGIC_V3,
+            _ => return Err("Invalid segment version".into()),
+        });
         bytes.extend_from_slice(
             &(u32::try_from(json.len()).map_err(|cause| cause.to_string())?).to_le_bytes(),
         );
@@ -2004,30 +2339,30 @@ fn finish_document_columns(
     ))
 }
 
+fn encode_canonical_metadata_page(
+    document: &Document,
+    facts: VectorFacts,
+) -> Result<Vec<u8>, String> {
+    let json = document.to_stored_canonical_vec()?;
+    let mut metadata_bytes = Vec::with_capacity(7 + json.len());
+    metadata_bytes.push(METADATA_CODEC_CANONICAL);
+    write_vector_facts(facts, &mut metadata_bytes);
+    metadata_bytes.extend_from_slice(&json);
+    Ok(metadata_bytes)
+}
+
 fn append_document_columns(
-    document: &mut Document,
+    document: &Document,
     payload: &mut Vec<u8>,
     vector_payload: &mut Vec<u8>,
     vector_ranges: &mut Vec<Range>,
 ) -> Result<Range, String> {
-    let vector = document.vector.take();
-    let facts = vector_facts(vector.as_deref())?;
-    let json = serde_json::to_vec(&document).map_err(|cause| cause.to_string())?;
-    let data = if let Some(values) = &vector {
-        let mut metadata_bytes = Vec::with_capacity(6 + json.len());
-        write_vector_facts(facts, &mut metadata_bytes);
-        metadata_bytes.extend_from_slice(&json);
-        let data = append(payload, &metadata_bytes)?;
-        let mut raw = Vec::with_capacity(values.len() * size_of::<f32>());
-        for value in values {
-            raw.extend_from_slice(&value.to_le_bytes());
-        }
-        vector_ranges.push(append(vector_payload, &raw)?);
-        data
-    } else {
-        append(payload, &json)?
-    };
-    document.vector = vector;
+    let vector = document.vector_values()?;
+    let facts = vector_facts(vector)?;
+    let data = append(payload, &encode_canonical_metadata_page(document, facts)?)?;
+    if let Some(values) = vector {
+        vector_ranges.push(append(vector_payload, &vector_frame_bytes(values)?)?);
+    }
     Ok(data)
 }
 
@@ -2036,8 +2371,8 @@ fn index_document_postings(
     row: u32,
     lists: &mut BTreeMap<String, Vec<Posting>>,
 ) -> Result<(u32, u32), String> {
-    let title = normalize_text(&document.title);
-    let body = normalize_text(&document.text);
+    let title = normalize_text(document.role_text(NativeRole::Title)?);
+    let body = normalize_text(document.role_text(NativeRole::Text)?);
     let title_tokens: Vec<_> = title.split_whitespace().collect();
     let body_tokens: Vec<_> = body.split_whitespace().collect();
     let mut frequencies: BTreeMap<&str, Posting> = BTreeMap::new();
@@ -2094,7 +2429,7 @@ pub fn build(
     let mut lists: BTreeMap<String, Vec<Posting>> = BTreeMap::new();
     let mut total_title_length = 0;
     let mut total_body_length = 0;
-    for (index, document) in documents.iter_mut().enumerate() {
+    for (index, document) in documents.iter().enumerate() {
         let row = u32::try_from(index).map_err(|cause| cause.to_string())?;
         let (title_length, body_length) = index_document_postings(document, row, &mut lists)?;
         total_title_length += u64::from(title_length);
@@ -2105,14 +2440,14 @@ pub fn build(
             &mut vector_payload,
             &mut vector_ranges,
         )?;
+        let source_attributes = document.columns().attributes();
         let attributes = filterable
             .as_ref()
             .map_or_else(
-                || serde_json::value::to_raw_value(&document.attributes),
+                || serde_json::value::to_raw_value(source_attributes),
                 |fields| {
                     serde_json::value::to_raw_value(
-                        &document
-                            .attributes
+                        &source_attributes
                             .iter()
                             .filter(|(name, _)| fields.contains(name.as_str()))
                             .collect::<BTreeMap<_, _>>(),
@@ -2127,7 +2462,7 @@ pub fn build(
             body_length,
             attributes: attributes.into(),
             data,
-            vector: document.vector.is_some(),
+            vector: document.vector_values()?.is_some(),
         });
     }
     let metadata = DocumentTable::from(metadata);
@@ -2139,7 +2474,7 @@ pub fn build(
     let vector_prefix = vector_prefix(&metadata)?;
     let header = Header {
         filter_masks: RefCell::default(),
-        version: 2,
+        version: 3,
         documents: metadata,
         terms,
         total_title_length,
@@ -2198,8 +2533,125 @@ fn parse_legacy_segment(bytes: &[u8]) -> Result<(LegacySegmentHeader, usize), St
     Ok((legacy, 16 + length))
 }
 
+fn owned_directory_row(row: &DocumentMeta<&str, &DocumentAttributes>, data: Range) -> DocumentMeta {
+    DocumentMeta {
+        id: row.id.to_owned().into_boxed_str(),
+        revision: row.revision,
+        title_length: row.title_length,
+        body_length: row.body_length,
+        attributes: row.attributes.clone(),
+        data,
+        vector: row.vector,
+    }
+}
+
+fn rebase_postings(terms: &mut TermDictionary, old_end: u32, new_end: u32) -> Result<(), String> {
+    for (_, term) in &mut terms.entries {
+        for block in &mut term.blocks {
+            if block.data.offset < old_end {
+                return Err("Posting range outside its payload".into());
+            }
+            block.data.offset = new_end
+                .checked_add(block.data.offset - old_end)
+                .ok_or("Migrated posting offset overflow")?;
+        }
+    }
+    Ok(())
+}
+
+fn migrate_v2_segment(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let (header, base) = parse_header(bytes)?;
+    let source = bytes.get(base..).ok_or("Truncated segment payload")?;
+    let old_vector_end = header.vector_end;
+    let mut metadata = Vec::with_capacity(header.documents.len());
+    let mut payload = Vec::new();
+    let mut vectors = Vec::new();
+    let mut vector_ranges = Vec::new();
+    for (index, row) in header.documents.iter().enumerate() {
+        let start = usize::try_from(row.data.offset).map_err(|cause| cause.to_string())?;
+        let length = usize::try_from(row.data.length).map_err(|cause| cause.to_string())?;
+        let end = start.checked_add(length).ok_or("Metadata range overflow")?;
+        let decoded = decode_page(
+            source
+                .get(start..end)
+                .ok_or("Truncated document metadata")?,
+        )?;
+        let (facts, document) = parse_document_metadata(&decoded)?;
+        if document.id != row.id
+            || document.revision != row.revision
+            || ((facts.flags & 1) != 0) != row.vector
+        {
+            return Err("Segment document does not match its directory".into());
+        }
+        let data = append(
+            &mut payload,
+            &encode_canonical_metadata_page(&document, facts)?,
+        )?;
+        if row.vector {
+            let range = header
+                .vector_range(index)?
+                .cloned()
+                .ok_or_else(|| "Missing vector frame".to_owned())?;
+            let vector_start = usize::try_from(range.offset).map_err(|cause| cause.to_string())?;
+            let vector_length = usize::try_from(range.length).map_err(|cause| cause.to_string())?;
+            let vector_end = vector_start
+                .checked_add(vector_length)
+                .ok_or("Vector range overflow")?;
+            vector_ranges.push(append_existing_frame(
+                &mut vectors,
+                source
+                    .get(vector_start..vector_end)
+                    .ok_or("Truncated vector frame")?,
+            )?);
+        }
+        metadata.push(owned_directory_row(&row, data));
+    }
+    let (metadata_end, vector_end) =
+        finish_document_columns(&mut payload, &vectors, &mut vector_ranges)?;
+    drop(vectors);
+    let tail = source
+        .get(old_vector_end as usize..)
+        .ok_or("Missing posting tail")?;
+    if payload
+        .len()
+        .checked_add(tail.len())
+        .is_none_or(|length| length > MAX_BYTES)
+    {
+        return Err("Converted segment exceeds sixteen MiB before its header".into());
+    }
+    payload.extend_from_slice(tail);
+    let mut terms = header.terms.clone();
+    rebase_postings(&mut terms, old_vector_end, vector_end)?;
+    let metadata = DocumentTable::from(metadata);
+    let migrated = Header {
+        filter_masks: RefCell::default(),
+        version: 3,
+        vector_prefix: vector_prefix(&metadata)?,
+        documents: metadata,
+        terms,
+        total_title_length: header.total_title_length,
+        total_body_length: header.total_body_length,
+        metadata_end,
+        vector_end,
+        vector_ranges,
+    };
+    validate_header(&migrated)?;
+    migrated.encode(&payload)
+}
+
 #[doc = "# Errors\nRejects invalid legacy segments, corrupt documents or postings, and converted segments above sixteen MiB."]
 pub fn migrate_segment(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    if bytes.len() >= 8 && &bytes[..8] == MAGIC_V3 {
+        parse_header(bytes)?;
+        return Ok(bytes.to_vec());
+    }
+    if bytes.len() >= 8 && &bytes[..8] == MAGIC_V2 {
+        return migrate_v2_segment(bytes);
+    }
+    migrate_v1_segment(bytes)
+}
+
+fn migrate_v1_segment(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let (legacy, base) = parse_legacy_segment(bytes)?;
     let source = bytes.get(base..).ok_or("Truncated legacy payload")?;
     let mut metadata = Vec::with_capacity(legacy.documents.len());
@@ -2218,18 +2670,21 @@ pub fn migrate_segment(bytes: &[u8]) -> Result<Vec<u8>, String> {
             .get(row.data.offset as usize..source_end as usize)
             .ok_or("Truncated legacy document")?;
         let decoded = decode_page(frame)?;
-        let document: Document =
-            serde_json::from_slice(&decoded).map_err(|cause| cause.to_string())?;
+        let document = Document::from_native_slice(&decoded)?;
+        let values = document.vector_values()?;
         if document.id.as_bytes() != row.id.as_bytes()
             || document.revision != row.revision
-            || document.vector.is_some() != row.vector
+            || values.is_some() != row.vector
         {
             return Err("Legacy document does not match its directory".into());
         }
-        let separated = split_document_frame_parts(frame, &decoded, document)?;
-        row.data = append_existing_frame(&mut payload, &separated.metadata)?;
-        if let Some(vector) = separated.vector {
-            vector_ranges.push(append_existing_frame(&mut vectors, &vector)?);
+        let facts = vector_facts(values)?;
+        row.data = append(
+            &mut payload,
+            &encode_canonical_metadata_page(&document, facts)?,
+        )?;
+        if let Some(values) = values {
+            vector_ranges.push(append(&mut vectors, &vector_frame_bytes(values)?)?);
         }
         metadata.push(row);
     }
@@ -2258,15 +2713,13 @@ pub fn migrate_segment(bytes: &[u8]) -> Result<Vec<u8>, String> {
             if block.data.offset < source_end || end as usize > source.len() {
                 return Err("Legacy posting range outside its payload".into());
             }
-            block.data.offset = vector_end
-                .checked_add(block.data.offset - source_end)
-                .ok_or("Migrated posting offset overflow")?;
         }
     }
+    rebase_postings(&mut terms, source_end, vector_end)?;
     let metadata = DocumentTable::from(metadata);
     let header = Header {
         filter_masks: RefCell::default(),
-        version: 2,
+        version: 3,
         vector_prefix: vector_prefix(&metadata)?,
         documents: metadata,
         terms,
@@ -2299,9 +2752,16 @@ fn append_existing_frame(payload: &mut Vec<u8>, frame: &[u8]) -> Result<Range, S
 
 #[doc = "# Errors\nRejects invalid framing, checksums, versions, ordering, frequencies, and posting directories."]
 pub fn parse_header(bytes: &[u8]) -> Result<(Header, usize), String> {
-    if bytes.len() < 16 || &bytes[..8] != MAGIC {
+    if bytes.len() < 16 {
         return Err("Invalid segment header".into());
     }
+    let expected_version = if &bytes[..8] == MAGIC_V2 {
+        2
+    } else if &bytes[..8] == MAGIC_V3 {
+        3
+    } else {
+        return Err("Invalid segment header".into());
+    };
     let length = u32::from_le_bytes(
         bytes[8..12]
             .try_into()
@@ -2323,6 +2783,9 @@ pub fn parse_header(bytes: &[u8]) -> Result<(Header, usize), String> {
     }
     let text = std::str::from_utf8(json).map_err(|cause| cause.to_string())?;
     let mut header: Header = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    if header.version != expected_version {
+        return Err("Segment magic does not match its version".into());
+    }
     validate_header(&header)?;
     header.vector_prefix = vector_prefix(&header.documents)?;
     header.documents.shrink_to_fit();
@@ -2330,7 +2793,10 @@ pub fn parse_header(bytes: &[u8]) -> Result<(Header, usize), String> {
 }
 
 fn validate_header(header: &Header) -> Result<(), String> {
-    if header.version != 2 || header.documents.is_empty() || header.documents.len() > 10000 {
+    if (header.version != 2 && header.version != 3)
+        || header.documents.is_empty()
+        || header.documents.len() > 10000
+    {
         return Err("Invalid segment version or document count".into());
     }
     let documents = &header.documents;
@@ -4396,12 +4862,38 @@ impl Search {
     }
 }
 
-pub fn document_terms(document: &Document) -> Vec<String> {
-    normalize_text(&format!("{} {}", document.title, document.text))
+#[doc = "# Errors\nRejects a document whose native title or text role is not text."]
+pub fn document_terms(document: &Document) -> Result<Vec<String>, String> {
+    let title = document.role_text(NativeRole::Title)?;
+    let text = document.role_text(NativeRole::Text)?;
+    Ok(normalize_text(&format!("{title} {text}"))
         .split_whitespace()
         .map(str::to_owned)
         .collect::<BTreeSet<_>>()
         .into_iter()
+        .collect())
+}
+
+#[cfg(test)]
+fn vector_bits(document: &Document) -> Result<Option<Vec<u32>>, String> {
+    match document.column(ColumnId::Role(NativeRole::Vector)) {
+        Some(ColumnValue::Vector(values)) => {
+            Ok(Some(values.iter().map(|value| value.to_bits()).collect()))
+        }
+        None => Ok(None),
+        Some(ColumnValue::Text(_) | ColumnValue::Attribute(_)) => {
+            Err("Native vector role is not a vector".into())
+        }
+    }
+}
+
+#[cfg(test)]
+fn documents_from_native_value(
+    value: serde_json::Value,
+) -> Result<Vec<Document>, serde_json::Error> {
+    serde_json::from_value::<Vec<serde_json::Value>>(value)?
+        .into_iter()
+        .map(Document::from_native_value)
         .collect()
 }
 
@@ -6548,8 +7040,11 @@ pub mod wasm {
         #[wasm_bindgen(constructor)]
         #[doc = "# Errors\nRejects invalid input serialization or segment framing, size, and integrity constraints."]
         pub fn new(json: &str, filterable: Option<String>) -> Result<Self, JsValue> {
-            let documents: Vec<Document> =
-                serde_json::from_str(json).map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let documents = serde_json::from_str::<Vec<CanonicalDocumentDto>>(json)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?
+                .into_iter()
+                .map(Document::from_canonical_dto)
+                .collect();
             let filterable = filterable
                 .map(|json| serde_json::from_str::<Vec<String>>(&json))
                 .transpose()
@@ -7252,14 +7747,14 @@ pub mod wasm {
     }
 
     #[wasm_bindgen]
-    #[doc = "# Errors\nRejects invalid v2 canonical header framing or serialization."]
+    #[doc = "# Errors\nRejects invalid v2 or v3 canonical header framing or serialization."]
     pub fn segment_header(bytes: &[u8]) -> Result<String, JsValue> {
         let (header, _) = parse_header(bytes).map_err(|cause| JsValue::from_str(&cause))?;
         serde_json::to_string(&header).map_err(|cause| JsValue::from_str(&cause.to_string()))
     }
 
     #[wasm_bindgen]
-    #[doc = "# Errors\nRejects invalid v1 sources or migration output above sixteen MiB."]
+    #[doc = "# Errors\nRejects invalid v1 or v2 sources or migration output above sixteen MiB."]
     pub fn segment_migrate(bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
         super::migrate_segment(bytes).map_err(|cause| JsValue::from_str(&cause))
     }
@@ -7289,10 +7784,12 @@ pub mod wasm {
     #[wasm_bindgen]
     #[doc = "# Errors\nRejects invalid document JSON or term serialization errors."]
     pub fn segment_document_terms(json: &str) -> Result<String, JsValue> {
-        let document: Document =
-            serde_json::from_str(json).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        serde_json::to_string(&document_terms(&document))
-            .map_err(|e| JsValue::from_str(&e.to_string()))
+        let document =
+            Document::from_canonical_json(json).map_err(|cause| JsValue::from_str(&cause))?;
+        serde_json::to_string(
+            &document_terms(&document).map_err(|cause| JsValue::from_str(&cause))?,
+        )
+        .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     #[wasm_bindgen]
@@ -7769,13 +8266,23 @@ mod query_document_projection_tests {
     use std::collections::BTreeMap;
 
     fn document(vector: Option<Vec<f32>>) -> Document {
-        Document {
-            id: "row-1".into(),
-            revision: 7,
-            title: "title".into(),
-            text: "body".into(),
-            attributes: BTreeMap::from([("field".into(), json!("value"))]),
+        Document::native(
+            "row-1".into(),
+            7,
+            "title".into(),
+            "body".into(),
+            BTreeMap::from([("field".into(), json!("value"))]),
             vector,
+        )
+    }
+
+    fn vector_bits(document: &Document) -> Result<Option<Vec<u32>>, Box<dyn std::error::Error>> {
+        match document.column(super::ColumnId::Role(super::NativeRole::Vector)) {
+            Some(super::ColumnValue::Vector(values)) => {
+                Ok(Some(values.iter().map(|value| value.to_bits()).collect()))
+            }
+            None => Ok(None),
+            Some(_) => Err("Native vector role is not a vector".into()),
         }
     }
 
@@ -7783,16 +8290,22 @@ mod query_document_projection_tests {
         vector: Option<Vec<f32>>,
         expected_summary: Value,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut document = document(vector);
-        let mut expected = serde_json::to_value(&document)?;
+        let document = document(vector.clone());
+        let mut expected = serde_json::from_str::<Value>(&document.to_canonical_json()?)?;
         let fields = expected
             .as_object_mut()
             .ok_or("Document was not an object")?;
         fields.remove("vector");
         fields.insert("vectorSummary".into(), expected_summary);
-        let actual = serde_json::from_str::<Value>(&serialize_query_document(&mut document)?)?;
+        let actual = serde_json::from_str::<Value>(&serialize_query_document(&document)?)?;
         assert_eq!(actual, expected);
-        assert!(document.vector.is_none());
+        assert!(actual.get("vector").is_none());
+        assert_eq!(
+            vector_bits(&document)?,
+            vector
+                .as_ref()
+                .map(|values| values.iter().map(|value| value.to_bits()).collect())
+        );
         Ok(())
     }
 
@@ -7801,7 +8314,7 @@ mod query_document_projection_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let values = vec![f32::MAX, -f32::MAX, 0.1, -0.0, f32::from_bits(1)];
         let source = document(Some(values.clone()));
-        let encoded = serde_json::to_vec(&source)?;
+        let encoded = source.to_canonical_vec()?;
         let fields =
             serde_json::from_slice::<BTreeMap<String, Box<serde_json::value::RawValue>>>(&encoded)?;
         let vector = serde_json::from_str::<Vec<Box<serde_json::value::RawValue>>>(
@@ -7825,13 +8338,10 @@ mod query_document_projection_tests {
                 .to_bits(),
             f64::from(-f32::MAX).to_bits()
         );
-        let decoded: Document = serde_json::from_slice(&encoded)?;
-        let decoded = decoded.vector.ok_or("Vector disappeared")?;
+        let decoded = Document::from_canonical_slice(&encoded)?;
+        let decoded = vector_bits(&decoded)?.ok_or("Vector disappeared")?;
         assert_eq!(
-            decoded
-                .iter()
-                .map(|value| value.to_bits())
-                .collect::<Vec<_>>(),
+            decoded,
             values
                 .iter()
                 .map(|value| value.to_bits())
@@ -7869,7 +8379,7 @@ mod filter_cache_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let documents = (0..200)
             .map(|index| {
-                serde_json::from_value::<Document>(json!({
+                Document::from_native_value(json!({
                     "id": format!("{index:03}"), "text": "paged vectors",
                     "attributes": {"eligible": index >= 5, "padding": "x".repeat(1024)},
                     "vector": if index % 3 == 0 { None } else { Some(vec![1.0, 0.0]) }
@@ -7911,7 +8421,7 @@ mod filter_cache_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let documents = (0..4)
             .map(|index| {
-                serde_json::from_value::<Document>(json!({
+                Document::from_native_value(json!({
                     "id": format!("{index}"), "text": "vector",
                     "attributes": {"group": if index == 3 { "other" } else { "selected" }},
                     "vector": if index == 1 { None } else { Some(vec![1.0, 0.0]) }
@@ -7935,7 +8445,7 @@ mod filter_cache_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let documents = (0..32)
             .map(|index| {
-                serde_json::from_value::<Document>(json!({
+                Document::from_native_value(json!({
                     "id": format!("{index:02}"), "text": format!("rust unique{index}"),
                     "attributes": {
                         "year": 2024 + index % 2, "__proto__": index % 2 == 0,
@@ -7958,13 +8468,16 @@ mod filter_cache_tests {
             let attributes: serde_json::Value = serde_json::from_str(metadata.attributes.get())?;
             assert_eq!(
                 attributes,
-                json!({"year": document.attributes["year"], "__proto__": document.attributes["__proto__"]})
+                json!({"year": document.columns().attributes()["year"], "__proto__": document.columns().attributes()["__proto__"]})
             );
             let start = selected_base + metadata.data.offset as usize;
             let payload =
                 super::decode_page(&selected.bytes[start..start + metadata.data.length as usize])?;
-            let stored: Document = serde_json::from_slice(&payload)?;
-            assert_eq!(stored.attributes, document.attributes);
+            let (_, stored) = super::parse_document_metadata(&payload)?;
+            assert_eq!(
+                stored.columns().attributes(),
+                document.columns().attributes()
+            );
         }
         for op in [
             "eq", "ne", "gt", "gte", "lt", "lte", "in", "notIn", "exists",
@@ -8059,13 +8572,15 @@ mod filter_cache_tests {
         let documents = inputs
             .iter()
             .enumerate()
-            .map(|(index, _)| Document {
-                id: format!("{index}"),
-                revision: 1,
-                title: String::new(),
-                text: "target".into(),
-                attributes: std::collections::BTreeMap::new(),
-                vector: None,
+            .map(|(index, _)| {
+                Document::native(
+                    format!("{index}"),
+                    1,
+                    String::new(),
+                    "target".into(),
+                    std::collections::BTreeMap::new(),
+                    None,
+                )
             })
             .collect();
         let mut header = build(documents, None)?.header;
@@ -8143,7 +8658,7 @@ mod filter_cache_tests {
             .iter()
             .enumerate()
             .map(|(index, _)| {
-                serde_json::from_value::<Document>(json!({
+                Document::from_native_value(json!({
                     "id": format!("{index}"), "text": "target", "attributes": {}
                 }))
             })
@@ -8216,7 +8731,7 @@ mod filter_cache_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let documents = (0..5000)
             .map(|index| {
-                serde_json::from_value::<Document>(json!({
+                Document::from_native_value(json!({
                     "id": format!("{index:05}"), "text": "target",
                     "attributes": {"group": index % 2100}
                 }))
@@ -8319,7 +8834,7 @@ mod filter_cache_tests {
             r#"{"ignored":1e999,"group":1}"#,
             r#"{"ignored":{"nested":1e999},"group":1}"#,
         ] {
-            let document: Document = serde_json::from_value(json!({
+            let document = Document::from_native_value(json!({
                 "id":"a", "text":"target", "attributes":{}
             }))?;
             let mut header = build(vec![document], None)?.header;
@@ -8361,7 +8876,7 @@ mod filter_cache_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let documents = (0..10_000)
             .map(|index| {
-                serde_json::from_value::<Document>(json!({
+                Document::from_native_value(json!({
                     "id": format!("{index}"), "text": "target", "attributes": {"group": index}
                 }))
             })
@@ -8397,7 +8912,7 @@ mod filter_cache_tests {
     #[test]
     fn masks_are_bounded_and_tombstones_remain_query_local()
     -> Result<(), Box<dyn std::error::Error>> {
-        let document: Document = serde_json::from_value(json!({
+        let document = Document::from_native_value(json!({
             "id": "a", "text": "target", "attributes": {"group": 0}
         }))?;
         let header = build(vec![document], None)?.header;
@@ -8627,13 +9142,15 @@ mod frequency_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         for (repetitions, total_body_length) in [(1, 759), (64, 48_576)] {
             let docs: Vec<Document> = (0..256)
-                .map(|index| Document {
-                    id: format!("{index:05}"),
-                    revision: 0,
-                    title: "beta alpha".into(),
-                    text: "alpha beta alpha ".repeat(repetitions),
-                    attributes: BTreeMap::from([("group".into(), json!(index % 4))]),
-                    vector: None,
+                .map(|index| {
+                    Document::native(
+                        format!("{index:05}"),
+                        0,
+                        "beta alpha".into(),
+                        "alpha beta alpha ".repeat(repetitions),
+                        BTreeMap::from([("group".into(), json!(index % 4))]),
+                        None,
+                    )
                 })
                 .collect();
             let built = build(docs, None)?;
@@ -8713,7 +9230,7 @@ mod frequency_tests {
     fn frequency_decoding_still_checks_positions_against_document_lengths()
     -> Result<(), Box<dyn std::error::Error>> {
         let built = build(
-            serde_json::from_value(json!([
+            super::documents_from_native_value(json!([
                 {"id":"a","text":"alpha beta alpha","attributes":{}}
             ]))?,
             None,
@@ -8747,7 +9264,7 @@ mod frequency_tests {
     fn excluded_rows_do_not_hide_corruption_or_disordered_blocks()
     -> Result<(), Box<dyn std::error::Error>> {
         let built = build(
-            serde_json::from_value(json!([
+            super::documents_from_native_value(json!([
                 {"id":"a","text":"alpha","attributes":{}},
                 {"id":"b","text":"alpha","attributes":{}},
                 {"id":"c","text":"alpha","attributes":{}}
@@ -8798,13 +9315,15 @@ mod frequency_tests {
     fn retained_eligible_rows_match_a_full_list_reference_in_every_mode()
     -> Result<(), Box<dyn std::error::Error>> {
         let docs: Vec<Document> = (0..256)
-            .map(|index| Document {
-                id: format!("{index:05}"),
-                revision: 0,
-                title: String::new(),
-                text: "alpha beta alpha".into(),
-                attributes: BTreeMap::from([("group".into(), json!(index % 8))]),
-                vector: None,
+            .map(|index| {
+                Document::native(
+                    format!("{index:05}"),
+                    0,
+                    String::new(),
+                    "alpha beta alpha".into(),
+                    BTreeMap::from([("group".into(), json!(index % 8))]),
+                    None,
+                )
             })
             .collect();
         let built = build(docs, None)?;
@@ -8882,7 +9401,7 @@ mod common_term_projection_tests {
                     "attributes": {}
                 })
             })
-            .map(serde_json::from_value)
+            .map(Document::from_native_value)
             .collect::<Result<_, _>>()?;
         let built = build(documents, None)?;
         let projection: Value = serde_json::from_str(
@@ -8930,7 +9449,7 @@ mod common_term_projection_tests {
                     "attributes": {}
                 })
             })
-            .map(serde_json::from_value)
+            .map(Document::from_native_value)
             .collect::<Result<_, _>>()?;
         let built = build(documents, None)?;
         assert!(built.common_projection.is_none());
@@ -8960,7 +9479,7 @@ mod common_term_projection_tests {
                 };
                 json!({ "id": id, "text": text, "attributes": {} })
             })
-            .map(serde_json::from_value)
+            .map(Document::from_native_value)
             .collect::<Result<_, _>>()?;
         let built = build(documents, None)?;
         let projection: Value = serde_json::from_str(
@@ -8999,7 +9518,7 @@ mod candidate_tests {
     #[test]
     fn reusable_candidates_preserve_phrase_order_and_exclusions()
     -> Result<(), Box<dyn std::error::Error>> {
-        let documents: Vec<Document> = serde_json::from_value(json!([
+        let documents = super::documents_from_native_value(json!([
             {"id":"a","text":"beta alpha beta","attributes":{}},
             {"id":"b","text":"alpha beta alpha","attributes":{}},
             {"id":"c","text":"alpha beta","attributes":{}},
@@ -9167,13 +9686,15 @@ mod dense_cutoff_tests {
         for stride in [1, 8] {
             let built = build(
                 (0..1024)
-                    .map(|row| Document {
-                        id: format!("{row:05}"),
-                        revision: 0,
-                        title: "alpha ".repeat(row / stride % 7),
-                        text: format!("alpha beta {}", "padding ".repeat(row / stride % 257)),
-                        attributes: BTreeMap::from([("group".into(), json!(row % 3))]),
-                        vector: None,
+                    .map(|row| {
+                        Document::native(
+                            format!("{row:05}"),
+                            0,
+                            "alpha ".repeat(row / stride % 7),
+                            format!("alpha beta {}", "padding ".repeat(row / stride % 257)),
+                            BTreeMap::from([("group".into(), json!(row % 3))]),
+                            None,
+                        )
                     })
                     .collect(),
                 None,
@@ -9260,21 +9781,23 @@ mod eligible_bound_tests {
     fn eligible_bounds_cover_actual_scores_without_loosening_physical_bounds()
     -> Result<(), Box<dyn std::error::Error>> {
         let docs = (0..384)
-            .map(|row| Document {
-                id: format!("{row:05}"),
-                revision: 0,
-                title: "alpha ".repeat(row % 2 * (row % 4 + 1)),
-                text: format!(
-                    "{} {}",
-                    match row % 3 {
-                        0 => "alpha beta",
-                        1 => "alpha gamma",
-                        _ => "beta gamma",
-                    },
-                    "padding ".repeat(row % 2 * (row % 17 + 20))
-                ),
-                attributes: BTreeMap::from([("group".into(), json!(row % 2))]),
-                vector: None,
+            .map(|row| {
+                Document::native(
+                    format!("{row:05}"),
+                    0,
+                    "alpha ".repeat(row % 2 * (row % 4 + 1)),
+                    format!(
+                        "{} {}",
+                        match row % 3 {
+                            0 => "alpha beta",
+                            1 => "alpha gamma",
+                            _ => "beta gamma",
+                        },
+                        "padding ".repeat(row % 2 * (row % 17 + 20))
+                    ),
+                    BTreeMap::from([("group".into(), json!(row % 2))]),
+                    None,
+                )
             })
             .collect();
         let built = build(docs, None)?;
@@ -9407,11 +9930,11 @@ mod cutoff_certificate_tests {
                     1 => String::from("\u{10000}"),
                     _ => format!("row-{row:03}"),
                 };
-                Document {
+                Document::native(
                     id,
-                    revision: 0,
-                    title: "alpha ".repeat(row % 4),
-                    text: format!(
+                    0,
+                    "alpha ".repeat(row % 4),
+                    format!(
                         "{} {}",
                         match row % 3 {
                             0 => "alpha beta",
@@ -9420,9 +9943,9 @@ mod cutoff_certificate_tests {
                         },
                         "padding ".repeat(row % 17)
                     ),
-                    attributes: BTreeMap::from([("group".into(), serde_json::json!(row % 2))]),
-                    vector: None,
-                }
+                    BTreeMap::from([("group".into(), serde_json::json!(row % 2))]),
+                    None,
+                )
             })
             .collect();
         build(documents, None)
@@ -9625,17 +10148,19 @@ mod required_term_tests {
     fn a_required_rare_term_avoids_scoring_common_only_rows()
     -> Result<(), Box<dyn std::error::Error>> {
         let docs = (0..4096)
-            .map(|row| Document {
-                id: format!("{row:05}"),
-                revision: 1,
-                title: String::new(),
-                text: format!(
-                    "{} {}",
-                    "alpha beta gamma ".repeat(8 + row % 8),
-                    if row % 97 == 0 { "needle" } else { "filler" }
-                ),
-                attributes: BTreeMap::new(),
-                vector: None,
+            .map(|row| {
+                Document::native(
+                    format!("{row:05}"),
+                    1,
+                    String::new(),
+                    format!(
+                        "{} {}",
+                        "alpha beta gamma ".repeat(8 + row % 8),
+                        if row % 97 == 0 { "needle" } else { "filler" }
+                    ),
+                    BTreeMap::new(),
+                    None,
+                )
             })
             .collect();
         let built = build(docs, None)?;
@@ -9693,24 +10218,26 @@ mod required_term_tests {
     fn required_terms_preserve_exhaustive_scores_with_filters_deletions_and_changed_statistics()
     -> Result<(), Box<dyn std::error::Error>> {
         let docs = (0..1024)
-            .map(|row| Document {
-                id: format!("{row:05}"),
-                revision: 1,
-                title: if row % 97 == 0 {
-                    "needle alpha".into()
-                } else {
-                    "gamma ".repeat(row % 3)
-                },
-                text: format!(
-                    "{} {} {} {} {}",
-                    "alpha ".repeat(row % 5),
-                    "beta ".repeat(row % 7),
-                    "gamma ".repeat(row % 11),
-                    if row % 53 == 0 { "scarce" } else { "filler" },
-                    "padding ".repeat(row % 17)
-                ),
-                attributes: BTreeMap::from([("group".into(), serde_json::json!(row % 2))]),
-                vector: None,
+            .map(|row| {
+                Document::native(
+                    format!("{row:05}"),
+                    1,
+                    if row % 97 == 0 {
+                        "needle alpha".into()
+                    } else {
+                        "gamma ".repeat(row % 3)
+                    },
+                    format!(
+                        "{} {} {} {} {}",
+                        "alpha ".repeat(row % 5),
+                        "beta ".repeat(row % 7),
+                        "gamma ".repeat(row % 11),
+                        if row % 53 == 0 { "scarce" } else { "filler" },
+                        "padding ".repeat(row % 17)
+                    ),
+                    BTreeMap::from([("group".into(), serde_json::json!(row % 2))]),
+                    None,
+                )
             })
             .collect();
         let built = build(docs, None)?;
@@ -9798,7 +10325,7 @@ mod uniform_hits_tests {
                     "wide" => ("filler ".repeat(index % 5), format!("alpha beta {}", "noise ".repeat(index % 67))),
                     _ => ("heading".to_owned(), format!("alpha beta {}", "noise ".repeat(index % 7))),
                 };
-                serde_json::from_value::<Document>(json!({"id":id,"title":title,"text":text,"attributes":{"group":index%3,"empty":null}}))
+                Document::from_native_value(json!({"id":id,"title":title,"text":text,"attributes":{"group":index%3,"empty":null}}))
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(build(documents, None)?)
@@ -9972,16 +10499,18 @@ mod dictionary_frames_tests {
             for cardinality in [1, 100, 700, 2048] {
                 let built = build(
                     (0..count)
-                        .map(|i| Document {
-                            id: format!("ação-{i:06}😀"),
-                            revision: u64::MAX,
-                            title: "cloudflare rust".into(),
-                            text: "cloudflare rust search".into(),
-                            attributes: BTreeMap::from([
-                                ("group".into(), serde_json::json!(i % cardinality)),
-                                ("nested".into(), serde_json::json!([null, true, "😀"])),
-                            ]),
-                            vector: None,
+                        .map(|i| {
+                            Document::native(
+                                format!("ação-{i:06}😀"),
+                                u64::MAX,
+                                "cloudflare rust".into(),
+                                "cloudflare rust search".into(),
+                                BTreeMap::from([
+                                    ("group".into(), serde_json::json!(i % cardinality)),
+                                    ("nested".into(), serde_json::json!([null, true, "😀"])),
+                                ]),
+                                None,
+                            )
                         })
                         .collect(),
                     None,
@@ -10031,7 +10560,7 @@ mod shared_attribute_identity_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let input = (0..512)
             .map(|index| {
-                serde_json::from_value::<Document>(json!({
+                Document::from_native_value(json!({
                     "id": format!("{index:04}"),
                     "text": "cloudflare rust",
                     "attributes": {
@@ -10196,13 +10725,15 @@ mod common_frame_validation_tests {
             .join(" ");
         let built = build(
             (0..2)
-                .map(|value| Document {
-                    id: value.to_string(),
-                    revision: 1,
-                    title: String::new(),
-                    text: text.clone(),
-                    attributes: BTreeMap::new(),
-                    vector: None,
+                .map(|value| {
+                    Document::native(
+                        value.to_string(),
+                        1,
+                        String::new(),
+                        text.clone(),
+                        BTreeMap::new(),
+                        None,
+                    )
                 })
                 .collect(),
             None,
@@ -10259,13 +10790,15 @@ mod common_frame_validation_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let built = build(
             (0..256)
-                .map(|value| Document {
-                    id: format!("row{value:04}"),
-                    revision: 1,
-                    title: "common term".into(),
-                    text: "common term common".into(),
-                    attributes: BTreeMap::new(),
-                    vector: None,
+                .map(|value| {
+                    Document::native(
+                        format!("row{value:04}"),
+                        1,
+                        "common term".into(),
+                        "common term common".into(),
+                        BTreeMap::new(),
+                        None,
+                    )
                 })
                 .collect(),
             None,
@@ -10307,13 +10840,15 @@ mod common_frame_validation_tests {
         let text = "dense ".repeat(512);
         let built = build(
             (0..256)
-                .map(|value| Document {
-                    id: format!("row{value:04}"),
-                    revision: 1,
-                    title: String::new(),
-                    text: text.clone(),
-                    attributes: BTreeMap::new(),
-                    vector: None,
+                .map(|value| {
+                    Document::native(
+                        format!("row{value:04}"),
+                        1,
+                        String::new(),
+                        text.clone(),
+                        BTreeMap::new(),
+                        None,
+                    )
                 })
                 .collect(),
             None,
@@ -10341,17 +10876,19 @@ mod selected_hot_posting_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let built = build(
             (0_u32..256)
-                .map(|index| Document {
-                    id: format!("row{index:04}"),
-                    revision: 1,
-                    title: String::new(),
-                    text: if index < 128 {
-                        format!("common {}", "padding ".repeat(300))
-                    } else {
-                        "common ".repeat(4)
-                    },
-                    attributes: BTreeMap::from([("group".into(), serde_json::json!(index % 2))]),
-                    vector: None,
+                .map(|index| {
+                    Document::native(
+                        format!("row{index:04}"),
+                        1,
+                        String::new(),
+                        if index < 128 {
+                            format!("common {}", "padding ".repeat(300))
+                        } else {
+                            "common ".repeat(4)
+                        },
+                        BTreeMap::from([("group".into(), serde_json::json!(index % 2))]),
+                        None,
+                    )
                 })
                 .collect(),
             None,
@@ -10438,13 +10975,15 @@ mod selected_hot_posting_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let built = build(
             (0_u32..512)
-                .map(|index| Document {
-                    id: format!("row{index:04}"),
-                    revision: 1,
-                    title: "common".into(),
-                    text: "dense ".repeat(512),
-                    attributes: BTreeMap::new(),
-                    vector: None,
+                .map(|index| {
+                    Document::native(
+                        format!("row{index:04}"),
+                        1,
+                        "common".into(),
+                        "dense ".repeat(512),
+                        BTreeMap::new(),
+                        None,
+                    )
                 })
                 .collect(),
             None,
@@ -10527,18 +11066,20 @@ mod columnar_v2_tests {
         ]
         .into_iter()
         .enumerate()
-        .map(|(index, vector)| Document {
-            id: format!("row-{index}"),
-            revision: 7,
-            title: "ação 日本語".into(),
-            text: "cloudflare rust cloudflare".into(),
-            attributes: BTreeMap::from([
-                ("tiny".into(), serde_json::json!(1e-307)),
-                ("max".into(), serde_json::json!(3.402_823_466_385_288_6e38)),
-                ("fraction".into(), serde_json::json!(0.1)),
-                ("nested".into(), serde_json::json!({"vector":"preserved"})),
-            ]),
-            vector,
+        .map(|(index, vector)| {
+            Document::native(
+                format!("row-{index}"),
+                7,
+                "ação 日本語".into(),
+                "cloudflare rust cloudflare".into(),
+                BTreeMap::from([
+                    ("tiny".into(), serde_json::json!(1e-307)),
+                    ("max".into(), serde_json::json!(3.402_823_466_385_288_6e38)),
+                    ("fraction".into(), serde_json::json!(0.1)),
+                    ("nested".into(), serde_json::json!({"vector":"preserved"})),
+                ]),
+                vector,
+            )
         })
         .collect()
     }
@@ -10556,10 +11097,7 @@ mod columnar_v2_tests {
         let mut payload = Vec::new();
         let mut metadata = built.header.documents.clone();
         for (row, document) in metadata.rows.iter_mut().zip(&documents) {
-            row.data = append(
-                &mut payload,
-                &serde_json::to_vec(document).map_err(|cause| cause.to_string())?,
-            )?;
+            row.data = append(&mut payload, &document.to_native_vec()?)?;
         }
         let document_end = u32::try_from(payload.len()).map_err(|cause| cause.to_string())?;
         let mut terms = built.header.terms;
@@ -10598,7 +11136,7 @@ mod columnar_v2_tests {
         let original = documents();
         let built = build(original.clone(), None)?;
         let (header, base) = parse_header(&built.bytes)?;
-        assert_eq!(header.version, 2);
+        assert_eq!(header.version, 3);
         assert_eq!(header.vector_ranges.len(), 3);
         assert!(parse_header(&built.bytes[..base]).is_ok());
         let payload = &built.bytes[base..];
@@ -10610,30 +11148,21 @@ mod columnar_v2_tests {
                 .transpose()?
                 .unwrap_or_default();
             let reconstructed = full_document_from_frames(data, vector)?;
-            let actual: Document =
-                serde_json::from_str(&reconstructed).map_err(|cause| cause.to_string())?;
+            let actual = Document::from_canonical_json(&reconstructed)?;
             assert_eq!(actual.id, document.id);
-            assert_eq!(
-                actual.vector.as_ref().map(|values| values
-                    .iter()
-                    .map(|value| value.to_bits())
-                    .collect::<Vec<_>>()),
-                document.vector.as_ref().map(|values| values
-                    .iter()
-                    .map(|value| value.to_bits())
-                    .collect::<Vec<_>>())
-            );
+            assert_eq!(super::vector_bits(&actual)?, super::vector_bits(document)?);
             let query: serde_json::Value =
                 serde_json::from_str(&query_document_from_metadata(data)?)
                     .map_err(|cause| cause.to_string())?;
             assert!(query.get("vector").is_none());
             assert_eq!(query["attributes"]["nested"]["vector"], "preserved");
-            if document.vector.is_none() {
+            let vector = super::vector_bits(document)?;
+            if vector.is_none() {
                 assert!(query["vectorSummary"].is_null());
             } else {
                 assert_eq!(
                     query["vectorSummary"][0],
-                    document.vector.as_ref().map_or(0, Vec::len)
+                    vector.as_ref().map_or(0, Vec::len)
                 );
             }
         }
@@ -10688,8 +11217,7 @@ mod columnar_v2_tests {
                 }
             }
             let source_document = decode_page(frame(old_payload, &before.data)?)?;
-            let expected: Document =
-                serde_json::from_slice(&source_document).map_err(|cause| cause.to_string())?;
+            let expected = Document::from_native_slice(&source_document)?;
             let data = frame(&migrated[base..], &after.data)?;
             let vector = header
                 .vector_range(row)?
@@ -10698,7 +11226,7 @@ mod columnar_v2_tests {
                 .unwrap_or_default();
             assert_eq!(
                 full_document_from_frames(data, vector)?,
-                serde_json::to_string(&expected).map_err(|cause| cause.to_string())?
+                expected.to_canonical_json()?
             );
         }
         for ((before_name, before), (after_name, after)) in
@@ -10716,20 +11244,22 @@ mod columnar_v2_tests {
                 assert_eq!(before_block.last, after_block.last);
             }
         }
-        assert!(migrate_segment(&migrated).is_err());
+        assert_eq!(migrate_segment(&migrated)?, migrated);
         Ok(())
     }
 
     #[test]
     fn dense_vector_ranges_cross_multiple_prefix_blocks() -> Result<(), String> {
         let values = (0_u16..130)
-            .map(|index| Document {
-                id: format!("row-{index:03}"),
-                revision: u64::from(index),
-                title: "rust".into(),
-                text: "cloudflare rust".into(),
-                attributes: BTreeMap::new(),
-                vector: (index % 3 != 1).then_some(vec![f32::from(index), 0.5]),
+            .map(|index| {
+                Document::native(
+                    format!("row-{index:03}"),
+                    u64::from(index),
+                    "rust".into(),
+                    "cloudflare rust".into(),
+                    BTreeMap::new(),
+                    (index % 3 != 1).then_some(vec![f32::from(index), 0.5]),
+                )
             })
             .collect::<Vec<_>>();
         let built = build(values.clone(), None)?;
@@ -10741,10 +11271,12 @@ mod columnar_v2_tests {
                 .map(|range| frame(&built.bytes[base..], range))
                 .transpose()?
                 .unwrap_or_default();
-            let reconstructed: Document =
-                serde_json::from_str(&full_document_from_frames(data, vector)?)
-                    .map_err(|cause| cause.to_string())?;
-            assert_eq!(reconstructed.vector, values[index].vector);
+            let reconstructed =
+                Document::from_canonical_json(&full_document_from_frames(data, vector)?)?;
+            assert_eq!(
+                super::vector_bits(&reconstructed)?,
+                super::vector_bits(&values[index])?
+            );
         }
         Ok(())
     }
@@ -10793,6 +11325,638 @@ mod columnar_v2_tests {
         let last = corrupt.last_mut().ok_or("Missing vector byte")?;
         *last ^= 1;
         assert!(full_document_from_frames(metadata, &corrupt).is_err());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod canonical_column_tests {
+    use super::{
+        ColumnId, ColumnValue, Document, DocumentTable, Filter, Header, NativeRole, Range, Search,
+        Statistics, append, build, decode_page, document_terms, full_document_from_frames,
+        migrate_segment, owned_directory_row, parse_document_metadata, parse_header,
+        query_document_from_metadata, rebase_postings, vector_prefix, write_vector_facts,
+    };
+    use std::collections::BTreeMap;
+
+    fn collision_documents() -> Vec<Document> {
+        let collided = [
+            ("id", serde_json::json!("attr-id")),
+            ("revision", serde_json::json!(99)),
+            ("title", serde_json::json!("attr-title")),
+            ("text", serde_json::json!("attr-text")),
+            ("vector", serde_json::json!([1, 2])),
+            ("year", serde_json::json!(3)),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value))
+        .collect();
+        vec![
+            Document::native(
+                "row-a",
+                7,
+                "alpha unique",
+                "shared beta",
+                collided,
+                Some(vec![f32::MAX, -0.0]),
+            ),
+            Document::native("row-b", 1, "", "shared", BTreeMap::new(), None),
+            Document::native(
+                "row-c",
+                2,
+                "gamma",
+                "shared gamma",
+                BTreeMap::from([("year".into(), serde_json::json!(4))]),
+                Some(Vec::new()),
+            ),
+        ]
+    }
+
+    fn frame<'a>(payload: &'a [u8], range: &Range) -> Result<&'a [u8], String> {
+        let offset = usize::try_from(range.offset).map_err(|cause| cause.to_string())?;
+        let length = usize::try_from(range.length).map_err(|cause| cause.to_string())?;
+        let end = offset.checked_add(length).ok_or("Frame range overflow")?;
+        payload
+            .get(offset..end)
+            .ok_or_else(|| "Missing test frame".into())
+    }
+
+    fn legacy_metadata_page(
+        facts: super::VectorFacts,
+        document: &Document,
+    ) -> Result<Vec<u8>, String> {
+        let json = document.to_native_metadata_vec()?;
+        if (facts.flags & 1) == 0 {
+            return Ok(json);
+        }
+        let mut page = Vec::with_capacity(6 + json.len());
+        write_vector_facts(facts, &mut page);
+        page.extend_from_slice(&json);
+        Ok(page)
+    }
+
+    fn encode_legacy_v2(bytes: &[u8]) -> Result<Vec<u8>, String> {
+        let (header, base) = parse_header(bytes)?;
+        let source = bytes.get(base..).ok_or("Truncated segment payload")?;
+        let mut metadata = Vec::new();
+        let mut rows = Vec::with_capacity(header.documents.len());
+        for row in header.documents.iter() {
+            let decoded = decode_page(frame(source, &row.data)?)?;
+            let (facts, document) = parse_document_metadata(&decoded)?;
+            if document.id != row.id || document.revision != row.revision {
+                return Err("Legacy fixture row does not match its directory".into());
+            }
+            let data = append(&mut metadata, &legacy_metadata_page(facts, &document)?)?;
+            rows.push(owned_directory_row(&row, data));
+        }
+        let metadata_end = u32::try_from(metadata.len()).map_err(|cause| cause.to_string())?;
+        let mut vector_ranges = header.vector_ranges.clone();
+        for range in &mut vector_ranges {
+            let relative = range
+                .offset
+                .checked_sub(header.metadata_end)
+                .ok_or("Vector range precedes metadata")?;
+            range.offset = metadata_end
+                .checked_add(relative)
+                .ok_or("Vector offset overflow")?;
+        }
+        let vectors = source
+            .get(header.metadata_end as usize..header.vector_end as usize)
+            .ok_or("Missing vector column")?;
+        metadata.extend_from_slice(vectors);
+        let vector_end = u32::try_from(metadata.len()).map_err(|cause| cause.to_string())?;
+        let tail = source
+            .get(header.vector_end as usize..)
+            .ok_or("Missing posting tail")?;
+        metadata.extend_from_slice(tail);
+        let mut terms = header.terms.clone();
+        rebase_postings(&mut terms, header.vector_end, vector_end)?;
+        let documents = DocumentTable::from(rows);
+        let prefix = vector_prefix(&documents)?;
+        let legacy = Header {
+            filter_masks: std::cell::RefCell::default(),
+            version: 2,
+            documents,
+            terms,
+            total_title_length: header.total_title_length,
+            total_body_length: header.total_body_length,
+            metadata_end,
+            vector_end,
+            vector_ranges,
+            vector_prefix: prefix,
+        };
+        legacy.encode(&metadata)
+    }
+
+    fn source_for<'a>(documents: &'a [Document], id: &str) -> Result<&'a Document, String> {
+        documents
+            .iter()
+            .find(|document| document.id == id)
+            .ok_or_else(|| format!("Missing {id}"))
+    }
+
+    fn text_role(document: &Document, role: NativeRole) -> Result<&str, String> {
+        match document.column(ColumnId::Role(role)) {
+            Some(ColumnValue::Text(text)) => Ok(text),
+            Some(ColumnValue::Vector(_) | ColumnValue::Attribute(_)) | None => {
+                Err("Missing native text role".into())
+            }
+        }
+    }
+
+    fn ranked(
+        bytes: &[u8],
+        text: &str,
+        mode: &str,
+        filters: &[Filter],
+        dead: &[u32],
+    ) -> Result<Vec<(u32, u64)>, String> {
+        let (header, base) = parse_header(bytes)?;
+        let statistics = Statistics {
+            documents: u64::try_from(header.documents.len()).map_err(|cause| cause.to_string())?,
+            title_length: header.total_title_length,
+            body_length: header.total_body_length,
+            frequencies: header
+                .terms
+                .iter()
+                .map(|(term, metadata)| (term.to_owned(), u64::from(metadata.df)))
+                .collect(),
+        };
+        let mut search = Search::new(header.clone(), statistics, text, mode, 10, dead, filters)?;
+        let words = crate::normalize_text(text);
+        for term in words.split_whitespace() {
+            if let Some(metadata) = header.terms.get(term) {
+                for block in &metadata.blocks {
+                    let start = base
+                        .checked_add(block.data.offset as usize)
+                        .ok_or("Posting offset overflow")?;
+                    let end = start
+                        .checked_add(block.data.length as usize)
+                        .ok_or("Posting length overflow")?;
+                    search.add(term, bytes.get(start..end).ok_or("Missing posting page")?)?;
+                }
+            }
+        }
+        Ok(search
+            .finish()?
+            .into_iter()
+            .map(|hit| (hit.row, hit.score.to_bits()))
+            .collect())
+    }
+
+    fn projections(bytes: &[u8]) -> Result<BTreeMap<String, (String, String)>, String> {
+        let (header, base) = parse_header(bytes)?;
+        let payload = bytes.get(base..).ok_or("Truncated segment payload")?;
+        let mut rows = BTreeMap::new();
+        for (index, row) in header.documents.iter().enumerate() {
+            let metadata = frame(payload, &row.data)?;
+            let vector = header
+                .vector_range(index)?
+                .map(|range| frame(payload, range))
+                .transpose()?
+                .unwrap_or_default();
+            let full = full_document_from_frames(metadata, vector)?;
+            let query = query_document_from_metadata(metadata)?;
+            if rows.insert(row.id.to_owned(), (full, query)).is_some() {
+                return Err("Duplicate row id".into());
+            }
+        }
+        Ok(rows)
+    }
+
+    fn directory(bytes: &[u8]) -> Result<Vec<(String, u64, u32, u32, String, bool)>, String> {
+        let (header, _) = parse_header(bytes)?;
+        Ok(header
+            .documents
+            .iter()
+            .map(|row| {
+                (
+                    row.id.to_owned(),
+                    row.revision,
+                    row.title_length,
+                    row.body_length,
+                    row.attributes.get().to_owned(),
+                    row.vector,
+                )
+            })
+            .collect())
+    }
+
+    fn payload_range(bytes: &[u8], vector_column: bool) -> Result<Vec<u8>, String> {
+        let (header, base) = parse_header(bytes)?;
+        let payload = bytes.get(base..).ok_or("Truncated segment payload")?;
+        let range = if vector_column {
+            header.metadata_end as usize..header.vector_end as usize
+        } else {
+            header.vector_end as usize..payload.len()
+        };
+        payload
+            .get(range)
+            .ok_or_else(|| "Missing payload column".into())
+            .map(<[u8]>::to_vec)
+    }
+
+    type BlockShape = (u32, u32, u32, u32, u32, u32, u32, u32, u32);
+
+    fn term_shapes(bytes: &[u8]) -> Result<Vec<(String, u32, Vec<BlockShape>)>, String> {
+        let (header, _) = parse_header(bytes)?;
+        let mut shapes = Vec::new();
+        for (term, metadata) in header.terms.iter() {
+            let mut blocks = Vec::new();
+            for block in &metadata.blocks {
+                blocks.push((
+                    block.first,
+                    block.last,
+                    block.count,
+                    block.max_title_tf,
+                    block.max_body_tf,
+                    block.min_title_length,
+                    block.min_body_length,
+                    block
+                        .data
+                        .offset
+                        .checked_sub(header.vector_end)
+                        .ok_or("Posting precedes vectors")?,
+                    block.data.length,
+                ));
+            }
+            shapes.push((term.to_owned(), metadata.df, blocks));
+        }
+        Ok(shapes)
+    }
+
+    fn allowed_rows(
+        bytes: &[u8],
+        field: &str,
+        value: serde_json::Value,
+    ) -> Result<Vec<bool>, String> {
+        let (header, _) = parse_header(bytes)?;
+        let mask = header.allowed(
+            &[Filter {
+                field: field.into(),
+                op: "eq".into(),
+                value,
+            }],
+            &[],
+        )?;
+        Ok(mask.iter().collect())
+    }
+
+    fn metadata_page(raw: &[u8]) -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        let range = append(&mut bytes, raw)?;
+        frame(&bytes, &range).map(<[u8]>::to_vec)
+    }
+
+    fn canonical_metadata_page(json: &str) -> Result<Vec<u8>, String> {
+        let mut raw = vec![super::METADATA_CODEC_CANONICAL];
+        write_vector_facts(
+            super::VectorFacts {
+                flags: 0,
+                dimensions: 0,
+            },
+            &mut raw,
+        );
+        raw.extend_from_slice(json.as_bytes());
+        metadata_page(&raw)
+    }
+
+    fn rejection_eq<T>(result: Result<T, String>, expected: &str) -> Result<(), String> {
+        match result {
+            Err(error) if error == expected => Ok(()),
+            Err(error) => Err(error),
+            Ok(_) => Err(format!("Expected rejection {expected}")),
+        }
+    }
+
+    fn rejection_contains<T>(result: Result<T, String>, needle: &str) -> Result<(), String> {
+        match result {
+            Err(error) if error.contains(needle) => Ok(()),
+            Err(error) => Err(format!("Rejection {error} did not contain {needle}")),
+            Ok(_) => Err(format!("Expected rejection containing {needle}")),
+        }
+    }
+
+    #[test]
+    fn native_roles_stay_distinct_from_same_name_attributes() -> Result<(), String> {
+        let documents = collision_documents();
+        let collided = &documents[0];
+        assert_eq!(collided.id, "row-a");
+        assert_eq!(collided.revision, 7);
+        assert_eq!(text_role(collided, NativeRole::Title)?, "alpha unique");
+        assert_eq!(text_role(collided, NativeRole::Text)?, "shared beta");
+        assert_eq!(
+            collided
+                .columns()
+                .attributes()
+                .get("id")
+                .and_then(serde_json::Value::as_str),
+            Some("attr-id")
+        );
+        assert_eq!(
+            collided.columns().attributes().get("revision"),
+            Some(&serde_json::json!(99))
+        );
+        assert_eq!(
+            collided
+                .columns()
+                .attributes()
+                .get("title")
+                .and_then(serde_json::Value::as_str),
+            Some("attr-title")
+        );
+        assert_eq!(
+            document_terms(collided)?,
+            vec![
+                "alpha".to_owned(),
+                "beta".to_owned(),
+                "shared".to_owned(),
+                "unique".to_owned(),
+            ]
+        );
+        let built = build(documents.clone(), None)?;
+        let (header, _) = parse_header(&built.bytes)?;
+        for (row, document) in header.documents.iter().zip(&documents) {
+            assert_eq!(row.id, document.id);
+            assert_eq!(row.revision, document.revision);
+            let projected: BTreeMap<String, serde_json::Value> =
+                serde_json::from_str(row.attributes.get()).map_err(|cause| cause.to_string())?;
+            assert_eq!(&projected, document.columns().attributes());
+        }
+        for term in ["alpha", "beta", "gamma", "shared", "unique"] {
+            assert!(header.terms.get(term).is_some(), "missing {term}");
+        }
+        for term in ["attr", "id", "revision", "title", "text", "vector"] {
+            assert!(header.terms.get(term).is_none(), "indexed {term}");
+        }
+        assert_eq!(
+            allowed_rows(&built.bytes, "title", serde_json::json!("attr-title"))?,
+            vec![true, false, false]
+        );
+        assert_eq!(
+            allowed_rows(&built.bytes, "id", serde_json::json!("attr-id"))?,
+            vec![true, false, false]
+        );
+        assert_eq!(
+            allowed_rows(&built.bytes, "revision", serde_json::json!(99))?,
+            vec![true, false, false]
+        );
+        assert!(
+            allowed_rows(&built.bytes, "title", serde_json::json!("alpha unique"))?
+                .iter()
+                .all(|bit| !bit)
+        );
+        assert!(
+            allowed_rows(&built.bytes, "revision", serde_json::json!(7))?
+                .iter()
+                .all(|bit| !bit)
+        );
+        let hits = ranked(&built.bytes, "alpha", "any", &[], &[])?;
+        let hit = hits.first().ok_or("Missing alpha hit")?;
+        assert_eq!(hit.0, 0);
+        assert_eq!(hits.len(), 1);
+        assert!(ranked(&built.bytes, "attr-title", "any", &[], &[])?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_v2_rows_rank_and_read_without_rewrite_then_migrate() -> Result<(), String> {
+        let documents = collision_documents();
+        let built = build(documents, None)?;
+        let legacy = encode_legacy_v2(&built.bytes)?;
+        let (legacy_header, _) = parse_header(&legacy)?;
+        assert_eq!(&legacy[..8], b"RAIOSEG2");
+        assert_eq!(legacy_header.version, 2);
+        let checksum = crc32fast::hash(&legacy);
+        for mode in ["any", "all"] {
+            assert_eq!(
+                ranked(&built.bytes, "shared", mode, &[], &[])?,
+                ranked(&legacy, "shared", mode, &[], &[])?
+            );
+            assert_eq!(
+                ranked(&built.bytes, "shared", mode, &[], &[0])?,
+                ranked(&legacy, "shared", mode, &[], &[0])?
+            );
+        }
+        let title_filter = [Filter {
+            field: "title".into(),
+            op: "eq".into(),
+            value: serde_json::json!("attr-title"),
+        }];
+        assert_eq!(
+            ranked(&built.bytes, "shared", "any", &title_filter, &[])?,
+            ranked(&legacy, "shared", "any", &title_filter, &[])?
+        );
+        assert_eq!(
+            ranked(&built.bytes, "shared gamma", "phrase", &[], &[])?,
+            ranked(&legacy, "shared gamma", "phrase", &[], &[])?
+        );
+        assert_eq!(
+            ranked(&built.bytes, "alpha", "any", &[], &[])?,
+            ranked(&legacy, "alpha", "any", &[], &[])?
+        );
+        assert_eq!(projections(&built.bytes)?, projections(&legacy)?);
+        assert_eq!(crc32fast::hash(&legacy), checksum);
+        let migrated = migrate_segment(&legacy)?;
+        assert_eq!(crc32fast::hash(&legacy), checksum);
+        assert_eq!(&migrated[..8], b"RAIOSEG3");
+        assert_eq!(directory(&built.bytes)?, directory(&legacy)?);
+        assert_eq!(directory(&legacy)?, directory(&migrated)?);
+        assert_eq!(
+            payload_range(&built.bytes, true)?,
+            payload_range(&legacy, true)?
+        );
+        assert_eq!(
+            payload_range(&legacy, true)?,
+            payload_range(&migrated, true)?
+        );
+        assert_eq!(
+            payload_range(&built.bytes, false)?,
+            payload_range(&legacy, false)?
+        );
+        assert_eq!(
+            payload_range(&legacy, false)?,
+            payload_range(&migrated, false)?
+        );
+        assert_eq!(term_shapes(&built.bytes)?, term_shapes(&legacy)?);
+        assert_eq!(term_shapes(&legacy)?, term_shapes(&migrated)?);
+        assert_eq!(projections(&built.bytes)?, projections(&migrated)?);
+        for (field, value) in [
+            ("title", serde_json::json!("attr-title")),
+            ("id", serde_json::json!("attr-id")),
+            ("revision", serde_json::json!(99)),
+            ("year", serde_json::json!(4)),
+        ] {
+            assert_eq!(
+                allowed_rows(&built.bytes, field, value.clone())?,
+                allowed_rows(&migrated, field, value)?
+            );
+        }
+        assert_eq!(
+            ranked(&built.bytes, "shared", "any", &[], &[0])?,
+            ranked(&migrated, "shared", "any", &[], &[0])?
+        );
+        assert_eq!(migrate_segment(&migrated)?, migrated);
+        assert_eq!(migrate_segment(&built.bytes)?, built.bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn query_metadata_keeps_vector_bytes_in_a_separate_frame() -> Result<(), String> {
+        let documents = collision_documents();
+        let built = build(documents.clone(), None)?;
+        assert_eq!(&built.bytes[..8], b"RAIOSEG3");
+        let (header, base) = parse_header(&built.bytes)?;
+        assert_eq!(header.version, 3);
+        let payload = built.bytes.get(base..).ok_or("Truncated segment payload")?;
+        for (index, row) in header.documents.iter().enumerate() {
+            let metadata = frame(payload, &row.data)?;
+            let metadata_end = row
+                .data
+                .offset
+                .checked_add(row.data.length)
+                .ok_or("Metadata range overflow")?;
+            assert!(metadata_end <= header.metadata_end);
+            let decoded = decode_page(metadata)?;
+            assert_eq!(
+                decoded.first().copied(),
+                Some(super::METADATA_CODEC_CANONICAL)
+            );
+            assert_eq!(decoded.get(1).copied(), Some(super::METADATA_CODEC_FACTS));
+            let flags = decoded.get(2).copied().ok_or("Missing vector flags")?;
+            assert_eq!((flags & 1) != 0, row.vector);
+            let stored: serde_json::Value =
+                serde_json::from_slice(decoded.get(7..).ok_or("Truncated canonical metadata")?)
+                    .map_err(|cause| cause.to_string())?;
+            assert!(stored.get("vector").is_none());
+            let vector = header
+                .vector_range(index)?
+                .map(|range| frame(payload, range))
+                .transpose()?
+                .unwrap_or_default();
+            if let Some(range) = header.vector_range(index)? {
+                assert!(range.offset >= header.metadata_end);
+            }
+            let source = source_for(&documents, row.id)?;
+            assert_eq!(
+                full_document_from_frames(metadata, vector)?,
+                source.to_canonical_json()?
+            );
+            let query = query_document_from_metadata(metadata)?;
+            assert_eq!(query, super::serialize_query_document(source)?);
+            let query_value: serde_json::Value =
+                serde_json::from_str(&query).map_err(|cause| cause.to_string())?;
+            assert!(query_value.get("vector").is_none());
+            assert!(query_value.get("vectorSummary").is_some());
+            assert_eq!(
+                query_value["roles"]["title"],
+                text_role(source, NativeRole::Title)?
+            );
+            assert_eq!(
+                query_value["attributes"]
+                    .get("title")
+                    .and_then(serde_json::Value::as_str),
+                source
+                    .columns()
+                    .attributes()
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn magic_codec_and_unknown_fields_fail_closed() -> Result<(), String> {
+        let built = build(collision_documents(), None)?;
+        assert_eq!(migrate_segment(&built.bytes)?, built.bytes);
+        let mut mismatched = built.bytes.clone();
+        mismatched[..8].copy_from_slice(b"RAIOSEG2");
+        rejection_eq(
+            parse_header(&mismatched).map(|_| ()),
+            "Segment magic does not match its version",
+        )?;
+        let unknown = metadata_page(&[9, b'{', b'}'])?;
+        rejection_eq(
+            query_document_from_metadata(&unknown).map(|_| ()),
+            "Unknown document metadata codec",
+        )?;
+        let mut vector_in_metadata = vec![super::METADATA_CODEC_CANONICAL];
+        write_vector_facts(
+            super::VectorFacts {
+                flags: 1,
+                dimensions: 1,
+            },
+            &mut vector_in_metadata,
+        );
+        vector_in_metadata.extend_from_slice(
+            br#"{"id":"row-a","revision":1,"roles":{"title":"","text":"shared"},"attributes":{},"vector":[1.0]}"#,
+        );
+        let vector_page = metadata_page(&vector_in_metadata)?;
+        rejection_contains(query_document_from_metadata(&vector_page), "vector")?;
+        let unknown_role = r#"{"id":"row-a","revision":1,"roles":{"title":"","text":"shared","weight":1},"attributes":{}}"#;
+        rejection_contains(Document::from_canonical_json(unknown_role), "weight")?;
+        let mut stored_role = vec![super::METADATA_CODEC_CANONICAL];
+        write_vector_facts(
+            super::VectorFacts {
+                flags: 0,
+                dimensions: 0,
+            },
+            &mut stored_role,
+        );
+        stored_role.extend_from_slice(unknown_role.as_bytes());
+        let role_page = metadata_page(&stored_role)?;
+        rejection_contains(query_document_from_metadata(&role_page), "weight")?;
+        assert!(
+            Document::from_canonical_json(r#"{"id":"row-a","text":"shared","attributes":{}}"#)
+                .is_err()
+        );
+        rejection_contains(
+            Document::from_canonical_json(
+                r#"{"id":"row-a","revision":4,"roles":{"text":"shared"},"attributes":{}}"#,
+            ),
+            "missing field `title`",
+        )?;
+        rejection_contains(
+            Document::from_canonical_json(
+                r#"{"id":"row-a","roles":{"title":"","text":"shared"},"attributes":{}}"#,
+            ),
+            "missing field `revision`",
+        )?;
+        rejection_contains(
+            Document::from_canonical_json(
+                r#"{"revision":1,"roles":{"title":"","text":"shared"},"attributes":{}}"#,
+            ),
+            "missing field `id`",
+        )?;
+        rejection_contains(
+            Document::from_canonical_json(
+                r#"{"id":"row-a","revision":1,"roles":{"title":null,"text":"shared"},"attributes":{}}"#,
+            ),
+            "null",
+        )?;
+        rejection_contains(
+            Document::from_canonical_json(
+                r#"{"id":"row-a","revision":null,"roles":{"title":"","text":"shared"},"attributes":{}}"#,
+            ),
+            "null",
+        )?;
+        rejection_contains(
+            query_document_from_metadata(&canonical_metadata_page(
+                r#"{"id":"row-a","revision":4,"roles":{"text":"shared"},"attributes":{}}"#,
+            )?),
+            "missing field `title`",
+        )?;
+        rejection_contains(
+            query_document_from_metadata(&canonical_metadata_page(
+                r#"{"id":"row-a","roles":{"title":"","text":"shared"},"attributes":{}}"#,
+            )?),
+            "missing field `revision`",
+        )?;
+        let native =
+            Document::from_native_json(r#"{"id":"row-a","text":"shared","attributes":{}}"#)?;
+        assert_eq!(native.revision, 0);
+        assert_eq!(text_role(&native, NativeRole::Title)?, "");
         Ok(())
     }
 }

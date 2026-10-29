@@ -1,3 +1,4 @@
+import { canonicalFixtureDocuments } from "./segment-fixture";
 import { decodeRoot } from "../src/manifest";
 import { afterAll, expect, test } from "bun:test";
 import { Effect, Match, Schema } from "effect";
@@ -17,11 +18,13 @@ initSync({
   ),
 });
 const documents = Array.from({ length: 10 }, (_, index) => corpus(index * 500, 1000000)).flat();
-using segment = new Segment(JSON.stringify(documents));
+using segment = new Segment(JSON.stringify(canonicalFixtureDocuments(documents)));
 const canonical = segment.bytes();
 const length = 16 + new DataView(canonical.buffer, canonical.byteOffset).getUint32(8, true);
 const frame = new Uint8Array(directory_compress(canonical.subarray(0, length)));
-using smallSegment = new Segment(JSON.stringify([document("a", "alpha")]));
+using smallSegment = new Segment(
+  JSON.stringify(canonicalFixtureDocuments([document("a", "alpha")])),
+);
 const smallCanonical = smallSegment.bytes();
 const smallLength =
   16 + new DataView(smallCanonical.buffer, smallCanonical.byteOffset).getUint32(8, true);
@@ -37,10 +40,12 @@ function directoryWithLength(expected: number) {
   const boundary = { padding: expected - length, bytes: canonical, length };
   for (const attempt of Array.from({ length: 8 }, (_, index) => index)) {
     using built = new Segment(
-      JSON.stringify([
-        { ...first, attributes: { ...first.attributes, padding: "x".repeat(boundary.padding) } },
-        ...documents.slice(1),
-      ]),
+      JSON.stringify(
+        canonicalFixtureDocuments([
+          { ...first, attributes: { ...first.attributes, padding: "x".repeat(boundary.padding) } },
+          ...documents.slice(1),
+        ]),
+      ),
     );
     boundary.bytes = built.bytes();
     boundary.length =

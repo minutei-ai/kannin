@@ -1,3 +1,4 @@
+import { encodeCanonicalDocuments } from "./segment-fixture";
 import { afterAll, expect, test } from "bun:test";
 import { Clock, Effect, Schema } from "effect";
 import { Directory, EligibilityQuery, Segment, initSync } from "../dist/wasm/raio_engine";
@@ -9,7 +10,6 @@ import {
   QueryResult,
   RootMigrationResult,
   Scalar,
-  StoredDocument,
   StoredRoot,
   TermFilters,
   VectorRebuildCheckpointMetadata,
@@ -44,9 +44,7 @@ const fixtures = Array.from({ length: 48 }, (_, index) =>
 
 test("declared native producers agree across 64 fields and exact subset minima", () => {
   using segment = new Segment(
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(
-      fixtures.map((source) => ({ ...source, revision: 1 })),
-    ),
+    encodeCanonicalDocuments(fixtures.map((source) => ({ ...source, revision: 1 }))),
     Schema.encodeSync(Schema.fromJsonString(NamespaceSchema.fields.filterable))(
       fields.toReversed(),
     ),
@@ -85,7 +83,7 @@ test("Unicode field order survives prepared eligibility models and exact subset 
   const names = ["\uE000", "😀"];
   const encodeNames = Schema.encodeSync(Schema.fromJsonString(NamespaceSchema.fields.filterable));
   using segment = new Segment(
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))([
+    encodeCanonicalDocuments([
       { ...document("a", "alpha beta", { "\uE000": "keep", "😀": 1 }), revision: 1 },
       { ...document("b", "alpha", { "\uE000": "keep", "😀": 0 }), revision: 1 },
       { ...document("c", "alpha beta gamma", { "\uE000": "drop", "😀": 1 }), revision: 1 },

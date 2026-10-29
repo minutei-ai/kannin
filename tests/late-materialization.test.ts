@@ -3,8 +3,9 @@ import { crc32 } from "node:zlib";
 import { Schema, Struct } from "effect";
 import { Directory, initSync, segment_query_document } from "../dist/wasm/raio_engine";
 import { decodeRoot, encodeRoot } from "../src/manifest";
-import { QueryDocument, QueryResult, LocatedDocument } from "../src/protocol";
+import { QueryResult, LocatedDocument } from "../src/protocol";
 import { request, startWorker, write } from "./harness";
+import { decodeNativeQueryFixture } from "./segment-fixture";
 
 initSync({
   module: new WebAssembly.Module(
@@ -153,7 +154,7 @@ test("hybrid rejects a selected CRC-valid payload ID that differs from its heade
   );
   expect(lookup[0]?.document.id).toBe("b");
   const start = stored.segment.headerBytes + stored.document.data.offset;
-  const payload = Schema.decodeSync(Schema.fromJsonString(QueryDocument))(
+  const payload = decodeNativeQueryFixture(
     segment_query_document(stored.bytes.subarray(start, start + stored.document.data.length)),
   );
   expect(payload.id).toBe("a");

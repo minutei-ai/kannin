@@ -1,3 +1,4 @@
+import { encodeCanonicalDocuments } from "./segment-fixture";
 import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -128,7 +129,9 @@ test("a full range evicts decoded posting handles within the shared twelve-MiB b
 
 test("posting range pressure does not reacquire a warm compressed directory", async () => {
   const key = "namespaces/range-directory-retention/segments/data.rsix";
-  using segment = new Segment('[{"id":"a","text":"alpha","attributes":{}}]');
+  using segment = new Segment(
+    encodeCanonicalDocuments([{ id: "a", text: "alpha", attributes: {} }]),
+  );
   const payload = new Uint8Array(16 * 1024 * 1024).fill(7);
   payload.set(segment.bytes());
   const headerBytes = 16 + new DataView(payload.buffer).getUint32(8, true);
@@ -164,7 +167,9 @@ test("posting range pressure does not reacquire a warm compressed directory", as
 
 test("hot metadata can reject large directories without lowering the forty-MiB validation limit", async () => {
   const key = "namespaces/range-directory-large/segments/data.rsix";
-  using segment = new Segment('[{"id":"a","text":"alpha","attributes":{}}]');
+  using segment = new Segment(
+    encodeCanonicalDocuments([{ id: "a", text: "alpha", attributes: {} }]),
+  );
   const original = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
   const json = new TextEncoder().encode(
     JSON.stringify([
@@ -179,7 +184,7 @@ test("hot metadata can reject large directories without lowering the forty-MiB v
     ]),
   );
   const frame = new Uint8Array(16 + json.byteLength);
-  frame.set(new TextEncoder().encode("RAIOSEG2"));
+  frame.set(segment.bytes().subarray(0, 8));
   const view = new DataView(frame.buffer);
   view.setUint32(8, json.byteLength, true);
   view.setUint32(12, crc32(json), true);
@@ -254,7 +259,9 @@ test("repeated directory scans retain a hot subset when the namespace exceeds ad
     (_, index) => index * 65536,
   ))
     crypto.getRandomValues(entropy.subarray(offset, offset + 65536));
-  using segment = new Segment('[{"id":"a","text":"alpha","attributes":{}}]');
+  using segment = new Segment(
+    encodeCanonicalDocuments([{ id: "a", text: "alpha", attributes: {} }]),
+  );
   const original = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
   const document = original.documents[0];
   if (document === undefined) throw new Error("Missing header fixture row");
@@ -270,7 +277,7 @@ test("repeated directory scans retain a hot subset when the namespace exceeds ad
     }),
   );
   const frame = new Uint8Array(16 + json.byteLength);
-  frame.set(new TextEncoder().encode("RAIOSEG2"));
+  frame.set(segment.bytes().subarray(0, 8));
   const view = new DataView(frame.buffer);
   view.setUint32(8, json.byteLength, true);
   view.setUint32(12, crc32(json), true);
@@ -301,7 +308,9 @@ test("repeated directory scans retain a hot subset when the namespace exceeds ad
 }, 30000);
 
 test("decoded directory scans retain validated metadata beyond cache capacity", async () => {
-  using segment = new Segment('[{"id":"a","text":"alpha","attributes":{}}]');
+  using segment = new Segment(
+    encodeCanonicalDocuments([{ id: "a", text: "alpha", attributes: {} }]),
+  );
   const original = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
   const json = new TextEncoder().encode(
     Schema.encodeSync(Schema.fromJsonString(SegmentHeader))({
@@ -315,7 +324,7 @@ test("decoded directory scans retain validated metadata beyond cache capacity", 
     }),
   );
   const frame = new Uint8Array(16 + json.byteLength);
-  frame.set(new TextEncoder().encode("RAIOSEG2"));
+  frame.set(segment.bytes().subarray(0, 8));
   const view = new DataView(frame.buffer);
   view.setUint32(8, json.byteLength, true);
   view.setUint32(12, crc32(json), true);
@@ -346,7 +355,9 @@ test("decoded directory scans retain validated metadata beyond cache capacity", 
 }, 30000);
 
 test("directory admission ages cold history while retaining a repeatedly read header", async () => {
-  using segment = new Segment('[{"id":"a","text":"alpha","attributes":{}}]');
+  using segment = new Segment(
+    encodeCanonicalDocuments([{ id: "a", text: "alpha", attributes: {} }]),
+  );
   const bytes = segment.bytes();
   const headerBytes = 16 + new DataView(bytes.buffer).getUint32(8, true);
   const bucket = await worker.getR2Bucket("STORAGE");

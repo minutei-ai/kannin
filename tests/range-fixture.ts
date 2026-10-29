@@ -1,3 +1,4 @@
+import { encodeCanonicalDocuments } from "./segment-fixture";
 import { env } from "cloudflare:workers";
 import { Effect, Match, Option, Schema, Semaphore } from "effect";
 import {
@@ -10,7 +11,12 @@ import {
   documentReadConcurrency,
 } from "../src/storage";
 import { Segment, Directory } from "../dist/wasm/raio_engine";
-import { SegmentHeader, RankingInput, StoredDocument } from "../src/protocol";
+import {
+  SegmentHeader,
+  RankingInput,
+  StoredDocument,
+  canonicalToNativeDocument,
+} from "../src/protocol";
 import {
   RangeProbeInput,
   RangeProbeResult,
@@ -47,7 +53,11 @@ export default {
           Effect.match({
             onFailure: () => new Response(null, { status: 503 }),
             onSuccess: (documents) =>
-              Response.json(Schema.encodeSync(Schema.Array(StoredDocument))(documents)),
+              Response.json(
+                Schema.encodeSync(Schema.Array(StoredDocument))(
+                  documents.map(canonicalToNativeDocument),
+                ),
+              ),
           }),
         ),
       );
@@ -129,7 +139,9 @@ export default {
     const input = Schema.decodeUnknownSync(RangeProbeInput)(await request.json());
     clearImmutableCache(input.key.slice(0, input.key.indexOf("/segments/")));
     if (input.preloadFrequency === true) {
-      using segment = new Segment('[{"id":"a","text":"alpha","attributes":{}}]');
+      using segment = new Segment(
+        encodeCanonicalDocuments([{ id: "a", text: "alpha", attributes: {} }]),
+      );
       const bytes = segment.bytes();
       const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
       using directory = new Directory(bytes);

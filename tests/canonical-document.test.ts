@@ -85,6 +85,9 @@ test("canonical metadata rejects vector payloads and unsupported role declaratio
       attributes: {},
     },
     { id: "one", revision: 1, roles: { title: "" }, attributes: {} },
+    { id: "one", revision: 1, roles: { text: "body" }, attributes: {} },
+    { id: "one", roles: { title: "", text: "body" }, attributes: {} },
+    { revision: 1, roles: { title: "", text: "body" }, attributes: {} },
     { id: "one", revision: 1, roles: { title: "", text: "body" }, attributes: {}, ann: true },
   ])
     expect(() => decode(JSON.stringify(value))).toThrow();

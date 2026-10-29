@@ -3,6 +3,7 @@ pub mod error;
 pub mod protocol;
 pub mod rank;
 pub mod reader;
+mod wire;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
@@ -79,6 +80,7 @@ fn handle(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    wire::retain_native_document_boundary()?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;

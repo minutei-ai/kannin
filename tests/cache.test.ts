@@ -200,7 +200,7 @@ test("native Cache API retains compressed canonical directories after memory evi
   if (canonical === null) throw new Error("Missing canonical header");
   expect(
     new TextDecoder().decode(new Uint8Array(await canonical.arrayBuffer()).subarray(0, 8)),
-  ).toBe("RAIOSEG2");
+  ).toBe("RAIOSEG3");
   await request(worker, "cached", "rebuild", {});
   expect(
     (await request(worker, "cached", "query", { ...textQuery("original cached"), match: "phrase" }))

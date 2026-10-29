@@ -1,3 +1,4 @@
+import { encodeCanonicalDocuments } from "./segment-fixture";
 import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
 import { initSync, Segment, Directory, PreparedQuery } from "../dist/wasm/raio_engine";
@@ -5,7 +6,6 @@ import {
   CommonLeaders,
   CommonTerms,
   SegmentHeader,
-  StoredDocument,
   RankingInput,
   PostingSpans,
   SegmentHits,
@@ -38,9 +38,7 @@ test("canonical leaders equal complete posting rankings only when their proof is
       else result.text = text;
       return result;
     });
-    using segment = new Segment(
-      Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(documents),
-    );
+    using segment = new Segment(encodeCanonicalDocuments(documents));
     const bytes = segment.bytes();
     const base = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
     using directory = Directory.canonical(bytes.subarray(0, base), base);

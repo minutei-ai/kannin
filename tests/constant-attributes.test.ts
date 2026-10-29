@@ -1,3 +1,4 @@
+import { encodeCanonicalDocuments } from "./segment-fixture";
 import { decodeRoot, encodeRoot } from "../src/manifest";
 import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
@@ -12,7 +13,6 @@ import {
 import {
   ConstantAttributes,
   RankingInput,
-  StoredDocument,
   SegmentHeader,
   SegmentHits,
   PostingSpans,
@@ -88,9 +88,7 @@ test("constant proofs retain only present equal scalars within their byte budget
       lastChange: index === 199,
     },
   }));
-  using segment = new Segment(
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(documents),
-  );
+  using segment = new Segment(encodeCanonicalDocuments(documents));
   const bytes = segment.bytes();
   const base = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
   using directory = Directory.canonical(bytes.subarray(0, base), base);
@@ -107,16 +105,14 @@ test("constant proofs retain only present equal scalars within their byte budget
     if (index === 0) return value;
     return { ...value, attributes: {} };
   });
-  using missing = new Segment(
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(absent),
-  );
+  using missing = new Segment(encodeCanonicalDocuments(absent));
   expect(missing.constant_attributes()).toBe("{}");
   expect(Schema.is(ConstantAttributes)({ padding: "x".repeat(513) })).toBe(false);
   expect(Schema.is(ConstantAttributes)({ fraction: 1.5 })).toBe(false);
   expect(Schema.is(ConstantAttributes)({ large: 2 ** 53 })).toBe(false);
   for (const x of ["a".repeat(504), "é".repeat(252), "🦀".repeat(126)]) {
     using boundary = new Segment(
-      Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(
+      encodeCanonicalDocuments(
         documents.slice(0, 2).map((value) => Object.assign({}, value, { attributes: { x } })),
       ),
     );
@@ -131,7 +127,7 @@ test("native numeric representations cannot certify converted filter values", ()
   const attributes =
     '{"year":2024,"integral":2.0,"fraction":1.5,"large":9007199254740993,"negativeZero":-0.0,"safeMin":-9007199254740991,"safeMax":9007199254740991}';
   using segment = new Segment(
-    `[${["a", "b"].map((id) => `{"id":"${id}","revision":1,"text":"rust","attributes":${attributes}}`).join(",")}]`,
+    `[${["a", "b"].map((id) => `{"id":"${id}","revision":1,"roles":{"title":"","text":"rust"},"attributes":${attributes}}`).join(",")}]`,
   );
   const bytes = segment.bytes();
   const base = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
@@ -206,9 +202,7 @@ test("uniform filtered leaders equal complete posting rankings and refuse incomp
     text: `rust cloudflare ${"padding ".repeat(index % 3)}`,
     attributes: { year: 2024, active: true, empty: null },
   }));
-  using segment = new Segment(
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(documents),
-  );
+  using segment = new Segment(encodeCanonicalDocuments(documents));
   const bytes = segment.bytes();
   const base = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
   using directory = Directory.canonical(bytes.subarray(0, base), base);

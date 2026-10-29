@@ -1,3 +1,4 @@
+import { encodeCanonicalDocuments } from "./segment-fixture";
 import { decodeRoot, encodeRoot } from "../src/manifest";
 import { afterAll, expect, test } from "bun:test";
 import { Schema, Struct } from "effect";
@@ -15,7 +16,6 @@ import {
   CompactTermBounds,
   QueryResult,
   SegmentHeader,
-  StoredDocument,
   TermCatalog,
   SearchStatistics,
 } from "../src/protocol";
@@ -53,9 +53,7 @@ const adversarial = [
 
 test("compact common projections preserve full correlated bounds and physical segment bytes", () => {
   using segment = new Segment(
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(
-      documents.map((source) => Object.assign({}, source, { revision: 1 })),
-    ),
+    encodeCanonicalDocuments(documents.map((source) => Object.assign({}, source, { revision: 1 }))),
   );
   const bytes = segment.bytes();
   const encoded = segment.common_projection();
@@ -130,7 +128,7 @@ test("compact common projections preserve full correlated bounds and physical se
 
 test("compact projections preserve block bounds when quantile groups merge length classes", () => {
   using segment = new Segment(
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(
+    encodeCanonicalDocuments(
       adversarial.map((source) => Object.assign({}, source, { title: "", revision: 1 })),
     ),
   );

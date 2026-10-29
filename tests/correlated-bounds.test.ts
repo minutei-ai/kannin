@@ -1,3 +1,4 @@
+import { encodeCanonicalDocuments } from "./segment-fixture";
 import { decodeRoot } from "../src/manifest";
 import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
@@ -38,7 +39,7 @@ const fixture = Array.from({ length: 200 }, (_, row) => ({
 
 test("shared length bounds remove cross-term slack without changing canonical bytes", () => {
   using segment = new Segment(
-    JSON.stringify(fixture.map((source) => Object.assign({}, source, { revision: 1 }))),
+    encodeCanonicalDocuments(fixture.map((source) => Object.assign({}, source, { revision: 1 }))),
   );
   const bytes = segment.bytes();
   const before = bytes.slice();
@@ -169,7 +170,7 @@ test("cold queries prune equivalent segments and cache loss preserves exact rows
 
 test("coarsened length partitions conservatively bound title boosts and changed live statistics", () => {
   using segment = new Segment(
-    JSON.stringify(
+    encodeCanonicalDocuments(
       Array.from({ length: 96 }, (_, row) => ({
         ...document(String(row), `${"beta gamma ".repeat(row + 1)}alpha unique${row}`, {
           group: row % 3,
@@ -233,7 +234,7 @@ test("coarsened length partitions conservatively bound title boosts and changed 
 test("expanded length synopses bypass cache generation rather than expanding query metadata", () => {
   const vocabulary = Array.from({ length: 64 }, (_, index) => `term${index}`).join(" ");
   using segment = new Segment(
-    JSON.stringify(
+    encodeCanonicalDocuments(
       Array.from({ length: 96 }, (_, index) => ({
         ...document(String(index), `${vocabulary} ${"alpha ".repeat(index + 1)}unique${index}`),
         revision: 1,
@@ -251,7 +252,7 @@ test("expanded length synopses bypass cache generation rather than expanding que
 
 test("derived overview ranges reject WASM integer overflow without trapping", () => {
   using segment = new Segment(
-    JSON.stringify([
+    encodeCanonicalDocuments([
       { ...document("a", "alpha"), revision: 1 },
       { ...document("b", "alpha"), revision: 1 },
     ]),

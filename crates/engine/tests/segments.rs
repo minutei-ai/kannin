@@ -2,13 +2,30 @@ use raio_engine::segment::{self, Document, Filter, Header, Search, Statistics};
 use std::collections::{BTreeMap, BTreeSet};
 
 fn document(id: impl Into<String>, text: impl Into<String>) -> Document {
-    Document {
-        id: id.into(),
-        revision: 0,
-        title: String::new(),
-        text: text.into(),
-        attributes: BTreeMap::new(),
-        vector: None,
+    Document::native(
+        id.into(),
+        0,
+        String::new(),
+        text.into(),
+        BTreeMap::new(),
+        None,
+    )
+}
+
+fn role_text<'a>(
+    document: &'a Document,
+    role: segment::NativeRole,
+) -> Result<&'a str, Box<dyn std::error::Error>> {
+    match document.column(segment::ColumnId::Role(role)) {
+        Some(segment::ColumnValue::Text(text)) => Ok(text),
+        _ => Err("missing native text role".into()),
+    }
+}
+
+fn role_words(document: &Document, role: segment::NativeRole) -> Vec<&str> {
+    match document.column(segment::ColumnId::Role(role)) {
+        Some(segment::ColumnValue::Text(text)) => text.split_whitespace().collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -77,8 +94,9 @@ fn object_ranges_are_self_contained_and_crc_checked() -> Result<(), Box<dyn std:
     for metadata in header.documents.iter() {
         let start = base + metadata.data.offset as usize;
         let mut page = built.bytes[start..start + metadata.data.length as usize].to_vec();
-        let decoded: Document = serde_json::from_slice(&segment::decode_page(&page)?)?;
-        assert_eq!(decoded.id.as_str(), metadata.id);
+        let query: serde_json::Value =
+            serde_json::from_str(&segment::query_document_from_metadata(&page)?)?;
+        assert_eq!(query["id"].as_str(), Some(metadata.id));
         page[4] ^= 1;
         assert!(segment::decode_page(&page).is_err());
     }
@@ -117,7 +135,9 @@ fn bm25_rewards_frequency_and_penalizes_unrelated_length() -> Result<(), Box<dyn
 fn phrase_positions_preserve_repeated_words_and_field_boundaries()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut title = document("split", "rust");
-    title.title = "cloudflare".into();
+    title
+        .columns_mut()
+        .set_text(segment::NativeRole::Title, "cloudflare".into())?;
     let docs = vec![
         document("repeated", "rust rust worker"),
         document("separated", "rust cloudflare rust"),
@@ -145,7 +165,8 @@ fn phrase_positions_preserve_repeated_words_and_field_boundaries()
 fn tombstones_and_filters_apply_before_top_k() -> Result<(), Box<dyn std::error::Error>> {
     let mut allowed = document("b", "rust");
     allowed
-        .attributes
+        .columns_mut()
+        .attributes_mut()
         .insert("public".into(), serde_json::json!(true));
     let private = document("a", "rust rust rust");
     let filter = Filter {
@@ -224,18 +245,19 @@ fn block_pruning_matches_exhaustive_bm25_on_varied_documents()
                 ),
             );
             if index % 3 == 0 {
-                doc.title = "alpha title".into();
+                doc.columns_mut()
+                    .set_text(segment::NativeRole::Title, "alpha title".into())?;
             }
-            doc
+            Ok(doc)
         })
-        .collect();
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
     let built = segment::build(docs.clone(), None)?;
     let stats = statistics(&built.header);
     let mut expected: Vec<_> = docs
         .iter()
         .map(|doc| {
-            let title = raio_engine::normalize_text(&doc.title);
-            let body = raio_engine::normalize_text(&doc.text);
+            let title = raio_engine::normalize_text(role_text(doc, segment::NativeRole::Title)?);
+            let body = raio_engine::normalize_text(role_text(doc, segment::NativeRole::Text)?);
             let title_tokens: Vec<_> = title.split_whitespace().collect();
             let body_tokens: Vec<_> = body.split_whitespace().collect();
             let scores = ["alpha", "beta"]
@@ -320,7 +342,7 @@ fn posting_directory_rejects_reordered_and_overlapping_rows()
             blocks.swap(0, 1);
         }
         let json = serde_json::to_vec(&header)?;
-        let mut bytes = b"RAIOSEG2".to_vec();
+        let mut bytes = b"RAIOSEG3".to_vec();
         bytes.extend_from_slice(&u32::try_from(json.len())?.to_le_bytes());
         bytes.extend_from_slice(&crc32fast::hash(&json).to_le_bytes());
         bytes.extend_from_slice(&json);
@@ -338,7 +360,7 @@ fn eligible_posting_spans_preserve_scores_across_gaps_and_tombstones()
     let docs = (0..512)
         .map(|index| {
             let mut doc = document(format!("{index:05}"), "alpha beta alpha");
-            doc.attributes.insert(
+            doc.columns_mut().attributes_mut().insert(
                 "group".into(),
                 serde_json::json!(!(128..384).contains(&index)),
             );
@@ -414,7 +436,7 @@ fn posting_spans_bound_gap_overfetch() -> Result<(), Box<dyn std::error::Error>>
     let docs = (0..384)
         .map(|index| {
             let mut doc = document(format!("{index:05}"), "alpha");
-            doc.attributes.insert(
+            doc.columns_mut().attributes_mut().insert(
                 "group".into(),
                 serde_json::json!(!(128..256).contains(&index)),
             );
@@ -520,13 +542,15 @@ fn intersections_match_exhaustive_membership_and_phrase_positions()
             };
             let mut doc = document(format!("{index:03}"), body);
             if index % 7 == 5 {
-                doc.title = "alpha beta".into();
+                doc.columns_mut()
+                    .set_text(segment::NativeRole::Title, "alpha beta".into())?;
             }
-            doc.attributes
+            doc.columns_mut()
+                .attributes_mut()
                 .insert("group".into(), serde_json::json!(index % 4));
-            doc
+            Ok(doc)
         })
-        .collect();
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
     for dead in [vec![], vec![0, 7, 14, 21]] {
         for filters in [
             vec![],
@@ -549,8 +573,8 @@ fn intersections_match_exhaustive_membership_and_phrase_positions()
                     .iter()
                     .filter(|(id, _)| {
                         docs.iter().find(|doc| doc.id == *id).is_some_and(|doc| {
-                            let title: Vec<_> = doc.title.split_whitespace().collect();
-                            let body: Vec<_> = doc.text.split_whitespace().collect();
+                            let title = role_words(doc, segment::NativeRole::Title);
+                            let body = role_words(doc, segment::NativeRole::Text);
                             if mode == "all" {
                                 return ["alpha", "beta", "gamma"]
                                     .iter()
@@ -704,7 +728,7 @@ fn compressed_directories_exceed_the_separate_mutation_log_budget()
     let documents = (0..260)
         .map(|index| {
             let mut doc = document(format!("large{index:04}"), "rust");
-            doc.attributes.insert(
+            doc.columns_mut().attributes_mut().insert(
                 "context".into(),
                 serde_json::Value::String("x".repeat(8192)),
             );
@@ -950,9 +974,12 @@ fn canonical_headers_reuse_compact_tuples_and_preserve_object_readers()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut first = document("ação", "rust busca frase");
     first.revision = u64::MAX;
-    first.title = "日本語 😀".into();
     first
-        .attributes
+        .columns_mut()
+        .set_text(segment::NativeRole::Title, "日本語 😀".into())?;
+    first
+        .columns_mut()
+        .attributes_mut()
         .insert("escape\nkey".into(), serde_json::json!("á\n😀"));
     let built = segment::build(vec![first, document("𐀀", "rust storage")], None)?;
     assert_eq!(built.bytes[16], b'[');
@@ -963,7 +990,7 @@ fn canonical_headers_reuse_compact_tuples_and_preserve_object_readers()
     );
     let json = serde_json::to_vec(&built.header)?;
     assert!(base < json.len() + 16);
-    let mut object = b"RAIOSEG2".to_vec();
+    let mut object = b"RAIOSEG3".to_vec();
     object.extend_from_slice(&u32::try_from(json.len())?.to_le_bytes());
     object.extend_from_slice(&crc32fast::hash(&json).to_le_bytes());
     object.extend_from_slice(&json);

@@ -43,7 +43,8 @@ import {
   compareFieldNames,
   Filter,
   DEFAULT_VECTOR_DIMENSIONS,
-  StoredDocument,
+  CanonicalDocument,
+  nativeToCanonicalDocument,
   ErrorBody,
   Log,
   Metadata,
@@ -2477,7 +2478,9 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
           location.vectorData,
         );
         const terms = Schema.decodeSync(strings)(
-          segment_document_terms(Schema.encodeSync(Schema.fromJsonString(StoredDocument))(source)),
+          segment_document_terms(
+            Schema.encodeSync(Schema.fromJsonString(CanonicalDocument))(source),
+          ),
         );
         const rows = dead.get(location.segment.key) ?? [];
         rows.push(location.row);
@@ -2538,7 +2541,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       if (input.upserts.length > 0) {
         const built = await Effect.runPromise(
           buildSegment(
-            input.upserts.map((document) => ({ ...document, revision: sequence })),
+            input.upserts.map((document) => nativeToCanonicalDocument(document, sequence)),
             filterableNames(columns),
           ),
         );
@@ -2970,8 +2973,8 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       if (candidates.length < 2 && !candidates.some((segment) => segment.dead.length))
         return { compacted: 0, segments: current.manifest.segments.length };
       const selected: typeof ordered = [];
-      const documents: Array<typeof StoredDocument.Type> = [];
-      const encodeDocument = Schema.encodeSync(Schema.fromJsonString(StoredDocument));
+      const documents: Array<typeof CanonicalDocument.Type> = [];
+      const encodeDocument = Schema.encodeSync(Schema.fromJsonString(CanonicalDocument));
       const encoder = new TextEncoder();
       for (const segment of candidates) {
         const window = { documents: documents.length, bytes: budget.bytes, exceeded: false };

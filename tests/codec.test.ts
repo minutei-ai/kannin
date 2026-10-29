@@ -1,3 +1,10 @@
+import {
+  canonicalFixtureDocuments,
+  encodeCanonicalDocuments,
+  decodeNativeDocumentFixture,
+  decodeNativeQueryFixture,
+  decodeNativeQueryFixtures,
+} from "./segment-fixture";
 import { expect, test } from "bun:test";
 import { Match, Schema, Struct } from "effect";
 import { crc32, deflateSync, inflateSync } from "node:zlib";
@@ -28,7 +35,9 @@ import {
 } from "../dist/wasm/raio_engine";
 import {
   StoredDocument,
-  QueryDocument,
+  CanonicalDocumentMetadata,
+  nativeToCanonicalDocument,
+  Document,
   PostingSpans,
   SegmentHeader,
   LocatedDocument,
@@ -54,11 +63,13 @@ initSync({
 test("common directory handles retain their coverage and reject complete-dictionary operations", () => {
   using segment = new Segment(
     JSON.stringify(
-      Array.from({ length: 8 }, (_, id) => ({
-        id: String(id),
-        text: "alpha beta",
-        attributes: {},
-      })),
+      canonicalFixtureDocuments(
+        Array.from({ length: 8 }, (_, id) => ({
+          id: String(id),
+          text: "alpha beta",
+          attributes: {},
+        })),
+      ),
     ),
   );
   const bytes = segment.bytes();
@@ -131,7 +142,9 @@ test("WASM text tokenization agrees across normalization forms", () => {
 
 test("directory parsing rejects invalid UTF-8 even with a valid header checksum", () => {
   const segment = new Segment(
-    JSON.stringify([{ id: "café", text: "alpha", attributes: { city: "São Paulo" } }]),
+    JSON.stringify(
+      canonicalFixtureDocuments([{ id: "café", text: "alpha", attributes: { city: "São Paulo" } }]),
+    ),
   );
   const encoded = new TextEncoder().encode(segment.header_json());
   const position = encoded.findIndex((byte) => byte === 0xc3);
@@ -140,7 +153,7 @@ test("directory parsing rejects invalid UTF-8 even with a valid header checksum"
     const json = encoded.slice();
     json[position] = invalid;
     const frame = new Uint8Array(16 + json.byteLength);
-    frame.set(new TextEncoder().encode("RAIOSEG2"));
+    frame.set(segment.bytes().subarray(0, 8));
     const view = new DataView(frame.buffer);
     view.setUint32(8, json.byteLength, true);
     view.setUint32(12, crc32(json), true);
@@ -164,7 +177,7 @@ test("WASM codec enforces the log-size budget", () => {
 
 test("canonical recovery retains metadata while publishing the identical compressed frame", () => {
   using segment = new Segment(
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))([
+    encodeCanonicalDocuments([
       { id: "é😀", revision: 1, text: "rust storage", attributes: { group: 1 } },
       { id: "\uE000", revision: 2, text: "rust durable", attributes: { group: 2 } },
       { id: "\u{10000}", revision: 3, text: "storage", attributes: { group: null } },
@@ -198,7 +211,7 @@ test("canonical recovery retains metadata while publishing the identical compres
 
 test("recovered frames preserve raw attribute whitespace, escapes and duplicate keys", () => {
   using segment = new Segment(
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))([
+    encodeCanonicalDocuments([
       { id: "a", revision: 1, text: "rust storage", attributes: { group: 1 } },
     ]),
   );
@@ -210,7 +223,7 @@ test("recovered frames preserve raw attribute whitespace, escapes and duplicate 
   expect(escaped).not.toBe(original);
   const json = new TextEncoder().encode(escaped);
   const canonical = new Uint8Array(16 + json.byteLength);
-  canonical.set(new TextEncoder().encode("RAIOSEG2"));
+  canonical.set(segment.bytes().subarray(0, 8));
   const view = new DataView(canonical.buffer);
   view.setUint32(8, json.byteLength, true);
   view.setUint32(12, crc32(json), true);
@@ -229,7 +242,7 @@ test("recovered frames preserve raw attribute whitespace, escapes and duplicate 
 
 test("compressed overviews preserve term bounds and exact filter minima across selectors", () => {
   const segment = new Segment(
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))([
+    encodeCanonicalDocuments([
       { id: "a", revision: 1, title: "", text: "cafe rust", attributes: { group: 1 } },
       {
         id: "b",
@@ -292,7 +305,7 @@ test("compressed overviews preserve term bounds and exact filter minima across s
 
 test("shared attribute groups preserve minima across operators and different document lengths", () => {
   const segment = new Segment(
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))([
+    encodeCanonicalDocuments([
       {
         id: "a",
         revision: 1,
@@ -379,7 +392,7 @@ test("overview bytes and projected catalogs are independent of attribute group i
   const samples = [];
   for (const shift of [0, 1, 2, 3, 0, 3, 2, 1]) {
     using segment = new Segment(
-      Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(
+      encodeCanonicalDocuments(
         groups.flatMap((attributes, group) =>
           Array.from({ length: 8 }, (_, index) => ({
             id: String(((group + shift) % groups.length) * 8 + index).padStart(3, "0"),
@@ -408,7 +421,7 @@ test("overview bytes and projected catalogs are independent of attribute group i
 
 test("overview groups stay scoped to their handle and are consumed by catalog projection", () => {
   using segment = new Segment(
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(
+    encodeCanonicalDocuments(
       Array.from({ length: 64 }, (_, index) => ({
         id: String(index),
         revision: 1,
@@ -523,7 +536,7 @@ test("bounded overview interning preserves inline summaries after the pool fills
     text: `unique${index} ${"body ".repeat(Math.floor(index / 71))}`,
     attributes: {},
   }));
-  using segment = new Segment(JSON.stringify(documents));
+  using segment = new Segment(JSON.stringify(canonicalFixtureDocuments(documents)));
   using directory = new Directory(segment.bytes());
   const overview = directory.overview();
   const fields = Schema.decodeUnknownSync(Schema.Array(Schema.Unknown))(
@@ -623,7 +636,7 @@ test("WASM ranked hits retain exact document ranges after their directory is rel
     { id: "b", revision: 4, title: "", text: "beta alpha", attributes: { group: 1 } },
     { id: "c", revision: 5, title: "", text: "alpha gamma", attributes: { group: 1 } },
   ]);
-  using segment = new Segment(JSON.stringify(documents));
+  using segment = new Segment(JSON.stringify(canonicalFixtureDocuments(documents)));
   const bytes = segment.bytes();
   const base = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
   const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
@@ -664,7 +677,7 @@ test("WASM ranked hits retain exact document ranges after their directory is rel
       const expected = documents.find((document) => document.id === hit.id);
       if (expected === undefined) throw new Error("Unexpected ranked document");
       expect(header.documents[hit.row]?.data).toEqual(hit.data);
-      const decoded = Schema.decodeSync(Schema.fromJsonString(StoredDocument))(
+      const decoded = decodeNativeDocumentFixture(
         segment_document(
           bytes.subarray(base + hit.data.offset, base + hit.data.offset + hit.data.length),
           new Uint8Array(),
@@ -824,7 +837,9 @@ test("prepared queries preserve per-segment masks and outlive their query-plan h
       { id: "e", text: "beta", attributes: { group: 1 } },
     ],
   ];
-  const segments = fixtures.map((docs) => new Segment(JSON.stringify(docs)));
+  const segments = fixtures.map(
+    (docs) => new Segment(JSON.stringify(canonicalFixtureDocuments(docs))),
+  );
   const buffers = segments.map((segment) => segment.bytes());
   const directories = buffers.map((bytes) => new Directory(bytes));
   for (const [text, mode] of ["ÁLPHA beta", "beta ÁLPHA", "alpha alpha beta"].flatMap(
@@ -905,11 +920,13 @@ test("prepared queries reject shared tombstones and preserve query-budget failur
 test("retained frequency pages preserve dynamic masks, block ordering and positional bounds", () => {
   const segment = new Segment(
     JSON.stringify(
-      Array.from({ length: 260 }, (_, index) => ({
-        id: String(index).padStart(3, "0"),
-        text: "alpha beta alpha",
-        attributes: { group: index % 2 },
-      })),
+      canonicalFixtureDocuments(
+        Array.from({ length: 260 }, (_, index) => ({
+          id: String(index).padStart(3, "0"),
+          text: "alpha beta alpha",
+          attributes: { group: index % 2 },
+        })),
+      ),
     ),
   );
   const bytes = segment.bytes();
@@ -984,10 +1001,16 @@ test("retained frequency pages preserve dynamic masks, block ordering and positi
 
 test("frequency page validation follows exact directory lifetime and never memoizes failure", () => {
   using longSegment = new Segment(
-    JSON.stringify(["a", "b"].map((id) => ({ id, text: "alpha ".repeat(101), attributes: {} }))),
+    JSON.stringify(
+      canonicalFixtureDocuments(
+        ["a", "b"].map((id) => ({ id, text: "alpha ".repeat(101), attributes: {} })),
+      ),
+    ),
   );
   using shortSegment = new Segment(
-    JSON.stringify(["a", "b"].map((id) => ({ id, text: "alpha", attributes: {} }))),
+    JSON.stringify(
+      canonicalFixtureDocuments(["a", "b"].map((id) => ({ id, text: "alpha", attributes: {} }))),
+    ),
   );
   const data = new Uint8Array([2, 0, 0, 1, 99, 1, 0, 1, 99]);
   const compressed = deflateSync(data);
@@ -1040,7 +1063,7 @@ test("frequency page validation follows exact directory lifetime and never memoi
 test("directory lookup preserves UTF-16 rows, duplicate requests and tombstones", () => {
   const ids = ["\uE000", "a😀", "\u{10000}", "ação", "a", "a-b", "😀"];
   using segment = new Segment(
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(
+    encodeCanonicalDocuments(
       ids.map((id) => ({ id, revision: 1, title: "", text: "alpha", attributes: {} })),
     ),
   );
@@ -1079,9 +1102,7 @@ test("cutoff posting pages preserve every competitive hit across modes, masks an
         attributes: { group },
       })),
   );
-  using segment = new Segment(
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(documents),
-  );
+  using segment = new Segment(encodeCanonicalDocuments(documents));
   const bytes = segment.bytes();
   const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
   const base = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
@@ -1150,12 +1171,14 @@ test("cutoff posting pages preserve every competitive hit across modes, masks an
 test("cutoff equality uses UTF-16 identifiers before discarding tied pages", () => {
   using segment = new Segment(
     JSON.stringify(
-      ["a", "😀", "\uE000"].flatMap((prefix) =>
-        Array.from({ length: 128 }, (_, index) => ({
-          id: `${prefix}-${String(index).padStart(4, "0")}`,
-          text: "alpha beta",
-          attributes: {},
-        })),
+      canonicalFixtureDocuments(
+        ["a", "😀", "\uE000"].flatMap((prefix) =>
+          Array.from({ length: 128 }, (_, index) => ({
+            id: `${prefix}-${String(index).padStart(4, "0")}`,
+            text: "alpha beta",
+            attributes: {},
+          })),
+        ),
       ),
     ),
   );
@@ -1224,7 +1247,7 @@ test("dense term seed cutoffs preserve complete top-k including their own cutoff
     ),
   ];
   for (const docs of fixtures) {
-    using segment = new Segment(JSON.stringify(docs));
+    using segment = new Segment(JSON.stringify(canonicalFixtureDocuments(docs)));
     const bytes = segment.bytes();
     const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
     const base = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
@@ -1272,11 +1295,13 @@ test("dense term seed cutoffs preserve complete top-k including their own cutoff
 test("seed ties retain top-k one and a kth row at the first eligible row of a page", () => {
   using segment = new Segment(
     JSON.stringify(
-      Array.from({ length: 2048 }, (_, index) => ({
-        id: String(index).padStart(5, "0"),
-        text: "alpha beta",
-        attributes: { selected: index % 128 === 0 },
-      })),
+      canonicalFixtureDocuments(
+        Array.from({ length: 2048 }, (_, index) => ({
+          id: String(index).padStart(5, "0"),
+          text: "alpha beta",
+          attributes: { selected: index % 128 === 0 },
+        })),
+      ),
     ),
   );
   const bytes = segment.bytes();
@@ -1330,7 +1355,7 @@ test("eligible document lengths prune filtered pages while preserving sparse top
       attributes: { selected: false },
     })),
   ]).flat();
-  using segment = new Segment(JSON.stringify(docs));
+  using segment = new Segment(JSON.stringify(canonicalFixtureDocuments(docs)));
   const bytes = segment.bytes();
   const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
   const base = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
@@ -1379,11 +1404,13 @@ test("eligible document lengths prune filtered pages while preserving sparse top
 test("compact directories validate framing, checksums and header semantics", () => {
   using segment = new Segment(
     JSON.stringify(
-      Array.from({ length: 128 }, (_, index) => ({
-        id: String(index).padStart(4, "0"),
-        text: "alpha beta",
-        attributes: { state: "initial" },
-      })),
+      canonicalFixtureDocuments(
+        Array.from({ length: 128 }, (_, index) => ({
+          id: String(index).padStart(4, "0"),
+          text: "alpha beta",
+          attributes: { state: "initial" },
+        })),
+      ),
     ),
   );
   const bytes = segment.bytes();
@@ -1395,9 +1422,9 @@ test("compact directories validate framing, checksums and header semantics", () 
   covered.set(compact, 16);
   expect(new DataView(encoded.buffer, encoded.byteOffset).getUint32(16, true)).toBe(crc32(covered));
   expect(new DataView(encoded.buffer, encoded.byteOffset).getUint32(12, true)).toBe(compact.length);
-  expect(compact[0]).toBe(2);
+  expect(compact[0]).toBe(3);
   const invalid = new Uint8Array(compact);
-  invalid[0] = 3;
+  invalid[0] = 4;
   const compressed = deflateSync(invalid);
   const forged = new Uint8Array(20 + compressed.byteLength);
   forged.set(encoded.subarray(0, 20));
@@ -1425,9 +1452,11 @@ test("compact directories validate framing, checksums and header semantics", () 
 
 test("compressed directories reject both output length mismatches and incomplete zlib streams", () => {
   using segment = new Segment(
-    JSON.stringify([
-      { id: "compressed", text: "alpha", attributes: { padding: "x".repeat(65536) } },
-    ]),
+    JSON.stringify(
+      canonicalFixtureDocuments([
+        { id: "compressed", text: "alpha", attributes: { padding: "x".repeat(65536) } },
+      ]),
+    ),
   );
   const bytes = segment.bytes();
   const length = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
@@ -1454,7 +1483,7 @@ test("compressed directories reject both output length mismatches and incomplete
 
 test("compact term envelopes preserve full-block maxima and filter minima exactly", () => {
   using segment = new Segment(
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(
+    encodeCanonicalDocuments(
       Array.from({ length: 768 }, (_, index) => ({
         id: String(index).padStart(4, "0"),
         revision: 1,
@@ -1583,7 +1612,7 @@ test("canonical eligibility models cover 64 fields while subset queries retain t
   const encodeFields = Schema.encodeSync(Schema.fromJsonString(NamespaceSchema.fields.filterable));
   const encodedFields = encodeFields(fields);
   using segment = new Segment(
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(
+    encodeCanonicalDocuments(
       Array.from({ length: 24 }, (_, index) => ({
         id: String(index).padStart(3, "0"),
         revision: 1,
@@ -1679,13 +1708,15 @@ test("canonical eligibility models cover 64 fields while subset queries retain t
 test("oversized field projections retain the original minimum fallback", () => {
   using segment = new Segment(
     JSON.stringify(
-      Array.from({ length: 1000 }, (_, index) => ({
-        id: String(index),
-        revision: 1,
-        title: "",
-        text: "alpha ".repeat(1 + (index % 3)),
-        attributes: { year: index },
-      })),
+      canonicalFixtureDocuments(
+        Array.from({ length: 1000 }, (_, index) => ({
+          id: String(index),
+          revision: 1,
+          title: "",
+          text: "alpha ".repeat(1 + (index % 3)),
+          attributes: { year: index },
+        })),
+      ),
     ),
   );
   using directory = new Directory(segment.bytes());
@@ -1703,15 +1734,17 @@ test("oversized field projections retain the original minimum fallback", () => {
     Schema.decodeSync(Schema.fromJsonString(EligibleMinimum))(directory.minimum(filters)),
   );
   using large = new Segment(
-    JSON.stringify([
-      {
-        id: "large",
-        revision: 1,
-        title: "",
-        text: "alpha",
-        attributes: { note: "x".repeat(8192) },
-      },
-    ]),
+    JSON.stringify(
+      canonicalFixtureDocuments([
+        {
+          id: "large",
+          revision: 1,
+          title: "",
+          text: "alpha",
+          attributes: { note: "x".repeat(8192) },
+        },
+      ]),
+    ),
   );
   using largeDirectory = new Directory(large.bytes());
   const largeFilters = '[{"field":"note","op":"exists","value":true}]';
@@ -1785,13 +1818,15 @@ test("overview projection still rejects malformed groups after eligibility scrat
 test("indexed eligibility predicates preserve field order, duplicates and every scalar operator", () => {
   using segment = new Segment(
     JSON.stringify(
-      Array.from({ length: 12 }, (_, index) => ({
-        id: String(index),
-        revision: 1,
-        title: "alpha ".repeat(index % 3),
-        text: "alpha ".repeat(1 + (index % 4)),
-        attributes: { year: index, group: index % 2, flag: index % 3 === 0 },
-      })),
+      canonicalFixtureDocuments(
+        Array.from({ length: 12 }, (_, index) => ({
+          id: String(index),
+          revision: 1,
+          title: "alpha ".repeat(index % 3),
+          text: "alpha ".repeat(1 + (index % 4)),
+          attributes: { year: index, group: index % 2, flag: index % 3 === 0 },
+        })),
+      ),
     ),
   );
   using directory = new Directory(segment.bytes());
@@ -1840,13 +1875,15 @@ test("indexed eligibility predicates preserve field order, duplicates and every 
 test("marginal eligibility bounds remain conservative across scalar predicates", () => {
   using segment = new Segment(
     JSON.stringify(
-      Array.from({ length: 1400 }, (_, index) => ({
-        id: String(index),
-        revision: 1,
-        title: "alpha ".repeat(index % 5),
-        text: "alpha ".repeat(1 + (index % 13)),
-        attributes: { group: index % 100, year: 2020 + (index % 7) },
-      })),
+      canonicalFixtureDocuments(
+        Array.from({ length: 1400 }, (_, index) => ({
+          id: String(index),
+          revision: 1,
+          title: "alpha ".repeat(index % 5),
+          text: "alpha ".repeat(1 + (index % 13)),
+          attributes: { group: index % 100, year: 2020 + (index % 7) },
+        })),
+      ),
     ),
   );
   using directory = new Directory(segment.bytes());
@@ -1936,13 +1973,15 @@ test("marginal bounds preserve missing and null values without assuming field co
   const attributes = [{}, { flag: null }, { flag: true }, { flag: false }];
   using segment = new Segment(
     JSON.stringify(
-      Array.from({ length: 2800 }, (_, index) => ({
-        id: String(index),
-        revision: 1,
-        title: "alpha ".repeat(index % 5),
-        text: "alpha ".repeat(1 + (index % 13)),
-        attributes: { group: index % 100, year: 2020 + (index % 7), ...attributes[index % 4] },
-      })),
+      canonicalFixtureDocuments(
+        Array.from({ length: 2800 }, (_, index) => ({
+          id: String(index),
+          revision: 1,
+          title: "alpha ".repeat(index % 5),
+          text: "alpha ".repeat(1 + (index % 13)),
+          attributes: { group: index % 100, year: 2020 + (index % 7), ...attributes[index % 4] },
+        })),
+      ),
     ),
   );
   using directory = new Directory(segment.bytes());
@@ -2036,7 +2075,7 @@ test("encoded eligibility scalar validation survives bounded reuse and rejects i
 
 function compressedDirectoryFixture() {
   using segment = new Segment(
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))([
+    encodeCanonicalDocuments([
       { id: "ação😀", revision: 1, text: "cloudflare rust", attributes: { group: 1 } },
       { id: "日本語", revision: 2, text: "rust search", attributes: { group: 2 }, vector: [1, 0] },
     ]),
@@ -2158,10 +2197,12 @@ test("cached common frames preserve coverage, owned bytes and budgets after owne
 test("cached common frames never trust rejected selection or checksum validation", () => {
   const text = Array.from({ length: 17 }, (_, index) => `term${index}`).join(" ");
   using segment = new Segment(
-    JSON.stringify([
-      { id: "0", text, attributes: {} },
-      { id: "1", text, attributes: {} },
-    ]),
+    JSON.stringify(
+      canonicalFixtureDocuments([
+        { id: "0", text, attributes: {} },
+        { id: "1", text, attributes: {} },
+      ]),
+    ),
   );
   const bytes = segment.bytes();
   const length = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
@@ -2190,8 +2231,14 @@ test("cached common frames never trust rejected selection or checksum validation
   expect(() => checksum.directory(40 * 1024 * 1024)).toThrow("integrity");
 });
 
+const VectorFrameFixture = Document.mapFields((fields) => ({
+  ...fields,
+  revision: Schema.optional(Schema.Int),
+  vector: Schema.optional(Schema.Array(Schema.Number)),
+}));
 function documentFrames(document: unknown) {
-  using segment = new Segment(JSON.stringify([document]));
+  const input = Schema.decodeUnknownSync(VectorFrameFixture)(document);
+  using segment = new Segment(JSON.stringify(canonicalFixtureDocuments([input])));
   const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
   const entry = header.documents[0];
   const bytes = segment.bytes();
@@ -2217,8 +2264,8 @@ test("query document projection preserves fields and rejects invalid vectors and
     text: "café\t text",
     attributes: { year: 2024, label: "ação", enabled: true, empty: null },
   };
-  const decodeFull = Schema.decodeSync(Schema.fromJsonString(StoredDocument));
-  const decodeProjection = Schema.decodeSync(Schema.fromJsonString(QueryDocument));
+  const decodeFull = decodeNativeDocumentFixture;
+  const decodeProjection = decodeNativeQueryFixture;
   const absent = documentFrames(document);
   expect(decodeProjection(segment_query_document(absent.metadata))).toEqual({
     ...decodeFull(segment_document(absent.metadata, absent.vector)),
@@ -2329,15 +2376,11 @@ test("native float32 extrema stay inside the stored vector contract after legacy
     base + vectorData.offset + vectorData.length,
   );
   for (const frames of [current, { metadata, vector: vectorFrame }]) {
-    const decoded = Schema.decodeSync(Schema.fromJsonString(StoredDocument))(
-      segment_document(frames.metadata, frames.vector),
-    );
+    const decoded = decodeNativeDocumentFixture(segment_document(frames.metadata, frames.vector));
     expect(decoded.vector?.[0]).toBe(maximum);
     expect(decoded.vector?.[1]).toBe(-maximum);
     expect(decoded.vector?.map(Math.fround)).toEqual(vector.map(Math.fround));
-    const query = Schema.decodeSync(Schema.fromJsonString(QueryDocument))(
-      segment_query_document(frames.metadata),
-    );
+    const query = decodeNativeQueryFixture(segment_query_document(frames.metadata));
     expect(query.vectorSummary).toEqual([768, true, true]);
   }
 });
@@ -2345,14 +2388,16 @@ test("native float32 extrema stay inside the stored vector contract after legacy
 test("native metadata batches preserve scalar projections and decline oversized decoded batches", () => {
   using segment = new Segment(
     JSON.stringify(
-      Array.from({ length: 16 }, (_, index) => ({
-        id: String(index).padStart(2, "0"),
-        revision: 1,
-        title: "á 字",
-        text: "rust search",
-        attributes: { n: index, nullable: null, maximum: Number.MAX_SAFE_INTEGER },
-        vector: [1, ...Array<number>(767).fill(0)],
-      })),
+      canonicalFixtureDocuments(
+        Array.from({ length: 16 }, (_, index) => ({
+          id: String(index).padStart(2, "0"),
+          revision: 1,
+          title: "á 字",
+          text: "rust search",
+          attributes: { n: index, nullable: null, maximum: Number.MAX_SAFE_INTEGER },
+          vector: [1, ...Array<number>(767).fill(0)],
+        })),
+      ),
     ),
   );
   const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
@@ -2364,7 +2409,7 @@ test("native metadata batches preserve scalar projections and decline oversized 
     selected.flatMap((document) => [document.data.offset, document.data.length]),
   );
   const expected = selected.map((document) =>
-    Schema.decodeSync(Schema.fromJsonString(QueryDocument))(
+    decodeNativeQueryFixture(
       segment_query_document(
         payload.subarray(document.data.offset, document.data.offset + document.data.length),
       ),
@@ -2372,9 +2417,7 @@ test("native metadata batches preserve scalar projections and decline oversized 
   );
   const encoded = segment_query_documents(payload, ranges);
   if (encoded === undefined) throw new Error("Small metadata batch unexpectedly declined");
-  expect(Schema.decodeSync(Schema.fromJsonString(Schema.Array(QueryDocument)))(encoded)).toEqual(
-    expected,
-  );
+  expect(decodeNativeQueryFixtures(encoded)).toEqual(expected);
   for (const invalid of [
     new Uint32Array(),
     new Uint32Array([0]),
@@ -2392,10 +2435,7 @@ test("native metadata batches preserve scalar projections and decline oversized 
   if (duplicate === undefined) throw new Error("Repeated metadata batch unexpectedly declined");
   const firstExpected = expected[0];
   if (firstExpected === undefined) throw new Error("Missing expected metadata projection");
-  expect(Schema.decodeSync(Schema.fromJsonString(Schema.Array(QueryDocument)))(duplicate)).toEqual([
-    firstExpected,
-    firstExpected,
-  ]);
+  expect(decodeNativeQueryFixtures(duplicate)).toEqual([firstExpected, firstExpected]);
   const damaged = payload.slice();
   damaged[last.data.offset + 4] = (damaged[last.data.offset + 4] ?? 0) ^ 1;
   expect(() =>
@@ -2403,9 +2443,11 @@ test("native metadata batches preserve scalar projections and decline oversized 
   ).not.toThrow();
   expect(() => segment_query_documents(damaged, ranges)).toThrow();
   using large = new Segment(
-    JSON.stringify([
-      { id: "large", revision: 1, title: "", text: "x".repeat(70000), attributes: {} },
-    ]),
+    JSON.stringify(
+      canonicalFixtureDocuments([
+        { id: "large", revision: 1, title: "", text: "x".repeat(70000), attributes: {} },
+      ]),
+    ),
   );
   const largeHeader = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(large.header_json());
   const largeBytes = large.bytes();
@@ -2417,30 +2459,30 @@ test("native metadata batches preserve scalar projections and decline oversized 
     largeBase + page.data.offset + page.data.length,
   );
   expect(segment_query_documents(frame, new Uint32Array([0, frame.length]))).toBeUndefined();
-  expect(
-    Schema.decodeSync(Schema.fromJsonString(QueryDocument))(segment_query_document(frame)).text,
-  ).toBe("x".repeat(70000));
+  expect(decodeNativeQueryFixture(segment_query_document(frame)).text).toBe("x".repeat(70000));
 });
 
 test("metadata batches mix native vector facts and scalar attribute kinds", () => {
   using segment = new Segment(
-    JSON.stringify([
-      {
-        id: "a",
-        revision: 1,
-        title: "",
-        text: "no vector",
-        attributes: { enabled: true, decimal: 4.25, absent: null, label: "字" },
-      },
-      {
-        id: "b",
-        revision: 1,
-        title: "",
-        text: "vector",
-        attributes: { enabled: false, integer: Number.MAX_SAFE_INTEGER },
-        vector: [1, ...Array<number>(767).fill(0)],
-      },
-    ]),
+    JSON.stringify(
+      canonicalFixtureDocuments([
+        {
+          id: "a",
+          revision: 1,
+          title: "",
+          text: "no vector",
+          attributes: { enabled: true, decimal: 4.25, absent: null, label: "字" },
+        },
+        {
+          id: "b",
+          revision: 1,
+          title: "",
+          text: "vector",
+          attributes: { enabled: false, integer: Number.MAX_SAFE_INTEGER },
+          vector: [1, ...Array<number>(767).fill(0)],
+        },
+      ]),
+    ),
   );
   const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
   const bytes = segment.bytes();
@@ -2453,10 +2495,10 @@ test("metadata batches mix native vector facts and scalar attribute kinds", () =
     ),
   );
   if (encoded === undefined) throw new Error("Mixed small metadata batch unexpectedly declined");
-  const decoded = Schema.decodeSync(Schema.fromJsonString(Schema.Array(QueryDocument)))(encoded);
+  const decoded = decodeNativeQueryFixtures(encoded);
   expect(decoded).toEqual(
     header.documents.map((document) =>
-      Schema.decodeSync(Schema.fromJsonString(QueryDocument))(
+      decodeNativeQueryFixture(
         segment_query_document(
           payload.subarray(document.data.offset, document.data.offset + document.data.length),
         ),
@@ -2466,18 +2508,25 @@ test("metadata batches mix native vector facts and scalar attribute kinds", () =
   expect(decoded.map((document) => document.vectorSummary)).toEqual([null, [768, true, true]]);
 });
 
-test("native metadata batch budget includes the exact decoded frame prefixes", () => {
+test.each([2, 3])("metadata codec %i batch budget includes exact decoded prefixes", (codec) => {
   for (const extra of [0, 1]) {
     const frames = [32768, 32768 + extra].map((length, index) => {
       const source = { id: String(index), revision: 1, title: "", text: "", attributes: {} };
-      const encode = Schema.encodeSync(Schema.fromJsonString(StoredDocument));
-      const overhead = new TextEncoder().encode(encode(source)).length + 6;
+      function encode(document: typeof StoredDocument.Type) {
+        if (codec === 2) return Schema.encodeSync(Schema.fromJsonString(StoredDocument))(document);
+        return Schema.encodeSync(Schema.fromJsonString(CanonicalDocumentMetadata))(
+          nativeToCanonicalDocument(document, document.revision),
+        );
+      }
+      const prefix = [2, 0, 0, 0, 0, 0];
+      if (codec === 3) prefix.unshift(3);
+      const overhead = new TextEncoder().encode(encode(source)).length + prefix.length;
       const json = new TextEncoder().encode(
         encode({ ...source, text: "x".repeat(length - overhead) }),
       );
       const decoded = new Uint8Array(length);
-      decoded.set([2, 0, 0, 0, 0, 0]);
-      decoded.set(json, 6);
+      decoded.set(prefix);
+      decoded.set(json, prefix.length);
       const compressed = deflateSync(decoded);
       const frame = new Uint8Array(8 + compressed.length);
       const view = new DataView(frame.buffer);
@@ -2497,31 +2546,29 @@ test("native metadata batch budget includes the exact decoded frame prefixes", (
       payload,
       new Uint32Array([0, first.length, first.length, second.length]),
     );
-    const scalar = frames.map((frame) =>
-      Schema.decodeSync(Schema.fromJsonString(QueryDocument))(segment_query_document(frame)),
-    );
+    const scalar = frames.map((frame) => decodeNativeQueryFixture(segment_query_document(frame)));
     if (extra === 1) {
       expect(encoded).toBeUndefined();
       expect(scalar.map((document) => document.id)).toEqual(["0", "1"]);
       continue;
     }
     if (encoded === undefined) throw new Error("Exact decoded batch budget unexpectedly declined");
-    expect(Schema.decodeSync(Schema.fromJsonString(Schema.Array(QueryDocument)))(encoded)).toEqual(
-      scalar,
-    );
+    expect(decodeNativeQueryFixtures(encoded)).toEqual(scalar);
   }
 });
 
 test("lazy selected hot postings preserve cutoff, filters, dead rows and remaining spans", () => {
   using segment = new Segment(
     JSON.stringify(
-      Array.from({ length: 512 }, (_, row) => ({
-        id: String(row).padStart(4, "0"),
-        revision: 1,
-        title: "common dense",
-        text: "dense ".repeat(512),
-        attributes: { group: row % 2 },
-      })),
+      canonicalFixtureDocuments(
+        Array.from({ length: 512 }, (_, row) => ({
+          id: String(row).padStart(4, "0"),
+          revision: 1,
+          title: "common dense",
+          text: "dense ".repeat(512),
+          attributes: { group: row % 2 },
+        })),
+      ),
     ),
   );
   const bytes = segment.bytes();
@@ -2582,11 +2629,13 @@ test("lazy selected hot postings preserve cutoff, filters, dead rows and remaini
 
 test("verified singleton summaries equal full posting rankings and preserve fallback boundaries", () => {
   using segment = new Segment(
-    JSON.stringify([
-      { id: "a", title: "alpha", text: "rare common", attributes: { group: 1 } },
-      { id: "𐀀", title: "beta", text: "unique common", attributes: { group: 1 } },
-      { id: "", title: "gamma", text: "third common", attributes: { group: 1 } },
-    ]),
+    JSON.stringify(
+      canonicalFixtureDocuments([
+        { id: "a", title: "alpha", text: "rare common", attributes: { group: 1 } },
+        { id: "𐀀", title: "beta", text: "unique common", attributes: { group: 1 } },
+        { id: "", title: "gamma", text: "third common", attributes: { group: 1 } },
+      ]),
+    ),
   );
   const bytes = segment.bytes();
   const base = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);

@@ -5,7 +5,8 @@ use super::super::{
     compress_directory_payload, decode_shaped_rows, document_terms, parse_compressed_directory,
     parse_header, put_int, rank_fields,
 };
-use super::NamedTextField;
+use super::super::{count_as_f64, local_field_statistics, rank_fields_with};
+use super::{Bm25Parameters, CorpusStatistics, FieldQuery, FieldStatistics, NamedTextField};
 use std::collections::{BTreeMap, BTreeSet};
 
 fn rejection<T>(result: Result<T, String>) -> Result<String, String> {
@@ -910,5 +911,498 @@ fn posting_pages_reject_corruption_regressed_inputs_and_trailing_bytes() -> Resu
     assert_eq!(decode(&[1, 0, 1, 0, 0, 1])?, "Trailing posting bytes");
     assert_eq!(decode(&[1, 0, 0])?, "Empty posting");
     assert_eq!(decode(&[1, 0, 2, 1, 1, 1, 0])?, "Token input regressed");
+    Ok(())
+}
+
+fn query<'a>(
+    fields: &'a [DocumentColumnId],
+    text: &'a str,
+    statistics: Option<&'a CorpusStatistics>,
+) -> FieldQuery<'a> {
+    FieldQuery {
+        fields,
+        text,
+        mode: "any",
+        top_k: 100,
+        dead: &[],
+        filters: &[],
+        bm25: Bm25Parameters::DEFAULT,
+        statistics,
+    }
+}
+
+fn scored(bytes: &[u8], query: &FieldQuery<'_>) -> Result<Vec<(String, u64)>, String> {
+    let (header, _) = parse_header(bytes)?;
+    Ok(rank_fields_with(bytes, query)?
+        .into_iter()
+        .map(|hit| {
+            (
+                header.documents.row(hit.row as usize).id.to_owned(),
+                hit.score.to_bits(),
+            )
+        })
+        .collect())
+}
+
+fn assert_close(actual: f64, expected: f64) {
+    assert!(
+        (actual - expected).abs() <= 1e-12 * expected.abs().max(1.0),
+        "{actual} != {expected}"
+    );
+}
+
+fn merged_order(mut hits: Vec<(String, u64)>) -> Vec<(String, u64)> {
+    hits.sort_by(|left, right| {
+        f64::from_bits(right.1)
+            .total_cmp(&f64::from_bits(left.1))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    hits
+}
+
+fn mixed_documents(count: u32) -> Vec<Document> {
+    (0..count)
+        .map(|index| {
+            let repeats = usize::from(u8::try_from(index % 5).unwrap_or(0));
+            let tags = format!(
+                "{}{}",
+                "fox ".repeat(repeats),
+                if index % 2 == 0 { "red" } else { "dog" }
+            );
+            let title = if index % 3 == 0 { "red fox" } else { "red" };
+            let body = "fox ".repeat(usize::from(u8::try_from(index % 4).unwrap_or(0)));
+            Document::native(
+                format!("row{index:03}"),
+                1,
+                title,
+                format!("{body}body"),
+                BTreeMap::from([
+                    ("keep".into(), serde_json::json!(index % 4 != 1)),
+                    ("tags".into(), serde_json::json!(tags)),
+                ]),
+                None,
+            )
+        })
+        .collect()
+}
+
+fn mixed_segment(documents: Vec<Document>) -> Result<Vec<u8>, String> {
+    Ok(build_text_fields(documents, None, &[NamedTextField::new("tags")])?.bytes)
+}
+
+fn all_fields() -> [DocumentColumnId; 3] {
+    [
+        DocumentColumnId::Role(NativeRole::Title),
+        DocumentColumnId::Role(NativeRole::Text),
+        tags("tags"),
+    ]
+}
+
+#[test]
+fn default_query_context_is_the_legacy_native_scoring_bit_for_bit() -> Result<(), String> {
+    let built = build(varied_documents(300), None)?;
+    let (header, _) = parse_header(&built.bytes)?;
+    let text = [DocumentColumnId::Role(NativeRole::Text)];
+    let legacy = rank_fields(&built.bytes, &text, "fox", "any", 100, &[], &[])?;
+    let contextual = rank_fields_with(&built.bytes, &query(&text, "fox", None))?;
+    assert_eq!(
+        legacy
+            .iter()
+            .map(|hit| (hit.row, hit.score.to_bits()))
+            .collect::<Vec<_>>(),
+        contextual
+            .iter()
+            .map(|hit| (hit.row, hit.score.to_bits()))
+            .collect::<Vec<_>>()
+    );
+    let documents = count_as_f64(u64::try_from(header.documents.len()).map_err(|c| c.to_string())?);
+    let frequency = count_as_f64(u64::from(
+        header
+            .fields
+            .dictionary(1)
+            .and_then(|(terms, _)| terms.get("fox"))
+            .ok_or("Missing term")?
+            .df,
+    ));
+    let average = count_as_f64(header.total_body_length()) / documents;
+    let idf = ((documents - frequency + 0.5) / (frequency + 0.5)).ln_1p();
+    assert_eq!(legacy.len(), 100);
+    for hit in &legacy {
+        let length = header.documents.field_length(1, hit.row as usize);
+        let saturated = f64::from(length) / (0.25 + 0.75 * f64::from(length) / average);
+        let expected = idf * saturated * 2.2 / (saturated + 1.2);
+        assert_eq!(hit.score.to_bits(), expected.to_bits());
+    }
+    let explicit = Bm25Parameters::new(1.2, 0.75)?;
+    assert_eq!(explicit, Bm25Parameters::DEFAULT);
+    Ok(())
+}
+
+#[test]
+fn shared_global_statistics_make_split_segments_bit_identical_to_one_segment() -> Result<(), String>
+{
+    let documents = mixed_documents(90);
+    let whole = mixed_segment(documents.clone())?;
+    let fields = all_fields();
+    for text in ["red fox", "fox", "dog red"] {
+        let global = local_field_statistics(&whole, &fields, text, "any", &[])?;
+        let expected = scored(&whole, &query(&fields, text, Some(&global)))?;
+        assert!(!expected.is_empty());
+        assert_eq!(expected, scored(&whole, &query(&fields, text, None))?);
+        let mut merged = Vec::new();
+        for range in [0..13, 13..60, 60..90] {
+            let part = mixed_segment(documents[range].to_vec())?;
+            merged.extend(scored(&part, &query(&fields, text, Some(&global)))?);
+        }
+        assert_eq!(merged_order(merged), expected);
+        let isolated = mixed_segment(documents[..13].to_vec())?;
+        assert_ne!(
+            scored(&isolated, &query(&fields, text, None))?,
+            scored(&isolated, &query(&fields, text, Some(&global)))?
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn tombstones_match_physical_removal_with_explicit_and_derived_statistics() -> Result<(), String> {
+    let documents = mixed_documents(40);
+    let dead = [3_u32, 10, 11, 10];
+    let kept = documents
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !dead.contains(&u32::try_from(*index).unwrap_or(u32::MAX)))
+        .map(|(_, document)| document.clone())
+        .collect::<Vec<_>>();
+    let full = mixed_segment(documents)?;
+    let removed = mixed_segment(kept)?;
+    let fields = all_fields();
+    fn tombstoned<'a>(
+        fields: &'a [DocumentColumnId],
+        dead: &'a [u32],
+        statistics: Option<&'a CorpusStatistics>,
+    ) -> FieldQuery<'a> {
+        FieldQuery {
+            dead,
+            ..query(fields, "red fox", statistics)
+        }
+    }
+    assert_eq!(
+        scored(&full, &tombstoned(&fields, &dead, None))?,
+        scored(&removed, &query(&fields, "red fox", None))?
+    );
+    let derived = local_field_statistics(&full, &fields, "red fox", "any", &dead)?;
+    assert_eq!(
+        derived,
+        local_field_statistics(&removed, &fields, "red fox", "any", &[])?
+    );
+    assert_eq!(derived.documents, 37);
+    let global = local_field_statistics(&full, &fields, "red fox", "any", &[])?;
+    assert_eq!(global.documents, 40);
+    let live = scored(&full, &tombstoned(&fields, &dead, Some(&global)))?;
+    assert_eq!(
+        merged_order(live.clone()),
+        scored(&removed, &query(&fields, "red fox", Some(&global)))?
+    );
+    assert_ne!(live, scored(&full, &tombstoned(&fields, &dead, None))?);
+    assert!(live.iter().all(|(id, _)| id != "row003" && id != "row010"));
+    Ok(())
+}
+
+#[test]
+fn filters_only_limit_eligibility_and_never_change_corpus_statistics() -> Result<(), String> {
+    let full = mixed_segment(mixed_documents(60))?;
+    let fields = all_fields();
+    let keep = [Filter {
+        field: "keep".into(),
+        op: "eq".into(),
+        value: serde_json::json!(true),
+    }];
+    let unfiltered = scored(&full, &query(&fields, "red fox", None))?;
+    let filtered = scored(
+        &full,
+        &FieldQuery {
+            filters: &keep,
+            ..query(&fields, "red fox", None)
+        },
+    )?;
+    assert!(!filtered.is_empty() && filtered.len() < unfiltered.len());
+    let by_id = unfiltered.into_iter().collect::<BTreeMap<_, _>>();
+    for (id, score) in &filtered {
+        assert_eq!(by_id.get(id), Some(score));
+    }
+    let global = local_field_statistics(&full, &fields, "red fox", "any", &[])?;
+    assert_eq!(global.documents, 60);
+    let explicit = scored(
+        &full,
+        &FieldQuery {
+            filters: &keep,
+            ..query(&fields, "red fox", Some(&global))
+        },
+    )?;
+    assert_eq!(explicit, filtered);
+    Ok(())
+}
+
+#[test]
+fn custom_k1_and_b_follow_the_closed_form_including_the_b_extremes() -> Result<(), String> {
+    let documents = ["fox fox dog", "fox", "fox dog dog dog", "dog"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, tags)| {
+            Document::native(
+                format!("row{index}"),
+                1,
+                "title",
+                "body",
+                BTreeMap::from([("tags".into(), serde_json::json!(tags))]),
+                None,
+            )
+        })
+        .collect();
+    let built = mixed_segment(documents)?;
+    let field = [tags("tags")];
+    let lengths = [3_u32, 1, 4, 1];
+    let frequencies = [2_u32, 1, 1, 0];
+    let (n, df, average) = (4.0_f64, 3.0_f64, 9.0_f64 / 4.0);
+    let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
+    for (k1, b) in [(1.2, 0.75), (2.0, 0.0), (0.5, 1.0), (1.2, 0.3), (7.5, 0.9)] {
+        let hits = rank_fields_with(
+            &built,
+            &FieldQuery {
+                bm25: Bm25Parameters::new(k1, b)?,
+                ..query(&field, "fox", None)
+            },
+        )?;
+        assert_eq!(hits.len(), 3);
+        for hit in hits {
+            let tf = f64::from(frequencies[hit.row as usize]);
+            let length = f64::from(lengths[hit.row as usize]);
+            let norm = k1 * (1.0 - b + b * length / average);
+            let expected = idf * tf * (k1 + 1.0) / (tf + norm);
+            assert_close(hit.score, expected);
+        }
+    }
+    let scores = |b: f64| -> Result<Vec<f64>, String> {
+        Ok(rank_fields_with(
+            &built,
+            &FieldQuery {
+                bm25: Bm25Parameters::new(1.2, b)?,
+                ..query(&field, "fox", None)
+            },
+        )?
+        .into_iter()
+        .filter(|hit| hit.row == 1 || hit.row == 2)
+        .map(|hit| hit.score)
+        .collect())
+    };
+    let no_normalization = scores(0.0)?;
+    assert_eq!(no_normalization.len(), 2);
+    assert_eq!(no_normalization[0].to_bits(), no_normalization[1].to_bits());
+    let full_normalization = scores(1.0)?;
+    assert!(full_normalization[0] > full_normalization[1]);
+    Ok(())
+}
+
+#[test]
+fn invalid_bm25_parameters_and_statistics_fail_closed() -> Result<(), String> {
+    for k1 in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert_eq!(
+            rejection(Bm25Parameters::new(k1, 0.5))?,
+            "BM25 k1 must be finite and positive"
+        );
+    }
+    for b in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
+        assert_eq!(
+            rejection(Bm25Parameters::new(1.2, b))?,
+            "BM25 b must be finite and within zero through one"
+        );
+    }
+    let overflow = Bm25Parameters::new(f64::MAX, 0.5)?;
+    let rare = (0..8)
+        .map(|index| {
+            let tags = if index == 0 { "fox fox fox fox" } else { "dog" };
+            Document::native(
+                format!("row{index}"),
+                1,
+                "title",
+                "body",
+                BTreeMap::from([("tags".into(), serde_json::json!(tags))]),
+                None,
+            )
+        })
+        .collect();
+    let field = [tags("tags")];
+    assert_eq!(
+        rejection(rank_fields_with(
+            &mixed_segment(rare)?,
+            &FieldQuery {
+                bm25: overflow,
+                ..query(&field, "fox", None)
+            }
+        ))?,
+        "Text score is not finite"
+    );
+    let built = mixed_segment(mixed_documents(8))?;
+    let good = local_field_statistics(&built, &field, "fox", "any", &[])?;
+    assert!(rank_fields_with(&built, &query(&field, "fox", Some(&good))).is_ok());
+    let fail = |statistics: &CorpusStatistics| {
+        rejection(rank_fields_with(
+            &built,
+            &query(&field, "fox", Some(statistics)),
+        ))
+    };
+    let with = |change: &dyn Fn(&mut CorpusStatistics)| {
+        let mut statistics = good.clone();
+        change(&mut statistics);
+        statistics
+    };
+    assert_eq!(
+        fail(&with(&|s| s.fields.clear()))?,
+        "Statistics do not match the selected text fields"
+    );
+    assert_eq!(
+        fail(&with(&|s| s.fields.push(s.fields[0].clone())))?,
+        "Duplicate statistics field"
+    );
+    let extra = FieldStatistics {
+        id: DocumentColumnId::Role(NativeRole::Text),
+        tokens: 0,
+        frequencies: BTreeMap::new(),
+    };
+    assert_eq!(
+        fail(&with(&|s| s.fields.push(extra.clone())))?,
+        "Statistics do not match the selected text fields"
+    );
+    assert_eq!(
+        fail(&with(
+            &|s| s.fields[0].id = DocumentColumnId::Role(NativeRole::Text)
+        ))?,
+        "Statistics do not match the selected text fields"
+    );
+    assert_eq!(
+        fail(&with(&|s| s.fields[0].frequencies.clear()))?,
+        "Statistics terms do not match the query"
+    );
+    assert_eq!(
+        fail(&with(&|s| {
+            s.fields[0].frequencies.insert("extra".into(), 0);
+        }))?,
+        "Statistics terms do not match the query"
+    );
+    assert_eq!(
+        fail(&with(&|s| {
+            s.fields[0]
+                .frequencies
+                .insert("fox".into(), s.documents + 1);
+        }))?,
+        "Term document frequency exceeds the document count"
+    );
+    assert_eq!(
+        fail(&with(&|s| s.documents = 7))?,
+        "Document total is below the live local rows"
+    );
+    assert_eq!(
+        fail(&with(&|s| s.fields[0].tokens -= 1))?,
+        "Field token total is below local rows"
+    );
+    assert_eq!(
+        fail(&with(&|s| {
+            s.fields[0].frequencies.insert("fox".into(), 1);
+        }))?,
+        "Term frequency is below local postings"
+    );
+    let many = CorpusStatistics {
+        documents: 8,
+        fields: (0..67)
+            .map(|index| FieldStatistics {
+                id: tags(&format!("f{index:02}")),
+                tokens: 0,
+                frequencies: BTreeMap::new(),
+            })
+            .collect(),
+    };
+    assert_eq!(fail(&many)?, "Named text fields exceed 64");
+    let vector = CorpusStatistics {
+        documents: 8,
+        fields: vec![FieldStatistics {
+            id: DocumentColumnId::Role(NativeRole::Vector),
+            tokens: 0,
+            frequencies: BTreeMap::new(),
+        }],
+    };
+    assert_eq!(
+        fail(&vector)?,
+        "Statistics do not match the selected text fields"
+    );
+    assert_eq!(
+        rejection(local_field_statistics(&built, &field, "fox", "nope", &[]))?,
+        "Unknown match mode"
+    );
+    assert_eq!(
+        rejection(local_field_statistics(&built, &field, "fox", "any", &[99]))?,
+        "Invalid deleted row"
+    );
+    Ok(())
+}
+
+#[test]
+fn statistics_are_keyed_by_exact_identity_across_native_and_attribute_names() -> Result<(), String>
+{
+    let document = Document::native(
+        "a",
+        1,
+        "nebula",
+        "body",
+        BTreeMap::from([("title".into(), serde_json::json!("nebula pulsar"))]),
+        None,
+    );
+    let built = build_text_fields(vec![document], None, &[NamedTextField::new("title")])?;
+    let fields = [DocumentColumnId::Role(NativeRole::Title), tags("title")];
+    let derived = local_field_statistics(&built.bytes, &fields, "nebula pulsar", "any", &[])?;
+    assert_eq!(derived.fields[0].id, fields[0]);
+    assert_eq!(derived.fields[1].id, fields[1]);
+    assert_eq!(derived.fields[0].tokens, 1);
+    assert_eq!(derived.fields[1].tokens, 2);
+    assert_eq!(
+        derived.fields[0].frequencies,
+        BTreeMap::from([("nebula".to_owned(), 1), ("pulsar".to_owned(), 0)])
+    );
+    assert_eq!(
+        derived.fields[1].frequencies,
+        BTreeMap::from([("nebula".to_owned(), 1), ("pulsar".to_owned(), 1)])
+    );
+    let baseline = scored(
+        &built.bytes,
+        &query(&fields, "nebula pulsar", Some(&derived)),
+    )?;
+    let mut reordered = derived.clone();
+    reordered.fields.reverse();
+    assert_eq!(
+        baseline,
+        scored(
+            &built.bytes,
+            &query(&fields, "nebula pulsar", Some(&reordered))
+        )?
+    );
+    let mut inflated = derived.clone();
+    inflated.fields[0].tokens = 9;
+    inflated.fields[1].tokens = 9;
+    assert_ne!(
+        baseline,
+        scored(
+            &built.bytes,
+            &query(&fields, "nebula pulsar", Some(&inflated))
+        )?
+    );
+    let mut native_only = derived.clone();
+    native_only.fields.truncate(1);
+    assert_eq!(
+        rejection(rank_fields_with(
+            &built.bytes,
+            &query(&fields, "nebula pulsar", Some(&native_only))
+        ))?,
+        "Statistics do not match the selected text fields"
+    );
     Ok(())
 }

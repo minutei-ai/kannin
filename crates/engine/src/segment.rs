@@ -1,7 +1,10 @@
 mod binary_directory;
 mod fields;
 
-pub use fields::{FieldAnalysis, FieldMeta, FieldTable, NamedTextField};
+pub use fields::{
+    Bm25Parameters, CorpusStatistics, FieldAnalysis, FieldMeta, FieldQuery, FieldStatistics,
+    FieldTable, NamedTextField,
+};
 
 use crate::analysis::WordV4Config;
 use crate::normalize_text;
@@ -2722,20 +2725,37 @@ pub fn rank_fields(
     dead: &[u32],
     filters: &[Filter],
 ) -> Result<Vec<Hit>, String> {
-    let (header, base) = parse_header(bytes)?;
-    fields::rank(
-        &header,
+    rank_fields_with(
         bytes,
-        base,
-        &fields::FieldQuery {
+        &FieldQuery {
             fields,
             text,
             mode,
             top_k,
             dead,
             filters,
+            bm25: Bm25Parameters::DEFAULT,
+            statistics: None,
         },
     )
+}
+
+#[doc = "# Errors\nRejects everything `rank_fields` rejects, plus global statistics that do not match the selected fields and analyzed query terms exactly, duplicate identities, document frequencies above the document count, and totals below the live local rows or loaded eligible postings. Callers must supply unfiltered live corpus statistics; this operation does not prove global counts by scanning filtered-out postings."]
+pub fn rank_fields_with(bytes: &[u8], query: &FieldQuery<'_>) -> Result<Vec<Hit>, String> {
+    let (header, base) = parse_header(bytes)?;
+    fields::rank(&header, bytes, base, query)
+}
+
+#[doc = "# Errors\nRejects malformed bytes, unknown or duplicate fields, invalid match modes, analysis over budget, invalid tombstones, and corrupt posting pages."]
+pub fn local_field_statistics(
+    bytes: &[u8],
+    fields: &[DocumentColumnId],
+    text: &str,
+    mode: &str,
+    dead: &[u32],
+) -> Result<CorpusStatistics, String> {
+    let (header, base) = parse_header(bytes)?;
+    fields::local_statistics(&header, bytes, base, fields, text, mode, dead)
 }
 
 fn attribute_json(

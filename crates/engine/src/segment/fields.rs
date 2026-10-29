@@ -1,10 +1,11 @@
 use super::{
     BLOCK_SIZE, Document, DocumentColumnId, DocumentTable, FieldPosting, Filter, Header, Hit,
-    MAX_QUERY_TERMS, NativeRole, PostingShape, TermDictionary, contribution, count_as_f64,
-    decode_shaped_rows, encode_group, offer_hit,
+    MAX_QUERY_TERMS, NativeRole, PostingShape, TermDictionary, count_as_f64, decode_shaped_rows,
+    encode_group, offer_hit,
 };
 use crate::analysis::{WordV4Analyzer, WordV4Config};
 use crate::normalize_text;
+use bit_vec::BitVec;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
@@ -558,13 +559,95 @@ fn collect_attribute(
     Ok(tokens)
 }
 
-pub(super) struct FieldQuery<'a> {
-    pub(super) fields: &'a [DocumentColumnId],
-    pub(super) text: &'a str,
-    pub(super) mode: &'a str,
-    pub(super) top_k: usize,
-    pub(super) dead: &'a [u32],
-    pub(super) filters: &'a [Filter],
+const STATISTICS_MISMATCH: &str = "Statistics do not match the selected text fields";
+const STATISTICS_TERMS: &str = "Statistics terms do not match the query";
+
+#[doc = "Okapi BM25 saturation and length-normalization parameters."]
+#[doc = ""]
+#[doc = "Internal validation only requires the mathematically valid domain"]
+#[doc = "(`k1 > 0`, `0 <= b <= 1`); public API bounds are not asserted here."]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Bm25Parameters {
+    k1: f64,
+    b: f64,
+}
+
+impl Bm25Parameters {
+    #[doc = "Parameters used by native segment scoring (`k1 = 1.2`, `b = 0.75`)."]
+    pub const DEFAULT: Self = Self { k1: 1.2, b: 0.75 };
+
+    #[doc = "# Errors\nRejects non-finite or non-positive `k1`, and `b` that is non-finite or outside zero through one."]
+    pub fn new(k1: f64, b: f64) -> Result<Self, String> {
+        if !k1.is_finite() || k1 <= 0.0 {
+            return Err("BM25 k1 must be finite and positive".into());
+        }
+        if !(0.0..=1.0).contains(&b) {
+            return Err("BM25 b must be finite and within zero through one".into());
+        }
+        Ok(Self { k1, b })
+    }
+
+    #[must_use]
+    pub const fn k1(self) -> f64 {
+        self.k1
+    }
+
+    #[must_use]
+    pub const fn b(self) -> f64 {
+        self.b
+    }
+
+    fn saturate(self, tf: u32, length: u32, average: f64) -> f64 {
+        let mean = if average > 0.0 { average } else { 1.0 };
+        f64::from(tf) / ((1.0 - self.b) + self.b * f64::from(length) / mean)
+    }
+}
+
+impl Default for Bm25Parameters {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+#[doc = "Corpus-wide statistics for one text field, keyed by its exact identity."]
+#[doc = ""]
+#[doc = "`frequencies` holds the document frequency of every analyzed query term of"]
+#[doc = "that field, including explicit zeros for absent terms."]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FieldStatistics {
+    pub id: DocumentColumnId,
+    pub tokens: u64,
+    pub frequencies: BTreeMap<String, u64>,
+}
+
+#[doc = "Caller-owned live corpus statistics: the global document count plus"]
+#[doc = "per-field token totals and query-term document frequencies."]
+#[doc = ""]
+#[doc = "Aggregate statistics over disjoint live segments before applying query filters."]
+#[doc = "Callers own corpus consistency: ranking checks field identities, term sets and"]
+#[doc = "numeric bounds, but does not scan filtered-out postings to prove global counts."]
+#[doc = "Segments sharing correct statistics score bit-identically to a single segment"]
+#[doc = "that holds the same documents."]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CorpusStatistics {
+    pub documents: u64,
+    pub fields: Vec<FieldStatistics>,
+}
+
+#[doc = "Query context for field ranking."]
+#[doc = ""]
+#[doc = "With `statistics: None` the corpus is the segment itself minus tombstones."]
+#[doc = "Filters only limit eligibility and never change either kind of statistics."]
+#[derive(Clone, Copy)]
+pub struct FieldQuery<'a> {
+    pub fields: &'a [DocumentColumnId],
+    pub text: &'a str,
+    pub mode: &'a str,
+    pub top_k: usize,
+    pub dead: &'a [u32],
+    pub filters: &'a [Filter],
+    pub bm25: Bm25Parameters,
+    pub statistics: Option<&'a CorpusStatistics>,
 }
 
 struct QueryToken {
@@ -579,12 +662,88 @@ struct LoadedField {
     tokens: Vec<QueryToken>,
     unique: Vec<String>,
     postings: Vec<TermPostings>,
-    frequencies: Vec<u32>,
+    local: Vec<u32>,
 }
 
 impl LoadedField {
     fn index(&self, term: &str) -> Option<usize> {
         self.unique.iter().position(|candidate| candidate == term)
+    }
+}
+
+struct Live {
+    mask: BitVec,
+    tombstoned: bool,
+    rows: u64,
+}
+
+impl Live {
+    fn new(mask: BitVec, tombstoned: bool) -> Result<Self, String> {
+        let rows = if tombstoned {
+            mask.iter().filter(|alive| *alive).count()
+        } else {
+            mask.len()
+        };
+        Ok(Self {
+            rows: u64::try_from(rows).map_err(|cause| cause.to_string())?,
+            mask,
+            tombstoned,
+        })
+    }
+
+    fn tokens(&self, header: &Header, ordinal: usize) -> Result<u64, String> {
+        if !self.tombstoned {
+            return Ok(header.fields.total(ordinal));
+        }
+        let mut sum = 0_u64;
+        for row in (0..self.mask.len()).filter(|row| self.mask[*row]) {
+            sum = sum
+                .checked_add(u64::from(header.documents.field_length(ordinal, row)))
+                .ok_or("Text field length overflow")?;
+        }
+        Ok(sum)
+    }
+}
+
+struct FieldScale {
+    average: f64,
+    frequencies: Vec<u64>,
+}
+
+struct Scoring {
+    documents: u64,
+    count: f64,
+    parameters: Bm25Parameters,
+    fields: Vec<FieldScale>,
+}
+
+impl Scoring {
+    fn new(documents: u64, parameters: Bm25Parameters, fields: Vec<FieldScale>) -> Self {
+        Self {
+            documents,
+            count: count_as_f64(documents),
+            parameters,
+            fields,
+        }
+    }
+
+    fn term(&self, tf: u32, length: u32, average: f64, df: u64) -> f64 {
+        if tf == 0 || self.documents == 0 || df == 0 || df > self.documents {
+            return 0.0;
+        }
+        let df = count_as_f64(df);
+        let idf = ((self.count - df + 0.5) / (df + 0.5)).ln_1p();
+        let saturated = self.parameters.saturate(tf, length, average);
+        let k1 = self.parameters.k1;
+        idf * saturated * (k1 + 1.0) / (saturated + k1)
+    }
+}
+
+fn average_length(tokens: u64, documents: u64) -> f64 {
+    if documents == 0 {
+        0.0
+    } else {
+        count_as_f64(tokens) / count_as_f64(documents)
     }
 }
 
@@ -597,15 +756,178 @@ pub(super) fn rank(
     let ordinals = select_ordinals(&header.fields, query.fields)?;
     let allowed = header.allowed(query.filters, query.dead)?;
     check_budget(query.mode, query.top_k)?;
-    let mut loaded = Vec::with_capacity(ordinals.len());
-    for ordinal in ordinals {
-        loaded.push(load_field(header, bytes, base, ordinal, query, &allowed)?);
+    let mask = if query.filters.is_empty() {
+        allowed.clone()
+    } else {
+        header.allowed(&[], query.dead)?
+    };
+    let live = Live::new(mask, !query.dead.is_empty())?;
+    let mut loaded = ordinals
+        .into_iter()
+        .map(|ordinal| plan_field(header, ordinal, query.text, query.mode))
+        .collect::<Result<Vec<_>, _>>()?;
+    let given = query
+        .statistics
+        .map(|statistics| match_statistics(statistics, header, &loaded))
+        .transpose()?;
+    let counted = given.is_none().then_some(&live.mask);
+    for field in &mut loaded {
+        load_field(header, bytes, base, field, &allowed, counted)?;
     }
+    let scoring = if let (Some(statistics), Some(matched)) = (query.statistics, given.as_deref()) {
+        explicit_scoring(statistics, matched, header, &loaded, &live, query.bm25)?
+    } else {
+        local_scoring(header, &loaded, &live, query.bm25)?
+    };
     if loaded.iter().all(|field| field.tokens.is_empty()) {
         return Ok(Vec::new());
     }
     let rows = candidate_rows(query.mode, &loaded)?;
-    score_rows(header, &loaded, &rows, query.top_k)
+    score_rows(header, &loaded, &scoring, &rows, query.top_k)
+}
+
+pub(super) fn local_statistics(
+    header: &Header,
+    bytes: &[u8],
+    base: usize,
+    fields: &[DocumentColumnId],
+    text: &str,
+    mode: &str,
+    dead: &[u32],
+) -> Result<CorpusStatistics, String> {
+    let ordinals = select_ordinals(&header.fields, fields)?;
+    let mask = header.allowed(&[], dead)?;
+    check_budget(mode, 1)?;
+    let nothing = BitVec::from_elem(mask.len(), false);
+    let live = Live::new(mask, !dead.is_empty())?;
+    let mut statistics = Vec::with_capacity(ordinals.len());
+    for ordinal in ordinals {
+        let mut field = plan_field(header, ordinal, text, mode)?;
+        load_field(header, bytes, base, &mut field, &nothing, Some(&live.mask))?;
+        let id = header
+            .fields
+            .get(ordinal)
+            .ok_or("Missing text field")?
+            .id()
+            .clone();
+        statistics.push(FieldStatistics {
+            id,
+            tokens: live.tokens(header, ordinal)?,
+            frequencies: field
+                .unique
+                .iter()
+                .cloned()
+                .zip(field.local.iter().map(|df| u64::from(*df)))
+                .collect(),
+        });
+    }
+    Ok(CorpusStatistics {
+        documents: live.rows,
+        fields: statistics,
+    })
+}
+
+fn match_statistics<'s>(
+    statistics: &'s CorpusStatistics,
+    header: &Header,
+    loaded: &[LoadedField],
+) -> Result<Vec<&'s FieldStatistics>, String> {
+    if statistics.fields.len() > FIELD_LIMIT + NATIVE_FIELDS {
+        return Err("Named text fields exceed 64".into());
+    }
+    for (index, field) in statistics.fields.iter().enumerate() {
+        if statistics.fields[..index]
+            .iter()
+            .any(|earlier| earlier.id == field.id)
+        {
+            return Err("Duplicate statistics field".into());
+        }
+    }
+    if statistics.fields.len() != loaded.len() {
+        return Err(STATISTICS_MISMATCH.into());
+    }
+    let mut matched = Vec::with_capacity(loaded.len());
+    for field in loaded {
+        let id = header
+            .fields
+            .get(field.ordinal)
+            .ok_or("Missing text field")?
+            .id();
+        let given = statistics
+            .fields
+            .iter()
+            .find(|candidate| &candidate.id == id)
+            .ok_or(STATISTICS_MISMATCH)?;
+        if given.frequencies.len() != field.unique.len()
+            || field
+                .unique
+                .iter()
+                .any(|term| !given.frequencies.contains_key(term))
+        {
+            return Err(STATISTICS_TERMS.into());
+        }
+        if given
+            .frequencies
+            .values()
+            .any(|df| *df > statistics.documents)
+        {
+            return Err("Term document frequency exceeds the document count".into());
+        }
+        matched.push(given);
+    }
+    Ok(matched)
+}
+
+fn explicit_scoring(
+    statistics: &CorpusStatistics,
+    matched: &[&FieldStatistics],
+    header: &Header,
+    loaded: &[LoadedField],
+    live: &Live,
+    parameters: Bm25Parameters,
+) -> Result<Scoring, String> {
+    if statistics.documents < live.rows {
+        return Err("Document total is below the live local rows".into());
+    }
+    let mut fields = Vec::with_capacity(loaded.len());
+    for (field, given) in loaded.iter().zip(matched) {
+        if given.tokens < live.tokens(header, field.ordinal)? {
+            return Err("Field token total is below local rows".into());
+        }
+        let mut frequencies = Vec::with_capacity(field.unique.len());
+        for (term, rows) in field.unique.iter().zip(&field.postings) {
+            let df = given
+                .frequencies
+                .get(term)
+                .copied()
+                .ok_or(STATISTICS_TERMS)?;
+            if df < u64::try_from(rows.len()).map_err(|cause| cause.to_string())? {
+                return Err("Term frequency is below local postings".into());
+            }
+            frequencies.push(df);
+        }
+        fields.push(FieldScale {
+            average: average_length(given.tokens, statistics.documents),
+            frequencies,
+        });
+    }
+    Ok(Scoring::new(statistics.documents, parameters, fields))
+}
+
+fn local_scoring(
+    header: &Header,
+    loaded: &[LoadedField],
+    live: &Live,
+    parameters: Bm25Parameters,
+) -> Result<Scoring, String> {
+    let mut fields = Vec::with_capacity(loaded.len());
+    for field in loaded {
+        fields.push(FieldScale {
+            average: average_length(live.tokens(header, field.ordinal)?, live.rows),
+            frequencies: field.local.iter().map(|df| u64::from(*df)).collect(),
+        });
+    }
+    Ok(Scoring::new(live.rows, parameters, fields))
 }
 
 fn select_ordinals(table: &FieldTable, ids: &[DocumentColumnId]) -> Result<Vec<usize>, String> {
@@ -715,35 +1037,52 @@ fn unique_terms(tokens: &[QueryToken]) -> Result<Vec<String>, String> {
     Ok(unique)
 }
 
-fn load_field(
+fn plan_field(
     header: &Header,
-    bytes: &[u8],
-    base: usize,
     ordinal: usize,
-    query: &FieldQuery<'_>,
-    allowed: &bit_vec::BitVec,
+    text: &str,
+    mode: &str,
 ) -> Result<LoadedField, String> {
     let field = header.fields.get(ordinal).ok_or("Missing text field")?;
-    let tokens = query_tokens(field.analysis(), query.text, query.mode)?;
+    let tokens = query_tokens(field.analysis(), text, mode)?;
     let unique = unique_terms(&tokens)?;
-    let mut postings = Vec::with_capacity(unique.len());
-    let mut frequencies = Vec::with_capacity(unique.len());
-    for term in &unique {
-        let (rows, frequency) = load_term(header, bytes, base, ordinal, term, allowed)?;
-        postings.push(rows);
-        frequencies.push(frequency);
-    }
     Ok(LoadedField {
         ordinal,
         tokens,
         unique,
-        postings,
-        frequencies,
+        postings: Vec::new(),
+        local: Vec::new(),
     })
 }
 
-fn block_is_masked(block: &super::BlockMeta, allowed: &bit_vec::BitVec) -> bool {
+#[doc = "Reads each unique query term's postings for rows in `allowed`. When `live`"]
+#[doc = "is given, also counts the term's document frequency over its live rows."]
+fn load_field(
+    header: &Header,
+    bytes: &[u8],
+    base: usize,
+    field: &mut LoadedField,
+    allowed: &BitVec,
+    live: Option<&BitVec>,
+) -> Result<(), String> {
+    let mut postings = Vec::with_capacity(field.unique.len());
+    let mut local = Vec::with_capacity(field.unique.len());
+    for term in &field.unique {
+        let (rows, frequency) = load_term(header, bytes, base, field.ordinal, term, allowed, live)?;
+        postings.push(rows);
+        local.push(frequency);
+    }
+    field.postings = postings;
+    field.local = local;
+    Ok(())
+}
+
+fn block_is_masked(block: &super::BlockMeta, allowed: &BitVec) -> bool {
     !(block.first as usize..=block.last as usize).any(|row| allowed.get(row).unwrap_or(false))
+}
+
+fn block_is_live(block: &super::BlockMeta, live: &BitVec) -> bool {
+    (block.first as usize..=block.last as usize).all(|row| live.get(row).unwrap_or(false))
 }
 
 fn load_term(
@@ -752,7 +1091,8 @@ fn load_term(
     base: usize,
     ordinal: usize,
     term: &str,
-    allowed: &bit_vec::BitVec,
+    allowed: &BitVec,
+    live: Option<&BitVec>,
 ) -> Result<(TermPostings, u32), String> {
     let (dictionary, lane) = header
         .fields
@@ -767,11 +1107,20 @@ fn load_term(
     let mut previous = None;
     for block in &metadata.blocks {
         if shape.lanes == 1 && block_is_masked(block, allowed) {
-            frequency = frequency
-                .checked_add(block.count)
-                .ok_or("Document frequency overflow")?;
-            previous = Some(block.last);
-            continue;
+            match live {
+                None => {
+                    previous = Some(block.last);
+                    continue;
+                }
+                Some(live) if block_is_live(block, live) => {
+                    frequency = frequency
+                        .checked_add(block.count)
+                        .ok_or("Document frequency overflow")?;
+                    previous = Some(block.last);
+                    continue;
+                }
+                Some(_) => {}
+            }
         }
         for (row, tokens) in read_block(bytes, base, block, shape, lane)? {
             if previous.is_some_and(|previous| previous >= row) {
@@ -787,7 +1136,9 @@ fn load_term(
             if tokens.len() > block.max_tf[lane] as usize {
                 return Err("Posting frequency exceeds its block".into());
             }
-            frequency += 1;
+            if live.is_some_and(|live| live.get(row as usize).unwrap_or(false)) {
+                frequency += 1;
+            }
             if allowed[row as usize] {
                 rows.insert(row, tokens);
             }
@@ -933,13 +1284,13 @@ fn phrase_from(
 fn score_rows(
     header: &Header,
     loaded: &[LoadedField],
+    scoring: &Scoring,
     rows: &[u32],
     top_k: usize,
 ) -> Result<Vec<Hit>, String> {
-    let documents = u64::try_from(header.documents.len()).map_err(|cause| cause.to_string())?;
     let mut heap = BinaryHeap::with_capacity(top_k);
     for row in rows {
-        let score = score_row(header, loaded, *row, documents)?;
+        let score = score_row(header, loaded, scoring, *row)?;
         if score > 0.0 {
             offer_hit(&mut heap, top_k, Hit { row: *row, score });
         }
@@ -957,37 +1308,27 @@ fn score_rows(
 fn score_row(
     header: &Header,
     loaded: &[LoadedField],
+    scoring: &Scoring,
     row: u32,
-    documents: u64,
 ) -> Result<f64, String> {
     let mut score = 0.0;
-    for field in loaded {
+    for (field, scale) in loaded.iter().zip(&scoring.fields) {
         let length = header.documents.field_length(field.ordinal, row as usize);
-        let total = header.fields.total(field.ordinal);
-        for (rows, frequency) in field.postings.iter().zip(&field.frequencies) {
+        for (rows, frequency) in field.postings.iter().zip(&scale.frequencies) {
             let tf = rows.get(&row).map_or(0, Vec::len);
-            score += field_bm25(
+            score += scoring.term(
                 u32::try_from(tf).map_err(|cause| cause.to_string())?,
                 length,
-                total,
-                documents,
+                scale.average,
                 *frequency,
             );
         }
     }
-    Ok(score)
-}
-
-fn field_bm25(tf: u32, length: u32, total: u64, documents: u64, df: u32) -> f64 {
-    if tf == 0 || documents == 0 || df == 0 || u64::from(df) > documents {
-        return 0.0;
+    if score.is_finite() {
+        Ok(score)
+    } else {
+        Err("Text score is not finite".into())
     }
-    let n = count_as_f64(documents);
-    let df = count_as_f64(u64::from(df));
-    let idf = ((n - df + 0.5) / (df + 0.5)).ln_1p();
-    let average = count_as_f64(total) / n;
-    let saturated = contribution(tf, length, average);
-    idf * saturated * 2.2 / (saturated + 1.2)
 }
 
 #[cfg(test)]

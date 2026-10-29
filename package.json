@@ -30,7 +30,7 @@
     "bench": "bun tooling/benchmark.ts",
     "prepare": "effect-tsgo patch --oxlint",
     "lint:ts": "oxlint --deny-warnings --report-unused-disable-directives .",
-    "lint:rust": "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings && cargo clippy --workspace --lib --target wasm32-unknown-unknown --release --locked -- -D warnings",
+    "lint:rust": "cargo clippy --workspace --all-targets --all-features --locked --keep-going -- -D warnings && cargo clippy --workspace --lib --target wasm32-unknown-unknown --release --locked --keep-going -- -D warnings",
     "quality": "bun run build && bun tooling/quality.ts",
     "typecheck": "tsc --singleThreaded --noEmit",
     "start": "bun dist/server/main.js"

@@ -5,10 +5,10 @@ fn document(id: impl Into<String>, text: impl Into<String>) -> Document {
     Document::native(id, 0, String::new(), text, BTreeMap::new(), None)
 }
 
-fn role_text<'a>(
-    document: &'a Document,
+fn role_text(
+    document: &Document,
     role: segment::NativeRole,
-) -> Result<&'a str, Box<dyn std::error::Error>> {
+) -> Result<&str, Box<dyn std::error::Error>> {
     match document.column(segment::ColumnId::Role(role)) {
         Some(segment::ColumnValue::Text(text)) => Ok(text),
         _ => Err("missing native text role".into()),

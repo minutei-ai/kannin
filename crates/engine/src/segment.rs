@@ -185,7 +185,7 @@ pub struct Columns {
 }
 
 impl Columns {
-    fn new(
+    const fn new(
         title: String,
         text: String,
         attributes: BTreeMap<String, serde_json::Value>,
@@ -210,12 +210,12 @@ impl Columns {
     }
 
     #[must_use]
-    pub fn attributes(&self) -> &BTreeMap<String, serde_json::Value> {
+    pub const fn attributes(&self) -> &BTreeMap<String, serde_json::Value> {
         &self.attributes
     }
 
     #[must_use]
-    pub fn attributes_mut(&mut self) -> &mut BTreeMap<String, serde_json::Value> {
+    pub const fn attributes_mut(&mut self) -> &mut BTreeMap<String, serde_json::Value> {
         &mut self.attributes
     }
 
@@ -265,11 +265,8 @@ struct CanonicalDocumentRef<'a> {
     revision: u64,
     roles: CanonicalRolesRef<'a>,
     attributes: &'a BTreeMap<String, serde_json::Value>,
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "serialize_optional_f32_slice"
-    )]
-    vector: Option<&'a [f32]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vector: Option<DocumentVectorRef<'a>>,
 }
 
 #[derive(Deserialize)]
@@ -307,11 +304,8 @@ struct NativeDocumentRef<'a> {
     title: &'a str,
     text: &'a str,
     attributes: &'a BTreeMap<String, serde_json::Value>,
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "serialize_optional_f32_slice"
-    )]
-    vector: Option<&'a [f32]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vector: Option<DocumentVectorRef<'a>>,
 }
 
 #[derive(Deserialize)]
@@ -361,13 +355,11 @@ fn serialize_f32_slice<S: serde::Serializer>(
     sequence.end()
 }
 
-fn serialize_optional_f32_slice<S: serde::Serializer>(
-    vector: &Option<&[f32]>,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    match vector {
-        Some(values) => serialize_f32_slice(values, serializer),
-        None => serializer.serialize_none(),
+struct DocumentVectorRef<'a>(&'a [f32]);
+
+impl Serialize for DocumentVectorRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serialize_f32_slice(self.0, serializer)
     }
 }
 
@@ -437,12 +429,12 @@ impl Document {
     }
 
     #[must_use]
-    pub fn columns(&self) -> &Columns {
+    pub const fn columns(&self) -> &Columns {
         &self.columns
     }
 
     #[must_use]
-    pub fn columns_mut(&mut self) -> &mut Columns {
+    pub const fn columns_mut(&mut self) -> &mut Columns {
         &mut self.columns
     }
 
@@ -569,7 +561,7 @@ impl Document {
             title: self.role_text(NativeRole::Title)?,
             text: self.role_text(NativeRole::Text)?,
             attributes: self.columns.attributes(),
-            vector: self.vector_values()?,
+            vector: self.vector_values()?.map(DocumentVectorRef),
         })
     }
 
@@ -601,7 +593,7 @@ impl Document {
             revision: self.revision,
             roles: self.roles_ref()?,
             attributes: self.columns.attributes(),
-            vector: self.vector_values()?,
+            vector: self.vector_values()?.map(DocumentVectorRef),
         })
     }
 
@@ -2560,6 +2552,23 @@ fn rebase_postings(terms: &mut TermDictionary, old_end: u32, new_end: u32) -> Re
     Ok(())
 }
 
+fn validate_migration_lengths(
+    document: &Document,
+    title_length: u32,
+    body_length: u32,
+) -> Result<(), String> {
+    let title = normalize_text(document.role_text(NativeRole::Title)?);
+    let body = normalize_text(document.role_text(NativeRole::Text)?);
+    let actual_title =
+        u32::try_from(title.split_whitespace().count()).map_err(|cause| cause.to_string())?;
+    let actual_body =
+        u32::try_from(body.split_whitespace().count()).map_err(|cause| cause.to_string())?;
+    if actual_title != title_length || actual_body != body_length {
+        return Err("Segment document token lengths do not match its directory".into());
+    }
+    Ok(())
+}
+
 fn migrate_v2_segment(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let (header, base) = parse_header(bytes)?;
     let source = bytes.get(base..).ok_or("Truncated segment payload")?;
@@ -2577,13 +2586,14 @@ fn migrate_v2_segment(bytes: &[u8]) -> Result<Vec<u8>, String> {
                 .get(start..end)
                 .ok_or("Truncated document metadata")?,
         )?;
-        let (facts, document) = parse_document_metadata(&decoded)?;
+        let (facts, mut document) = parse_document_metadata(&decoded)?;
         if document.id != row.id
             || document.revision != row.revision
             || ((facts.flags & 1) != 0) != row.vector
         {
             return Err("Segment document does not match its directory".into());
         }
+        validate_migration_lengths(&document, row.title_length, row.body_length)?;
         let data = append(
             &mut payload,
             &encode_canonical_metadata_page(&document, facts)?,
@@ -2598,12 +2608,11 @@ fn migrate_v2_segment(bytes: &[u8]) -> Result<Vec<u8>, String> {
             let vector_end = vector_start
                 .checked_add(vector_length)
                 .ok_or("Vector range overflow")?;
-            vector_ranges.push(append_existing_frame(
-                &mut vectors,
-                source
-                    .get(vector_start..vector_end)
-                    .ok_or("Truncated vector frame")?,
-            )?);
+            let frame = source
+                .get(vector_start..vector_end)
+                .ok_or("Truncated vector frame")?;
+            attach_vector_frame(&mut document, frame, facts)?;
+            vector_ranges.push(append_existing_frame(&mut vectors, frame)?);
         }
         metadata.push(owned_directory_row(&row, data));
     }
@@ -2679,6 +2688,7 @@ fn migrate_v1_segment(bytes: &[u8]) -> Result<Vec<u8>, String> {
         {
             return Err("Legacy document does not match its directory".into());
         }
+        validate_migration_lengths(&document, row.title_length, row.body_length)?;
         let facts = vector_facts(values)?;
         row.data = append(
             &mut payload,
@@ -11250,6 +11260,34 @@ mod columnar_v2_tests {
     }
 
     #[test]
+    fn legacy_v1_migration_rejects_payload_and_directory_length_disagreement() -> Result<(), String>
+    {
+        let source = legacy_segment()?;
+        let (mut header, base) = super::parse_legacy_segment(&source)?;
+        let first = header
+            .documents
+            .first_mut()
+            .ok_or("Missing legacy document")?;
+        first.body_length += 1;
+        header.total_body_length += 1;
+        let json = serde_json::to_vec(&header).map_err(|cause| cause.to_string())?;
+        let mut corrupt = b"RAIOSEG1".to_vec();
+        corrupt.extend_from_slice(
+            &u32::try_from(json.len())
+                .map_err(|cause| cause.to_string())?
+                .to_le_bytes(),
+        );
+        corrupt.extend_from_slice(&crc32fast::hash(&json).to_le_bytes());
+        corrupt.extend_from_slice(&json);
+        corrupt.extend_from_slice(source.get(base..).ok_or("Missing legacy payload")?);
+        assert_eq!(
+            migrate_segment(&corrupt),
+            Err("Segment document token lengths do not match its directory".into()),
+        );
+        Ok(())
+    }
+
+    #[test]
     fn dense_vector_ranges_cross_multiple_prefix_blocks() -> Result<(), String> {
         let values = (0_u16..130)
             .map(|index| {
@@ -11799,6 +11837,51 @@ mod canonical_column_tests {
         );
         assert_eq!(migrate_segment(&migrated)?, migrated);
         assert_eq!(migrate_segment(&built.bytes)?, built.bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn migration_rejects_directory_lengths_that_disagree_with_document_roles() -> Result<(), String>
+    {
+        let built = build(collision_documents(), None)?;
+        let legacy = encode_legacy_v2(&built.bytes)?;
+        for title in [true, false] {
+            let (mut header, base) = parse_header(&legacy)?;
+            let mut rows = header
+                .documents
+                .iter()
+                .map(|row| owned_directory_row(&row, row.data.clone()))
+                .collect::<Vec<_>>();
+            let first = rows.first_mut().ok_or("Missing migration fixture row")?;
+            if title {
+                first.title_length += 1;
+                header.total_title_length += 1;
+            } else {
+                first.body_length += 1;
+                header.total_body_length += 1;
+            }
+            header.documents = DocumentTable::from(rows);
+            let changed = header.encode(legacy.get(base..).ok_or("Missing migration payload")?)?;
+            parse_header(&changed)?;
+            rejection_eq(
+                migrate_segment(&changed),
+                "Segment document token lengths do not match its directory",
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn migration_validates_legacy_vector_frames_before_copying_them() -> Result<(), String> {
+        let built = build(collision_documents(), None)?;
+        let mut legacy = encode_legacy_v2(&built.bytes)?;
+        let (header, base) = parse_header(&legacy)?;
+        let vector = header.vector_range(0)?.ok_or("Missing migration vector")?;
+        let checksum = base + vector.offset as usize + 4;
+        let byte = legacy.get_mut(checksum).ok_or("Missing vector checksum")?;
+        *byte ^= 1;
+        parse_header(&legacy)?;
+        rejection_contains(migrate_segment(&legacy), "integrity")?;
         Ok(())
     }
 

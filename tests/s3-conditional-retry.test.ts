@@ -61,7 +61,10 @@ function nativeFailure(exit: Exit.Exit<unknown, ObjectStoreFailure>) {
   if (Exit.isSuccess(exit)) throw new Error("Expected native conditional write failure");
   const failure = Cause.findErrorOption(exit.cause);
   if (Option.isNone(failure)) throw new Error("Native write failure was lost");
-  return Schema.decodeUnknownSync(ObjectStoreFailure)(failure.value.cause).cause;
+  const original = failure.value.cause;
+  if (!Schema.is(ObjectStoreFailure)(original))
+    throw new Error("Native object-store failure wrapper was lost", { cause: original });
+  return original.cause;
 }
 
 test("conditional S3 retries retain the exact original precondition and bytes", async () => {

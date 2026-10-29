@@ -1566,7 +1566,7 @@ test("compact term envelopes preserve full-block maxima and filter minima exactl
 
 test("field eligibility retains numeric wire values, missing cells and query scope", () => {
   using segment = new Segment(
-    '[{"id":"a","revision":1,"title":"","text":"alpha","attributes":{"year":2.0}},{"id":"b","revision":1,"title":"","text":"alpha alpha","attributes":{"year":9007199254740993}},{"id":"c","revision":1,"title":"","text":"alpha","attributes":{"year":null}},{"id":"d","revision":1,"title":"","text":"alpha alpha alpha","attributes":{}}]',
+    '[{"id":"a","revision":1,"roles":{"title":"","text":"alpha"},"attributes":{"year":2.0}},{"id":"b","revision":1,"roles":{"title":"","text":"alpha alpha"},"attributes":{"year":9007199254740993}},{"id":"c","revision":1,"roles":{"title":"","text":"alpha"},"attributes":{"year":null}},{"id":"d","revision":1,"roles":{"title":"","text":"alpha alpha alpha"},"attributes":{}}]',
   );
   using directory = new Directory(segment.bytes());
   const warm = '[{"field":"year","op":"exists","value":true}]';

@@ -46,6 +46,36 @@ test("migration never infers a v5 checkpoint expiry from its upload age", async 
   expect((await bucket.head(rootKey(namespace)))?.etag).toBe(current.etag);
 });
 
+test("collection rejects a live legacy checkpoint before retiring any objects", async () => {
+  const namespace = "collection-legacy-checkpoint";
+  expect(
+    (await request(worker, namespace, "write", write([document("a", "retained")]))).status,
+  ).toBe(200);
+  const bucket = await bucketFor();
+  const current = await bucket.get(rootKey(namespace));
+  if (current === null) throw new Error("Missing current Root");
+  const root = decodeRoot(await current.text());
+  const key = checkpointKey(namespace, "00000000-0000-4000-8000-0000000000c1");
+  const checkpoint = await bucket.put(
+    key,
+    await legacySnapshotText(bucket, { root, fields: [] }, 1),
+    {
+      customMetadata: Schema.encodeSync(VectorRebuildCheckpointMetadata)({
+        expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+      }),
+    },
+  );
+  if (checkpoint === null) throw new Error("Missing legacy checkpoint");
+  const before = await bucket.list({ prefix: `namespaces/${namespace}/segments/`, limit: 1000 });
+  expect((await request(worker, namespace, "collect", {})).status).toBe(503);
+  const after = await bucket.list({ prefix: `namespaces/${namespace}/segments/`, limit: 1000 });
+  expect(after.objects.map((object) => [object.key, object.etag])).toEqual(
+    before.objects.map((object) => [object.key, object.etag]),
+  );
+  expect((await bucket.list({ prefix: `namespaces/${namespace}/retired/` })).objects).toEqual([]);
+  expect((await bucket.head(key))?.etag).toBe(checkpoint.etag);
+});
+
 test("migrates pooled Root and rebuild checkpoint without changing logical reads or expiry", async () => {
   const namespace = "root-migration-complete";
   const upserts = Array.from({ length: 205 }, (_, index) => ({
@@ -92,6 +122,8 @@ test("migrates pooled Root and rebuild checkpoint without changing logical reads
   if (legacyCheckpoint === null) throw new Error("Missing legacy checkpoint");
   await worker.unsafeEvictDurableObject("raio", "SearchNamespace", { name: namespace });
   expect((await request(worker, namespace, "query", vectorQuery)).status).toBe(503);
+  expect((await request(worker, namespace, "collect", {})).status).toBe(503);
+  expect((await bucket.list({ prefix: `namespaces/${namespace}/retired/` })).objects).toEqual([]);
 
   const migrated = Schema.decodeUnknownSync(RootMigrationResult)(
     await (await request(worker, namespace, "migrate-root", {})).json(),

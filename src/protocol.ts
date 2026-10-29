@@ -328,6 +328,35 @@ export const Float64BitsText = Schema.String.check(
     return ((BigInt(`0x${value}`) >> 52n) & 0x7ffn) !== 0x7ffn || "Typed float must be finite";
   }),
 );
+function base64Digit(code: number): number {
+  if (code >= 65 && code <= 90) return code - 65;
+  if (code >= 97 && code <= 122) return code - 71;
+  if (code >= 48 && code <= 57) return code + 4;
+  if (code === 43) return 62;
+  if (code === 47) return 63;
+  return -1;
+}
+export const BytesBase64Text = Schema.String.check(
+  Schema.makeFilter((value) => {
+    if (value.length % 4 !== 0 || value.length > 11_184_812)
+      return "Expected padded base64 within the decoded 8 MiB bound";
+    const state = { padding: 0, offset: 0 };
+    if (value.endsWith("==")) state.padding = 2;
+    else if (value.endsWith("=")) state.padding = 1;
+    if ((value.length / 4) * 3 - state.padding > 8_388_608)
+      return "Bytes exceed the decoded 8 MiB bound";
+    const end = value.length - state.padding;
+    while (state.offset < end) {
+      if (base64Digit(value.charCodeAt(state.offset)) < 0) return "Invalid base64 alphabet";
+      state.offset += 1;
+    }
+    if (state.padding === 2 && base64Digit(value.charCodeAt(end - 1)) % 16 !== 0)
+      return "Non-canonical base64 padding bits";
+    if (state.padding === 1 && base64Digit(value.charCodeAt(end - 1)) % 4 !== 0)
+      return "Non-canonical base64 padding bits";
+    return true;
+  }),
+);
 export const UuidText = Schema.String.check(
   Schema.isPattern(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\s\S])/),
 );

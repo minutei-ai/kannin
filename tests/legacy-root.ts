@@ -1,4 +1,4 @@
-import { Schema, Struct } from "effect";
+import { Option, Schema, Struct } from "effect";
 import { crc32, deflateSync } from "node:zlib";
 import type { Miniflare } from "miniflare";
 import { Directory, initSync, segment_document, segment_header } from "../dist/wasm/raio_engine";
@@ -10,17 +10,24 @@ import {
   LegacyStoredRoot,
   LegacyStoredRootV3,
   LegacyStoredRootV4,
+  LegacyStoredRootV5,
   LocatedDocument,
   RootMigrationInput,
   SegmentHeader,
   StoredRoot,
   VectorRebuildSnapshot,
+  nativeSchemaFromColumns,
   type Root,
 } from "../src/protocol";
 import { encodeRoot } from "../src/manifest";
 
 type Bucket = Awaited<ReturnType<Miniflare["getR2Bucket"]>>;
-type Version = 1 | 2 | 3 | 4;
+type Version = 1 | 2 | 3 | 4 | 5;
+
+function legacyNativeSchema(root: typeof Root.Type) {
+  if (root.schema === undefined) return undefined;
+  return nativeSchemaFromColumns(root.schema);
+}
 
 initSync({
   module: new WebAssembly.Module(
@@ -144,8 +151,14 @@ async function physicalLegacyRoot(bucket: Bucket, root: typeof Root.Type) {
     });
   }
   const keys = new Map(root.segments.map((segment, row) => [segment.key, segments[row]?.key]));
+  const schema = legacyNativeSchema(root);
+  const { schema: _schema, ...fields } = root;
   return Schema.decodeSync(LegacyPackedRoot)({
-    ...root,
+    ...fields,
+    ...Option.match(Option.fromUndefinedOr(schema), {
+      onNone: () => ({}),
+      onSome: (native) => ({ schema: native }),
+    }),
     segments,
     bloomPacks: root.bloomPacks.map((pack) => ({
       ...pack,
@@ -197,11 +210,21 @@ async function inlineRoot(bucket: Bucket, root: typeof LegacyPackedRoot.Type) {
 }
 
 async function legacyRootValue(bucket: Bucket, root: typeof Root.Type, version: Version) {
-  const physical = await physicalLegacyRoot(bucket, root);
   const stored = Schema.decodeSync(Schema.fromJsonString(StoredRoot))(encodeRoot(root));
+  const schema = legacyNativeSchema(root);
+  const { schema: _schema, ...storedFields } = stored;
+  const legacyStored = {
+    ...storedFields,
+    ...Option.match(Option.fromUndefinedOr(schema), {
+      onNone: () => ({}),
+      onSome: (native) => ({ schema: native }),
+    }),
+  };
+  if (version === 5) return Schema.decodeSync(LegacyStoredRootV5)({ ...legacyStored, version: 5 });
+  const physical = await physicalLegacyRoot(bucket, root);
   if (version === 4)
     return Schema.decodeSync(LegacyStoredRootV4)({
-      ...stored,
+      ...legacyStored,
       version: 4,
       bloomPacks: physical.bloomPacks,
       segments: stored.segments.map((segment, row) => {
@@ -213,7 +236,7 @@ async function legacyRootValue(bucket: Bucket, root: typeof Root.Type, version: 
   const inline = await inlineRoot(bucket, physical);
   if (version === 1) return Schema.decodeSync(LegacyRoot)(inline);
   const pooled = Schema.decodeSync(LegacyStoredRootV3)({
-    ...stored,
+    ...legacyStored,
     version: 3,
     segments: stored.segments.map((segment, row) => {
       const source = inline.segments[row];

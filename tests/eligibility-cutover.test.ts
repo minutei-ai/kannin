@@ -97,7 +97,7 @@ test("write and compaction publish pooled declared models while subset ranking m
   const object = await bucket.get(`namespaces/${namespaces[0]}/root.json`);
   if (object === null) throw new Error("Missing produced Root");
   const stored = Schema.decodeSync(Schema.fromJsonString(StoredRoot))(await object.text());
-  expect(stored.version).toBe(5);
+  expect(stored.version).toBe(6);
   expect(stored.eligibilityModels).toHaveLength(1);
   expect(stored.segments.every((segment) => segment.eligibilityIndex === 0)).toBe(true);
   const logical = decodeRoot(Schema.encodeSync(Schema.fromJsonString(StoredRoot))(stored));
@@ -321,7 +321,7 @@ for (const version of [1, 2, 3, 4] as const)
     const response = await request(worker, namespace, "migrate-root", {});
     expect(response.status).toBe(200);
     expect(Schema.decodeUnknownSync(RootMigrationResult)(await response.json())).toMatchObject({
-      version: 5,
+      version: 6,
       rootRewritten: true,
       migratedSnapshots: 1,
       expiredSnapshots: 0,
@@ -354,7 +354,7 @@ for (const version of [1, 2, 3, 4] as const)
     const repeated = Schema.decodeUnknownSync(RootMigrationResult)(
       await (await request(worker, namespace, "migrate-root", {})).json(),
     );
-    expect(repeated).toMatchObject({ version: 5, rootRewritten: false, migratedSnapshots: 0 });
+    expect(repeated).toMatchObject({ version: 6, rootRewritten: false, migratedSnapshots: 0 });
     expect((await bucket.head(key))?.etag).toBe(migrated.etag);
     expect((await bucket.head(checkpointKey))?.etag).toBe(checkpoint.etag);
   }, 15000);

@@ -8,6 +8,7 @@ import {
   VectorMessage,
   VectorSyncResult,
   Health,
+  resolvedVectorDimensions,
 } from "../src/protocol";
 import { request, startWorker } from "./harness";
 
@@ -123,7 +124,7 @@ test("configured vector dimensions survive canonical maintenance and reset witho
     const bucket = await worker.getR2Bucket("STORAGE");
     const stored = await bucket.get(`namespaces/${namespace}/root.json`);
     if (stored === null) throw new Error("Missing configured root");
-    expect(decodeRoot(await stored.text()).schema?.vectorDimensions).toBe(dimensions);
+    expect(resolvedVectorDimensions(decodeRoot(await stored.text()).schema)).toBe(dimensions);
     for (const kind of ["vector", "hybrid"] as const) {
       const response = await request(worker, namespace, "query", {
         ...query(kind),

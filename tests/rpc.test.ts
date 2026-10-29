@@ -134,7 +134,7 @@ test("Effect SDK performs native binding RPC with Worker and coordinator HTTP di
     await (await call({ namespace: "rpc", operation: "migrate-root" })).json(),
   );
   expect(migrated).toEqual({
-    version: 5,
+    version: 6,
     sequence: 1,
     rootRewritten: false,
     migratedSnapshots: 0,

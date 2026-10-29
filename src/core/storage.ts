@@ -65,6 +65,7 @@ import {
   DirectoryCacheMiss,
   Rejected,
   NamespaceSchema,
+  namespaceColumnsFromNative,
   ConstantAttributes,
   BloomPack,
   TextPlan,
@@ -2983,8 +2984,17 @@ export function createStorage(runtime: SearchRuntime) {
         segments.push({ ...metadata, bloom: { packIndex, row } });
       }
     }
-    const { segments: _segments, ...fields } = legacy;
-    return { ...fields, bloomPacks, segments };
+    const { segments: _segments, schema, ...fields } = legacy;
+    const schemaFields = Option.match(Option.fromUndefinedOr(schema), {
+      onNone: () => ({}),
+      onSome: (native) => ({ schema: namespaceColumnsFromNative(native) }),
+    });
+    return {
+      ...fields,
+      ...schemaFields,
+      bloomPacks,
+      segments,
+    };
   });
 
   const appendBloomSegment = Effect.fn("kannin.appendBloomSegment")(function* (

@@ -75,12 +75,11 @@ export const VectorFilterFields = Schema.Array(FieldName).check(
 const MIN_VECTOR_DIMENSIONS = 1;
 const MAX_VECTOR_DIMENSIONS = 10_752;
 export const DEFAULT_VECTOR_DIMENSIONS = 768;
+const VectorDimensions = Schema.Int.check(
+  Schema.isBetween({ minimum: MIN_VECTOR_DIMENSIONS, maximum: MAX_VECTOR_DIMENSIONS }),
+);
 export const NamespaceSchema = Schema.Struct({
-  vectorDimensions: Schema.optional(
-    Schema.Int.check(
-      Schema.isBetween({ minimum: MIN_VECTOR_DIMENSIONS, maximum: MAX_VECTOR_DIMENSIONS }),
-    ),
-  ),
+  vectorDimensions: Schema.optional(VectorDimensions),
   filterable: Schema.Array(FieldName).check(
     Schema.isMaxLength(64),
     Schema.makeFilter(
@@ -95,6 +94,96 @@ export const NamespaceSchema = Schema.Struct({
       "Vector filter fields must be filterable",
   ),
 );
+const NativeVectorColumn = Schema.Struct({
+  source: Schema.Literal("native-vector"),
+  dimensions: Schema.optional(VectorDimensions),
+});
+const LegacyAttributeColumn = Schema.Struct({
+  source: Schema.Literal("attribute"),
+  name: FieldName,
+  value: Schema.Literal("legacy-untyped"),
+  vectorFilterOrder: Schema.optional(
+    Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 4 })),
+  ),
+});
+const ColumnDeclaration = Schema.Union([NativeVectorColumn, LegacyAttributeColumn]);
+const validNamespaceColumns = (columns: ReadonlyArray<typeof ColumnDeclaration.Type>) => {
+  const vector = columns[0];
+  if (vector === undefined || vector.source !== "native-vector")
+    return "Native vector column must lead the namespace schema";
+  if (columns.some((column, index) => index > 0 && column.source === "native-vector"))
+    return "Namespace schema has one native vector column";
+  const names = new Set<string>();
+  const orders: Array<number> = [];
+  for (const column of columns) {
+    if (column.source !== "attribute") continue;
+    if (names.has(column.name)) return "Duplicate filterable field";
+    names.add(column.name);
+    if (column.vectorFilterOrder !== undefined) orders.push(column.vectorFilterOrder);
+  }
+  orders.sort((left, right) => left - right);
+  return (
+    orders.every((order, index) => order === index) ||
+    "Vector filter order must be dense and unique"
+  );
+};
+export const NamespaceColumns = Schema.Struct({
+  columns: Schema.Array(ColumnDeclaration).check(
+    Schema.isBetweenLength(1, 65),
+    Schema.makeFilter(validNamespaceColumns),
+  ),
+});
+export function namespaceColumnsFromNative(
+  schema: typeof NamespaceSchema.Type,
+): typeof NamespaceColumns.Type {
+  const orders = new Map(schema.vectorFilterFields.map((name, index) => [name, index]));
+  const columns: Array<typeof ColumnDeclaration.Type> = [{ source: "native-vector" }];
+  if (schema.vectorDimensions !== undefined)
+    columns[0] = { source: "native-vector", dimensions: schema.vectorDimensions };
+  for (const name of schema.filterable) {
+    const vectorFilterOrder = orders.get(name);
+    if (vectorFilterOrder === undefined)
+      columns.push({ source: "attribute", name, value: "legacy-untyped" });
+    else columns.push({ source: "attribute", name, value: "legacy-untyped", vectorFilterOrder });
+  }
+  return { columns };
+}
+export function nativeSchemaFromColumns(
+  schema: typeof NamespaceColumns.Type,
+): typeof NamespaceSchema.Type {
+  const attributes = schema.columns.filter((column) => column.source === "attribute");
+  const vector = schema.columns[0];
+  const native = {
+    filterable: attributes.map((column) => column.name),
+    vectorFilterFields: attributes
+      .flatMap((column) => {
+        if (column.vectorFilterOrder === undefined) return [];
+        return [[column.vectorFilterOrder, column.name] as const];
+      })
+      .sort((left, right) => left[0] - right[0])
+      .map(([, name]) => name),
+  };
+  if (vector?.source === "native-vector" && vector.dimensions !== undefined)
+    return { ...native, vectorDimensions: vector.dimensions };
+  return native;
+}
+export function filterableNames(schema: typeof NamespaceColumns.Type | undefined) {
+  if (schema === undefined) return undefined;
+  return schema.columns.flatMap((column) => {
+    if (column.source === "attribute") return [column.name];
+    return [];
+  });
+}
+export function vectorFilterNames(schema: typeof NamespaceColumns.Type | undefined) {
+  if (schema === undefined) return undefined;
+  return nativeSchemaFromColumns(schema).vectorFilterFields;
+}
+export function resolvedVectorDimensions(schema: typeof NamespaceColumns.Type | undefined) {
+  const vector = schema?.columns[0];
+  if (vector?.source === "native-vector" && vector.dimensions !== undefined)
+    return vector.dimensions;
+  return DEFAULT_VECTOR_DIMENSIONS;
+}
 export const Vector = Schema.Array(
   Schema.Finite.check(
     Schema.isBetween({ minimum: -3.4028234663852886e38, maximum: 3.4028234663852886e38 }),
@@ -253,6 +342,7 @@ const validMetadataBoundary = (
   "Invalid segment metadata boundary";
 export const Root = PackedRootValue.mapFields((fields) => ({
   ...fields,
+  schema: Schema.optional(NamespaceColumns),
   segments: Schema.Array(MetadataSegment.check(Schema.makeFilter(validMetadataBoundary))),
 })).check(Schema.makeFilter(validBloomReferences));
 export const UnpackedSegment = Root.fields.segments.value
@@ -713,7 +803,7 @@ const validStoredRootMetadata = (
 export const LegacyStoredRootV4 = PackedStoredRoot.check(
   Schema.makeFilter(validStoredRootMetadata),
 );
-export const StoredRoot = PackedStoredRoot.mapFields((fields) => ({
+export const LegacyStoredRootV5 = PackedStoredRoot.mapFields((fields) => ({
   ...fields,
   version: Schema.Literal(5),
   segments: Schema.Array(
@@ -724,6 +814,11 @@ export const StoredRoot = PackedStoredRoot.mapFields((fields) => ({
       }))
       .check(Schema.makeFilter(validMetadataBoundary)),
   ),
+})).check(Schema.makeFilter(validStoredRootMetadata));
+export const StoredRoot = LegacyStoredRootV5.mapFields((fields) => ({
+  ...fields,
+  version: Schema.Literal(6),
+  schema: Schema.optional(NamespaceColumns),
 })).check(Schema.makeFilter(validStoredRootMetadata));
 export const StoredVectorRebuildSnapshot = VectorRebuildSnapshot.mapFields((fields) => ({
   ...fields,
@@ -792,6 +887,7 @@ export const RootMigrationInput = Schema.Union([
   LegacyStoredRoot,
   LegacyStoredRootV3,
   LegacyStoredRootV4,
+  LegacyStoredRootV5,
   StoredRoot,
 ]);
 export const VectorRebuildSnapshotMigrationInput = Schema.Union([
@@ -800,6 +896,7 @@ export const VectorRebuildSnapshotMigrationInput = Schema.Union([
   VectorRebuildSnapshot.mapFields((fields) => ({ ...fields, root: LegacyStoredRoot })),
   VectorRebuildSnapshot.mapFields((fields) => ({ ...fields, root: LegacyStoredRootV3 })),
   VectorRebuildSnapshot.mapFields((fields) => ({ ...fields, root: LegacyStoredRootV4 })),
+  VectorRebuildSnapshot.mapFields((fields) => ({ ...fields, root: LegacyStoredRootV5 })),
   StoredVectorRebuildSnapshot,
 ]);
 export const VECTOR_REBUILD_CHECKPOINT_BYTES = 8 * 1024 * 1024;
@@ -1272,7 +1369,7 @@ export const NamespaceCommand = Schema.Union([
   }),
 ]);
 export const RootMigrationResult = Schema.Struct({
-  version: Schema.Literal(5),
+  version: Schema.Literal(6),
   sequence: Root.fields.sequence,
   rootRewritten: Schema.Boolean,
   migratedSnapshots: Schema.Int,

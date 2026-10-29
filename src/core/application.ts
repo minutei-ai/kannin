@@ -94,6 +94,11 @@ import {
   VectorMessage,
   VectorSyncResult,
   NamespaceSchema,
+  namespaceColumnsFromNative,
+  nativeSchemaFromColumns,
+  filterableNames,
+  vectorFilterNames,
+  resolvedVectorDimensions,
   TextTerms,
   NativeVectorHits,
   NativeVectorPage,
@@ -1825,12 +1830,12 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
     timings: Headers,
     executions?: TextExecutions,
   ) {
-    const dimensions = manifest.schema?.vectorDimensions ?? DEFAULT_VECTOR_DIMENSIONS;
+    const dimensions = resolvedVectorDimensions(manifest.schema);
     if (input.kind !== "text" && input.vector.length !== dimensions)
       throw new Rejected({ status: 400, message: `Vector dimension must be ${dimensions}` });
     if (manifest.sequence < (input.minimumSequence ?? 0))
       throw new Rejected({ status: 409, message: "Requested sequence is not committed" });
-    const filterable = manifest.schema?.filterable ?? [];
+    const filterable = filterableNames(manifest.schema) ?? [];
     for (const filter of input.filters)
       if (!filterable.includes(filter.field))
         throw new Rejected({
@@ -2082,7 +2087,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         | ReturnType<typeof decodeRootForMigration>
         | ReturnType<typeof decodeVectorRebuildSnapshotForMigration>,
     ) {
-      if (saved.kind === "current") {
+      if (saved.kind === "current" || saved.kind === "schema") {
         if ("snapshot" in saved) return saved.snapshot.root;
         return saved.root;
       }
@@ -2091,6 +2096,9 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
           if ("snapshot" in saved) return saved.snapshot.root;
           return saved.root;
         })();
+        const columns = Option.getOrUndefined(
+          Option.map(Option.fromUndefinedOr(root.schema), namespaceColumnsFromNative),
+        );
         const segments = [];
         for (const segment of root.segments) segments.push(await this.migrateSegment(segment));
         const prepared: { value: typeof ConvertedInlineRoot.Type } = {
@@ -2104,7 +2112,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
                 segments,
                 (segment) =>
                   Effect.map(
-                    rebuildEligibility(segment, root.schema?.filterable),
+                    rebuildEligibility(segment, filterableNames(columns)),
                     (eligibility) => ({
                       ...segment,
                       eligibility,
@@ -2127,8 +2135,14 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         segments.push(converted);
         replacements.set(segment.key, converted.key);
       }
+      const { schema: legacySchema, ...fields } = root;
+      const schemaFields = Option.match(Option.fromUndefinedOr(legacySchema), {
+        onNone: () => ({}),
+        onSome: (native) => ({ schema: namespaceColumnsFromNative(native) }),
+      });
       return {
-        ...root,
+        ...fields,
+        ...schemaFields,
         segments,
         bloomPacks: root.bloomPacks.map((descriptor) =>
           Object.assign({}, descriptor, {
@@ -2175,14 +2189,6 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
             message: "Too many rebuild checkpoints for bounded migration",
           });
         for (const checkpoint of page.objects) {
-          if (
-            checkpoint.customMetadata?.expiresAt === undefined &&
-            now - checkpoint.uploaded.getTime() >= SNAPSHOT_RETENTION_MS
-          ) {
-            await this.env.STORAGE.delete(checkpoint.key);
-            progress.expired += 1;
-            continue;
-          }
           progress.bytes += checkpoint.size;
           if (
             checkpoint.size > VECTOR_REBUILD_CHECKPOINT_BYTES ||
@@ -2215,7 +2221,8 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
             captured.customMetadata?.expiresAt !== undefined ||
             saved.kind === "current" ||
             saved.sourceVersion === 3 ||
-            saved.sourceVersion === 4
+            saved.sourceVersion === 4 ||
+            saved.sourceVersion === 5
           )
             expiration.value = Schema.decodeUnknownSync(VectorRebuildCheckpointMetadata)(
               captured.customMetadata,
@@ -2255,7 +2262,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       }
       if (root === undefined || object === null)
         return Schema.encodeSync(RootMigrationResult)({
-          version: 5,
+          version: 6,
           sequence: 0,
           rootRewritten: false,
           migratedSnapshots: progress.migrated,
@@ -2278,7 +2285,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       this.namespacePublished = false;
       await this.publishNamespace();
       return Schema.encodeSync(RootMigrationResult)({
-        version: 5,
+        version: 6,
         sequence: root.root.sequence,
         rootRewritten: root.kind !== "current",
         migratedSnapshots: progress.migrated,
@@ -2416,11 +2423,17 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         input.reset !== true
       ) {
         const encodeSchema = Schema.encodeSync(Schema.fromJsonString(NamespaceSchema));
-        if (encodeSchema(input.schema) !== encodeSchema(current.manifest.schema))
+        if (
+          encodeSchema(input.schema) !==
+          encodeSchema(nativeSchemaFromColumns(current.manifest.schema))
+        )
           throw new Rejected({ status: 409, message: "Changing namespace schema requires reset" });
       }
-      const schema = input.schema ?? current.manifest.schema;
-      const dimensions = schema?.vectorDimensions ?? DEFAULT_VECTOR_DIMENSIONS;
+      const columns = Option.match(Option.fromUndefinedOr(input.schema), {
+        onNone: () => current.manifest.schema,
+        onSome: namespaceColumnsFromNative,
+      });
+      const dimensions = resolvedVectorDimensions(columns);
       if (
         current.manifest.sequence > 0 &&
         current.manifest.schema === undefined &&
@@ -2512,7 +2525,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         const built = await Effect.runPromise(
           buildSegment(
             input.upserts.map((document) => ({ ...document, revision: sequence })),
-            schema?.filterable,
+            filterableNames(columns),
           ),
         );
         const key = `${this.prefix}/segments/${sequence}-${runtime.immutableIdentity(await sha256Bytes(built.bytes))}.rsix`;
@@ -2571,7 +2584,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         jobs.push({ log: logKey, sequence });
       const receipt = { sequence, requestId: input.requestId, digest: fingerprint };
       const manifest = {
-        schema,
+        schema: columns,
         version: 1,
         sequence,
         head: logKey,
@@ -2599,7 +2612,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
     }
 
     private async rebuildVectors(input: typeof VectorRebuild.Type) {
-      const fields = (await this.root()).manifest.schema?.vectorFilterFields ?? [];
+      const fields = vectorFilterNames((await this.root()).manifest.schema) ?? [];
       const snapshot = input.snapshot ?? crypto.randomUUID();
       const key = `${this.prefix}/vector-rebuild/${snapshot}.json`;
       const saved = { root: (await this.root()).manifest, fields };
@@ -3004,7 +3017,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       };
       if (documents.length > 0) {
         const built = await Effect.runPromise(
-          buildSegment(documents, current.manifest.schema?.filterable),
+          buildSegment(documents, filterableNames(current.manifest.schema)),
         );
         const key = `${this.prefix}/segments/compact-${current.manifest.sequence}-${crypto.randomUUID()}.rsix`;
         const stored = await this.env.STORAGE.put(key, built.bytes);
@@ -3188,7 +3201,10 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
                   new TextEncoder().encode(encodeRoot(manifest)).byteLength;
                 current.manifestEncodedBytes = manifestEncodedBytes;
                 return yield* Schema.encodeEffect(Metadata)({
-                  schema: manifest.schema ?? null,
+                  schema: Option.match(Option.fromUndefinedOr(manifest.schema), {
+                    onNone: () => null,
+                    onSome: nativeSchemaFromColumns,
+                  }),
                   sequence: manifest.sequence,
                   documents: manifest.documents,
                   segments: manifest.segments.length,
@@ -3858,7 +3874,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
   async function acquireCachedSnapshot(cacheKey: URL, minimumSequence: number) {
     return Effect.runPromise(
       Effect.gen(function* () {
-        const cache = yield* Effect.tryPromise(() => caches.open("raio-snapshots-v5")).pipe(
+        const cache = yield* Effect.tryPromise(() => caches.open("raio-snapshots-v6")).pipe(
           Effect.orElseSucceed(() => undefined),
         );
         if (cache === undefined) return { cache, snapshot: undefined, rejected: false };
@@ -3937,7 +3953,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
     minimumSequence: number,
     timings: Headers,
   ) {
-    const cacheKey = new URL(`https://raio-cache.internal/snapshots-v5/${namespace}`);
+    const cacheKey = new URL(`https://raio-cache.internal/snapshots-v6/${namespace}`);
     cacheKey.searchParams.set("bucket", env.STORAGE_CACHE_SCOPE);
     const cache: { value: CachePort | undefined } = { value: undefined };
     const memory = warmSnapshots.get(cacheKey.href);
@@ -4017,7 +4033,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         const refresh = yield* Effect.forkDetach(
           Effect.gen(function* () {
             const refreshCache = yield* Effect.tryPromise(() =>
-              caches.open("raio-snapshots-v5"),
+              caches.open("raio-snapshots-v6"),
             ).pipe(Effect.orElseSucceed(() => undefined));
             yield* refreshSnapshot(ctx, env, namespace, 0, cacheKey, refreshCache);
           }).pipe(

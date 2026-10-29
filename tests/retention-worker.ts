@@ -81,7 +81,7 @@ export default {
       const namespace = Schema.decodeSync(Schema.fromJsonString(NamespaceName))(
         await request.text(),
       );
-      for (const phase of ["bloom-packs", "segments"]) {
+      for (const phase of ["bloom-packs", "segments", "vector-rebuild"]) {
         const page = await env.STORAGE.list({
           prefix: `namespaces/${namespace}/${phase}/`,
           limit: 1000,

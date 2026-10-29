@@ -169,7 +169,7 @@ test("CachePort shares immutable bytes, isolates scopes and authenticates every 
         expect(
           yield* Effect.promise(() => unauthorized.match(key)).pipe(Effect.exit),
         ).toMatchObject({ _tag: "Failure" });
-        const snapshots = yield* Effect.promise(() => provider.open("raio-snapshots-v5"));
+        const snapshots = yield* Effect.promise(() => provider.open("raio-snapshots-v6"));
         yield* Effect.promise(() => snapshots.put(key, value()));
         expect(yield* Effect.promise(() => snapshots.match(key))).toBeUndefined();
         expect(

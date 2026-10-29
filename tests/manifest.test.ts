@@ -10,10 +10,18 @@ import {
   LegacyStoredRoot,
   LegacyStoredRootV3,
   LegacyStoredRootV4,
+  LegacyStoredRootV5,
   LegacyPackedRoot,
+  NamespaceColumns,
+  NamespaceSchema,
   Root,
   StoredRoot,
   VectorRebuildSnapshot,
+  filterableNames,
+  namespaceColumnsFromNative,
+  nativeSchemaFromColumns,
+  resolvedVectorDimensions,
+  vectorFilterNames,
 } from "../src/protocol";
 import {
   decodeRoot,
@@ -154,7 +162,7 @@ const storedV2 = Schema.decodeSync(LegacyStoredRoot)({
   segments: storedV3.segments.map(({ eligibilityIndex: _eligibilityIndex, ...segment }) => segment),
 });
 
-test("Root v5 pools shared metadata and retains valid Bloom pack holes", () => {
+test("Root v6 pools shared metadata and retains valid Bloom pack holes", () => {
   const wire = encodeRoot(root);
   const expanded = decodeRoot(wire);
   expect(expanded).toEqual(root);
@@ -163,7 +171,7 @@ test("Root v5 pools shared metadata and retains valid Bloom pack holes", () => {
   expect(expanded.segments[0]?.commonTerms).toBe(expanded.segments[1]?.commonTerms);
   expect(expanded.segments[0]?.commonProjection).toBe(expanded.segments[1]?.commonProjection);
   expect(expanded.segments[0]?.eligibility).toBe(expanded.segments[1]?.eligibility);
-  expect(wire).toContain('"version":5');
+  expect(wire).toContain('"version":6');
   expect(wire).toContain('"bloomPacks"');
   expect(wire).toContain('"bloom":{"packIndex":0,"row":2}');
   expect(wire).not.toContain('"documentBloom":');
@@ -176,7 +184,7 @@ test("Root v5 pools shared metadata and retains valid Bloom pack holes", () => {
   ]);
 });
 
-test("Root v5 rejects invalid Bloom pack descriptors and segment references", () => {
+test("Root v6 rejects invalid Bloom pack descriptors and segment references", () => {
   const wire = encodeRoot(root);
   const invalidPackIndex = wire.replace('"packIndex":0', '"packIndex":2');
   expect(() => decodeRoot(invalidPackIndex)).toThrow();
@@ -210,7 +218,7 @@ test("pooled Root references remain bounds checked", () => {
   expect(() => decodeRoot(missingEligibility)).toThrow();
 });
 
-test("migration decoder distinguishes current v5 from legacy v1, v2, v3, and packed v4", async () => {
+test("migration decoder distinguishes current v6 from legacy v1, v2, v3, packed v4, and schema v5", async () => {
   const wire = encodeRoot(root);
   expect(decodeRootForMigration(wire)).toEqual({ kind: "current", root });
   const storedCurrent = Schema.decodeSync(Schema.fromJsonString(StoredRoot))(wire);
@@ -263,7 +271,7 @@ test("migration decoder distinguishes current v5 from legacy v1, v2, v3, and pac
 test("rebuild snapshots retain their envelope and use the same migration classification", () => {
   const wire = new TextDecoder().decode(encodeVectorRebuildSnapshot(snapshot));
   expect(decodeVectorRebuildSnapshot(wire)).toEqual(snapshot);
-  expect(wire).toContain('"version":5');
+  expect(wire).toContain('"version":6');
   const legacy = Schema.encodeSync(
     Schema.fromJsonString(
       VectorRebuildSnapshot.mapFields((fields) => ({ ...fields, root: LegacyRoot })),
@@ -307,4 +315,104 @@ test("rebuild snapshots retain their envelope and use the same migration classif
     needsEligibility: false,
     snapshot: { fields: [], root: legacyInlineRoot },
   });
+});
+
+test("column declarations keep both native orders and do not invent attribute types", () => {
+  const encodeNative = Schema.encodeSync(Schema.fromJsonString(NamespaceSchema));
+  const omitted = Schema.decodeSync(NamespaceSchema)({
+    filterable: ["vector", "title", "text"],
+    vectorFilterFields: ["text", "vector"],
+  });
+  const explicit = Schema.decodeSync(NamespaceSchema)({ ...omitted, vectorDimensions: 768 });
+  const omittedColumns = namespaceColumnsFromNative(omitted);
+  const explicitColumns = namespaceColumnsFromNative(explicit);
+  expect(omittedColumns.columns[0]).toEqual({ source: "native-vector" });
+  expect(explicitColumns.columns[0]).toEqual({ source: "native-vector", dimensions: 768 });
+  expect(omittedColumns.columns.filter((column) => column.source === "attribute")).toEqual([
+    { source: "attribute", name: "vector", value: "legacy-untyped", vectorFilterOrder: 1 },
+    { source: "attribute", name: "title", value: "legacy-untyped" },
+    { source: "attribute", name: "text", value: "legacy-untyped", vectorFilterOrder: 0 },
+  ]);
+  expect(filterableNames(omittedColumns)).toEqual(["vector", "title", "text"]);
+  expect(vectorFilterNames(omittedColumns)).toEqual(["text", "vector"]);
+  expect(resolvedVectorDimensions(undefined)).toBe(768);
+  expect(resolvedVectorDimensions(omittedColumns)).toBe(768);
+  expect(resolvedVectorDimensions(explicitColumns)).toBe(768);
+  expect(encodeNative(nativeSchemaFromColumns(omittedColumns))).toBe(encodeNative(omitted));
+  expect(encodeNative(nativeSchemaFromColumns(explicitColumns))).toBe(encodeNative(explicit));
+  expect(encodeNative(omitted)).not.toBe(encodeNative(explicit));
+  expect(() =>
+    Schema.decodeUnknownSync(NamespaceColumns)({
+      columns: [
+        { source: "native-vector" },
+        { source: "attribute", name: "year", value: "string" },
+      ],
+    }),
+  ).toThrow();
+  expect(() =>
+    Schema.decodeUnknownSync(NamespaceColumns)({
+      columns: [{ source: "id", name: "id", value: "legacy-untyped" }],
+    }),
+  ).toThrow();
+  expect(() =>
+    Schema.decodeUnknownSync(NamespaceColumns)({
+      columns: [
+        { source: "attribute", name: "vector", value: "legacy-untyped" },
+        { source: "native-vector" },
+      ],
+    }),
+  ).toThrow();
+  const declared = Schema.decodeSync(Root)({ ...root, schema: omittedColumns });
+  const explicitRoot = Schema.decodeSync(Root)({ ...root, schema: explicitColumns });
+  const wire = encodeRoot(declared);
+  expect(decodeRoot(wire)).toEqual(declared);
+  expect(wire).toContain('"source":"native-vector"');
+  expect(wire).not.toContain('"dimensions"');
+  expect(wire).not.toContain('"filterable"');
+  expect(encodeRoot(explicitRoot)).toContain('"dimensions":768');
+  const stored = Schema.decodeSync(Schema.fromJsonString(StoredRoot))(wire);
+  const legacyV5 = Schema.decodeSync(LegacyStoredRootV5)({
+    ...stored,
+    version: 5,
+    schema: omitted,
+  });
+  const legacyWire = Schema.encodeSync(Schema.fromJsonString(LegacyStoredRootV5))(legacyV5);
+  expect(legacyWire).toContain('"version":5');
+  expect(legacyWire).toContain('"vectorFilterFields":["text","vector"]');
+  expect(() => decodeRoot(legacyWire)).toThrow();
+  expect(decodeRootForMigration(legacyWire)).toEqual({
+    kind: "schema",
+    sourceVersion: 5,
+    root: declared,
+  });
+  const legacySnapshot = Schema.encodeSync(
+    Schema.fromJsonString(
+      VectorRebuildSnapshot.mapFields((fields) => ({ ...fields, root: LegacyStoredRootV5 })),
+    ),
+  )({ root: legacyV5, fields: ["text", "vector"] });
+  expect(() => decodeVectorRebuildSnapshot(legacySnapshot)).toThrow();
+  expect(decodeVectorRebuildSnapshotForMigration(legacySnapshot)).toEqual({
+    kind: "schema",
+    sourceVersion: 5,
+    snapshot: { root: declared, fields: ["text", "vector"] },
+  });
+});
+
+test("stored column readers reject unsupported declaration properties", () => {
+  const schema = namespaceColumnsFromNative({
+    filterable: ["text"],
+    vectorFilterFields: [],
+  });
+  const declared = Schema.decodeSync(Root)({ ...root, schema });
+  const stored = Schema.decodeSync(Schema.fromJsonString(StoredRoot))(encodeRoot(declared));
+  for (const invalid of [
+    { ...schema, idType: "uint" },
+    { columns: schema.columns.map((column) => Object.assign({}, column, { fullText: true })) },
+  ]) {
+    const corrupted = { ...stored, schema: invalid };
+    expect(() => decodeRoot(JSON.stringify(corrupted))).toThrow();
+    expect(() =>
+      decodeVectorRebuildSnapshot(JSON.stringify({ root: corrupted, fields: [] })),
+    ).toThrow();
+  }
 });

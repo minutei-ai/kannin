@@ -240,6 +240,21 @@ test("shared storage probe checks real S3 semantics and cleans up after a reject
       const remaining = yield* store.list({ prefix: "kannin-conformance/" });
       expect(remaining.objects).toEqual([]);
       expect(remaining.truncated).toBe(false);
+      const removed: string[] = [];
+      const occupied = ObjectStore.of({
+        ...store,
+        write: () => Effect.succeedNone,
+        remove: (key) =>
+          Effect.sync(() => {
+            removed.push(key);
+          }),
+      });
+      const rejected = yield* checkObjectStore().pipe(
+        Effect.provideService(ObjectStore, occupied),
+        Effect.exit,
+      );
+      expect(Exit.isFailure(rejected)).toBe(true);
+      expect(removed).toEqual([]);
     }),
   );
 }, 30000);

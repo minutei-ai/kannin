@@ -1,4 +1,4 @@
-import { Cause, Effect, Schema, Schedule, Semaphore } from "effect";
+import { Cause, Clock, Effect, Schema, Schedule, Semaphore } from "effect";
 import { timingSafeEqual } from "node:crypto";
 import { ObjectStore } from "../src/object-store";
 import { ObjectBucket } from "./object-bucket";
@@ -23,6 +23,7 @@ const conflictMessage = "R2 manifest changed; retry the operation with the same 
 export const portableApplication = Effect.fn("kannin.portableApplication")(function* (
   options: PortableOptions,
 ) {
+  const clock = yield* Clock.Clock;
   const run = Effect.runPromiseWith(yield* Effect.context<ObjectStore>());
   const objects = yield* ObjectStore;
   const bucket = new ObjectBucket(objects);
@@ -110,6 +111,7 @@ export const portableApplication = Effect.fn("kannin.portableApplication")(funct
     waitUntil,
   );
   const runtime: SearchRuntime = {
+    clock,
     env,
     cache: options.cache ?? disabledCache,
     engineModule: options.module,

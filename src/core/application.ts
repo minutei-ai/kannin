@@ -2,6 +2,13 @@ import { sha256Bytes } from "../hash";
 import { listNamespaces, namespaceCatalogPrefix, namespaceCatalogReadyKey } from "../namespaces";
 import { TextExecutions } from "../text-executions";
 import {
+  captureReaderLease,
+  finishStrongRead,
+  ownedRead,
+  rejectExpiredReader,
+  strongQueryFailure,
+} from "./read-lease";
+import {
   decodeRoot,
   encodeRoot,
   decodeRootEffect,
@@ -220,7 +227,10 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       )
         return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });
       const input = decoded.value;
-      const selected = await Effect.runPromise(readSegmentCache(url, props.value));
+      const selected = await Effect.runPromise(readSegmentCache(url, props.value), {
+        signal: request.signal,
+      });
+      request.signal.throwIfAborted();
       const cacheKey = selected.key;
       const cache = selected.cache;
       if (selected.response !== undefined) {
@@ -231,116 +241,144 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       }
       const storage = this.env.STORAGE;
       const context = this.ctx;
-      const response = await Effect.runPromise(
-        Effect.gen(function* () {
-          const canonical = Effect.acquireUseRelease(
-            Effect.tryPromise(() =>
-              storage.get(input.key, { range: { offset: input.offset, length: input.length } }),
-            ),
-            (object) =>
-              Effect.gen(function* () {
-                if (object === null)
-                  return new Response(null, {
-                    status: 404,
-                    headers: { "cache-control": "no-store" },
-                  });
-                const bytes = yield* Effect.tryPromise(() => object.arrayBuffer()).pipe(
-                  Effect.uninterruptible,
-                );
-                if (bytes.byteLength !== input.length)
-                  return new Response(null, {
-                    status: 503,
-                    headers: { "cache-control": "no-store" },
-                  });
-                const encoded = yield* Effect.try(() =>
-                  Match.value(url.pathname).pipe(
-                    Match.when("/directory-v5", () =>
-                      directory_compress(new Uint8Array(bytes)).slice(),
-                    ),
-                    Match.orElse(() => bytes),
-                  ),
-                );
-                if (url.pathname === "/directory-v5")
-                  publishDirectoryFrame(input.key, input.length, new Uint8Array(encoded), context);
-                return new Response(encoded, {
-                  headers: {
-                    "content-type": "application/octet-stream",
-                    "cache-control": "public, max-age=31536000, immutable",
-                    "content-length": String(encoded.byteLength),
-                    etag: object.httpEtag,
-                  },
-                });
-              }),
-            (object) => {
-              if (object === null || object.bodyUsed) return Effect.void;
-              return Effect.tryPromise(() => object.body.cancel()).pipe(Effect.ignore);
-            },
-          );
-          if (url.pathname !== "/directory-v5" || directoryMiss.value !== null)
-            return yield* canonical;
-          const reader = yield* acquireDirectoryFrame(input.key, input.length);
-          const observed = yield* waitDirectoryFrame(reader);
-          const cached = Fiber.join(reader).pipe(
-            Effect.map(
-              Option.map(
-                (bytes) =>
-                  new Response(new Uint8Array(bytes), {
-                    headers: {
-                      "content-type": "application/octet-stream",
-                      "cache-control": "public, max-age=31536000, immutable",
-                      "content-length": String(bytes.byteLength),
-                      "x-raio-cache": "r2-directory-hit",
-                    },
-                  }),
-              ),
-            ),
-          );
-          if (Option.isSome(observed)) {
-            const result = yield* cached;
-            if (Option.isSome(result)) return result.value;
-            return yield* canonical;
-          }
-          return yield* Effect.uninterruptibleMask((restore) =>
+      const pending = Effect.runPromise(
+        ownedRead((originSignal) =>
+          Effect.runPromise(
             Effect.gen(function* () {
-              const fallback = yield* Effect.forkDetach(restore(canonical));
-              context.waitUntil(
-                new Promise<void>((resolve) => fallback.addObserver(() => resolve())),
+              const canonical = Effect.acquireUseRelease(
+                Effect.tryPromise(() =>
+                  storage.get(input.key, {
+                    range: { offset: input.offset, length: input.length },
+                    signal: originSignal,
+                  }),
+                ),
+                (object) =>
+                  Effect.gen(function* () {
+                    if (object === null)
+                      return new Response(null, {
+                        status: 404,
+                        headers: { "cache-control": "no-store" },
+                      });
+                    const bytes = yield* Effect.tryPromise(() => object.arrayBuffer()).pipe(
+                      Effect.uninterruptible,
+                    );
+                    originSignal.throwIfAborted();
+                    if (bytes.byteLength !== input.length)
+                      return new Response(null, {
+                        status: 503,
+                        headers: { "cache-control": "no-store" },
+                      });
+                    const encoded = yield* Effect.try(() =>
+                      Match.value(url.pathname).pipe(
+                        Match.when("/directory-v5", () =>
+                          directory_compress(new Uint8Array(bytes)).slice(),
+                        ),
+                        Match.orElse(() => bytes),
+                      ),
+                    );
+                    if (url.pathname === "/directory-v5")
+                      publishDirectoryFrame(
+                        input.key,
+                        input.length,
+                        new Uint8Array(encoded),
+                        context,
+                      );
+                    return new Response(encoded, {
+                      headers: {
+                        "content-type": "application/octet-stream",
+                        "cache-control": "public, max-age=31536000, immutable",
+                        "content-length": String(encoded.byteLength),
+                        etag: object.httpEtag,
+                      },
+                    });
+                  }),
+                (object) => {
+                  if (object === null || object.bodyUsed) return Effect.void;
+                  return Effect.tryPromise(() => object.body.cancel()).pipe(Effect.ignore);
+                },
               );
-              return yield* restore(
-                Effect.race(
-                  Fiber.join(fallback),
-                  cached.pipe(
-                    Effect.flatMap(
-                      Option.match({
-                        onSome: Effect.succeed,
-                        onNone: () => Fiber.join(fallback),
+              if (url.pathname !== "/directory-v5" || directoryMiss.value !== null)
+                return yield* canonical;
+              const reader = yield* acquireDirectoryFrame(input.key, input.length);
+              const observed = yield* waitDirectoryFrame(reader);
+              const cached = Fiber.join(reader).pipe(
+                Effect.map(
+                  Option.map(
+                    (bytes) =>
+                      new Response(new Uint8Array(bytes), {
+                        headers: {
+                          "content-type": "application/octet-stream",
+                          "cache-control": "public, max-age=31536000, immutable",
+                          "content-length": String(bytes.byteLength),
+                          "x-raio-cache": "r2-directory-hit",
+                        },
+                      }),
+                  ),
+                ),
+              );
+              if (Option.isSome(observed)) {
+                const result = yield* cached;
+                if (Option.isSome(result)) return result.value;
+                return yield* canonical;
+              }
+              return yield* Effect.uninterruptibleMask((restore) =>
+                Effect.gen(function* () {
+                  const fallback = yield* Effect.forkDetach(restore(canonical));
+                  context.waitUntil(
+                    new Promise<void>((resolve) => fallback.addObserver(() => resolve())),
+                  );
+                  return yield* restore(
+                    Effect.race(
+                      Fiber.join(fallback),
+                      cached.pipe(
+                        Effect.flatMap(
+                          Option.match({
+                            onSome: Effect.succeed,
+                            onNone: () => Fiber.join(fallback),
+                          }),
+                        ),
+                      ),
+                    ),
+                  ).pipe(
+                    Effect.ensuring(
+                      Effect.gen(function* () {
+                        const stopped = yield* Effect.forkDetach(
+                          Fiber.interruptAll([reader, fallback]),
+                        );
+                        context.waitUntil(
+                          new Promise<void>((resolve) => stopped.addObserver(() => resolve())),
+                        );
                       }),
                     ),
-                  ),
-                ),
-              ).pipe(
-                Effect.ensuring(
-                  Effect.gen(function* () {
-                    const stopped = yield* Effect.forkDetach(
-                      Fiber.interruptAll([reader, fallback]),
-                    );
-                    context.waitUntil(
-                      new Promise<void>((resolve) => stopped.addObserver(() => resolve())),
-                    );
-                  }),
-                ),
+                  );
+                }),
               );
             }),
-          );
+            { signal: originSignal },
+          ),
+        ).pipe(
+          Effect.timeoutOrElse({
+            duration: "30 seconds",
+            orElse: () =>
+              new Rejected({
+                status: 503,
+                message: "Immutable cache fill exceeded its read budget",
+              }),
+          }),
+        ),
+      );
+      context.waitUntil(
+        pending.then(async (response) => {
+          if (cache !== undefined && response.ok)
+            await Effect.runPromise(
+              Effect.tryPromise(() => cache.put(cacheKey, response.clone())).pipe(
+                Effect.timeoutOption("5 seconds"),
+                Effect.ignore,
+              ),
+            );
         }),
       );
-      if (cache !== undefined && response.ok)
-        context.waitUntil(
-          Effect.runPromise(
-            Effect.tryPromise(() => cache.put(cacheKey, response.clone())).pipe(Effect.ignore),
-          ),
-        );
-      return response;
+      return pending;
     }
   }
   const decodeLog = Schema.decodeSync(Schema.fromJsonString(Log));
@@ -402,7 +440,14 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });
       const encodedFilters = Schema.encodeSync(TermFilters)(actual);
       return Effect.runPromise(
-        readTermProjections(props.value.ranges, props.value.terms, actual, prefixes, this.ctx).pipe(
+        readTermProjections(
+          props.value.ranges,
+          props.value.terms,
+          actual,
+          prefixes,
+          this.ctx,
+          request.signal,
+        ).pipe(
           Effect.flatMap(({ catalogs, telemetry, rootFallback }) =>
             Effect.gen(function* () {
               const entryEnded = yield* Clock.currentTimeNanos;
@@ -730,12 +775,26 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
     return minimum;
   }
 
+  function queryRangeSignal(outer: AbortSignal | undefined, fiber: AbortSignal) {
+    if (outer === undefined) return fiber;
+    return AbortSignal.any([outer, fiber]);
+  }
+
+  function runQueryEffect<A, E>(effect: Effect.Effect<A, E>, signal?: AbortSignal) {
+    signal?.throwIfAborted();
+    const options: { value: { readonly signal: AbortSignal } | undefined } = { value: undefined };
+    if (signal !== undefined) options.value = { signal };
+    return Effect.runPromise(effect, options.value);
+  }
+
   async function rankText(
     input: typeof Query.Type,
     root: typeof Root.Type,
     timings: Headers,
     ctx: BackgroundContext,
+    signal?: AbortSignal,
   ) {
+    signal?.throwIfAborted();
     const started = Effect.runSync(Clock.currentTimeNanos);
     if (input.kind === "vector") return [];
     timings.append("server-timing", 'text_phase;desc="catalog"');
@@ -767,7 +826,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       if (dictionary === undefined) return false;
       return terms.every((term) => Object.hasOwn(dictionary, term));
     });
-    const bloomMatches = await Effect.runPromise(
+    const bloomMatches = await runQueryEffect(
       Match.value(covered).pipe(
         Match.when(true, () => {
           timings.append("server-timing", 'text_membership;desc="manifest"');
@@ -775,6 +834,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         }),
         Match.orElse(() => bloomCandidates(root, terms, "term")),
       ),
+      signal,
     );
     const unrestricted = new Map<string, string>();
     if (input.filters.length > 0) {
@@ -1011,7 +1071,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         Match.when(true, () => common.map((projection) => projection.dictionary)),
         Match.orElse(() => undefined),
       );
-      const projections = await Effect.runPromise(
+      const projections = await runQueryEffect(
         Match.value(common.length === selected.length && (!correlatedPhrase || rootBounded)).pipe(
           Match.when(true, () =>
             Effect.sync(() => {
@@ -1030,9 +1090,11 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
               input.filters,
               timings,
               rootPrefixes,
+              signal,
             ),
           ),
         ),
+        signal,
       );
       const catalog = selected.map((segment, index) => {
         const projection = projections[index];
@@ -1382,7 +1444,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
           ),
         );
       const prepared = compilation.query;
-      const batches = await Effect.runPromise(
+      const batches = await runQueryEffect(
         Effect.forEach(
           eligible,
           ({ segment, identity, singleton }) =>
@@ -1515,16 +1577,17 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
                                 Effect.gen(function* () {
                                   const bytes = yield* rankIo.withPermit(
                                     Effect.tryPromise({
-                                      try: () =>
+                                      try: (fiberSignal) =>
                                         range(
                                           segment.key,
                                           segment.headerBytes + group.offset,
                                           group.end - group.offset,
+                                          false,
+                                          true,
+                                          undefined,
+                                          queryRangeSignal(signal, fiberSignal),
                                         ),
-                                      catch: (cause) => {
-                                        if (Schema.is(Rejected)(cause)) return cause;
-                                        return new Cause.UnknownError(cause);
-                                      },
+                                      catch: (cause) => strongQueryFailure(cause),
                                     }),
                                   );
                                   return {
@@ -1601,6 +1664,8 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
                     return undefined;
                   }),
                 ),
+                false,
+                signal,
               );
             }).pipe(
               Effect.map((hits) => {
@@ -1622,6 +1687,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
             ),
           { concurrency: rankingConcurrency },
         ),
+        signal,
       );
       scheduling.matches = batches.reduce((count, batch) => count + batch.length, 0);
       ranked.push(...batches.flat());
@@ -1730,10 +1796,16 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
     return ranked.slice(0, input.topK);
   }
 
-  async function rankVectors(input: typeof Query.Type, root: typeof Root.Type, timings: Headers) {
+  async function rankVectors(
+    input: typeof Query.Type,
+    root: typeof Root.Type,
+    timings: Headers,
+    signal?: AbortSignal,
+  ) {
+    signal?.throwIfAborted();
     if (input.kind === "text" || root.documents === 0) return [];
     const started = Effect.runSync(Clock.currentTimeNanos);
-    const hits = await Effect.runPromise(
+    const hits = await runQueryEffect(
       Effect.acquireUseRelease(
         Effect.try(() => new VectorRanker(new Float32Array(input.vector), input.topK)),
         (ranker) =>
@@ -1777,8 +1849,16 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
                                 status: 503,
                                 message: "Invalid canonical vector range",
                               });
-                            const frame = yield* Effect.tryPromise(() =>
-                              range(segment.key, segment.headerBytes + data.offset, data.length),
+                            const frame = yield* Effect.tryPromise((fiberSignal) =>
+                              range(
+                                segment.key,
+                                segment.headerBytes + data.offset,
+                                data.length,
+                                false,
+                                true,
+                                undefined,
+                                queryRangeSignal(signal, fiberSignal),
+                              ),
                             );
                             const discarded = yield* Effect.try(() =>
                               ranker.push_frame(row.id, frame),
@@ -1794,6 +1874,9 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
                 undefined,
                 false,
                 input.kind === "vector",
+                undefined,
+                false,
+                signal,
               );
             }
             const encoded = yield* Effect.try(() => ranker.finish());
@@ -1818,6 +1901,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
           }),
         (ranker) => Effect.sync(() => ranker.free()),
       ),
+      signal,
     );
     const ended = Effect.runSync(Clock.currentTimeNanos);
     timings.append("server-timing", `vector_index;dur=${Number(ended - started) / 1e6}`);
@@ -1830,6 +1914,24 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
     ctx: BackgroundContext,
     timings: Headers,
     executions?: TextExecutions,
+    signal?: AbortSignal,
+  ) {
+    signal?.throwIfAborted();
+    return Effect.runPromise(
+      ownedRead((ownedSignal) =>
+        executeQuery(input, manifest, ctx, timings, executions, ownedSignal),
+      ),
+      { signal },
+    );
+  }
+
+  async function executeQuery(
+    input: typeof Query.Type,
+    manifest: typeof Root.Type,
+    ctx: BackgroundContext,
+    timings: Headers,
+    executions?: TextExecutions,
+    signal?: AbortSignal,
   ) {
     const dimensions = resolvedVectorDimensions(manifest.schema);
     if (input.kind !== "text" && input.vector.length !== dimensions)
@@ -1844,20 +1946,24 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
           message: `Attribute is not filterable: ${filter.field}`,
         });
     if (input.kind === "text") {
-      const materialize = async () => {
-        const hits = await rankText(input, manifest, timings, ctx);
+      const materialize = async (producerSignal?: AbortSignal) => {
+        const hits = await rankText(input, manifest, timings, ctx, producerSignal);
         timings.append("server-timing", 'text_phase;desc="documents"');
         const started = Effect.runSync(Clock.currentTimeNanos);
-        const rows = await Effect.runPromise(
-          readDocumentHits(hits.map((hit) => [hit.segment, hit.data, hit.score] as const)),
+        const rows = await runQueryEffect(
+          readDocumentHits(
+            hits.map((hit) => [hit.segment, hit.data, hit.score] as const),
+            producerSignal,
+          ),
+          producerSignal,
         );
         const ended = Effect.runSync(Clock.currentTimeNanos);
         timings.append("server-timing", `text_documents;dur=${Number(ended - started) / 1e6}`);
         return rows;
       };
       const rows = await Match.value(executions).pipe(
-        Match.when(undefined, materialize),
-        Match.orElse((active) => active.evaluate(manifest, input, timings, materialize)),
+        Match.when(undefined, () => materialize(signal)),
+        Match.orElse((active) => active.evaluate(manifest, input, timings, materialize, signal)),
       );
       return encodeQueryResult({
         rows,
@@ -1866,8 +1972,8 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       });
     }
     const [text, vectors] = await Promise.all([
-      rankText(input, manifest, timings, ctx),
-      rankVectors(input, manifest, timings),
+      rankText(input, manifest, timings, ctx, signal),
+      rankVectors(input, manifest, timings, signal),
     ]);
     const scores = new Map<string, Awaited<ReturnType<typeof rankText>>[number]>();
     if (input.kind === "hybrid") {
@@ -1889,8 +1995,12 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       ),
     );
     const started = Effect.runSync(Clock.currentTimeNanos);
-    const rows = await Effect.runPromise(
-      readDocumentHits(hits.map((hit) => [hit.segment, hit.data, hit.score] as const)),
+    const rows = await runQueryEffect(
+      readDocumentHits(
+        hits.map((hit) => [hit.segment, hit.data, hit.score] as const),
+        signal,
+      ),
+      signal,
     );
     if (input.kind === "hybrid") {
       if (rows.length !== hits.length)
@@ -1948,17 +2058,24 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       return `namespaces/${this.namespace}`;
     }
 
-    private async root() {
+    private async root(signal?: AbortSignal) {
+      signal?.throwIfAborted();
       if (this.current !== undefined) return this.current;
-      const object = await this.env.STORAGE.get(`${this.prefix}/root.json`);
+      const object = await this.env.STORAGE.get(`${this.prefix}/root.json`, {
+        ...(signal !== undefined && { signal }),
+      });
       if (object !== null) {
-        this.current = { manifest: decodeRoot(await object.text()), etag: object.etag };
+        const encoded = await object.text();
+        signal?.throwIfAborted();
+        this.current = { manifest: decodeRoot(encoded), etag: object.etag };
         return this.current;
       }
       const acknowledged = await this.env.STORAGE.list({
         prefix: `${this.prefix}/receipts/`,
         limit: 1,
+        ...(signal !== undefined && { signal }),
       });
+      signal?.throwIfAborted();
       if (acknowledged.objects.length > 0)
         throw new Rejected({
           status: 503,
@@ -1977,6 +2094,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         bloomPacks: [],
         segments: [],
       };
+      signal?.throwIfAborted();
       this.current = { manifest, etag: null };
       return this.current;
     }
@@ -3089,7 +3207,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
 
     private perform(command: typeof NamespaceCommand.Type, queryTimings: Headers) {
       const namespace = command.namespace;
-      return Effect.gen({ self: this }, function* () {
+      const program = Effect.gen({ self: this }, function* () {
         if (this.namespace !== undefined && this.namespace !== namespace)
           return yield* new Rejected({ status: 403, message: "Coordinator namespace mismatch" });
         this.namespace = namespace;
@@ -3102,17 +3220,30 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
               this.withRootPermit(
                 Effect.gen({ self: this }, function* () {
                   const admitted = yield* Clock.currentTimeNanos;
+                  const started = yield* captureReaderLease;
                   if (runtime.freshRoots) {
                     this.current = undefined;
                     this.acknowledgedReceipt = undefined;
                   }
-                  const current = yield* Effect.tryPromise({
-                    try: () => this.root(),
-                    catch: (cause) => {
-                      if (Schema.is(Rejected)(cause)) return cause;
-                      return new Cause.UnknownError(cause);
-                    },
-                  });
+                  const loaded = yield* finishStrongRead(
+                    started,
+                    Effect.tryPromise({
+                      try: (signal) => this.root(signal),
+                      catch: strongQueryFailure,
+                    }),
+                  ).pipe(Effect.interruptible, Effect.exit);
+                  if (Exit.isFailure(loaded)) {
+                    this.current = undefined;
+                    this.acknowledgedReceipt = undefined;
+                    return yield* Effect.failCause(loaded.cause);
+                  }
+                  const current = loaded.value;
+                  const admission = yield* rejectExpiredReader(started).pipe(Effect.exit);
+                  if (Exit.isFailure(admission)) {
+                    this.current = undefined;
+                    this.acknowledgedReceipt = undefined;
+                    return yield* Effect.failCause(admission.cause);
+                  }
                   const captured = yield* Clock.currentTimeNanos;
                   const lease = Symbol();
                   this.readers.set(lease, current.manifest);
@@ -3121,30 +3252,27 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
                     manifest: current.manifest,
                     wait: Number(admitted - queued) / 1e6,
                     root: Number(captured - admitted) / 1e6,
+                    started,
                   };
                 }),
               ),
-              ({ manifest, wait, root }) =>
-                Effect.tryPromise({
-                  try: async () => {
-                    const response = await query(
-                      input,
-                      manifest,
-                      this.ctx,
-                      queryTimings,
-                      this.textExecutions,
-                    );
+              ({ manifest, wait, root, started }) =>
+                finishStrongRead(
+                  started,
+                  Effect.tryPromise({
+                    try: (signal) =>
+                      query(input, manifest, this.ctx, queryTimings, this.textExecutions, signal),
+                    catch: (cause) => strongQueryFailure(cause),
+                  }),
+                ).pipe(
+                  Effect.map((response) => {
                     queryTimings.append(
                       "server-timing",
                       `query_wait;dur=${wait},query_root;dur=${root}`,
                     );
                     return response;
-                  },
-                  catch: (cause) => {
-                    if (Schema.is(Rejected)(cause)) return cause;
-                    return new Cause.UnknownError(cause);
-                  },
-                }),
+                  }),
+                ),
               ({ lease }) =>
                 Effect.sync(() => {
                   this.readers.delete(lease);
@@ -3406,6 +3534,8 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
           return yield* new Rejected({ status: 503, message: "Operation returned no result" });
         return result.value;
       });
+      if (runtime.clock === undefined) return program;
+      return Effect.provideService(program, Clock.Clock, runtime.clock);
     }
 
     async execute(input: typeof RpcCommand.Encoded): Promise<typeof RpcReply.Encoded> {
@@ -3556,7 +3686,8 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
                 );
                 if (manifest !== undefined) {
                   const value = yield* Effect.tryPromise({
-                    try: () => query(command.input, manifest, ctx, new Headers()),
+                    try: (signal) =>
+                      query(command.input, manifest, ctx, new Headers(), undefined, signal),
                     catch: (cause) => {
                       if (Schema.is(Rejected)(cause)) return cause;
                       return new Cause.UnknownError(cause);
@@ -4263,7 +4394,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
               const snapshotEnded = yield* Clock.currentTimeNanos;
               if (manifest !== undefined) {
                 const evaluated = yield* Effect.tryPromise({
-                  try: () => query(input, manifest, ctx, queryTimings),
+                  try: (signal) => query(input, manifest, ctx, queryTimings, undefined, signal),
                   catch: (cause) => {
                     if (Schema.is(Rejected)(cause)) return cause;
                     return new Cause.UnknownError(cause);

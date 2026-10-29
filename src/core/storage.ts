@@ -158,7 +158,13 @@ export function createStorage(runtime: SearchRuntime) {
   const frequencyPages = new Map<string, { page: FrequencyPage; bytes: number }>();
   const frequencyBudget = { bytes: 0 };
   const cacheOrder = new Map<string, "range" | "frequency">();
-  const pendingRanges = new Map<string, Promise<Uint8Array>>();
+  type RangeAcquisition = {
+    readonly controller: AbortController;
+    readonly waiters: { count: number };
+    readonly anchored: { value: boolean };
+    promise: Promise<Uint8Array> | undefined;
+  };
+  const pendingRanges = new Map<string, RangeAcquisition>();
   const MAX_PENDING_RANGES = 64;
   const SMALL_RANGE_LIMIT = 64 * 1024;
   const SMALL_RANGE_BODY_UNIT = 64 * 1024;
@@ -719,6 +725,56 @@ export function createStorage(runtime: SearchRuntime) {
     return published;
   }
 
+  function rangeSignal(outer: AbortSignal | undefined, fiber: AbortSignal) {
+    if (outer === undefined) return fiber;
+    return AbortSignal.any([outer, fiber]);
+  }
+
+  function leaveRangeWaiter(
+    shared: RangeAcquisition,
+    signal: AbortSignal,
+    participation: { active: boolean },
+    onAbort: () => void,
+    abort: boolean,
+  ) {
+    if (participation.active === false) return;
+    participation.active = false;
+    signal.removeEventListener("abort", onAbort);
+    shared.waiters.count -= 1;
+    if (abort === true && shared.waiters.count === 0 && shared.anchored.value === false)
+      shared.controller.abort();
+  }
+
+  function bindRangeWaiter(shared: RangeAcquisition, signal: AbortSignal | undefined) {
+    const promise = shared.promise;
+    if (promise === undefined)
+      return Promise.reject(new Cause.UnknownError("Range acquisition missing"));
+    if (signal === undefined) {
+      shared.anchored.value = true;
+      return promise;
+    }
+    const participation = { active: true };
+    shared.waiters.count += 1;
+    const onAbort = () => {
+      leaveRangeWaiter(shared, signal, participation, onAbort, true);
+    };
+    const observed = promise.then(
+      (bytes) => {
+        leaveRangeWaiter(shared, signal, participation, onAbort, false);
+        signal.throwIfAborted();
+        return bytes;
+      },
+      (cause: unknown) => {
+        leaveRangeWaiter(shared, signal, participation, onAbort, false);
+        signal.throwIfAborted();
+        throw cause;
+      },
+    );
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort);
+    return observed;
+  }
+
   async function range(
     key: string,
     offset: number,
@@ -726,7 +782,9 @@ export function createStorage(runtime: SearchRuntime) {
     compressedDirectory = false,
     retain = true,
     directoryMiss?: typeof DirectoryCacheMiss.Type,
+    signal?: AbortSignal,
   ) {
+    signal?.throwIfAborted();
     const resource = Match.value(compressedDirectory).pipe(
       Match.when(true, () => "directory-v5"),
       Match.orElse(() => "range"),
@@ -748,7 +806,15 @@ export function createStorage(runtime: SearchRuntime) {
     if (compressedDirectory) noteDirectoryRequest(cacheKey);
     const pendingKey = `${cacheKey}/${retain}`;
     const pending = pendingRanges.get(pendingKey);
-    if (pending !== undefined) return pending;
+    if (pending !== undefined && pending.controller.signal.aborted === false)
+      return bindRangeWaiter(pending, signal);
+    if (pending !== undefined) pendingRanges.delete(pendingKey);
+    const shared: RangeAcquisition = {
+      controller: new AbortController(),
+      waiters: { count: 0 },
+      anchored: { value: false },
+      promise: undefined,
+    };
     const acquisition = (async () => {
       const input = Schema.encodeSync(SegmentRange)({ key, offset, length });
       const url = new URL(`https://segments.internal/${resource}`);
@@ -816,8 +882,12 @@ export function createStorage(runtime: SearchRuntime) {
         Effect.gen(function* () {
           reads.rangeR2FallbackReads += 1;
           if (compressedDirectory) reads.directoryR2FallbackReads += 1;
+          shared.controller.signal.throwIfAborted();
           return yield* Effect.tryPromise(() =>
-            env.STORAGE.get(key, { range: { offset, length } }),
+            env.STORAGE.get(key, {
+              range: { offset, length },
+              signal: shared.controller.signal,
+            }),
           );
         }),
         (object) =>
@@ -828,6 +898,7 @@ export function createStorage(runtime: SearchRuntime) {
                 message: "Committed R2 segment unavailable",
               });
             const body = yield* Effect.tryPromise(() => object.arrayBuffer());
+            shared.controller.signal.throwIfAborted();
             reads.rangeR2FallbackBytes += body.byteLength;
             if (body.byteLength !== length)
               return yield* new Rejected({
@@ -874,6 +945,8 @@ export function createStorage(runtime: SearchRuntime) {
         reads.rangeCacheTimeouts += 1;
         return yield* fallback;
       });
+      const runOptions: { signal?: AbortSignal } = {};
+      runOptions.signal = shared.controller.signal;
       const bytes = await Effect.runPromise(
         Match.value(compressedDirectory).pipe(
           Match.when(true, () => {
@@ -930,6 +1003,7 @@ export function createStorage(runtime: SearchRuntime) {
               );
           }),
         ),
+        runOptions,
       );
       reads.rangeBytes += bytes.byteLength;
       if (!compressedDirectory && bytes.byteLength !== length)
@@ -938,19 +1012,19 @@ export function createStorage(runtime: SearchRuntime) {
       else if (retain) remember(cacheKey, bytes);
       return bytes;
     })();
-    if (pendingRanges.size >= MAX_PENDING_RANGES) return acquisition;
-    const shared = acquisition.then(
+    const published = acquisition.then(
       (bytes) => {
-        pendingRanges.delete(pendingKey);
+        if (pendingRanges.get(pendingKey) === shared) pendingRanges.delete(pendingKey);
         return bytes;
       },
       (cause: unknown) => {
-        pendingRanges.delete(pendingKey);
-        return Promise.reject(cause);
+        if (pendingRanges.get(pendingKey) === shared) pendingRanges.delete(pendingKey);
+        throw cause;
       },
     );
-    pendingRanges.set(pendingKey, shared);
-    return shared;
+    shared.promise = published;
+    if (pendingRanges.size < MAX_PENDING_RANGES) pendingRanges.set(pendingKey, shared);
+    return bindRangeWaiter(shared, signal);
   }
 
   const acquireDirectory = Effect.fn("kannin.acquireDirectory")(
@@ -961,6 +1035,7 @@ export function createStorage(runtime: SearchRuntime) {
       preferR2: boolean,
       query?: PreparedQuery,
       documentLookup: boolean = false,
+      signal?: AbortSignal,
     ) =>
       Effect.gen(function* () {
         const commonMiss = { value: false, observed: false };
@@ -1250,7 +1325,16 @@ export function createStorage(runtime: SearchRuntime) {
                 if (Option.isSome(frame)) return frame.value;
                 if (!canonical)
                   return yield* Effect.tryPromise({
-                    try: () => range(key, 0, headerBytes, true, true, directoryMiss),
+                    try: (fiberSignal) =>
+                      range(
+                        key,
+                        0,
+                        headerBytes,
+                        true,
+                        true,
+                        directoryMiss,
+                        rangeSignal(signal, fiberSignal),
+                      ),
                     catch: (cause) => {
                       if (Schema.is(Rejected)(cause)) return cause;
                       return new Cause.UnknownError(cause);
@@ -1260,8 +1344,11 @@ export function createStorage(runtime: SearchRuntime) {
                 reads.rangeR2FallbackReads += 1;
                 reads.directoryR2FallbackReads += 1;
                 return yield* Effect.acquireUseRelease(
-                  Effect.tryPromise(() =>
-                    env.STORAGE.get(key, { range: { offset: 0, length: headerBytes } }),
+                  Effect.tryPromise((fiberSignal) =>
+                    env.STORAGE.get(key, {
+                      range: { offset: 0, length: headerBytes },
+                      signal: rangeSignal(signal, fiberSignal),
+                    }),
                   ),
                   (object) =>
                     Effect.gen(function* () {
@@ -1271,6 +1358,7 @@ export function createStorage(runtime: SearchRuntime) {
                           message: "Committed R2 segment unavailable",
                         });
                       const body = yield* Effect.tryPromise(() => object.arrayBuffer());
+                      signal?.throwIfAborted();
                       reads.rangeR2FallbackBytes += body.byteLength;
                       reads.directoryR2FallbackBytes += body.byteLength;
                       if (body.byteLength !== headerBytes)
@@ -1378,6 +1466,7 @@ export function createStorage(runtime: SearchRuntime) {
       preferR2 = false,
       query?: PreparedQuery,
       documentLookup: boolean = false,
+      signal?: AbortSignal,
     ) =>
       Effect.acquireUseRelease(
         Effect.sync(() => {
@@ -1414,6 +1503,7 @@ export function createStorage(runtime: SearchRuntime) {
                 preferR2,
                 query,
                 documentLookup,
+                signal,
               );
               if (permits === undefined) return yield* acquire;
               return yield* permits.withPermit(acquire);
@@ -1740,6 +1830,7 @@ export function createStorage(runtime: SearchRuntime) {
       actualFilters: typeof TermFilters.Type,
       prefixes: ReadonlyArray<typeof CommonTerms.Type> | undefined,
       ctx: BackgroundContext,
+      signal?: AbortSignal,
     ) =>
       Effect.gen(function* () {
         const started = yield* Clock.currentTimeNanos;
@@ -2071,6 +2162,10 @@ export function createStorage(runtime: SearchRuntime) {
                         }),
                       undefined,
                       true,
+                      false,
+                      undefined,
+                      false,
+                      signal,
                     ),
                   );
                 });
@@ -2168,6 +2263,7 @@ export function createStorage(runtime: SearchRuntime) {
       filters: typeof TermFilters.Type,
       timings: Headers,
       rootPrefixes: ReadonlyArray<typeof CommonTerms.Type> | undefined,
+      signal?: AbortSignal,
     ) =>
       Effect.gen(function* () {
         if (
@@ -2363,10 +2459,13 @@ export function createStorage(runtime: SearchRuntime) {
                 )(selection.value);
                 const fetchedAt = yield* Clock.currentTimeNanos;
                 const response = yield* Effect.tryPromise({
-                  try: () =>
+                  try: (fiberSignal) =>
                     runtime
                       .terms({ props: { ...props, selection: encodedSelection } })
-                      .fetch("https://terms.internal/catalog-v12", { headers }),
+                      .fetch("https://terms.internal/catalog-v12", {
+                        headers,
+                        signal: rangeSignal(signal, fiberSignal),
+                      }),
                   catch: (cause) => {
                     if (Schema.is(Rejected)(cause)) return cause;
                     return new Cause.UnknownError(cause);
@@ -2384,7 +2483,18 @@ export function createStorage(runtime: SearchRuntime) {
                   metrics.nativeHits += 1;
                 }
                 const bodyAt = yield* Clock.currentTimeNanos;
-                const text = yield* Effect.tryPromise(() => response.text());
+                const text = yield* Effect.tryPromise({
+                  try: (fiberSignal) => {
+                    const selected = rangeSignal(signal, fiberSignal);
+                    if (selected.aborted === true)
+                      return Promise.reject(new Error("All fibers interrupted without error"));
+                    return response.text();
+                  },
+                  catch: (cause) => {
+                    if (Schema.is(Rejected)(cause)) return cause;
+                    return new Cause.UnknownError(cause);
+                  },
+                });
                 metrics.bodyMs += Number((yield* Clock.currentTimeNanos) - bodyAt) / 1e6;
                 if (!response.ok)
                   return yield* new Rejected({
@@ -3331,16 +3441,18 @@ export function createStorage(runtime: SearchRuntime) {
     offset: number,
     length: number,
     readAheadEnd: number,
+    signal?: AbortSignal,
   ) {
     const identity = `${env.STORAGE_CACHE_SCOPE}:${key}/${offset}/${length}`;
     const windowBytes = SMALL_RANGE_LIMIT / 16;
-    if (length > windowBytes || buffers.has(identity)) return range(key, offset, length);
+    if (length > windowBytes || buffers.has(identity))
+      return range(key, offset, length, false, true, undefined, signal);
     const start = headerBytes + Math.floor((offset - headerBytes) / windowBytes) * windowBytes;
     const end = Math.min(
       readAheadEnd,
       headerBytes + Math.ceil((offset - headerBytes + length) / windowBytes) * windowBytes,
     );
-    const bytes = await range(key, start, end - start);
+    const bytes = await range(key, start, end - start, false, true, undefined, signal);
     const frame = bytes.slice(offset - start, offset - start + length);
     remember(identity, frame);
     return frame;
@@ -3353,6 +3465,7 @@ export function createStorage(runtime: SearchRuntime) {
     objectBytes: number,
     readAheadEnd: number,
     payload?: Uint8Array,
+    signal?: AbortSignal,
   ) {
     const offset = headerBytes + data.offset;
     if (
@@ -3368,7 +3481,7 @@ export function createStorage(runtime: SearchRuntime) {
         throw new Rejected({ status: 503, message: "Truncated segment document payload" });
       return payload.subarray(data.offset, data.offset + data.length);
     }
-    return readDocumentBytes(key, headerBytes, offset, data.length, readAheadEnd);
+    return readDocumentBytes(key, headerBytes, offset, data.length, readAheadEnd, signal);
   }
 
   async function readDocument(
@@ -3425,6 +3538,7 @@ export function createStorage(runtime: SearchRuntime) {
         typeof Row.Type.score,
       ]
     >,
+    signal?: AbortSignal,
   ) {
     const indexed = locations.map((location, index) => [index, location] as const);
     const grouped = new Map<string, (typeof indexed)[number][]>();
@@ -3583,13 +3697,15 @@ export function createStorage(runtime: SearchRuntime) {
               return undefined;
             return yield* permits.withPermit(
               Effect.tryPromise({
-                try: () =>
+                try: (fiberSignal) =>
                   range(
                     segment.key,
                     segment.headerBytes + physical.start,
                     physical.end - physical.start,
                     false,
                     false,
+                    undefined,
+                    rangeSignal(signal, fiberSignal),
                   ),
                 catch: (cause) => {
                   if (Schema.is(Rejected)(cause)) return cause;
@@ -3609,6 +3725,7 @@ export function createStorage(runtime: SearchRuntime) {
               permits,
               payload,
               physical.start,
+              signal,
             );
             for (const [index, document] of documents.entries()) {
               const hit = window[index];
@@ -3639,6 +3756,7 @@ export function createStorage(runtime: SearchRuntime) {
     permits: Semaphore.Semaphore,
     payload?: Uint8Array,
     payloadOffset: number = 0,
+    signal?: AbortSignal,
   ) {
     const identity = `${env.STORAGE_CACHE_SCOPE}:${key}`;
     const cached = directories.get(identity);
@@ -3761,10 +3879,18 @@ export function createStorage(runtime: SearchRuntime) {
             }
             return yield* permits.withPermit(
               Effect.tryPromise({
-                try: async () =>
+                try: async (fiberSignal) =>
                   decodeCanonicalQueryDocument(
                     segment_query_document(
-                      await readDocumentFrame(key, headerBytes, page, objectBytes, metadataEnd),
+                      await readDocumentFrame(
+                        key,
+                        headerBytes,
+                        page,
+                        objectBytes,
+                        metadataEnd,
+                        undefined,
+                        rangeSignal(signal, fiberSignal),
+                      ),
                     ),
                   ),
                 catch: (cause) => {
@@ -3781,7 +3907,8 @@ export function createStorage(runtime: SearchRuntime) {
         return payload.subarray(first.offset - payloadOffset, span.end - payloadOffset);
       return yield* permits.withPermit(
         Effect.tryPromise({
-          try: () => {
+          try: (fiberSignal) => {
+            const selected = rangeSignal(signal, fiberSignal);
             if (span.contiguous)
               return readDocumentBytes(
                 key,
@@ -3789,8 +3916,17 @@ export function createStorage(runtime: SearchRuntime) {
                 headerBytes + first.offset,
                 span.end - first.offset,
                 metadataEnd,
+                selected,
               );
-            return range(key, headerBytes + first.offset, span.end - first.offset, false, false);
+            return range(
+              key,
+              headerBytes + first.offset,
+              span.end - first.offset,
+              false,
+              false,
+              undefined,
+              selected,
+            );
           },
           catch: (cause) => {
             if (Schema.is(Rejected)(cause)) return cause;

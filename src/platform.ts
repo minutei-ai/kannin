@@ -1,4 +1,5 @@
 import type { Binding } from "./rpc";
+import type * as Clock from "effect/Clock";
 import type { SegmentCacheProps, TermProjectionProps, ObjectVersion } from "./protocol";
 
 export interface BackgroundContext {
@@ -24,6 +25,7 @@ export interface ObjectBody extends ObjectInfo {
   readonly text: () => Promise<string>;
 }
 export interface ObjectListOptions {
+  signal?: AbortSignal;
   prefix?: string;
   limit?: number;
   delimiter?: string;
@@ -37,11 +39,14 @@ export type ObjectList = {
 export interface Bucket {
   get(
     key: string,
-    options: { readonly onlyIf: ObjectCondition },
+    options: { readonly onlyIf: ObjectCondition; readonly signal?: AbortSignal },
   ): Promise<ObjectBody | ObjectInfo | null>;
   get(
     key: string,
-    options?: { readonly range?: { readonly offset: number; readonly length: number } },
+    options?: {
+      readonly range?: { readonly offset: number; readonly length: number };
+      readonly signal?: AbortSignal;
+    },
   ): Promise<ObjectBody | null>;
   head(key: string): Promise<ObjectInfo | null>;
   put(
@@ -87,6 +92,7 @@ export interface CacheProvider {
   open(name: string): Promise<CachePort>;
 }
 export interface SearchRuntime extends BackgroundContext {
+  readonly clock?: Clock.Clock;
   readonly env: Environment;
   readonly cache: CacheProvider;
   readonly engineModule: WebAssembly.Module;

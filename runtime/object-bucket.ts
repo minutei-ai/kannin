@@ -1,4 +1,4 @@
-import { Effect, Option, Stream } from "effect";
+import { Context, Effect, Option, Stream } from "effect";
 import type { ObjectStore } from "../src/object-store";
 import type { StoredObject } from "../src/object-store";
 import type { ObjectCatalogMetadata, ObjectWriteCondition } from "../src/protocol";
@@ -39,8 +39,20 @@ function allows(condition: ObjectCondition, etag: string) {
   if (condition.etagDoesNotMatch === "*" || condition.etagDoesNotMatch === etag) return false;
   return true;
 }
-function objectBody(object: StoredObject): ObjectBody {
-  const body = Stream.toReadableStream(object.body);
+function completedRead<A>(pending: Promise<A>, signal?: AbortSignal) {
+  return pending.then(
+    (value) => {
+      signal?.throwIfAborted();
+      return value;
+    },
+    (cause: unknown) => {
+      signal?.throwIfAborted();
+      throw cause;
+    },
+  );
+}
+function objectBody(object: StoredObject, signal?: AbortSignal): ObjectBody {
+  const body = Stream.toReadableStreamWith(object.body, Context.empty(), { signal });
   const response = new Response(body);
   return {
     ...info(object.metadata),
@@ -48,8 +60,8 @@ function objectBody(object: StoredObject): ObjectBody {
     get bodyUsed() {
       return response.bodyUsed;
     },
-    arrayBuffer: () => response.arrayBuffer(),
-    text: () => response.text(),
+    arrayBuffer: () => completedRead(response.arrayBuffer(), signal),
+    text: () => completedRead(response.text(), signal),
   };
 }
 export class ObjectBucket implements Bucket {
@@ -57,37 +69,51 @@ export class ObjectBucket implements Bucket {
 
   get(
     key: string,
-    options: { readonly onlyIf: ObjectCondition },
+    options: { readonly onlyIf: ObjectCondition; readonly signal?: AbortSignal },
   ): Promise<ObjectBody | ObjectInfo | null>;
   get(
     key: string,
-    options?: { readonly range?: { readonly offset: number; readonly length: number } },
+    options?: {
+      readonly range?: { readonly offset: number; readonly length: number };
+      readonly signal?: AbortSignal;
+    },
   ): Promise<ObjectBody | null>;
   async get(
     key: string,
     options: {
       readonly onlyIf?: ObjectCondition;
       readonly range?: { readonly offset: number; readonly length: number };
+      readonly signal?: AbortSignal;
     } = {},
   ): Promise<ObjectBody | ObjectInfo | null> {
+    options.signal?.throwIfAborted();
     if (options.onlyIf !== undefined) {
-      const observed = await this.head(key);
+      const observed = await this.head(key, options.signal);
       if (observed === null) return null;
       if (!allows(options.onlyIf, observed.etag)) return observed;
     }
     const object = await Effect.runPromise(
       this.store.read(key, { ...(options.range !== undefined && { range: options.range }) }),
+      { signal: options.signal },
     );
-    if (Option.isNone(object)) return null;
-    const result = objectBody(object.value);
+    if (Option.isNone(object)) {
+      options.signal?.throwIfAborted();
+      return null;
+    }
+    const result = objectBody(object.value, options.signal);
+    if (options.signal?.aborted) {
+      await result.body.cancel();
+      options.signal.throwIfAborted();
+    }
     if (options.onlyIf !== undefined && !allows(options.onlyIf, result.etag)) {
       await result.body.cancel();
       return info(object.value.metadata);
     }
     return result;
   }
-  async head(key: string): Promise<ObjectInfo | null> {
-    const result = await Effect.runPromise(this.store.head(key));
+  async head(key: string, signal?: AbortSignal): Promise<ObjectInfo | null> {
+    signal?.throwIfAborted();
+    const result = await completedRead(Effect.runPromise(this.store.head(key), { signal }), signal);
     if (Option.isNone(result)) return null;
     return info(result.value);
   }
@@ -123,6 +149,7 @@ export class ObjectBucket implements Bucket {
     return Effect.runPromise(this.store.remove(key));
   }
   async list(options: ObjectListOptions = {}): Promise<ObjectList> {
+    options.signal?.throwIfAborted();
     const page = await Effect.runPromise(
       this.store.list({
         ...(options.prefix !== undefined && { prefix: options.prefix }),
@@ -131,7 +158,9 @@ export class ObjectBucket implements Bucket {
         ...(options.cursor !== undefined && { cursor: options.cursor }),
         ...(options.include !== undefined && { includeMetadata: options.include.length > 0 }),
       }),
+      { signal: options.signal },
     );
+    options.signal?.throwIfAborted();
     const fields = {
       objects: page.objects.map(info),
       delimitedPrefixes: [...page.delimitedPrefixes],

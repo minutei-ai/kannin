@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { Schema } from "effect";
+import { Effect, Schema } from "effect";
 import { Query, QueryResult, Root } from "../src/protocol";
 import { TextExecutions } from "../src/text-executions";
 
@@ -155,4 +155,123 @@ test("settling one selection does not discard another active selection on the sa
   expect(control.calls).toBe(1);
   second.resolve(rows);
   expect(await Promise.all([active, follower])).toEqual([rows, rows]);
+});
+
+test("aborting the last waiter aborts ranking and ignores a later success", async () => {
+  const executions = new TextExecutions();
+  const gate = Promise.withResolvers<(typeof QueryResult.Type)["rows"]>();
+  const seen = { aborted: false };
+  const rank = (signal: AbortSignal) => {
+    signal.addEventListener("abort", () => {
+      seen.aborted = true;
+    });
+    return gate.promise;
+  };
+  const caller = new AbortController();
+  const pending = executions.evaluate(root, input, new Headers(), rank, caller.signal);
+  caller.abort();
+  gate.resolve(rows);
+  const settled = await pending.then(
+    () => "resolved",
+    () => "rejected",
+  );
+  expect(settled).toBe("rejected");
+  expect(seen.aborted).toBe(true);
+});
+
+test("an already aborted caller never starts a text producer", async () => {
+  const executions = new TextExecutions();
+  const caller = new AbortController();
+  const reason = new Error("cancelled before ranking");
+  const observed = { calls: 0 };
+  caller.abort(reason);
+  await expect(
+    executions.evaluate(
+      root,
+      input,
+      new Headers(),
+      () => {
+        observed.calls += 1;
+        return Promise.resolve(rows);
+      },
+      caller.signal,
+    ),
+  ).rejects.toBe(reason);
+  expect(observed.calls).toBe(0);
+});
+
+test("a producer aborting its caller during startup is observed without an unhandled rejection", async () => {
+  const executions = new TextExecutions();
+  const caller = new AbortController();
+  const reason = new Error("caller aborted during startup");
+  await expect(
+    executions.evaluate(
+      root,
+      input,
+      new Headers(),
+      () => {
+        caller.abort(reason);
+        return Promise.reject(new Error("producer stopped"));
+      },
+      caller.signal,
+    ),
+  ).rejects.toBe(reason);
+});
+
+test("one of two waiters aborting leaves the shared ranking running", async () => {
+  const executions = new TextExecutions();
+  const gate = Promise.withResolvers<(typeof QueryResult.Type)["rows"]>();
+  const seen = { aborted: false };
+  const rank = (signal: AbortSignal) => {
+    signal.addEventListener("abort", () => {
+      seen.aborted = true;
+    });
+    return gate.promise;
+  };
+  const caller = new AbortController();
+  const siblingSignal = new AbortController();
+  const first = executions.evaluate(root, input, new Headers(), rank, caller.signal);
+  const sibling = executions.evaluate(root, input, new Headers(), rank, siblingSignal.signal);
+  caller.abort();
+  expect(seen.aborted).toBe(false);
+  gate.resolve(rows);
+  expect(await sibling).toEqual(rows);
+  const settled = await first.then(
+    () => "resolved",
+    () => "rejected",
+  );
+  expect(settled).toBe("rejected");
+  expect(seen.aborted).toBe(false);
+});
+
+test("aborting the last waiter interrupts a nested Effect runtime", async () => {
+  const executions = new TextExecutions();
+  const entered = Promise.withResolvers<void>();
+  const interrupted = { value: false };
+  const rank = (signal: AbortSignal) =>
+    Effect.runPromise(
+      Effect.gen(function* () {
+        yield* Effect.sync(() => {
+          entered.resolve();
+        });
+        yield* Effect.never.pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              interrupted.value = true;
+            }),
+          ),
+        );
+      }),
+      { signal },
+    );
+  const caller = new AbortController();
+  const pending = executions.evaluate(root, input, new Headers(), rank, caller.signal);
+  await entered.promise;
+  caller.abort();
+  const settled = await pending.then(
+    () => "resolved",
+    () => "rejected",
+  );
+  expect(settled).toBe("rejected");
+  expect(interrupted.value).toBe(true);
 });

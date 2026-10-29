@@ -2,7 +2,7 @@ import { Cause, Effect, Match, Redacted, Schedule, Schema } from "effect";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { S3StoreConfig } from "../src/protocol";
+import type { CacheClientConfig, S3StoreConfig } from "../src/protocol";
 import { containerCommand } from "./container-command";
 
 export const portableApiToken = "oci-contract-token";
@@ -89,6 +89,7 @@ export const startPortableApiContainer = Effect.fn("kannin.portableApi.container
   engine: ApiContainerEngine,
   image: string,
   storage: typeof S3StoreConfig.Type,
+  cache?: typeof CacheClientConfig.Type,
 ) {
   const options = Match.value(engine).pipe(
     Match.when("docker", () => ({
@@ -104,6 +105,16 @@ export const startPortableApiContainer = Effect.fn("kannin.portableApi.container
       remove: ["rm", "--force", "--time", "15"],
     })),
   );
+  const cacheEnvironment: string[] = [];
+  if (cache !== undefined)
+    cacheEnvironment.push(
+      "--env",
+      `KANNIN_CACHE_ENDPOINT=${cache.endpoint}`,
+      "--env",
+      `KANNIN_CACHE_TOKEN=${Redacted.value(cache.token)}`,
+      "--env",
+      `KANNIN_CACHE_TIMEOUT_MS=${cache.timeoutMillis}`,
+    );
   const reservation = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
@@ -140,6 +151,7 @@ export const startPortableApiContainer = Effect.fn("kannin.portableApi.container
       `KANNIN_STORAGE_ACCESS_KEY_ID=${Redacted.value(storage.accessKeyId)}`,
       "--env",
       `KANNIN_STORAGE_SECRET_ACCESS_KEY=${Redacted.value(storage.secretAccessKey)}`,
+      ...cacheEnvironment,
       image,
       ...options.command,
     ]),

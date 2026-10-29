@@ -82,7 +82,6 @@ test("declared native producers agree across 64 fields and exact subset minima",
 });
 
 test("Unicode field order survives prepared eligibility models and exact subset minima", () => {
-  // UTF-16 sorts the supplementary character before U+E000; Rust UTF-8 does the reverse.
   const names = ["\uE000", "😀"];
   const encodeNames = Schema.encodeSync(Schema.fromJsonString(NamespaceSchema.fields.filterable));
   using segment = new Segment(

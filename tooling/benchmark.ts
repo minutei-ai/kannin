@@ -48,6 +48,8 @@ for (const consistency of ["strong", "edge-eventual"] as const)
     for (const _iteration of Array.from({ length: 50 }, (_, ordinal) => ordinal)) {
       const start = performance.now();
       const response = await request(worker, "benchmark", "query", query);
+      if (!response.ok)
+        throw new Error(`Measured query failed: ${response.status} ${await response.text()}`);
       const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
       if (result.rows.length === 0) throw new Error("Empty benchmark result");
       if (result.consistency !== consistency)

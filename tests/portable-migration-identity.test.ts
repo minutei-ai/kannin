@@ -46,7 +46,7 @@ test("a migration retry never republishes a portable segment captured by an earl
         yield* Effect.tryPromise(() => seeded.arrayBuffer());
         yield* Effect.promise(seed.dispose);
         const original = yield* Effect.tryPromise(() => bucket.get(rootKey));
-        if (original === null) return yield* Effect.die("Missing seeded Root");
+        if (original === null) throw new Error("Missing seeded Root");
         const encoded = yield* Effect.tryPromise(() => original.text());
         const stored = yield* Schema.decodeEffect(Schema.fromJsonString(StoredRoot))(encoded);
         const legacy = yield* Schema.decodeEffect(LegacyStoredRootV4)({
@@ -89,7 +89,7 @@ test("a migration retry never republishes a portable segment captured by an earl
         expect(migrated.status).toBe(200);
         yield* Effect.tryPromise(() => migrated.arrayBuffer());
         const committed = yield* Effect.tryPromise(() => bucket.get(rootKey));
-        if (committed === null) return yield* Effect.die("Missing migrated Root");
+        if (committed === null) throw new Error("Missing migrated Root");
         const committedText = yield* Effect.tryPromise(() => committed.text());
         const root = yield* Effect.try(() => decodeRoot(committedText));
         expect(root.segments).toHaveLength(1);

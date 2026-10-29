@@ -395,8 +395,10 @@ export const FieldBm25Parameters = Schema.Struct({
   b: Schema.Finite.check(Schema.isBetween({ minimum: 0, maximum: 1 })),
 });
 export const DEFAULT_FIELD_BM25 = { k1: 1.2, b: 0.75 } as const;
-const SafeCount = Schema.Number.check(
-  Schema.makeFilter(Number.isSafeInteger, "Expected a nonnegative safe integer"),
+const SafeCount = Schema.Finite.check(
+  Schema.makeFilter(
+    (value) => Number.isSafeInteger(value) || "Expected a nonnegative safe integer",
+  ),
   Schema.isGreaterThanOrEqualTo(0),
 );
 const TextColumnId = DocumentColumnId.check(

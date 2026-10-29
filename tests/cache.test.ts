@@ -261,7 +261,10 @@ test("previous-generation derived directory objects are neither read nor replace
   for (const [index, identity] of previous.entries()) {
     const object = await bucket.get(identity);
     if (object === null) throw new Error(`Missing previous-generation object ${identity}`);
-    expect(object.etag).toBe(seeded[index]?.etag);
+    const original = seeded[index];
+    if (original === undefined || original === null)
+      throw new Error(`Missing previous-generation receipt ${identity}`);
+    expect(object.etag).toBe(original.etag);
     expect(new Uint8Array(await object.arrayBuffer())).toEqual(stale);
   }
 });

@@ -286,7 +286,10 @@ test("strong reader leases bound stalled reads without dropping a live captured 
     gates.rootEntered = yield* Deferred.make<void>();
     gates.rootRelease = yield* Deferred.make<void>();
     block.root = true;
-    const caller = new AbortController();
+    const caller = yield* Effect.acquireRelease(
+      Effect.sync(() => new AbortController()),
+      (owned) => Effect.sync(() => owned.abort()),
+    );
     const cancelled = track(
       reader.fetch(
         new Request(

@@ -2315,10 +2315,6 @@ impl PostingSource for FieldPosting {
     }
 }
 
-fn encode_postings(postings: &[Posting]) -> Result<Vec<u8>, String> {
-    encode_shaped(postings, PostingShape::NATIVE)
-}
-
 fn encode_shaped<R: PostingSource>(postings: &[R], shape: PostingShape) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     put_int(

@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { Schema } from "effect";
-import { SegmentTextField, SegmentTextFields, WordV4Config } from "../src/protocol";
+import { SegmentTextFields } from "../src/protocol";
+import type { SegmentTextField, WordV4Config } from "../src/protocol";
 
 const analysis: typeof WordV4Config.Type = {
   max_token_length: 39,

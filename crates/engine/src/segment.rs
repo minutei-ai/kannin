@@ -5050,10 +5050,10 @@ pub fn bloom_filter_many<'a>(
 #[cfg(target_arch = "wasm32")]
 pub mod wasm {
     use super::{
-        BuiltSegment, Document, DocumentAttributes, DocumentMeta, Filter, Header, MAX_BYTES,
-        MAX_QUERY_TERMS, Range, Search, SelectedAttributes, Statistics, TermDictionary, TermMeta,
-        TermScorer, append, bloom_build, bloom_filter_many, build, compare_document_ids,
-        decode_page, document_terms, matches, parse_header,
+        BuiltSegment, CanonicalDocumentDto, Document, DocumentAttributes, DocumentMeta, Filter,
+        Header, MAX_BYTES, MAX_QUERY_TERMS, Range, Search, SelectedAttributes, Statistics,
+        TermDictionary, TermMeta, TermScorer, append, bloom_build, bloom_filter_many, build,
+        compare_document_ids, decode_page, document_terms, matches, parse_header,
     };
     use serde::{Deserialize, Serialize};
     use std::cell::RefCell;

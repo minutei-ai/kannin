@@ -139,7 +139,7 @@ fn generic_pair_matches_legacy_scores_order_and_pruning_across_the_block_boundar
     for count in [127_u32, 128, 129, 300] {
         let documents = varied_documents(count);
         let legacy = build_versioned(documents.clone(), None, &[], 3)?;
-        let generic = build(documents)?;
+        let generic = build(documents, None)?;
         assert_eq!(&legacy.bytes[..8], b"RAIOSEG3");
         assert_eq!(&generic.bytes[..8], b"RAIOSEG4");
         let (_, legacy_base) = parse_header(&legacy.bytes)?;
@@ -174,13 +174,13 @@ fn generic_pair_matches_legacy_scores_order_and_pruning_across_the_block_boundar
 fn mixed_version_segments_score_identically_under_shared_statistics() -> Result<(), String> {
     let documents = varied_documents(260);
     let (first, second) = documents.split_at(130);
-    let whole = build(documents.clone())?;
+    let whole = build(documents.clone(), None)?;
     let statistics = statistics_for(&whole.bytes)?;
     let mixed = [
         build_versioned(first.to_vec(), None, &[], 3)?,
-        build(second.to_vec())?,
+        build(second.to_vec(), None)?,
     ];
-    let uniform = [build(first.to_vec())?, build(second.to_vec())?];
+    let uniform = [build(first.to_vec(), None)?, build(second.to_vec(), None)?];
     for (text, mode) in [("fox", "any"), ("red fox", "phrase"), ("red fox", "all")] {
         let collect = |segments: &[super::super::BuiltSegment; 2]| -> Result<Vec<_>, String> {
             let mut hits = Vec::new();
@@ -232,10 +232,13 @@ fn legacy_headers_synthesize_the_same_generic_native_pair() -> Result<(), String
 
 #[test]
 fn native_phrases_never_cross_the_title_and_text_lanes() -> Result<(), String> {
-    let built = build(vec![
-        Document::native("a", 1, "red", "fox", BTreeMap::new(), None),
-        Document::native("b", 1, "red fox", "dog", BTreeMap::new(), None),
-    ])?;
+    let built = build(
+        vec![
+            Document::native("a", 1, "red", "fox", BTreeMap::new(), None),
+            Document::native("b", 1, "red fox", "dog", BTreeMap::new(), None),
+        ],
+        None,
+    )?;
     let statistics = statistics_for(&built.bytes)?;
     let hits = native_hits(&built.bytes, statistics, "red fox", "phrase", 10)?;
     assert_eq!(
@@ -259,10 +262,13 @@ fn native_phrases_never_cross_the_title_and_text_lanes() -> Result<(), String> {
 
 #[test]
 fn per_field_scoring_reads_native_lanes_from_the_same_index_owner() -> Result<(), String> {
-    let built = build(vec![
-        Document::native("a", 1, "fox", "dog", BTreeMap::new(), None),
-        Document::native("b", 1, "dog", "fox fox", BTreeMap::new(), None),
-    ])?;
+    let built = build(
+        vec![
+            Document::native("a", 1, "fox", "dog", BTreeMap::new(), None),
+            Document::native("b", 1, "dog", "fox fox", BTreeMap::new(), None),
+        ],
+        None,
+    )?;
     let title = [DocumentColumnId::Role(NativeRole::Title)];
     let text = [DocumentColumnId::Role(NativeRole::Text)];
     assert_eq!(
@@ -314,7 +320,7 @@ fn attributes_named_title_or_text_stay_isolated_from_native_roles() -> Result<()
         ]),
         None,
     );
-    let plain = build(vec![document.clone()])?;
+    let plain = build(vec![document.clone()], None)?;
     let named = build_text_fields(
         vec![document.clone()],
         None,
@@ -395,7 +401,7 @@ fn attribute_only_terms_do_not_change_native_statistics_bloom_or_common_selectio
         ),
         Document::native("b", 1, "fox", "fox", BTreeMap::new(), None),
     ];
-    let plain = build(documents.clone())?;
+    let plain = build(documents.clone(), None)?;
     let named = build_text_fields(documents.clone(), None, &[NamedTextField::new("tags")])?;
     assert_eq!(
         plain.header.total_title_length(),

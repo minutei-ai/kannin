@@ -3205,14 +3205,14 @@ fn common_directory_magic_for(version: u32) -> Result<&'static [u8; 8], String> 
     }
 }
 
-fn is_common_directory_magic(magic: &[u8; 8]) -> bool {
-    magic == COMMON_DIRECTORY_MAGIC || magic == COMMON_DIRECTORY_MAGIC_V4
+fn is_common_directory_magic(magic: [u8; 8]) -> bool {
+    magic == *COMMON_DIRECTORY_MAGIC || magic == *COMMON_DIRECTORY_MAGIC_V4
 }
 
-fn frame_magic_matches(magic: &[u8; 8], version: u32) -> bool {
+fn frame_magic_matches(magic: [u8; 8], version: u32) -> bool {
     match version {
-        2 | 3 => magic == DIRECTORY_MAGIC || magic == COMMON_DIRECTORY_MAGIC,
-        4 => magic == DIRECTORY_MAGIC_V6 || magic == COMMON_DIRECTORY_MAGIC_V4,
+        2 | 3 => magic == *DIRECTORY_MAGIC || magic == *COMMON_DIRECTORY_MAGIC,
+        4 => magic == *DIRECTORY_MAGIC_V6 || magic == *COMMON_DIRECTORY_MAGIC_V4,
         _ => false,
     }
 }
@@ -3225,7 +3225,7 @@ fn directory_frame_magic(bytes: &[u8], partial: bool) -> Result<[u8; 8], String>
         .try_into()
         .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?;
     let accepted = if partial {
-        is_common_directory_magic(&magic)
+        is_common_directory_magic(magic)
     } else {
         &magic == DIRECTORY_MAGIC || &magic == DIRECTORY_MAGIC_V6
     };
@@ -3520,7 +3520,7 @@ fn compress_directory_payload(
     magic: [u8; 8],
 ) -> Result<Vec<u8>, String> {
     let maximum_compact = length
-        + (if is_common_directory_magic(&magic) {
+        + (if is_common_directory_magic(magic) {
             MAX_COMMON_FRAME_BYTES + 4
         } else {
             0
@@ -3607,7 +3607,7 @@ fn decode_directory_contents(
             .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
     ) as usize;
     let maximum_compact = expected
-        + (if is_common_directory_magic(&magic) {
+        + (if is_common_directory_magic(magic) {
             MAX_COMMON_FRAME_BYTES + 4
         } else {
             0
@@ -3640,7 +3640,7 @@ fn decode_directory_contents(
             return Err("Compressed directory integrity check failed".into());
         }
     }
-    let (header_bytes, hot_bytes) = if is_common_directory_magic(&magic) {
+    let (header_bytes, hot_bytes) = if is_common_directory_magic(magic) {
         let (header, hot) = common_directory_parts(&decoded, expected)?;
         (header, Some(hot))
     } else {
@@ -3654,23 +3654,14 @@ fn decode_directory_contents(
         return Err("Common posting payload exceeds memory budget".into());
     }
     let header = binary_directory::decode(header_bytes, max_heap_bytes.saturating_sub(reserved))?;
-    if !frame_magic_matches(&magic, header.version) {
+    if !frame_magic_matches(magic, header.version) {
         return Err("Directory magic does not match its version".into());
     }
     header.documents.attributes.validate_expansion(expected)?;
     if !previously_validated {
         validate_header(&header)?;
-        if is_common_directory_magic(&magic) && header.fields.has_named_terms() {
-            return Err("Common directory cannot carry named postings".into());
-        }
-        if is_common_directory_magic(&magic)
-            && (header.terms().len() > 16
-                || header
-                    .terms()
-                    .iter()
-                    .any(|(term, metadata)| term.len() > 64 || metadata.df <= 1))
-        {
-            return Err("Invalid common-directory term selection".into());
+        if is_common_directory_magic(magic) {
+            validate_common_directory_header(&header)?;
         }
     }
     let hot = match hot_bytes {
@@ -3692,6 +3683,21 @@ fn decode_directory_contents(
         verified.set(true);
     }
     Ok(DecodedDirectory { header, hot })
+}
+
+fn validate_common_directory_header(header: &Header) -> Result<(), String> {
+    if header.fields.has_named_terms() {
+        return Err("Common directory cannot carry named postings".into());
+    }
+    if header.terms().len() > 16
+        || header
+            .terms()
+            .iter()
+            .any(|(term, metadata)| term.len() > 64 || metadata.df <= 1)
+    {
+        return Err("Invalid common-directory term selection".into());
+    }
+    Ok(())
 }
 
 fn common_directory_parts(decoded: &[u8], expected: usize) -> Result<(&[u8], &[u8]), String> {
@@ -4635,7 +4641,7 @@ impl Search {
                 return None;
             }
             let first = metadata.blocks.first()?;
-            let frequency = (first.max_tf[0], first.max_tf[1]);
+            let frequency: (u32, u32) = first.max_tf.into();
             if frequency != (0, 1) && frequency != (1, 0) {
                 return None;
             }
@@ -4647,7 +4653,7 @@ impl Search {
                     || block.count == 0
                     || block.count > u32::try_from(BLOCK_SIZE).ok()?
                     || block.last.checked_sub(block.first)?.checked_add(1)? != block.count
-                    || (block.max_tf[0], block.max_tf[1]) != frequency
+                    || <(u32, u32)>::from(block.max_tf) != frequency
                     || block.data.length == 0
                     || block.data.offset < previous_end
                     || end > maximum_bytes
@@ -5266,7 +5272,7 @@ impl Search {
                     .flat_map(|meta| meta.blocks.iter())
                     .map(|block| {
                         let minimum = if unrestricted {
-                            Some((block.min_length[0], block.min_length[1]))
+                            Some(block.min_length.into())
                         } else {
                             let rows = block.first as usize..=block.last as usize;
                             rows.filter(|row| self.allowed[*row])
@@ -11942,10 +11948,10 @@ mod columnar_v2_tests {
 #[cfg(test)]
 mod canonical_column_tests {
     use super::{
-        ColumnId, ColumnValue, Document, DocumentTable, Filter, Header, NativeRole, Range, Search,
-        Statistics, append, build, decode_page, document_terms, full_document_from_frames,
-        migrate_segment, owned_directory_row, parse_document_metadata, parse_header,
-        query_document_from_metadata, rebase_postings, vector_prefix, write_vector_facts,
+        ColumnId, ColumnValue, Document, DocumentTable, FieldTable, Filter, Header, NativeRole,
+        Range, Search, Statistics, append, build, decode_page, document_terms, fields,
+        full_document_from_frames, migrate_segment, owned_directory_row, parse_document_metadata,
+        parse_header, query_document_from_metadata, rebase_postings, write_vector_facts,
     };
     use std::collections::BTreeMap;
 

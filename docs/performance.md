@@ -1,5 +1,21 @@
 # Deployed BM25 comparison
 
+## Pending local process-cold benchmark
+
+`tooling/benchmark-cold.ts` shares the exact corpus generator and query definitions with the existing warm workerd benchmark. It ingests into an owned temporary R2 emulator store, stops the ingestion process, and starts a fresh workerd process before every measured strong query. Startup and query/body-decode time are reported separately, with raw samples, acknowledged sequence checks, identical rows/scores across restarts and corpus/Worker/WASM hashes. Queue consumers are disabled. Temporary state and each owned process are disposed on success and failure.
+
+This is process-cold measurement: canonical data, derived objects and any persisted Cache API state remain available, and OS/backend caches are uncontrolled. It does not flush host caches, establish physically cold storage, emulate the Railway control plane, compare Docker, or measure hosted latency. Five samples per query are the default; no tail percentile claim follows from that sample count. The driver has not yet been executed or validated by the full gate; it supplies no new performance result.
+
+After a passing gate, run through the shared-host resource wrapper when its budget permits:
+
+```sh
+RAIO_BENCH_DOCUMENTS=10000 RAIO_BENCH_COLD_SAMPLES=5 /home/yorizel/.local/bin/resource-run bun tooling/benchmark-cold.ts
+```
+
+`RAIO_BENCH_COLD_SAMPLES` accepts 1–20. The corpus size matches the warm driver. Comparable Docker/workerd cold and warm measurements and hosted Railway validation remain delivery gates.
+
+## Historical deployed BM25 comparison
+
 This is a bounded synthetic measurement, not a general parity claim. Both services received the same 10,000 documents. The client ran in Brazil; Cloudflare HTTP responses came from GRU, and Turbopuffer used aws-sa-east-1. At the time of this measurement, Kannin strong reads used a coordinator outside South America. An experiment fetching the canonical R2 manifest directly in the edge Worker was evaluated separately below and reverted after it regressed latency. Kannin edge reads use the explicit less-than-one-second snapshot contract, with minimumSequence set to the final acknowledged write. Turbopuffer reads are strong. Those guarantees differ even when the static corpus produces identical Kannin rows.
 
 Each case has five warmups followed by 50 sequential measured requests per engine. Each iteration runs Kannin strong, Kannin edge, then Turbopuffer. The report records the first request separately; it does not prove a cold process. Timings include HTTP, response body consumption and decoding. No query-result cache is used. Fifty observations provide limited evidence about tail latency; raw samples and operational targets stay outside this public repository.

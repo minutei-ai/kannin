@@ -2,8 +2,9 @@ import { createHash } from "node:crypto";
 import { availableParallelism, cpus } from "node:os";
 import { Schema } from "effect";
 import { QueryResult, Health, Row } from "../src/protocol";
-import { request, startWorker, textQuery, write } from "../tests/harness";
+import { request, startWorker, write } from "../tests/harness";
 import { corpus } from "./corpus";
+import { benchmarkQueries } from "./benchmark-queries";
 
 const size = Schema.decodeSync(
   Schema.Int.check(Schema.isBetween({ minimum: 1000, maximum: 1000000 })),
@@ -33,37 +34,9 @@ for (const offset of Array.from({ length: Math.ceil(size / 500) }, (_, ordinal) 
 const ingestMs = performance.now() - ingestion;
 const reports = [];
 const baselines = new Map<string, string>();
-const queries = [
-  ["rare", textQuery("unique42")],
-  ["selective", textQuery("group42")],
-  ["common", textQuery("cloudflare rust")],
-  ["filtered", textQuery("cloudflare", 10, [{ field: "group", op: "eq", value: 42 }])],
-  ["common-all", { ...textQuery("cloudflare rust"), match: "all" }],
-  ["common-phrase", { ...textQuery("cloudflare rust"), match: "phrase" }],
-  [
-    "filtered-all",
-    {
-      ...textQuery("cloudflare rust", 10, [{ field: "group", op: "eq", value: 42 }]),
-      match: "all",
-    },
-  ],
-  [
-    "filtered-phrase",
-    {
-      ...textQuery("cloudflare rust", 10, [{ field: "group", op: "eq", value: 42 }]),
-      match: "phrase",
-    },
-  ],
-  ...[64, 256, 512].map(
-    (count) =>
-      [
-        `rare-${count}-terms`,
-        textQuery(Array.from({ length: count }, (_, index) => `unique${42 + index}`).join(" ")),
-      ] as const,
-  ),
-] as const;
+
 for (const consistency of ["strong", "edge-eventual"] as const)
-  for (const [name, selected] of queries) {
+  for (const [name, selected] of benchmarkQueries) {
     const query = { ...selected, consistency };
     for (const _warmup of Array.from({ length: 5 }, (_, ordinal) => ordinal)) {
       const response = await request(worker, "benchmark", "query", query);

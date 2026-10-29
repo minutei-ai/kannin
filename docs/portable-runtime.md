@@ -11,6 +11,8 @@ bun run build
 
 Supply configuration from an external environment file or secret manager. Never commit a deployment environment file. The bucket must already exist; startup checks existing canonical Roots and fails on unavailable or invalid storage.
 
+The current S3 adapter forces path-style addressing. Railway documents virtual-hosted addressing for new buckets and path-style addressing for some older buckets; see [Railway URL styles](https://docs.railway.com/storage-buckets#url-style). Configurable URL style and native Railway bucket wiring remain implementation/hosted-validation gates. Passing the local path-style RustFS contract does not establish compatibility with a new Railway bucket.
+
 | Variable                           | Purpose                                                          |
 | ---------------------------------- | ---------------------------------------------------------------- |
 | `RAIO_API_TOKEN`                   | Nonempty bearer token for every public namespace request         |
@@ -22,7 +24,7 @@ Supply configuration from an external environment file or secret manager. Never 
 | `HOST` / `PORT`                    | Listener, defaults `0.0.0.0:3000`                                |
 | `KANNIN_WASM_PATH`                 | Native build artifact, default `./dist/wasm/raio_engine_bg.wasm` |
 
-The Rust/WASM engine performs exact cosine search over the canonical vector frames in immutable segments. The native API accepts client-generated vectors with `schema.vectorDimensions` from 1 to 10,752, defaulting to 768. Dimension changes require reset; this extension awaits the complete gate. Use the same bucket configuration across replicas. No app volume or vector-service credentials are required. Persist and back up the object-storage service independently; ephemeral test backends are disposable fixtures, not production durability.
+The Rust/WASM engine performs exact cosine search over the canonical vector frames in immutable segments. The native API accepts client-generated vectors with `schema.vectorDimensions` from 1 to 10,752, defaulting to 768. Dimension changes require reset; this extension passed the complete gate at `3f56aa6`. Use the same bucket configuration across replicas. No app volume or vector-service credentials are required. Persist and back up the object-storage service independently; ephemeral test backends are disposable fixtures, not production durability.
 
 Run the built server with the external variables already loaded:
 

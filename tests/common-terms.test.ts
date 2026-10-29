@@ -334,7 +334,9 @@ test("unfiltered phrase Root fallback leaves later correlated projections visibl
       id: Schema.decodeUnknownSync(Id)(id).replace(/^target-/u, "control-"),
       score,
     })),
-  ).toEqual(controlResult.rows.map(({ id, score }) => ({ id, score })));
+  ).toEqual(
+    controlResult.rows.map(({ id, score }) => ({ id: Schema.decodeUnknownSync(Id)(id), score })),
+  );
   expect(first.headers.get("server-timing")).toContain("catalog_rpc_sum");
   expect(first.headers.get("server-timing")).toContain("directories=0");
   for (const source of correlated) await readerBucket.put(source.key, source.body);

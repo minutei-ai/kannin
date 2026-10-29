@@ -41,11 +41,9 @@ const projection = Schema.decodeSync(CommonTermProjection)({
   partitions: [[[1, 1, 0, 0]]],
   independent: [[[1, 1, 0, 0]]],
 });
-const dictionary = Schema.decodeUnknownSync(LegacyStoredRootV6.fields.commonTermDictionaries.value)(
-  {
-    alpha: { df: 2, bounds: [[1, 1, 0, 0]] },
-  },
-);
+const dictionary = Schema.decodeSync(LegacyStoredRootV6.fields.commonTermDictionaries.value)({
+  alpha: { df: 2, bounds: [[1, 1, 0, 0]] },
+});
 const eligibility = Schema.decodeSync(EligibilityProjection)({
   fields: ["group"],
   data: {

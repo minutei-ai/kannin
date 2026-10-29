@@ -175,7 +175,7 @@ const expandStoredSchema = (root: typeof LegacyStoredRootV5.Type): typeof Root.T
 
 const expandPackedRoot = (root: typeof LegacyStoredRootV4.Type): typeof LegacyPackedRoot.Type => {
   const { commonProjections, commonTermDictionaries, eligibilityModels, ...fields } = root;
-  return Schema.decodeUnknownSync(LegacyPackedRoot)({
+  return Schema.decodeSync(LegacyPackedRoot)({
     ...fields,
     version: 1 as const,
     segments: expandSharedSegments(
@@ -225,7 +225,7 @@ const expandLegacyStoredRoot = (
       })),
     });
   const { commonProjections, commonTermDictionaries, eligibilityModels, ...fields } = stored;
-  return Schema.decodeUnknownSync(LegacyInlineRoot)({
+  return Schema.decodeSync(LegacyInlineRoot)({
     ...fields,
     version: 1,
     segments: expandSharedSegments(

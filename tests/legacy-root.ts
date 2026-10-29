@@ -165,7 +165,7 @@ async function physicalLegacyRoot(bucket: Bucket, root: typeof Root.Type) {
   const keys = new Map(root.segments.map((segment, row) => [segment.key, segments[row]?.key]));
   const schema = legacyNativeSchema(root);
   const fields = Struct.omit(root, ["schema", "idType"]);
-  return Schema.decodeUnknownSync(LegacyPackedRoot)({
+  return Schema.decodeSync(LegacyPackedRoot)({
     ...fields,
     ...Option.match(Option.fromUndefinedOr(schema), {
       onNone: () => ({}),

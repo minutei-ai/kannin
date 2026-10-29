@@ -15,8 +15,15 @@ const cacheEnvironment = Config.option(Config.String("KANNIN_CACHE_ENDPOINT")).p
   }),
 );
 
-export const portableEnvironment = Config.all({
+export const portableServiceEnvironment = Config.all({
   RAIO_API_TOKEN: Config.Redacted("RAIO_API_TOKEN"),
+}).pipe(
+  Config.flatMap((base) =>
+    cacheEnvironment.pipe(Config.map((cache) => Object.assign({}, base, cache))),
+  ),
+);
+
+export const portableEnvironment = Config.all({
   KANNIN_STORAGE_BUCKET: Config.String("KANNIN_STORAGE_BUCKET"),
   KANNIN_STORAGE_ENDPOINT: Config.String("KANNIN_STORAGE_ENDPOINT"),
   KANNIN_STORAGE_REGION: Config.String("KANNIN_STORAGE_REGION").pipe(
@@ -29,6 +36,6 @@ export const portableEnvironment = Config.all({
   KANNIN_STORAGE_SECRET_ACCESS_KEY: Config.Redacted("KANNIN_STORAGE_SECRET_ACCESS_KEY"),
 }).pipe(
   Config.flatMap((base) =>
-    cacheEnvironment.pipe(Config.map((cache) => Object.assign({}, base, cache))),
+    portableServiceEnvironment.pipe(Config.map((service) => Object.assign({}, service, base))),
   ),
 );

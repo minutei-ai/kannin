@@ -4,6 +4,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      measure_workerd:
+        description: Measure bounded process-cold and warm workerd samples after the full gate
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -47,4 +52,23 @@ jobs:
             dist/wasm/
             dist/server/
             dist/cache/
+          retention-days: 1
+      - name: Measure local workerd after the passing gate
+        if: github.event_name == 'workflow_dispatch' && inputs.measure_workerd
+        timeout-minutes: 10
+        env:
+          RAIO_BENCH_DOCUMENTS: "1000"
+          RAIO_BENCH_COLD_SAMPLES: "3"
+        run: |
+          bun tooling/benchmark-cold.ts > "$RUNNER_TEMP/kannin-process-cold.json"
+          bun tooling/benchmark.ts > "$RUNNER_TEMP/kannin-warm.json"
+      - name: Retain bounded workerd measurement reports
+        if: github.event_name == 'workflow_dispatch' && inputs.measure_workerd
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: workerd-measurements
+          path: |
+            ${{ runner.temp }}/kannin-process-cold.json
+            ${{ runner.temp }}/kannin-warm.json
+          if-no-files-found: error
           retention-days: 1

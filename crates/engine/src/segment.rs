@@ -11435,6 +11435,13 @@ mod canonical_column_tests {
     }
 
     fn encode_legacy_v2(bytes: &[u8]) -> Result<Vec<u8>, String> {
+        encode_legacy_v2_with_facts(bytes, std::convert::identity)
+    }
+
+    fn encode_legacy_v2_with_facts(
+        bytes: &[u8],
+        change: impl Fn(super::VectorFacts) -> super::VectorFacts,
+    ) -> Result<Vec<u8>, String> {
         let (header, base) = parse_header(bytes)?;
         let source = bytes.get(base..).ok_or("Truncated segment payload")?;
         let mut metadata = Vec::new();
@@ -11445,7 +11452,10 @@ mod canonical_column_tests {
             if document.id != row.id || document.revision != row.revision {
                 return Err("Legacy fixture row does not match its directory".into());
             }
-            let data = append(&mut metadata, &legacy_metadata_page(facts, &document)?)?;
+            let data = append(
+                &mut metadata,
+                &legacy_metadata_page(change(facts), &document)?,
+            )?;
             rows.push(owned_directory_row(&row, data));
         }
         let metadata_end = u32::try_from(metadata.len()).map_err(|cause| cause.to_string())?;
@@ -11882,6 +11892,23 @@ mod canonical_column_tests {
         *byte ^= 1;
         parse_header(&legacy)?;
         rejection_contains(migrate_segment(&legacy), "integrity")?;
+        Ok(())
+    }
+
+    #[test]
+    fn migration_rejects_valid_frames_with_a_conflicting_vector_summary() -> Result<(), String> {
+        let built = build(collision_documents(), None)?;
+        let legacy = encode_legacy_v2_with_facts(&built.bytes, |mut facts| {
+            if facts.flags & 1 != 0 {
+                facts.dimensions += 1;
+            }
+            facts
+        })?;
+        parse_header(&legacy)?;
+        rejection_eq(
+            migrate_segment(&legacy),
+            "Vector frame does not match metadata vector summary",
+        )?;
         Ok(())
     }
 

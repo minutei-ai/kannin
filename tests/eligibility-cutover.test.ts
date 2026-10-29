@@ -81,6 +81,47 @@ test("declared native producers agree across 64 fields and exact subset minima",
   }
 });
 
+test("Unicode field order survives prepared eligibility models and exact subset minima", () => {
+  // UTF-16 sorts the supplementary character before U+E000; Rust UTF-8 does the reverse.
+  const names = ["\uE000", "😀"];
+  const encodeNames = Schema.encodeSync(Schema.fromJsonString(NamespaceSchema.fields.filterable));
+  using segment = new Segment(
+    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))([
+      { ...document("a", "alpha beta", { "\uE000": "keep", "😀": 1 }), revision: 1 },
+      { ...document("b", "alpha", { "\uE000": "keep", "😀": 0 }), revision: 1 },
+      { ...document("c", "alpha beta gamma", { "\uE000": "drop", "😀": 1 }), revision: 1 },
+    ]),
+    encodeNames(names.toReversed()),
+  );
+  using directory = new Directory(segment.bytes());
+  const encoded = segment.eligibility(encodeNames(names.toReversed()));
+  if (encoded === undefined) throw new Error("Missing Unicode eligibility model");
+  expect(directory.eligibility(encodeNames(names))).toBe(encoded);
+  expect(Schema.decodeSync(Schema.fromJsonString(EligibilityProjection))(encoded).fields).toEqual(
+    names,
+  );
+  const check = (
+    filters: readonly (typeof Filter.Type)[],
+    expected: typeof EligibleMinimum.Type,
+  ) => {
+    const input = Schema.encodeSync(TermFilters)(filters);
+    using prepared = new EligibilityQuery(input);
+    const minimum = Schema.decodeSync(Schema.fromJsonString(EligibleMinimum));
+    expect(minimum(prepared.minimum(encoded))).toEqual(expected);
+    expect(minimum(directory.minimum(input))).toEqual(expected);
+  };
+  check([{ field: "\uE000", op: "eq", value: "keep" }], [0, 1]);
+  check([{ field: "😀", op: "eq", value: 1 }], [0, 2]);
+  check(
+    [
+      { field: "😀", op: "eq", value: 1 },
+      { field: "\uE000", op: "eq", value: "keep" },
+    ],
+    [0, 2],
+  );
+  check([{ field: "😀", op: "eq", value: 2 }], null);
+});
+
 test("write and compaction publish pooled declared models while subset ranking matches canonical fallback", async () => {
   const namespaces = ["eligibility-cutover", "eligibility-cutover-reference"] as const;
   for (const namespace of namespaces)

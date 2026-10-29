@@ -349,27 +349,13 @@ test("column declarations keep both native orders and do not invent attribute ty
   expect(encodeNative(nativeSchemaFromColumns(omittedColumns))).toBe(encodeNative(omitted));
   expect(encodeNative(nativeSchemaFromColumns(explicitColumns))).toBe(encodeNative(explicit));
   expect(encodeNative(omitted)).not.toBe(encodeNative(explicit));
-  expect(() =>
-    Schema.decodeUnknownSync(NamespaceColumns)({
-      columns: [
-        { source: "native-vector" },
-        { source: "attribute", name: "year", value: "string" },
-      ],
-    }),
-  ).toThrow();
-  expect(() =>
-    Schema.decodeSync(NamespaceColumns)({
-      columns: [{ source: "id", name: "id", value: "legacy-untyped" }],
-    }),
-  ).toThrow();
-  expect(() =>
-    Schema.decodeUnknownSync(NamespaceColumns)({
-      columns: [
-        { source: "attribute", name: "vector", value: "legacy-untyped" },
-        { source: "native-vector" },
-      ],
-    }),
-  ).toThrow();
+  const decodeColumns = Schema.decodeSync(Schema.fromJsonString(NamespaceColumns));
+  for (const wire of [
+    '{"columns":[{"source":"native-vector"},{"source":"attribute","name":"year","value":"string"}]}',
+    '{"columns":[{"source":"id","name":"id","value":"legacy-untyped"}]}',
+    '{"columns":[{"source":"attribute","name":"vector","value":"legacy-untyped"},{"source":"native-vector"}]}',
+  ])
+    expect(() => decodeColumns(wire)).toThrow();
   const declared = Schema.decodeSync(Root)({ ...root, schema: omittedColumns });
   const explicitRoot = Schema.decodeSync(Root)({ ...root, schema: explicitColumns });
   const wire = encodeRoot(declared);

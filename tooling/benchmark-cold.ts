@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, symlink } from "node:fs/promises";
 import { availableParallelism, cpus, tmpdir } from "node:os";
 import { join } from "node:path";
 import { Schema } from "effect";
@@ -14,6 +14,15 @@ const size = Schema.decodeSync(
 const repetitions = Schema.decodeSync(
   Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 20 })),
 )(Number(process.env.RAIO_BENCH_COLD_SAMPLES ?? 5));
+const cacheMode = Schema.decodeUnknownSync(Schema.Literals(["retained", "empty"]))(
+  process.env.RAIO_BENCH_CACHE_MODE ?? "retained",
+);
+const cacheConditions = {
+  retained:
+    "canonical R2, derived objects and any persisted Cache API state retained; OS/backend caches uncontrolled; no host cache flush",
+  empty:
+    "fresh Cache API and coordination state per sample; canonical R2 and derived objects retained through an R2-only symlink; OS/backend caches uncontrolled; no host cache flush",
+};
 await using cleanup = new AsyncDisposableStack();
 const persistence = await mkdtemp(join(tmpdir(), "kannin-process-cold-"));
 cleanup.defer(() => rm(persistence, { recursive: true, force: true }));
@@ -46,8 +55,15 @@ for (const [name, selected] of benchmarkQueries) {
   const baselines = new Set<string>();
   for (const repetition of Array.from({ length: repetitions }, (_, ordinal) => ordinal)) {
     await using sampleCleanup = new AsyncDisposableStack();
+    const samplePersistence = { path: persistence };
+    if (cacheMode === "empty") {
+      const isolated = await mkdtemp(join(tmpdir(), "kannin-cache-cold-"));
+      sampleCleanup.defer(() => rm(isolated, { recursive: true, force: true }));
+      await symlink(join(persistence, "r2"), join(isolated, "r2"), "dir");
+      samplePersistence.path = isolated;
+    }
     const starting = performance.now();
-    const worker = await startWorker(persistence);
+    const worker = await startWorker(samplePersistence.path);
     sampleCleanup.defer(() => worker.dispose());
     const startupMs = performance.now() - starting;
     const started = performance.now();
@@ -89,8 +105,8 @@ console.log(
     {
       runtime: "local-workerd",
       phase: "first strong query after a fresh workerd process per sample",
-      cacheConditions:
-        "canonical R2, derived objects and any persisted Cache API state retained; OS/backend caches uncontrolled; no host cache flush",
+      cacheMode,
+      cacheConditions: cacheConditions[cacheMode],
       queueConsumers: false,
       cpu: cpus()[0]?.model,
       availableParallelism: availableParallelism(),

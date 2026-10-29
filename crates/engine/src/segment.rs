@@ -11922,6 +11922,43 @@ mod canonical_column_tests {
     }
 
     #[test]
+    fn document_attribute_numbers_keep_binary64_bits_across_codecs() -> Result<(), String> {
+        for value in [
+            1e-307,
+            f64::from(f32::MAX),
+            0.1,
+            -0.0,
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            f64::MAX,
+        ] {
+            let source = Document::native(
+                "numeric-attribute",
+                1,
+                "",
+                "",
+                BTreeMap::from([("number".into(), serde_json::json!(value))]),
+                None,
+            );
+            let mut native = source.to_native_vec()?;
+            for _ in 0..3 {
+                let document = Document::from_native_slice(&native)?;
+                let canonical = document.to_canonical_vec()?;
+                let document = Document::from_canonical_slice(&canonical)?;
+                let actual = document
+                    .columns()
+                    .attributes()
+                    .get("number")
+                    .and_then(serde_json::Value::as_f64)
+                    .ok_or("Missing numeric attribute")?;
+                assert_eq!(actual.to_bits(), value.to_bits());
+                native = document.to_native_vec()?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn query_metadata_keeps_vector_bytes_in_a_separate_frame() -> Result<(), String> {
         let documents = collision_documents();
         let built = build(documents.clone(), None)?;

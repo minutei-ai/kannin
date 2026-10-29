@@ -17,7 +17,7 @@ const validWarm = Schema.makeFilter(
   },
 );
 const warm = Schema.Struct(warmFields).check(validWarm);
-const query = BenchmarkReport.fields.reports.value;
+const queryIdentity = BenchmarkReport.fields.reports.value;
 const cold = Schema.Struct({
   repetition: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   readMs: duration,
@@ -46,7 +46,9 @@ export const BenchmarkMeasurement = Schema.Union([
     runtime: Schema.Literal("local-workerd"),
     phase: Schema.optional(Schema.Never),
     resourceConditions: Schema.String.check(Schema.isMinLength(1)),
-    reports: Schema.Array(Schema.Struct({ ...query.fields, ...warmFields }).check(validWarm)),
+    reports: Schema.Array(
+      Schema.Struct({ ...queryIdentity.fields, ...warmFields }).check(validWarm),
+    ),
   }),
   Schema.Struct({
     ...common,
@@ -56,7 +58,7 @@ export const BenchmarkMeasurement = Schema.Union([
     resourceConditions: Schema.String.check(Schema.isMinLength(1)),
     reports: Schema.Array(
       Schema.Struct({
-        ...query.fields,
+        ...queryIdentity.fields,
         samples: workerdCold,
       }),
     ),
@@ -73,7 +75,7 @@ export const BenchmarkMeasurement = Schema.Union([
     }),
     reports: Schema.Array(
       Schema.Struct({
-        ...query.fields,
+        ...queryIdentity.fields,
         cold: containerCold,
         warm,
       }),

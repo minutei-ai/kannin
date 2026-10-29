@@ -1,7 +1,9 @@
+use crate::segment::{ColumnId, ColumnValue, Document};
 use alyze::analyze::{
     AnalysisOptions, Analyzer, LanguageWithStopwords, ReusableBuffer, StemmingLanguage,
     StopwordRemoval, TokenizerOptions, stemming_cache::StemmingCache,
 };
+use alyze::uax29::word::Options as WordOptions;
 use serde::{Deserialize, Serialize};
 
 const MAX_ANALYSIS_TOKENS: usize = 65_536;
@@ -111,7 +113,7 @@ impl WordV4Config {
             })
             .transpose()?;
         let options = AnalysisOptions {
-            tokenizer: TokenizerOptions::UAX29Word(Default::default()),
+            tokenizer: TokenizerOptions::UAX29Word(WordOptions::default()),
             maximum_token_length: Some(usize::from(self.max_token_length)),
             case_sensitive: self.case_sensitive,
             stopword_removal,
@@ -146,6 +148,32 @@ impl WordV4Analyzer {
     ) {
         self.analyzer
             .analyze_inputs(inputs, &mut self.buffer, callback);
+    }
+
+    #[doc = "# Errors\nRejects non-string attributes and arrays containing non-string values before emitting any tokens."]
+    pub fn analyze_attribute(
+        &mut self,
+        document: &Document,
+        name: &str,
+        callback: impl FnMut(alyze::analyze::Token<'_>) -> bool,
+    ) -> Result<(), String> {
+        match document.column(ColumnId::Attribute(name)) {
+            None | Some(ColumnValue::Attribute(serde_json::Value::Null)) => {}
+            Some(ColumnValue::Attribute(serde_json::Value::String(text))) => {
+                self.analyze_inputs(std::iter::once(text.as_str()), callback);
+            }
+            Some(ColumnValue::Attribute(serde_json::Value::Array(values))) => {
+                if values.iter().any(|value| !value.is_string()) {
+                    return Err("Full-text arrays must contain only strings".into());
+                }
+                self.analyze_inputs(
+                    values.iter().filter_map(serde_json::Value::as_str),
+                    callback,
+                );
+            }
+            Some(_) => return Err("Full-text attributes must be strings or string arrays".into()),
+        }
+        Ok(())
     }
 }
 
@@ -218,7 +246,7 @@ mod tests {
         });
         assert_eq!(tokens, ["fox"]);
         tokens.clear();
-        analyzer.analyze_inputs(["🐡 café"].into_iter(), |token| {
+        analyzer.analyze_inputs(std::iter::once("🐡 café"), |token| {
             tokens.push(format!(
                 "{}:{}:{}",
                 token.input_index, token.position, token.text
@@ -226,6 +254,62 @@ mod tests {
             true
         });
         assert_eq!(tokens, ["0:0:🐡", "0:1:café"]);
+        Ok(())
+    }
+
+    #[test]
+    fn word_v4_attribute_owner_never_reads_native_roles_or_partially_indexes_invalid_arrays()
+    -> Result<(), String> {
+        let document = Document::native(
+            "a",
+            1,
+            "nativeexclusive",
+            "bodyexclusive",
+            [
+                ("title".into(), serde_json::json!("attribute quasar")),
+                ("text".into(), serde_json::json!(["fox", "", "the dog"])),
+                ("absent".into(), serde_json::Value::Null),
+                ("invalid".into(), serde_json::json!(["fox", null])),
+                ("number".into(), serde_json::json!(42)),
+            ]
+            .into(),
+            None,
+        );
+        let mut analyzer = WordV4Analyzer::new(WordV4Config::default())?;
+        let mut tokens = Vec::new();
+        analyzer.analyze_attribute(&document, "title", |token| {
+            tokens.push((token.text.to_owned(), token.position, token.input_index));
+            true
+        })?;
+        assert_eq!(
+            tokens,
+            [("attribute".into(), 0, 0), ("quasar".into(), 1, 0)]
+        );
+        tokens.clear();
+        analyzer.analyze_attribute(&document, "text", |token| {
+            tokens.push((token.text.to_owned(), token.position, token.input_index));
+            true
+        })?;
+        assert_eq!(tokens, [("fox".into(), 0, 0), ("dog".into(), 2, 2)]);
+        tokens.clear();
+        for field in ["absent", "missing", "vector"] {
+            analyzer.analyze_attribute(&document, field, |token| {
+                tokens.push((token.text.to_owned(), token.position, token.input_index));
+                true
+            })?;
+        }
+        assert_eq!(tokens, Vec::<(String, usize, usize)>::new());
+        for field in ["invalid", "number"] {
+            assert!(
+                analyzer
+                    .analyze_attribute(&document, field, |token| {
+                        tokens.push((token.text.to_owned(), token.position, token.input_index));
+                        true
+                    })
+                    .is_err()
+            );
+        }
+        assert_eq!(tokens, Vec::<(String, usize, usize)>::new());
         Ok(())
     }
 
@@ -274,7 +358,7 @@ mod tests {
             assert!(WordV4Analyzer::new(config).is_err());
         }
         assert!(analyze_json(r#"{"unknown":true}"#, r#"["fox"]"#).is_err());
-        assert!(analyze_json("{}", r#"[null]"#).is_err());
+        assert!(analyze_json("{}", "[null]").is_err());
         assert!(analyze_json("{}", r#"["\ud800"]"#).is_err());
     }
 

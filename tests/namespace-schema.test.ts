@@ -312,6 +312,89 @@ test("namespace-local canonical filters are immediately visible after schema-onl
   expect(after).toEqual(before);
 });
 
+test("string ranges preserve binary order and exact types across native query kinds", async () => {
+  const namespace = "string-ranges";
+  const vector = [1, 0];
+  const values = [
+    { id: "a", attributes: { label: "a" } },
+    { id: "aa", attributes: { label: "aa" } },
+    { id: "bmp", attributes: { label: "\uE000" } },
+    { id: "emoji", attributes: { label: "😀" } },
+    { id: "empty", attributes: { label: "" } },
+    { id: "null", attributes: { label: null } },
+    { id: "missing", attributes: {} },
+    { id: "number", attributes: { label: 1 } },
+  ];
+  expect(
+    (
+      await request(worker, namespace, "write", {
+        requestId: "seed",
+        schema: { filterable: ["label"], vectorFilterFields: [], vectorDimensions: 2 },
+        upserts: values.map((value) => ({ ...value, text: "ordered record", vector })),
+        deletes: [],
+      })
+    ).status,
+  ).toBe(200);
+  for (const input of [
+    textQuery("ordered"),
+    { kind: "vector", vector, topK: 10, filters: [] },
+    { kind: "hybrid", text: "ordered", vector, topK: 10, filters: [] },
+  ])
+    for (const [op, value, ids] of [
+      ["gt", "a", ["aa", "bmp", "emoji"]],
+      ["gte", "a", ["a", "aa", "bmp", "emoji"]],
+      ["lt", "aa", ["a", "empty"]],
+      ["lte", "aa", ["a", "aa", "empty"]],
+      ["gte", "\uE000", ["bmp", "emoji"]],
+      ["lt", "😀", ["a", "aa", "bmp", "empty"]],
+      ["lt", "1", ["empty"]],
+      ["gt", 0, ["number"]],
+    ] as const) {
+      const response = await request(worker, namespace, "query", {
+        ...input,
+        filters: [{ field: "label", op, value }],
+      });
+      expect(response.status).toBe(200);
+      expect(
+        Schema.decodeUnknownSync(QueryResult)(await response.json()).rows.map((row) => row.id),
+      ).toEqual([...ids]);
+    }
+  for (const value of [true, null, ["a"]])
+    expect(
+      (
+        await request(worker, namespace, "query", {
+          ...textQuery("ordered"),
+          filters: [{ field: "label", op: "gt", value }],
+        })
+      ).status,
+    ).toBe(400);
+  expect(
+    (
+      await request(worker, namespace, "write", {
+        requestId: "replace-and-delete",
+        upserts: [{ id: "a", text: "ordered record", attributes: { label: "z" }, vector }],
+        deletes: ["emoji"],
+      })
+    ).status,
+  ).toBe(200);
+  for (const phase of ["before", "after"]) {
+    if (phase === "after")
+      for (const operation of ["compact", "rebuild"])
+        expect((await request(worker, namespace, operation, {})).status).toBe(200);
+    const response = await request(worker, namespace, "query", {
+      kind: "vector",
+      vector,
+      topK: 10,
+      minimumSequence: 2,
+      filters: [{ field: "label", op: "gte", value: "\uE000" }],
+    });
+    expect(response.status).toBe(200);
+    const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+    expect(result.rows.map((row) => row.id)).toEqual(["bmp"]);
+    expect(result.sequence).toBe(2);
+  }
+});
+
 test("scalar arrays survive queries, replacement and canonical maintenance", async () => {
   const namespace = "array-attributes";
   const vector = [1, 0];

@@ -48,6 +48,12 @@ test("prepared constant filters preserve scalar predicates and recover after mal
     { field: "n", op: "exists", value: false },
     { field: "flag", op: "eq", value: true },
     { field: "text", op: "eq", value: 'ação\n"\\' },
+    { field: "n", op: "notIn", value: [null, -1.5] },
+    { field: "text", op: "notIn", value: ["", "🦀"] },
+    { field: "text", op: "gt", value: "ação" },
+    { field: "text", op: "gte", value: "🦀" },
+    { field: "text", op: "lt", value: "\uE000" },
+    { field: "text", op: "lte", value: "" },
   ]);
   for (const predicates of [...filters.map((filter) => [filter]), filters]) {
     const encodedFilters = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Filter)))(

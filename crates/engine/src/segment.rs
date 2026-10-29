@@ -3282,17 +3282,22 @@ pub struct Filter {
     pub value: serde_json::Value,
 }
 
-fn compare_number(value: &serde_json::Value, expected: &serde_json::Value, op: &str) -> bool {
-    if let (Some(a), Some(b)) = (value.as_f64(), expected.as_f64()) {
-        return match op {
-            "gt" => a > b,
-            "gte" => a >= b,
-            "lt" => a < b,
-            "lte" => a <= b,
-            _ => false,
-        };
-    }
-    false
+fn compare_scalar(value: &serde_json::Value, expected: &serde_json::Value, op: &str) -> bool {
+    let ordering = match (value, expected) {
+        (serde_json::Value::String(a), serde_json::Value::String(b)) => Some(a.cmp(b)),
+        (serde_json::Value::Number(a), serde_json::Value::Number(b)) => a
+            .as_f64()
+            .zip(b.as_f64())
+            .and_then(|(left, right)| left.partial_cmp(&right)),
+        _ => None,
+    };
+    ordering.is_some_and(|order| match op {
+        "gt" => order.is_gt(),
+        "gte" => order.is_ge(),
+        "lt" => order.is_lt(),
+        "lte" => order.is_le(),
+        _ => false,
+    })
 }
 
 #[doc = "# Errors\nRejects unknown operators or invalid exists predicates."]
@@ -3343,7 +3348,7 @@ impl Filter {
                     expected.iter().any(|value| values.contains(value))
                 }),
             "gt" | "gte" | "lt" | "lte" => {
-                actual.is_some_and(|value| compare_number(value, &self.value, &self.op))
+                actual.is_some_and(|value| compare_scalar(value, &self.value, &self.op))
             }
             _ => return Err("Unknown filter operation".into()),
         };
@@ -11017,6 +11022,69 @@ mod scalar_column_tests {
 mod array_filter_tests {
     use super::{Filter, matches};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn scalar_ranges_preserve_binary_string_order_and_reject_cross_type_coercion()
+    -> Result<(), String> {
+        for (actual, value, expected) in [
+            (
+                serde_json::json!(""),
+                serde_json::json!("a"),
+                [false, false, true, true],
+            ),
+            (
+                serde_json::json!("a"),
+                serde_json::json!("aa"),
+                [false, false, true, true],
+            ),
+            (
+                serde_json::json!("A"),
+                serde_json::json!("a"),
+                [false, false, true, true],
+            ),
+            (
+                serde_json::json!("é"),
+                serde_json::json!("e\u{301}"),
+                [true, true, false, false],
+            ),
+            (
+                serde_json::json!("\u{e000}"),
+                serde_json::json!("😀"),
+                [false, false, true, true],
+            ),
+            (
+                serde_json::json!("😀"),
+                serde_json::json!("😀"),
+                [false, true, false, true],
+            ),
+            (serde_json::json!(1), serde_json::json!("1"), [false; 4]),
+            (serde_json::json!("1"), serde_json::json!(1), [false; 4]),
+            (serde_json::json!(null), serde_json::json!("a"), [false; 4]),
+            (serde_json::json!(true), serde_json::json!(1), [false; 4]),
+            (serde_json::json!(["a"]), serde_json::json!("b"), [false; 4]),
+            (
+                serde_json::json!(0),
+                serde_json::json!(-0.0),
+                [false, true, false, true],
+            ),
+            (
+                serde_json::json!(1.5),
+                serde_json::json!(1),
+                [true, true, false, false],
+            ),
+        ] {
+            for (op, expected) in ["gt", "gte", "lt", "lte"].into_iter().zip(expected) {
+                let filter = Filter {
+                    field: "value".to_owned(),
+                    op: op.to_owned(),
+                    value: value.clone(),
+                };
+                assert_eq!(filter.matches(Some(&actual))?, expected);
+                assert!(!filter.matches(None)?);
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn scalar_exclusion_is_exact_and_preserves_missing_values() -> Result<(), String> {

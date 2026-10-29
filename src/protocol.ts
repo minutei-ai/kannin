@@ -123,7 +123,7 @@ export const Filter = Schema.Union([
   Schema.Struct({
     field: FieldName,
     op: Schema.Literals(["gt", "gte", "lt", "lte"]),
-    value: Schema.Finite,
+    value: Schema.Union([Schema.Finite, Unicode]),
   }),
   Schema.Struct({
     field: FieldName,

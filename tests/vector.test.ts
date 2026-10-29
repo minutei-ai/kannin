@@ -363,6 +363,8 @@ test("native scalar and array filters find eligible vectors outside the unfilter
     [{ field: "group", op: "in", value: ["eligible", "absent"] }],
     [{ field: "group", op: "ne", value: "distractor" }],
     [{ field: "group", op: "notIn", value: ["distractor", "absent"] }],
+    [{ field: "group", op: "gte", value: "eligible" }],
+    [{ field: "group", op: "gt", value: "distractor" }],
     [{ field: "eligible", op: "contains", value: "eligible" }],
     [{ field: "eligible", op: "notContains", value: "distractor" }],
     [{ field: "eligible", op: "containsAny", value: ["absent", "eligible"] }],

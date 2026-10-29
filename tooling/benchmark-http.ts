@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { Cause, Effect, Schema } from "effect";
-import { Query, QueryResult, Row, Write, WriteResult } from "../src/protocol";
+import { Metadata, Query, QueryResult, Row, Write, WriteResult } from "../src/protocol";
 import { write } from "../tests/harness";
 import { benchmarkQueries } from "./benchmark-queries";
 import { corpus } from "./corpus";
@@ -32,6 +32,27 @@ const post = Effect.fn("kannin.benchmark.http")(function* (
       throw new Error(`Benchmark ${operation} failed: ${response.status} ${await response.text()}`);
     return response.text();
   });
+});
+
+const cacheEvidence = Effect.fn("kannin.benchmark.cacheEvidence")(function* (
+  config: typeof HttpBenchmarkConfig.Type,
+) {
+  const body = yield* Effect.tryPromise(async () => {
+    const response = await fetch(`${config.endpoint}/v1/namespaces/benchmark/metadata`, {
+      headers: { authorization: `Bearer ${config.token}` },
+      signal: AbortSignal.timeout(60000),
+    });
+    if (!response.ok) throw new Error(`Benchmark metadata failed: ${response.status}`);
+    return response.text();
+  });
+  const metadata = yield* Schema.decodeEffect(Schema.fromJsonString(Metadata))(body);
+  return {
+    immutableCacheHits: metadata.cache.cacheApiHits,
+    overviewCacheHits: metadata.cache.overviewCacheApiHits,
+    termCacheHits: metadata.cache.termWorkerCacheHits,
+    rangeFallbackReads: metadata.cache.rangeR2FallbackReads,
+    directoryFallbackReads: metadata.cache.directoryR2FallbackReads,
+  };
 });
 
 export function benchmarkHttpApi<E, R>(
@@ -88,7 +109,8 @@ export function benchmarkHttpApi<E, R>(
         yield* restart;
         const restartMs = performance.now() - starting;
         const readMs = yield* query;
-        cold.push({ repetition, restartMs, readMs });
+        const cache = yield* cacheEvidence(config);
+        cold.push({ repetition, restartMs, readMs, cache });
       }
       for (const _warmup of Array.from({ length: 5 }, (_, index) => index)) yield* query;
       const warm = [];
@@ -107,6 +129,7 @@ export function benchmarkHttpApi<E, R>(
         rowsSha256: Bun.CryptoHasher.hash("sha256", baseline, "hex"),
         cold,
         warm: { p50: ordered[24], p95: ordered[47], samples: warm },
+        cacheAfterWarm: yield* cacheEvidence(config),
       });
     }
     return {

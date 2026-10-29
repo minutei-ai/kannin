@@ -16,6 +16,8 @@ A local workerd route probe of the gate072 Worker retains five authenticated 404
 
 A dependency refresh on 2026-10-28 selects official TypeScript SDK 2.13.0 for the next complete gate. Earlier SDK 2.12.0 results below remain historical evidence; they do not validate the new installed client. The pinned public-source baseline remains explicit rather than being silently relabeled. The [2.13.0 release](https://github.com/turbopuffer/turbopuffer-typescript/releases/tag/v2.13.0) includes customer-managed `encryption_context` and separate strong/eventual consistency variants with `max_staleness_seconds`. Kannin's native edge-text snapshot contract does not implement that public eventual-consistency policy; accepting these fields without their behavior would not establish compatibility.
 
+A focused check of the [write guide](https://turbopuffer.com/docs/write) on 2026-10-29 confirms namespace names use `[A-Za-z0-9-_.]{1,128}`. Unicode attribute names do not imply Unicode namespace names. The existing ASCII namespace character contract matches that declaration; dot-only path segments and URI normalization remain separate unresolved transport cases.
+
 ## Implemented conformance boundaries
 
 The public HTTP error envelope now includes the required `status: error` member alongside its message, preserving the numeric HTTP status. Query, coordinator, gateway and administrative-list failures use the owning ErrorBody Schema. Administrative listing catches native acquisition and namespace-validation failures, logs the original failure and returns a sanitized, private/no-store 503. The native binding RpcReply/Rejected wire contract is unchanged.

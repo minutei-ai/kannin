@@ -48,14 +48,11 @@ test("a stale manifest ETag rejects the commit and its segment stays invisible",
   const current = await bucket.get(rootKey);
   if (current === null) throw new Error("Missing R2 root");
   const root = Schema.decodeSync(Schema.fromJsonString(StoredRoot))(await current.text());
-  const racingRoot = StoredRoot.mapFields((fields) => ({
-    ...fields,
-    testRace: Schema.Boolean,
-  }));
-  await bucket.put(
-    rootKey,
-    Schema.encodeSync(Schema.fromJsonString(racingRoot))({ ...root, testRace: true }),
-  );
+  await bucket.put(rootKey, `${Schema.encodeSync(Schema.fromJsonString(StoredRoot))(root)}\n`);
+  const replaced = await bucket.get(rootKey);
+  if (replaced === null) throw new Error("Missing racing R2 root");
+  expect(replaced.etag).not.toBe(current.etag);
+  expect(Schema.decodeSync(Schema.fromJsonString(StoredRoot))(await replaced.text())).toEqual(root);
   const input = write([document("b", "after")]);
   expect((await request(worker, "cas", "write", input)).status).toBe(409);
   expect(

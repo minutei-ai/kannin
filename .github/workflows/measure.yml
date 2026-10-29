@@ -13,7 +13,7 @@ concurrency:
   group: measure-${{ github.ref_name }}
   cancel-in-progress: false
 jobs:
-  workerd:
+  local-backends:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -34,8 +34,13 @@ jobs:
           gh run download "$GATE_RUN" --name worker --dir dist
           test -s dist/worker/worker.js
           test -s dist/worker/raio_engine_bg.wasm
+          test -s dist/server/main.js
+          test -s dist/server/healthcheck.js
+          test -s dist/cache/main.js
+          test -s dist/wasm/raio_engine_bg.wasm
       - run: bun install --frozen-lockfile
-      - name: Measure cold processes with retained and empty Cache API, then warm reads
+      - run: sudo apt-get update && sudo apt-get install -y podman
+      - name: Measure workerd and Docker with the validated engine
         timeout-minutes: 10
         env:
           RAIO_BENCH_DOCUMENTS: "1000"
@@ -44,15 +49,17 @@ jobs:
           RAIO_BENCH_CACHE_MODE=retained bun tooling/benchmark-cold.ts > "$RUNNER_TEMP/process-cold.json"
           RAIO_BENCH_CACHE_MODE=empty bun tooling/benchmark-cold.ts > "$RUNNER_TEMP/cache-cold.json"
           bun tooling/benchmark.ts > "$RUNNER_TEMP/warm.json"
-          bun tooling/verify-benchmarks.ts "$RUNNER_TEMP/process-cold.json" "$RUNNER_TEMP/cache-cold.json" "$RUNNER_TEMP/warm.json"
+          RAIO_BENCH_CACHE_MODE=retained bun tooling/benchmark-container.ts > "$RUNNER_TEMP/docker.json"
+          bun tooling/verify-benchmarks.ts "$RUNNER_TEMP/process-cold.json" "$RUNNER_TEMP/cache-cold.json" "$RUNNER_TEMP/warm.json" "$RUNNER_TEMP/docker.json"
       - name: Retain successful measurement reports and gate provenance
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: workerd-measurements
+          name: local-backend-measurements
           path: |
             ${{ runner.temp }}/process-cold.json
             ${{ runner.temp }}/cache-cold.json
             ${{ runner.temp }}/warm.json
+            ${{ runner.temp }}/docker.json
             ${{ runner.temp }}/gate.json
           if-no-files-found: error
           retention-days: 1

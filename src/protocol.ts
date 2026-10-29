@@ -3,6 +3,61 @@ import { Effect, Schema, SchemaGetter, SchemaIssue, Struct } from "effect";
 const Unicode = Schema.String.check(
   Schema.makeFilter((text) => text.isWellFormed() || "Expected well-formed Unicode"),
 );
+const AnalysisLanguage = Schema.Literals([
+  "arabic",
+  "danish",
+  "dutch",
+  "english",
+  "finnish",
+  "french",
+  "german",
+  "greek",
+  "hungarian",
+  "italian",
+  "norwegian",
+  "portuguese",
+  "romanian",
+  "russian",
+  "spanish",
+  "swedish",
+  "tamil",
+  "turkish",
+]);
+export const WordV4Config = Schema.Struct({
+  max_token_length: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 255 })),
+  case_sensitive: Schema.Boolean,
+  stopwords: Schema.NullOr(
+    AnalysisLanguage.check(
+      Schema.makeFilter(
+        (language) =>
+          !["arabic", "greek", "romanian", "tamil", "turkish"].includes(language) ||
+          "Stopword removal is unavailable for this language",
+      ),
+    ),
+  ),
+  stemming: Schema.NullOr(AnalysisLanguage),
+  ascii_folding: Schema.Boolean,
+}).check(
+  Schema.makeFilter(
+    (config) =>
+      !config.case_sensitive ||
+      (config.stopwords === null && config.stemming === null) ||
+      "Case-sensitive analysis cannot remove stopwords or apply stemming",
+  ),
+);
+const AnalysisOffset = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
+export const AnalyzedTokens = Schema.Array(
+  Schema.Struct({
+    text: Unicode,
+    position: AnalysisOffset,
+    position_length: Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)),
+    input_index: AnalysisOffset,
+    byte_start: AnalysisOffset,
+    byte_end: AnalysisOffset,
+  }).check(
+    Schema.makeFilter((token) => token.byte_end > token.byte_start || "Invalid token byte range"),
+  ),
+).check(Schema.isMaxLength(65_536));
 export const Id = Unicode.check(Schema.isBetweenLength(1, 128));
 export const NamespacePrefix = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9_.-]{1,128}$/));
 export const NamespaceName = NamespacePrefix.check(

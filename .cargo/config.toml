@@ -5,4 +5,4 @@ jobs = 1
 RUST_TEST_THREADS = "1"
 
 [target.wasm32-unknown-unknown]
-rustflags = ["-C", "target-feature=+simd128"]
+rustflags = ["-C", "target-feature=+simd128", "--cfg", 'getrandom_backend="wasm_js"']

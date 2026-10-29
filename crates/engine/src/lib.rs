@@ -2,6 +2,7 @@ use std::fmt;
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 use unicode_segmentation::UnicodeSegmentation;
 
+pub mod analysis;
 pub mod segment;
 pub mod vector;
 
@@ -112,6 +113,12 @@ pub mod wasm {
     #[must_use]
     pub fn tokenize(text: &str) -> String {
         super::normalize_text(text)
+    }
+
+    #[wasm_bindgen]
+    #[doc = "# Errors\nRejects invalid analyzer configuration, oversized input, and token output beyond the analysis budget."]
+    pub fn word_v4(config: &str, inputs: &str) -> Result<String, JsValue> {
+        super::analysis::analyze_json(config, inputs).map_err(|cause| JsValue::from_str(&cause))
     }
 }
 

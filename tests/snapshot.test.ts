@@ -41,7 +41,7 @@ test("snapshot frames reject truncation, invalid versions, lengths and mismatche
     expect(Effect.runSync(Effect.exit(readSnapshotFrame(bytes.slice(0, length))))._tag).toBe(
       "Failure",
     );
-  for (const unsupported of [49, 50, 51, 52, 54]) {
+  for (const unsupported of [49, 50, 51, 52, 53, 55]) {
     const version = bytes.slice(0);
     new Uint8Array(version)[7] = unsupported;
     expect(Effect.runSync(Effect.exit(readSnapshotFrame(version)))._tag).toBe("Failure");

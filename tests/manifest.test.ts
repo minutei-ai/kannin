@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { Effect, Schema } from "effect";
+import { Effect, Schema, Struct } from "effect";
 import {
   BloomPack,
   CommonTermProjection,
@@ -222,13 +222,16 @@ test("migration decoder distinguishes current v6 from legacy v1, v2, v3, packed 
   const wire = encodeRoot(root);
   expect(decodeRootForMigration(wire)).toEqual({ kind: "current", root });
   const storedCurrent = Schema.decodeSync(Schema.fromJsonString(StoredRoot))(wire);
-  const storedV4 = Schema.decodeSync(LegacyStoredRootV4)({ ...storedCurrent, version: 4 });
+  const storedV4 = Schema.decodeSync(LegacyStoredRootV4)({
+    ...Struct.omit(storedCurrent, ["schema"]),
+    version: 4,
+  });
   const packedV4 = Schema.encodeSync(Schema.fromJsonString(LegacyStoredRootV4))(storedV4);
   expect(() => decodeRoot(packedV4)).toThrow();
   expect(decodeRootForMigration(packedV4)).toEqual({
     kind: "packed",
     sourceVersion: 4,
-    root: Schema.decodeSync(LegacyPackedRoot)(root),
+    root: Schema.decodeSync(LegacyPackedRoot)(Struct.omit(root, ["schema"])),
   });
   const legacyV1 = Schema.encodeSync(Schema.fromJsonString(LegacyRoot))(legacyRoot);
   expect(decodeRootForMigration(legacyV1)).toEqual({
@@ -289,7 +292,9 @@ test("rebuild snapshots retain their envelope and use the same migration classif
     snapshot,
   });
   const storedV4 = Schema.decodeSync(LegacyStoredRootV4)({
-    ...Schema.decodeSync(Schema.fromJsonString(StoredRoot))(encodeRoot(root)),
+    ...Struct.omit(Schema.decodeSync(Schema.fromJsonString(StoredRoot))(encodeRoot(root)), [
+      "schema",
+    ]),
     version: 4,
   });
   const packedV4 = Schema.encodeSync(
@@ -301,7 +306,10 @@ test("rebuild snapshots retain their envelope and use the same migration classif
   expect(decodeVectorRebuildSnapshotForMigration(packedV4)).toEqual({
     kind: "packed",
     sourceVersion: 4,
-    snapshot: { root: Schema.decodeSync(LegacyPackedRoot)(root), fields: [] },
+    snapshot: {
+      root: Schema.decodeSync(LegacyPackedRoot)(Struct.omit(root, ["schema"])),
+      fields: [],
+    },
   });
   const pooled = Schema.encodeSync(
     Schema.fromJsonString(
@@ -350,7 +358,7 @@ test("column declarations keep both native orders and do not invent attribute ty
     }),
   ).toThrow();
   expect(() =>
-    Schema.decodeUnknownSync(NamespaceColumns)({
+    Schema.decodeSync(NamespaceColumns)({
       columns: [{ source: "id", name: "id", value: "legacy-untyped" }],
     }),
   ).toThrow();

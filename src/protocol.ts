@@ -325,7 +325,7 @@ const PackedRootValue = Schema.Struct({
   bloomPacks: Schema.Array(Schema.suspend(() => BloomPack)),
   segments: Schema.Array(LegacyPackedSegment),
 });
-const validBloomReferences = (root: typeof PackedRootValue.Type) =>
+const validBloomReferences = (root: Pick<typeof PackedRootValue.Type, "bloomPacks" | "segments">) =>
   root.segments.every(
     (segment) =>
       root.bloomPacks[segment.bloom.packIndex]?.segmentKeys[segment.bloom.row] === segment.key,

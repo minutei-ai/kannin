@@ -374,7 +374,7 @@ test("SDK resolves a valid success payload by the requested operation", async ()
     _tag: "Success",
     value: {
       ...value,
-      version: 5,
+      version: 6,
       rootRewritten: false,
       migratedSnapshots: 0,
       expiredSnapshots: 0,

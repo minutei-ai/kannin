@@ -177,14 +177,16 @@ test("directory parsing rejects invalid UTF-8 even with a valid header checksum"
       canonicalFixtureDocuments([{ id: "café", text: "alpha", attributes: { city: "São Paulo" } }]),
     ),
   );
-  const encoded = new TextEncoder().encode(segment.header_json());
+  const source = segment.bytes();
+  const headerLength = new DataView(source.buffer, source.byteOffset).getUint32(8, true);
+  const encoded = source.slice(16, 16 + headerLength);
   const position = encoded.findIndex((byte) => byte === 0xc3);
   expect(position).toBeGreaterThanOrEqual(0);
   for (const invalid of [0xff, 0xc0]) {
     const json = encoded.slice();
     json[position] = invalid;
     const frame = new Uint8Array(16 + json.byteLength);
-    frame.set(segment.bytes().subarray(0, 8));
+    frame.set(source.subarray(0, 8));
     const view = new DataView(frame.buffer);
     view.setUint32(8, json.byteLength, true);
     view.setUint32(12, crc32(json), true);
@@ -246,15 +248,17 @@ test("recovered frames preserve raw attribute whitespace, escapes and duplicate 
       { id: "a", revision: 1, text: "rust storage", attributes: { group: 1 } },
     ]),
   );
-  const original = segment.header_json();
+  const source = segment.bytes();
+  const headerLength = new DataView(source.buffer, source.byteOffset).getUint32(8, true);
+  const original = new TextDecoder().decode(source.subarray(16, 16 + headerLength));
   const escaped = original.replace(
-    '"attributes":{"group":1}',
-    '"attributes": { "gr\\u006fup": 0, "group": 1, "label": "a\\u0062" }',
+    '{"group":1}',
+    '{ "gr\\u006fup": 0, "group": 1, "label": "a\\u0062" }',
   );
   expect(escaped).not.toBe(original);
   const json = new TextEncoder().encode(escaped);
   const canonical = new Uint8Array(16 + json.byteLength);
-  canonical.set(segment.bytes().subarray(0, 8));
+  canonical.set(source.subarray(0, 8));
   const view = new DataView(canonical.buffer);
   view.setUint32(8, json.byteLength, true);
   view.setUint32(12, crc32(json), true);

@@ -5656,16 +5656,451 @@ pub fn bloom_filter_many<'a>(
 #[cfg(target_arch = "wasm32")]
 pub mod wasm {
     use super::{
-        BuiltSegment, CanonicalDocumentDto, Document, DocumentAttributes, DocumentMeta, Filter,
-        Header, MAX_BYTES, MAX_QUERY_TERMS, Range, Search, SelectedAttributes, Statistics,
-        TermDictionary, TermMeta, TermScorer, append, bloom_build, bloom_filter_many, build,
-        compare_document_ids, decode_page, document_terms, matches, parse_header,
+        Bm25Parameters, BuiltSegment, CanonicalDocumentDto, CorpusStatistics, Document,
+        DocumentAttributes, DocumentColumnId, DocumentMeta, FieldQuery, FieldStatistics, Filter,
+        Header, MAX_BYTES, MAX_QUERY_TERMS, NamedTextField, NativeRole, Range, Search,
+        SelectedAttributes, Statistics, TermDictionary, TermMeta, TermScorer, append, bloom_build,
+        bloom_filter_many, build, build_text_fields, compare_document_ids, decode_page,
+        document_terms, local_field_statistics, matches, parse_header, rank_fields_with,
     };
     use serde::{Deserialize, Serialize};
     use std::cell::RefCell;
     use std::collections::{BTreeMap, BTreeSet};
     use std::rc::{Rc, Weak};
     use wasm_bindgen::prelude::*;
+
+    const FIELD_JSON_LIMIT: usize = 16 * 1024 * 1024;
+    const SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
+
+    fn deserialize_nonnull_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+        T: Deserialize<'de>,
+    {
+        T::deserialize(deserializer).map(Some)
+    }
+
+    #[derive(Deserialize)]
+    #[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+    enum FieldColumnDto {
+        Native { role: String },
+        Attribute { name: String },
+    }
+
+    impl TryFrom<FieldColumnDto> for DocumentColumnId {
+        type Error = String;
+
+        fn try_from(value: FieldColumnDto) -> Result<Self, Self::Error> {
+            match value {
+                FieldColumnDto::Native { role } => match role.as_str() {
+                    "title" => Ok(Self::Role(NativeRole::Title)),
+                    "text" => Ok(Self::Role(NativeRole::Text)),
+                    "vector" => Err("Vector is not a text field".into()),
+                    _ => Err("Unknown native document role".into()),
+                },
+                FieldColumnDto::Attribute { name }
+                    if !name.is_empty()
+                        && name.encode_utf16().count() <= 128
+                        && name.len() <= 128
+                        && !name.starts_with('$') =>
+                {
+                    Ok(Self::Attribute(name))
+                }
+                FieldColumnDto::Attribute { .. } => Err("Invalid attribute field name".into()),
+            }
+        }
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct NamedFieldDto {
+        name: String,
+        #[serde(default)]
+        config: crate::analysis::WordV4Config,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FieldBuildDto {
+        documents: Vec<super::CanonicalDocumentDto>,
+        text_fields: Vec<NamedFieldDto>,
+        #[serde(default)]
+        #[serde(deserialize_with = "deserialize_nonnull_option")]
+        filterable: Option<Vec<String>>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FieldStatisticDto {
+        id: FieldColumnDto,
+        tokens: u64,
+        frequencies: BTreeMap<String, u64>,
+    }
+
+    #[derive(Serialize)]
+    #[serde(untagged)]
+    enum FieldColumnOut {
+        Native {
+            source: &'static str,
+            role: &'static str,
+        },
+        Attribute {
+            source: &'static str,
+            name: String,
+        },
+    }
+
+    impl From<&DocumentColumnId> for FieldColumnOut {
+        fn from(id: &DocumentColumnId) -> Self {
+            match id {
+                DocumentColumnId::Role(NativeRole::Title) => Self::Native {
+                    source: "native",
+                    role: "title",
+                },
+                DocumentColumnId::Role(NativeRole::Text) => Self::Native {
+                    source: "native",
+                    role: "text",
+                },
+                DocumentColumnId::Role(NativeRole::Vector) => Self::Native {
+                    source: "native",
+                    role: "vector",
+                },
+                DocumentColumnId::Attribute(name) => Self::Attribute {
+                    source: "attribute",
+                    name: name.clone(),
+                },
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct FieldStatisticsOut<'a> {
+        id: FieldColumnOut,
+        tokens: u64,
+        frequencies: &'a BTreeMap<String, u64>,
+    }
+
+    #[derive(Serialize)]
+    struct CorpusStatisticsOut<'a> {
+        documents: u64,
+        fields: Vec<FieldStatisticsOut<'a>>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct CorpusStatisticsDto {
+        documents: u64,
+        fields: Vec<FieldStatisticDto>,
+    }
+
+    impl TryFrom<CorpusStatisticsDto> for CorpusStatistics {
+        type Error = String;
+
+        fn try_from(value: CorpusStatisticsDto) -> Result<Self, Self::Error> {
+            if value.documents > SAFE_JSON_INTEGER {
+                return Err("Document count exceeds safe JSON integer range".into());
+            }
+            if value.fields.len() > 66 {
+                return Err("Corpus field count exceeds field budget".into());
+            }
+            let fields = value
+                .fields
+                .into_iter()
+                .map(|field| {
+                    if field.tokens > SAFE_JSON_INTEGER
+                        || field.frequencies.len() > MAX_QUERY_TERMS
+                        || field
+                            .frequencies
+                            .values()
+                            .any(|count| *count > SAFE_JSON_INTEGER)
+                    {
+                        return Err("Field count exceeds safe JSON integer range".into());
+                    }
+                    Ok(FieldStatistics {
+                        id: field.id.try_into()?,
+                        tokens: field.tokens,
+                        frequencies: field.frequencies,
+                    })
+                })
+                .collect::<Result<_, String>>()?;
+            Ok(Self {
+                documents: value.documents,
+                fields,
+            })
+        }
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FieldQueryDto {
+        fields: Vec<FieldColumnDto>,
+        text: String,
+        mode: String,
+        #[serde(default = "default_top_k")]
+        top_k: usize,
+        #[serde(default)]
+        dead: Vec<u32>,
+        #[serde(default)]
+        filters: Vec<FieldFilterDto>,
+        #[serde(default)]
+        #[serde(deserialize_with = "deserialize_nonnull_option")]
+        bm25: Option<Bm25Dto>,
+        #[serde(default)]
+        #[serde(deserialize_with = "deserialize_nonnull_option")]
+        statistics: Option<CorpusStatisticsDto>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FieldStatisticsQueryDto {
+        fields: Vec<FieldColumnDto>,
+        text: String,
+        mode: String,
+        #[serde(default)]
+        dead: Vec<u32>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Bm25Dto {
+        k1: f64,
+        b: f64,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FieldFilterDto {
+        field: String,
+        op: String,
+        value: serde_json::Value,
+    }
+
+    struct DecodedFieldQuery {
+        fields: Vec<DocumentColumnId>,
+        text: String,
+        mode: String,
+        top_k: usize,
+        dead: Vec<u32>,
+        filters: Vec<Filter>,
+        bm25: Bm25Parameters,
+        statistics: Option<CorpusStatistics>,
+    }
+
+    impl DecodedFieldQuery {
+        fn as_query(&self) -> FieldQuery<'_> {
+            FieldQuery {
+                fields: &self.fields,
+                text: &self.text,
+                mode: &self.mode,
+                top_k: self.top_k,
+                dead: &self.dead,
+                filters: &self.filters,
+                bm25: self.bm25,
+                statistics: self.statistics.as_ref(),
+            }
+        }
+    }
+
+    impl FieldFilterDto {
+        fn into_filter(self) -> Result<Filter, String> {
+            if self.field.is_empty()
+                || self.field.encode_utf16().count() > 128
+                || self.field.len() > 128
+                || self.field.starts_with('$')
+            {
+                return Err("Invalid filter field name".into());
+            }
+            let scalar = |value: &serde_json::Value| match value {
+                serde_json::Value::Null
+                | serde_json::Value::Bool(_)
+                | serde_json::Value::String(_) => true,
+                serde_json::Value::Number(number) => number.as_f64().is_some_and(|number| {
+                    number.is_finite()
+                        && (number.fract() != 0.0 || number.abs() <= 9_007_199_254_740_991.0)
+                }),
+                serde_json::Value::Array(_) | serde_json::Value::Object(_) => false,
+            };
+            let valid = match self.op.as_str() {
+                "eq" | "ne" | "contains" | "notContains" => scalar(&self.value),
+                "gt" | "gte" | "lt" | "lte" => {
+                    self.value.is_string() || (self.value.is_number() && scalar(&self.value))
+                }
+                "exists" => self.value.is_boolean(),
+                "in" => self.value.as_array().is_some_and(|items| {
+                    (1..=32).contains(&items.len()) && items.iter().all(scalar)
+                }),
+                "notIn" | "containsAny" | "notContainsAny" => self
+                    .value
+                    .as_array()
+                    .is_some_and(|items| items.len() <= 32 && items.iter().all(scalar)),
+                _ => false,
+            };
+            if !valid {
+                return Err("Invalid field filter".into());
+            }
+            Ok(Filter {
+                field: self.field,
+                op: self.op,
+                value: self.value,
+            })
+        }
+    }
+
+    const fn default_top_k() -> usize {
+        10
+    }
+
+    fn check_field_json(value: &str) -> Result<(), JsValue> {
+        if value.len() > FIELD_JSON_LIMIT {
+            Err(JsValue::from_str("Field JSON exceeds sixteen MiB"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn decode_field_query(json: &str) -> Result<DecodedFieldQuery, JsValue> {
+        check_field_json(json)?;
+        let dto: FieldQueryDto =
+            serde_json::from_str(json).map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        if dto.fields.is_empty()
+            || dto.fields.len() > 66
+            || dto.dead.len() > 100_000
+            || dto.filters.len() > 64
+            || !(1..=100).contains(&dto.top_k)
+            || dto.text.is_empty()
+            || dto.text.encode_utf16().count() > 8_192
+        {
+            return Err(JsValue::from_str("Field query exceeds its input budget"));
+        }
+        let fields = dto
+            .fields
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(|cause| JsValue::from_str(&cause))?;
+        let bm25 = dto
+            .bm25
+            .map_or(Ok(Bm25Parameters::DEFAULT), |p| {
+                Bm25Parameters::new(p.k1, p.b)
+            })
+            .map_err(|cause| JsValue::from_str(&cause))?;
+        let statistics = dto
+            .statistics
+            .map(TryInto::try_into)
+            .transpose()
+            .map_err(|cause: String| JsValue::from_str(&cause))?;
+        let filters = dto
+            .filters
+            .into_iter()
+            .map(FieldFilterDto::into_filter)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|cause| JsValue::from_str(&cause))?;
+        Ok(DecodedFieldQuery {
+            fields,
+            text: dto.text,
+            mode: dto.mode,
+            top_k: dto.top_k,
+            dead: dto.dead,
+            filters,
+            bm25,
+            statistics,
+        })
+    }
+
+    #[wasm_bindgen]
+    #[doc = "# Errors\nRejects malformed or oversized field build JSON, invalid canonical documents, declarations, and segments beyond engine budgets."]
+    pub fn segment_build_text_fields(json: &str) -> Result<Vec<u8>, JsValue> {
+        check_field_json(json)?;
+        let dto: FieldBuildDto =
+            serde_json::from_str(json).map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        if dto.documents.is_empty()
+            || dto.documents.len() > 10_000
+            || dto.text_fields.len() > 64
+            || dto
+                .filterable
+                .as_ref()
+                .is_some_and(|fields| fields.len() > 64)
+        {
+            return Err(JsValue::from_str("Field build exceeds its input budget"));
+        }
+        let documents = dto
+            .documents
+            .into_iter()
+            .map(Document::from_canonical_dto)
+            .collect();
+        let fields = dto
+            .text_fields
+            .iter()
+            .map(|field| NamedTextField {
+                attribute: &field.name,
+                config: field.config,
+            })
+            .collect::<Vec<_>>();
+        build_text_fields(documents, dto.filterable.as_deref(), &fields)
+            .map(|built| built.bytes)
+            .map_err(|cause| JsValue::from_str(&cause))
+    }
+
+    #[wasm_bindgen]
+    #[doc = "# Errors\nRejects malformed field query JSON, invalid global statistics, corrupt segments, filters, and tombstones."]
+    pub fn segment_rank_fields(bytes: &[u8], json: &str) -> Result<String, JsValue> {
+        let decoded = decode_field_query(json)?;
+        let query = decoded.as_query();
+        let hits = rank_fields_with(bytes, &query).map_err(|cause| JsValue::from_str(&cause))?;
+        serde_json::to_string(&hits).map_err(|cause| JsValue::from_str(&cause.to_string()))
+    }
+
+    #[wasm_bindgen]
+    #[doc = "# Errors\nRejects malformed field query JSON, unsafe count transport, corrupt segments, and invalid tombstones."]
+    pub fn segment_local_field_statistics(bytes: &[u8], json: &str) -> Result<String, JsValue> {
+        check_field_json(json)?;
+        let dto: FieldStatisticsQueryDto =
+            serde_json::from_str(json).map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        if dto.fields.is_empty()
+            || dto.fields.len() > 66
+            || dto.dead.len() > 100_000
+            || dto.text.is_empty()
+            || dto.text.encode_utf16().count() > 8_192
+        {
+            return Err(JsValue::from_str(
+                "Field statistics query exceeds its input budget",
+            ));
+        }
+        let fields = dto
+            .fields
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(|cause| JsValue::from_str(&cause))?;
+        let statistics = local_field_statistics(bytes, &fields, &dto.text, &dto.mode, &dto.dead)
+            .map_err(|cause| JsValue::from_str(&cause))?;
+        if statistics.documents > SAFE_JSON_INTEGER
+            || statistics.fields.iter().any(|field| {
+                field.tokens > SAFE_JSON_INTEGER
+                    || field
+                        .frequencies
+                        .values()
+                        .any(|count| *count > SAFE_JSON_INTEGER)
+            })
+        {
+            return Err(JsValue::from_str(
+                "Field statistics exceed safe JSON integer range",
+            ));
+        }
+        let output = CorpusStatisticsOut {
+            documents: statistics.documents,
+            fields: statistics
+                .fields
+                .iter()
+                .map(|field| FieldStatisticsOut {
+                    id: (&field.id).into(),
+                    tokens: field.tokens,
+                    frequencies: &field.frequencies,
+                })
+                .collect(),
+        };
+        serde_json::to_string(&output).map_err(|cause| JsValue::from_str(&cause.to_string()))
+    }
 
     #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
     struct TermSummary {

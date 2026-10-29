@@ -390,6 +390,64 @@ export const Filter = Schema.Union([
     value: Schema.Boolean,
   }),
 ]);
+export const FieldBm25Parameters = Schema.Struct({
+  k1: Schema.Finite.check(Schema.isGreaterThan(0)),
+  b: Schema.Finite.check(Schema.isBetween({ minimum: 0, maximum: 1 })),
+});
+export const DEFAULT_FIELD_BM25 = { k1: 1.2, b: 0.75 } as const;
+const SafeCount = Schema.Number.check(
+  Schema.makeFilter(Number.isSafeInteger, "Expected a nonnegative safe integer"),
+  Schema.isGreaterThanOrEqualTo(0),
+);
+const TextColumnId = DocumentColumnId.check(
+  Schema.makeFilter(
+    (column) =>
+      column.source === "attribute" || column.role !== "vector" || "Vector is not a text field",
+  ),
+);
+export const FieldStatistics = Schema.Struct({
+  id: TextColumnId,
+  tokens: SafeCount,
+  frequencies: Schema.Record(Unicode, SafeCount).check(
+    Schema.makeFilter(
+      (frequencies) => Object.keys(frequencies).length <= 512 || "Too many query term frequencies",
+    ),
+  ),
+});
+export const CorpusStatistics = Schema.Struct({
+  documents: SafeCount,
+  fields: Schema.Array(FieldStatistics).check(Schema.isMaxLength(66)),
+});
+export const FieldStatisticsQuery = Schema.Struct({
+  fields: Schema.Array(TextColumnId).check(Schema.isBetweenLength(1, 66)),
+  text: Unicode.check(Schema.isBetweenLength(1, 8192)),
+  mode: Schema.Literals(["any", "all", "phrase"]),
+  dead: Schema.optional(
+    Schema.Array(Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 4_294_967_295 }))).check(
+      Schema.isMaxLength(100_000),
+    ),
+  ),
+});
+export const FieldQuery = FieldStatisticsQuery.mapFields((fields) => ({
+  ...fields,
+  top_k: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 100 }))),
+  filters: Schema.optional(Schema.Array(Filter).check(Schema.isMaxLength(64))),
+  bm25: Schema.optional(FieldBm25Parameters),
+  statistics: Schema.optional(CorpusStatistics),
+}));
+export const NamedTextField = Schema.Struct({
+  name: FieldName,
+  config: Schema.optional(WordV4Config),
+});
+export const FieldBuild = Schema.Struct({
+  documents: Schema.Array(CanonicalDocument).check(Schema.isBetweenLength(1, 10_000)),
+  text_fields: Schema.Array(NamedTextField).check(Schema.isMaxLength(64)),
+  filterable: Schema.optional(Schema.Array(FieldName).check(Schema.isMaxLength(64))),
+});
+export const FieldRankHit = Schema.Struct({
+  row: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  score: Schema.Finite,
+});
 const QueryFields = {
   consistency: Schema.optional(Schema.Literals(["strong", "edge-eventual"])),
   minimumSequence: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),

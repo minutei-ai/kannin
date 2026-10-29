@@ -53,3 +53,10 @@ test("public string IDs enforce UTF-8 bytes without narrowing the native ID cont
   expect(Exit.isFailure(Effect.runSyncExit(encodePublicId("a".repeat(65))))).toBe(true);
   expect(Schema.is(Id)("a".repeat(65))).toBe(true);
 });
+
+test("public ID decoding validates the namespace policy at its boundary", () => {
+  for (const policy of ["integer", "UINT", "", null, undefined, 1, { type: "uint" }])
+    expect(Exit.isFailure(Effect.runSyncExit(decodePublicId(policy, JSON.rawJSON("1"))))).toBe(
+      true,
+    );
+});

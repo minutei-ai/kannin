@@ -1,13 +1,13 @@
 import { Effect, Schema } from "effect";
-import { CanonicalId, NativeJsonNumeric, PublicStringId } from "./protocol";
-import type { IdType } from "./protocol";
+import { CanonicalId, IdType, NativeJsonNumeric, PublicStringId } from "./protocol";
 
 export const decodePublicId = Effect.fn("kannin.public.decodeId")(function* (
-  policy: typeof IdType.Type,
+  policy: unknown,
   input: unknown,
 ) {
-  if (policy === "string") return yield* Schema.decodeUnknownEffect(PublicStringId)(input);
-  if (policy === "uuid")
+  const idType = yield* Schema.decodeUnknownEffect(IdType)(policy);
+  if (idType === "string") return yield* Schema.decodeUnknownEffect(PublicStringId)(input);
+  if (idType === "uuid")
     return yield* Schema.decodeUnknownEffect(CanonicalId)({ kind: "uuid", value: input });
   const numeric = yield* Schema.decodeUnknownEffect(NativeJsonNumeric)(input);
   return yield* Schema.decodeUnknownEffect(CanonicalId)({ kind: "uint", value: numeric.rawJSON });

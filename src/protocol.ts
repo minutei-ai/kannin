@@ -73,6 +73,11 @@ export const AnalyzedTokens = Schema.Array(
   ),
 ).check(Schema.isMaxLength(65_536));
 export const Id = Unicode.check(Schema.isBetweenLength(1, 128));
+export const PublicStringId = Id.check(
+  Schema.makeFilter(
+    (id) => textEncoder.encode(id).byteLength <= 64 || "Public string ID exceeds 64 UTF-8 bytes",
+  ),
+);
 export const NamespacePrefix = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9_.-]{1,128}$/));
 export const NamespaceName = NamespacePrefix.check(
   Schema.makeFilter(

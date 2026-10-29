@@ -1,8 +1,22 @@
 import { Effect, Schema, SchemaGetter, SchemaIssue, Struct } from "effect";
 
+const textEncoder = new TextEncoder();
 const Unicode = Schema.String.check(
   Schema.makeFilter((text) => text.isWellFormed() || "Expected well-formed Unicode"),
 );
+export const DistanceMetric = Schema.Literals(["cosine_distance", "euclidean_squared"]);
+export const VectorDistanceHits = Schema.Array(
+  Schema.Tuple([
+    Unicode.check(
+      Schema.makeFilter(
+        (key) =>
+          (key.length > 0 && textEncoder.encode(key).byteLength <= 512) ||
+          "Vector candidate key exceeds its byte budget",
+      ),
+    ),
+    Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0)),
+  ]),
+).check(Schema.isMaxLength(10_000));
 const AnalysisLanguage = Schema.Literals([
   "arabic",
   "danish",
@@ -78,7 +92,6 @@ export const Operation = Schema.Literals([
   "migrate-root",
 ]);
 export const Scalar = Schema.Union([Unicode, Schema.Finite, Schema.Boolean, Schema.Null]);
-const textEncoder = new TextEncoder();
 export const FieldName = Unicode.check(
   Schema.isBetweenLength(1, 128),
   Schema.makeFilter(

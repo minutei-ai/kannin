@@ -3320,6 +3320,24 @@ impl Filter {
                     .as_array()
                     .is_some_and(|items| items.contains(value))
             }),
+            "contains" => actual
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|values| values.contains(&self.value)),
+            "notContains" => !actual
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|values| values.contains(&self.value)),
+            "containsAny" => actual
+                .and_then(serde_json::Value::as_array)
+                .zip(self.value.as_array())
+                .is_some_and(|(values, expected)| {
+                    expected.iter().any(|value| values.contains(value))
+                }),
+            "notContainsAny" => !actual
+                .and_then(serde_json::Value::as_array)
+                .zip(self.value.as_array())
+                .is_some_and(|(values, expected)| {
+                    expected.iter().any(|value| values.contains(value))
+                }),
             "gt" | "gte" | "lt" | "lte" => {
                 actual.is_some_and(|value| compare_number(value, &self.value, &self.op))
             }
@@ -10981,6 +10999,60 @@ mod scalar_column_tests {
         assert_eq!(serde_json::to_vec(&restored)?, expected);
         assert_eq!(vector_prefix(&table)?, [0]);
         assert_eq!(table.vectors.iter().filter(|value| *value).count(), 10);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod array_filter_tests {
+    use super::{Filter, matches};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn membership_preserves_types_empty_intersections_and_negation() -> Result<(), String> {
+        let attributes: BTreeMap<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "tags": ["ação", "😀", 1, true, null],
+                "empty": [],
+                "null": null,
+                "scalar": "ação"
+            }))
+            .map_err(|cause| cause.to_string())?;
+        for (field, op, value, expected) in [
+            ("tags", "contains", serde_json::json!("ação"), true),
+            ("tags", "contains", serde_json::json!("AÇÃO"), false),
+            ("tags", "contains", serde_json::json!(1), true),
+            ("tags", "contains", serde_json::json!("1"), false),
+            ("tags", "contains", serde_json::json!(null), true),
+            ("null", "contains", serde_json::json!(null), false),
+            ("missing", "contains", serde_json::json!("ação"), false),
+            ("missing", "notContains", serde_json::json!("ação"), true),
+            ("scalar", "contains", serde_json::json!("ação"), false),
+            (
+                "tags",
+                "containsAny",
+                serde_json::json!([false, "😀"]),
+                true,
+            ),
+            (
+                "tags",
+                "containsAny",
+                serde_json::json!([false, "1"]),
+                false,
+            ),
+            ("tags", "containsAny", serde_json::json!([]), false),
+            ("tags", "notContainsAny", serde_json::json!([]), true),
+            ("empty", "notContainsAny", serde_json::json!([1]), true),
+            ("null", "notContainsAny", serde_json::json!([null]), true),
+            ("scalar", "notContains", serde_json::json!("ação"), true),
+        ] {
+            let filter = Filter {
+                field: field.to_owned(),
+                op: op.to_owned(),
+                value,
+            };
+            assert_eq!(matches(&attributes, &[filter])?, expected);
+        }
         Ok(())
     }
 }

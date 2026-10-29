@@ -354,6 +354,12 @@ test("scalar arrays survive queries, replacement and canonical maintenance", asy
       [{ field: "tags", op: "exists", value: true }, ["a", "b"]],
       [{ field: "tags", op: "eq", value: null }, ["b"]],
       [{ field: "tags", op: "ne", value: null }, ["a", "c"]],
+      [{ field: "tags", op: "contains", value: "ação" }, ["a"]],
+      [{ field: "tags", op: "notContains", value: "ação" }, ["b", "c"]],
+      [{ field: "tags", op: "containsAny", value: ["absent", "😀"] }, ["a"]],
+      [{ field: "tags", op: "notContainsAny", value: ["absent", "😀"] }, ["b", "c"]],
+      [{ field: "tags", op: "containsAny", value: [] }, []],
+      [{ field: "tags", op: "notContainsAny", value: [] }, ["a", "b", "c"]],
     ] as const) {
       const filtered = await request(worker, namespace, "query", { ...input, filters: [filter] });
       expect(filtered.status).toBe(200);
@@ -362,6 +368,21 @@ test("scalar arrays survive queries, replacement and canonical maintenance", asy
       ).toEqual([...ids]);
     }
   }
+  for (const filter of [
+    { field: "tags", op: "containsAny", value: Array.from({ length: 33 }, () => "ação") },
+    { field: "tags", op: "contains", value: [] },
+    { field: "tags", op: "in", value: [] },
+  ])
+    expect(
+      (
+        await request(worker, namespace, "query", {
+          kind: "vector",
+          vector,
+          topK: 1,
+          filters: [filter],
+        })
+      ).status,
+    ).toBe(400);
   expect(
     (
       await request(worker, namespace, "write", {

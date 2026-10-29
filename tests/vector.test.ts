@@ -333,10 +333,11 @@ test("hybrid combines lexical and vector ranking using RRF", async () => {
 
 test("native metadata equality finds eligible vectors outside the unfiltered top fifty", async () => {
   const upserts = Array.from({ length: 160 }, (_, index) => {
-    const attributes = { group: "distractor", year: 2020 };
+    const attributes = { group: "distractor", year: 2020, eligible: ["distractor"] };
     const values = vector(1);
     if (index >= 100) {
       attributes.group = "eligible";
+      attributes.eligible = ["eligible"];
       values[0] = 0.6;
       values[1] = 0.8;
     }
@@ -361,6 +362,10 @@ test("native metadata equality finds eligible vectors outside the unfiltered top
     [{ field: "group", op: "eq", value: "eligible" }],
     [{ field: "group", op: "in", value: ["eligible", "absent"] }],
     [{ field: "group", op: "ne", value: "distractor" }],
+    [{ field: "eligible", op: "contains", value: "eligible" }],
+    [{ field: "eligible", op: "notContains", value: "distractor" }],
+    [{ field: "eligible", op: "containsAny", value: ["absent", "eligible"] }],
+    [{ field: "eligible", op: "notContainsAny", value: ["distractor"] }],
   ])
     for (const topK of [10, 50]) {
       const response = await request(worker, "prefilter", "query", {

@@ -117,7 +117,7 @@ export const QueryDocument = StoredDocument.mapFields((fields) => ({
 export const Filter = Schema.Union([
   Schema.Struct({
     field: FieldName,
-    op: Schema.Literals(["eq", "ne"]),
+    op: Schema.Literals(["eq", "ne", "contains", "notContains"]),
     value: Scalar,
   }),
   Schema.Struct({
@@ -129,6 +129,11 @@ export const Filter = Schema.Union([
     field: FieldName,
     op: Schema.Literal("in"),
     value: Schema.Array(Scalar).check(Schema.isBetweenLength(1, 32)),
+  }),
+  Schema.Struct({
+    field: FieldName,
+    op: Schema.Literals(["containsAny", "notContainsAny"]),
+    value: Schema.Array(Scalar).check(Schema.isMaxLength(32)),
   }),
   Schema.Struct({
     field: FieldName,

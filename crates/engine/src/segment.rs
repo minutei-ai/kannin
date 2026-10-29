@@ -8301,7 +8301,13 @@ mod query_document_projection_tests {
         vector: Option<Vec<f32>>,
         expected_summary: Value,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let document = document(vector.clone());
+        let expected_bits = vector.as_ref().map(|values| {
+            values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        });
+        let document = document(vector);
         let mut expected = serde_json::from_str::<Value>(&document.to_canonical_json()?)?;
         let fields = expected
             .as_object_mut()
@@ -8311,12 +8317,7 @@ mod query_document_projection_tests {
         let actual = serde_json::from_str::<Value>(&serialize_query_document(&document)?)?;
         assert_eq!(actual, expected);
         assert!(actual.get("vector").is_none());
-        assert_eq!(
-            vector_bits(&document)?,
-            vector
-                .as_ref()
-                .map(|values| values.iter().map(|value| value.to_bits()).collect())
-        );
+        assert_eq!(vector_bits(&document)?, expected_bits);
         Ok(())
     }
 
@@ -9521,7 +9522,7 @@ mod common_term_projection_tests {
 
 #[cfg(test)]
 mod candidate_tests {
-    use super::{Document, Search, Statistics, build};
+    use super::{Search, Statistics, build};
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::rc::Rc;
@@ -9788,10 +9789,8 @@ mod eligible_bound_tests {
     use serde_json::json;
     use std::collections::BTreeMap;
 
-    #[test]
-    fn eligible_bounds_cover_actual_scores_without_loosening_physical_bounds()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let docs = (0..384)
+    fn documents() -> Vec<Document> {
+        (0..384)
             .map(|row| {
                 Document::native(
                     format!("{row:05}"),
@@ -9810,8 +9809,13 @@ mod eligible_bound_tests {
                     None,
                 )
             })
-            .collect();
-        let built = build(docs, None)?;
+            .collect()
+    }
+
+    #[test]
+    fn eligible_bounds_cover_actual_scores_without_loosening_physical_bounds()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let built = build(documents(), None)?;
         let (header, base) = parse_header(&built.bytes)?;
         let statistics = Statistics {
             documents: u64::try_from(header.documents.len())?,
@@ -11573,7 +11577,9 @@ mod canonical_column_tests {
         Ok(rows)
     }
 
-    fn directory(bytes: &[u8]) -> Result<Vec<(String, u64, u32, u32, String, bool)>, String> {
+    type DirectoryRow = (String, u64, u32, u32, String, bool);
+
+    fn directory(bytes: &[u8]) -> Result<Vec<DirectoryRow>, String> {
         let (header, _) = parse_header(bytes)?;
         Ok(header
             .documents
@@ -11764,7 +11770,10 @@ mod canonical_column_tests {
         let hit = hits.first().ok_or("Missing alpha hit")?;
         assert_eq!(hit.0, 0);
         assert_eq!(hits.len(), 1);
-        assert!(ranked(&built.bytes, "attr-title", "any", &[], &[])?.is_empty());
+        assert_eq!(
+            ranked(&built.bytes, "attr-title", "any", &[], &[])?,
+            Vec::<(u32, u64)>::new()
+        );
         Ok(())
     }
 
@@ -11981,7 +11990,7 @@ mod canonical_column_tests {
     fn magic_codec_and_unknown_fields_fail_closed() -> Result<(), String> {
         let built = build(collision_documents(), None)?;
         assert_eq!(migrate_segment(&built.bytes)?, built.bytes);
-        let mut mismatched = built.bytes.clone();
+        let mut mismatched = built.bytes;
         mismatched[..8].copy_from_slice(b"RAIOSEG2");
         rejection_eq(
             parse_header(&mismatched).map(|_| ()),

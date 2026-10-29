@@ -2,7 +2,7 @@
 
 ## Local process-cold measurement protocol
 
-`tooling/benchmark-cold.ts` shares the exact corpus generator and query definitions with the existing warm workerd benchmark. It ingests into an owned temporary R2 emulator store, stops the ingestion process, and starts a fresh workerd process before every measured strong query. Startup and query/body-decode time are reported separately, with raw samples, acknowledged sequence checks, identical rows/scores across restarts and corpus/Worker/WASM hashes. Both drivers now include a Schema-encoded query hash and an exact row/score hash per query; their strong requests use the same final acknowledged `minimumSequence`. These hashes matched across five reports and eleven strong workloads in run 40902599601. Queue consumers are disabled. Temporary state and each owned process are disposed on success and failure.
+`tooling/benchmark-cold.ts` shares the exact corpus generator and query definitions with the existing warm workerd benchmark. It ingests into an owned temporary R2 emulator store, stops the ingestion process, and starts a fresh workerd process before every measured strong query. Startup and query/body-decode time are reported separately, with raw samples, acknowledged sequence checks, identical rows/scores across restarts and corpus/Worker/WASM hashes. Both drivers now include a Schema-encoded query hash and an exact row/score hash per query; their strong requests use the same final acknowledged `minimumSequence`. These hashes matched across five reports and eleven strong workloads in runs 40902599601 and 40955889009. Queue consumers are disabled. Temporary state and each owned process are disposed on success and failure.
 
 The default `RAIO_BENCH_CACHE_MODE=retained` is process-cold measurement: canonical data, derived objects and any persisted Cache API state remain available. `RAIO_BENCH_CACHE_MODE=empty` creates fresh Cache API and coordination state for every sample, linking only the same canonical R2 directory. Both modes retain derived objects in R2 and leave OS/backend caches uncontrolled. The latter isolates application cache loss without copying canonical data or clearing host caches. It does not flush host caches, establish physically cold storage, emulate the Railway control plane, compare Docker, or measure hosted latency. Five samples per query are the default; no tail percentile claim follows from that sample count. The drivers passed the complete gate and executed at `a4a1b3f`; the bounded observations below do not establish physically cold storage or hosted performance.
 
@@ -23,6 +23,30 @@ The prepared Docker driver reuses the OCI API image, S3 fixture and Varnish fixt
 `RAIO_BENCH_COLD_SAMPLES` accepts 1–20 in the workerd and direct HTTP drivers, and 1–5 in the container driver. Both workflows select 3. The corpus size matches the warm driver. Comparable Docker/workerd cold and warm measurements and hosted Railway validation remain delivery gates.
 
 The workflow matrix includes a fifth report for Docker with Varnish restarted before each cold sample. It uses the same native empty-cache mode, result hashes, resource caps and scoped cleanup as the retained-CDN arm. All five workloads executed serially in run 40902599601 after a successful complete gate, within the ten-minute measurement timeout and with one-day report retention.
+
+## Bounded local observations at a7fc13f
+
+[Run 40955889009](https://github.com/minutei-ai/kannin/actions/runs/40955889009) passed the complete gate and all five serial measurement arms, followed by the full report verifier. It measured commit `a7fc13f1d5cd529011d5936b98b1a310e8d46b02`, tree `f3ca8aa324a3665936ddde1e3c649cfae085feab`, on 1,000 documents at strong sequence 2. All five reports match corpus `3b99a137c63f0a06c33e55477d6f5d1cefdc1c3d1c75a1b00f968ccdb835cdd6`, WASM `10dd0ed0f0cd2d7743c04098ee1c77219d3a6ec5892be3c98abe8bbb87d39c72`, and the query and exact row/score hashes for all eleven strong workloads. Independent inspection of the downloaded records also checked repetition order, finite timings, 50-sample warm groups and nearest-rank percentiles.
+
+Cold values are median read milliseconds from three fresh-process samples, excluding startup/shutdown/readiness. Warm columns use fifty reads after five warmups; Docker warm values come from the retained-CDN arm. Empty-cache modes retain canonical and derived object-store objects and do not flush OS/backend caches.
+
+| Query           | workerd cold ms | workerd empty ms | Docker cold ms | Docker empty ms | workerd warm p50/p95 ms | Docker warm p50/p95 ms |
+| --------------- | --------------: | ---------------: | -------------: | --------------: | ----------------------: | ---------------------: |
+| rare            |           73.80 |            85.77 |          85.64 |           91.68 |             2.83 / 3.65 |           4.34 / 55.72 |
+| selective       |          110.72 |           133.48 |         132.80 |          156.95 |             3.60 / 4.92 |           5.93 / 61.38 |
+| common          |           51.63 |            58.37 |          43.50 |           49.59 |             2.73 / 4.23 |           5.68 / 57.56 |
+| filtered        |           82.18 |            96.66 |          68.72 |          117.08 |             3.58 / 5.55 |           5.43 / 61.48 |
+| common-all      |           49.74 |            59.97 |          41.97 |           49.75 |             2.65 / 3.47 |           5.01 / 61.44 |
+| common-phrase   |           72.39 |            78.49 |          58.59 |           62.84 |             2.83 / 4.38 |           5.53 / 57.15 |
+| filtered-all    |           84.30 |            94.96 |          67.31 |           97.85 |             3.68 / 5.45 |           5.45 / 66.43 |
+| filtered-phrase |           89.62 |            95.61 |          81.99 |          117.43 |             3.86 / 6.19 |           6.07 / 61.26 |
+| rare-64-terms   |           90.39 |           105.32 |         123.72 |          110.37 |             3.30 / 5.21 |           5.79 / 65.42 |
+| rare-256-terms  |          107.67 |           118.20 |         101.23 |          165.40 |             5.42 / 7.46 |           7.38 / 61.19 |
+| rare-512-terms  |          135.04 |           139.25 |         226.49 |          234.62 |            9.01 / 10.14 |          11.22 / 66.22 |
+
+The runner reported AMD EPYC 7763 and four available logical CPUs. workerd inherited runner limits. Docker API and RustFS each had 1 CPU/512 MiB, while Varnish had 0.5 CPU/512 MiB, all without swap. These unequal budgets prevent platform ranking or performance-parity claims. The first Docker rare read was 817.00 ms with retained CDN and 804.23 ms with empty CDN; the three-sample medians above include those costs. Cold application counters totalled 58 immutable-cache hits with retained CDN and zero with empty CDN; these are application counters rather than Varnish server counters.
+
+Railway's control plane and hosted Railway/Cloudflare latency were not measured. This run also does not measure hosted Turbopuffer or the later typed-ID/Root7 candidate. The compressed report artifact was 32,979 bytes (130,324 bytes of expanded JSON). Only these reports and provenance were downloaded to `/home/yorizel/.t3/scratch/kannin/benchmarks/40955889009/`; no local build, image, backend or benchmark was started. The GitHub artifact has one-day retention.
 
 ## Bounded local observations at ae683d1
 

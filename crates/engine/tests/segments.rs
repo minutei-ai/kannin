@@ -5,8 +5,8 @@ fn document(id: impl Into<String>, text: impl Into<String>) -> Document {
     Document::native(id, 0, String::new(), text, BTreeMap::new(), None)
 }
 
-fn legacy(header: &segment::Header) -> Result<segment::Header, String> {
-    segment::Header::from_parts(
+fn legacy(header: &Header) -> Result<Header, String> {
+    Header::from_parts(
         3,
         header.documents.clone(),
         header.fields.clone(),

@@ -341,7 +341,10 @@ fn attributes_named_title_or_text_stay_isolated_from_native_roles() -> Result<()
     for term in ["quasar", "nebula", "pulsar"] {
         assert!(named.header.terms().get(term).is_none());
         let statistics = statistics_for(&named.bytes)?;
-        assert!(native_hits(&named.bytes, statistics, term, "any", 10)?.is_empty());
+        assert_eq!(
+            native_hits(&named.bytes, statistics, term, "any", 10)?,
+            Vec::<(String, u64)>::new()
+        );
     }
     assert!(
         !document_terms(&document)?
@@ -360,7 +363,7 @@ fn attributes_named_title_or_text_stay_isolated_from_native_roles() -> Result<()
         )?,
         [0]
     );
-    assert!(
+    assert_eq!(
         ranked_ids(
             &named.bytes,
             &[DocumentColumnId::Role(NativeRole::Title)],
@@ -369,8 +372,8 @@ fn attributes_named_title_or_text_stay_isolated_from_native_roles() -> Result<()
             10,
             &[],
             &[]
-        )?
-        .is_empty()
+        )?,
+        Vec::<u32>::new()
     );
     assert_eq!(
         ranked_ids(
@@ -565,7 +568,10 @@ fn word_v4_phrases_do_not_cross_array_elements_or_stopword_gaps() -> Result<(), 
         &[NamedTextField::new("tags")],
     )?;
     let field = [tags("tags")];
-    assert!(ranked_ids(&adjacent.bytes, &field, "fox dog", "phrase", 10, &[], &[])?.is_empty());
+    assert_eq!(
+        ranked_ids(&adjacent.bytes, &field, "fox dog", "phrase", 10, &[], &[])?,
+        Vec::<u32>::new()
+    );
     assert_eq!(
         ranked_ids(&adjacent.bytes, &field, "fox dog", "all", 10, &[], &[])?,
         [0]
@@ -599,8 +605,14 @@ fn word_v4_phrases_do_not_cross_array_elements_or_stopword_gaps() -> Result<(), 
         ranked_ids(&built.bytes, &field, "café", "any", 10, &[], &[])?,
         [0, 1]
     );
-    assert!(ranked_ids(&built.bytes, &field, "café foxes", "phrase", 10, &[], &[])?.is_empty());
-    assert!(ranked_ids(&built.bytes, &field, "cafe", "any", 10, &[], &[])?.is_empty());
+    assert_eq!(
+        ranked_ids(&built.bytes, &field, "café foxes", "phrase", 10, &[], &[])?,
+        Vec::<u32>::new()
+    );
+    assert_eq!(
+        ranked_ids(&built.bytes, &field, "cafe", "any", 10, &[], &[])?,
+        Vec::<u32>::new()
+    );
     assert_eq!(
         ranked_ids(
             &built.bytes,

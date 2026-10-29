@@ -1969,16 +1969,9 @@ fn filterable_fields(names: &[String]) -> Result<BTreeSet<&str>, String> {
     let selected: BTreeSet<_> = names.iter().map(String::as_str).collect();
     if names.len() > 64
         || selected.len() != names.len()
-        || names.iter().any(|name| {
-            name.len() > 64
-                || !name
-                    .as_bytes()
-                    .first()
-                    .is_some_and(|first| first.is_ascii_alphabetic() || *first == b'_')
-                || !name
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        })
+        || names
+            .iter()
+            .any(|name| name.is_empty() || name.len() > 128 || name.starts_with('$'))
     {
         return Err("Invalid filterable attributes".to_owned());
     }
@@ -7999,10 +7992,10 @@ mod filter_cache_tests {
         for fields in [
             vec!["year".into(), "year".into()],
             vec![String::new()],
-            vec!["1year".into()],
-            vec!["a-b".into()],
-            vec!["á".into()],
-            vec!["x".repeat(65)],
+            vec!["$reserved".into()],
+            vec!["x".repeat(129)],
+            vec![format!("{}x", "é".repeat(64))],
+            vec![format!("{}x", "😀".repeat(32))],
             (0..65).map(|index| format!("field{index}")).collect(),
         ] {
             assert!(build(documents.clone(), Some(&fields)).is_err());
@@ -11016,6 +11009,42 @@ mod scalar_column_tests {
         assert_eq!(serde_json::to_vec(&restored)?, expected);
         assert_eq!(vector_prefix(&table)?, [0]);
         assert_eq!(table.vectors.iter().filter(|value| *value).count(), 10);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod attribute_name_tests {
+    use super::filterable_fields;
+
+    #[test]
+    fn names_use_utf8_byte_bounds_and_binary_field_order() -> Result<(), String> {
+        for name in [
+            "1year".to_owned(),
+            "a-b".to_owned(),
+            "ação".to_owned(),
+            "a/b".to_owned(),
+            "x".repeat(128),
+            "é".repeat(64),
+            "😀".repeat(32),
+        ] {
+            let names = [name.clone()];
+            assert!(filterable_fields(&names)?.contains(name.as_str()));
+        }
+        for name in [
+            String::new(),
+            "$reserved".to_owned(),
+            "x".repeat(129),
+            format!("{}x", "é".repeat(64)),
+            format!("{}x", "😀".repeat(32)),
+        ] {
+            assert!(filterable_fields(&[name]).is_err());
+        }
+        let names = ["😀".to_owned(), "\u{e000}".to_owned()];
+        assert_eq!(
+            filterable_fields(&names)?.into_iter().collect::<Vec<_>>(),
+            ["\u{e000}", "😀"]
+        );
         Ok(())
     }
 }

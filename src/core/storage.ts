@@ -39,6 +39,7 @@ import type {
   LocatedDocument,
 } from "../protocol";
 import {
+  compareFieldNames,
   StoredDocument,
   QueryDocument,
   SegmentHeader,
@@ -2171,7 +2172,7 @@ export function createStorage(runtime: SearchRuntime) {
           });
         const encodedFilters = yield* Schema.encodeEffect(TermFilters)(filters);
         const fieldSelector = encodeEligibilityFields(
-          [...new Set(filters.map((filter) => filter.field))].toSorted(),
+          [...new Set(filters.map((filter) => filter.field))].toSorted(compareFieldNames),
         );
         const eligibilityQuery = yield* Effect.acquireRelease(
           Effect.sync(() => new EligibilityQuery(encodedFilters)),
@@ -2342,7 +2343,9 @@ export function createStorage(runtime: SearchRuntime) {
                   const actual = selection.value.filters;
                   selection.value = {
                     kind: "fields",
-                    fields: [...new Set(actual.map((filter) => filter.field))].toSorted(),
+                    fields: [...new Set(actual.map((filter) => filter.field))].toSorted(
+                      compareFieldNames,
+                    ),
                   };
                   headers.set("x-kannin-filters", filterHeader);
                 }

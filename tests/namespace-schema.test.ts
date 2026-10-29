@@ -10,6 +10,8 @@ import {
   NamespaceSchema,
   QueryResult,
   WriteResult,
+  FieldName,
+  compareFieldNames,
 } from "../src/protocol";
 import { request, startWorker, textQuery } from "./harness";
 
@@ -312,6 +314,102 @@ test("namespace-local canonical filters are immediately visible after schema-onl
   expect(after).toEqual(before);
 });
 
+test("attribute names enforce UTF-8 byte bounds and native field ordering", () => {
+  for (const name of [
+    "1year",
+    "a-b",
+    "ação",
+    "a/b",
+    "x".repeat(128),
+    "é".repeat(64),
+    "😀".repeat(32),
+  ])
+    expect(Schema.is(FieldName)(name)).toBe(true);
+  for (const name of [
+    "",
+    "$reserved",
+    "x".repeat(129),
+    `${"é".repeat(64)}x`,
+    `${"😀".repeat(32)}x`,
+    "\uD800",
+  ])
+    expect(Schema.is(FieldName)(name)).toBe(false);
+  expect(["😀", "\uE000", "é", "a", "aa", ""].toSorted(compareFieldNames)).toEqual([
+    "",
+    "a",
+    "aa",
+    "é",
+    "\uE000",
+    "😀",
+  ]);
+});
+
+test("Unicode attribute names survive canonical restart and multi-field filtering", async () => {
+  const persistence = await mkdtemp(join(tmpdir(), "kannin-unicode-fields-"));
+  await using cleanup = new AsyncDisposableStack();
+  cleanup.defer(() => rm(persistence, { recursive: true, force: true }));
+  const namespace = "unicode-fields";
+  const fields = ["1year", "a-b", "ação", "😀", "\uE000", 'quote"\\field', "a/b", "😀".repeat(32)];
+  const vector = [1, 0];
+  const attributes = Object.fromEntries(fields.map((field) => [field, "selected"]));
+  {
+    const writer = await startWorker(persistence);
+    await using lifetime = new AsyncDisposableStack();
+    lifetime.defer(() => writer.dispose());
+    expect(
+      (
+        await request(writer, namespace, "write", {
+          requestId: "seed",
+          schema: { filterable: fields, vectorFilterFields: [], vectorDimensions: 2 },
+          upserts: [
+            { id: "a", text: "names record", attributes, vector },
+            {
+              id: "b",
+              text: "names record",
+              vector,
+              attributes: Object.fromEntries(fields.map((field) => [field, "other"])),
+            },
+          ],
+          deletes: [],
+        })
+      ).status,
+    ).toBe(200);
+  }
+  const reader = await startWorker(persistence);
+  cleanup.defer(() => reader.dispose());
+  for (const input of [
+    textQuery("names"),
+    { kind: "vector", vector, topK: 10, filters: [] },
+    { kind: "hybrid", text: "names", vector, topK: 10, filters: [] },
+  ]) {
+    const response = await request(reader, namespace, "query", {
+      ...input,
+      minimumSequence: 1,
+      filters: fields.map((field) => ({ field, op: "eq", value: "selected" })),
+    });
+    expect(response.status).toBe(200);
+    const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+    expect(result.rows.map((row) => row.id)).toEqual(["a"]);
+    expect(result.rows[0]?.attributes).toEqual(attributes);
+  }
+  for (const [index, field] of ["$reserved", `${"😀".repeat(32)}x`].entries()) {
+    const invalid = `invalid-field-${index}`;
+    expect(
+      (
+        await request(reader, invalid, "write", {
+          requestId: "invalid",
+          schema: { filterable: [field], vectorFilterFields: [] },
+          upserts: [{ id: "a", text: "invalid", attributes: { [field]: "value" } }],
+          deletes: [],
+        })
+      ).status,
+    ).toBe(400);
+    expect(
+      await (await reader.getR2Bucket("STORAGE")).get(`namespaces/${invalid}/root.json`),
+    ).toBeNull();
+  }
+});
+
 test("string ranges preserve binary order and exact types across native query kinds", async () => {
   const namespace = "string-ranges";
   const vector = [1, 0];
@@ -330,7 +428,12 @@ test("string ranges preserve binary order and exact types across native query ki
       await request(worker, namespace, "write", {
         requestId: "seed",
         schema: { filterable: ["label"], vectorFilterFields: [], vectorDimensions: 2 },
-        upserts: values.map((value) => ({ ...value, text: "ordered record", vector })),
+        upserts: values.map(({ id, attributes }) => ({
+          id,
+          attributes,
+          text: "ordered record",
+          vector,
+        })),
         deletes: [],
       })
     ).status,

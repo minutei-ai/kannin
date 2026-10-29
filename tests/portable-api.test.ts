@@ -38,12 +38,22 @@ test("portable API persists native writes and strong queries across application 
           app.fetch(
             request(`/v1/namespaces/${namespace}/write`, {
               requestId: "first",
-              schema: { filterable: [], vectorFilterFields: [], vectorDimensions: 2 },
+              schema: {
+                filterable: ["😀", "\uE000", "ação"],
+                vectorFilterFields: [],
+                vectorDimensions: 2,
+              },
               upserts: [
                 {
                   id: "one",
                   text: "portable search",
-                  attributes: { group: "a", tags: ["ação", "😀"] },
+                  attributes: {
+                    group: "a",
+                    tags: ["ação", "😀"],
+                    ação: "selected",
+                    "😀": "selected",
+                    "\uE000": "selected",
+                  },
                   vector: [1, 0],
                 },
               ],
@@ -68,7 +78,11 @@ test("portable API persists native writes and strong queries across application 
               kind: "text",
               text: "portable",
               topK: 10,
-              filters: [],
+              filters: ["😀", "\uE000", "ação"].map((field) => ({
+                field,
+                op: "eq",
+                value: "selected",
+              })),
             }),
           ),
         );
@@ -84,7 +98,11 @@ test("portable API persists native writes and strong queries across application 
               kind: "vector",
               vector: [1, 0],
               topK: 1,
-              filters: [],
+              filters: ["😀", "\uE000", "ação"].map((field) => ({
+                field,
+                op: "eq",
+                value: "selected",
+              })),
               minimumSequence: 1,
             }),
           ),

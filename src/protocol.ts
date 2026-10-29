@@ -23,13 +23,33 @@ export const Operation = Schema.Literals([
   "migrate-root",
 ]);
 export const Scalar = Schema.Union([Unicode, Schema.Finite, Schema.Boolean, Schema.Null]);
-export const FieldName = Schema.String.check(Schema.isPattern(/^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/));
+const textEncoder = new TextEncoder();
+export const FieldName = Unicode.check(
+  Schema.isBetweenLength(1, 128),
+  Schema.makeFilter(
+    (name) =>
+      (!name.startsWith("$") && textEncoder.encode(name).byteLength <= 128) ||
+      "Attribute names must fit 128 UTF-8 bytes and cannot start with $",
+  ),
+);
+export function compareFieldNames(left: string, right: string): number {
+  let offset = 0;
+  const length = Math.min(left.length, right.length);
+  while (offset < length) {
+    const a = left.codePointAt(offset);
+    const b = right.codePointAt(offset);
+    if (a === undefined || b === undefined) break;
+    if (a !== b) return a - b;
+    offset += 1;
+    if (a > 0xffff) offset += 1;
+  }
+  return left.length - right.length;
+}
 export const AttributeValue = Schema.Union([
   Scalar,
   Schema.Array(Scalar).check(Schema.isMaxLength(4096)),
 ]);
 export const Attributes = Schema.Record(FieldName, AttributeValue);
-const textEncoder = new TextEncoder();
 const encodeAttributes = Schema.encodeSync(Schema.fromJsonString(Attributes), {
   disableChecks: true,
 });
@@ -826,7 +846,7 @@ const EligibilityProjectionValue = Schema.Struct({
       (fields) =>
         fields.every((field, index) => {
           const previous = fields[index - 1];
-          return previous === undefined || previous < field;
+          return previous === undefined || compareFieldNames(previous, field) < 0;
         }) || "Eligibility fields must be sorted and unique",
     ),
   ),

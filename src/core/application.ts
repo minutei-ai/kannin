@@ -40,6 +40,7 @@ import {
 } from "../../dist/wasm/raio_engine";
 import type { Snapshot, TextPlan, NativeVectorLocation } from "../protocol";
 import {
+  compareFieldNames,
   Filter,
   DEFAULT_VECTOR_DIMENSIONS,
   StoredDocument,
@@ -379,7 +380,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       if (filters.value._tag === "Failure")
         return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });
       const actual = filters.value.value;
-      const fields = [...new Set(actual.map((filter) => filter.field))].toSorted();
+      const fields = [...new Set(actual.map((filter) => filter.field))].toSorted(compareFieldNames);
       const selection = props.value.selection;
       const prefixes = props.value.prefixes;
       if (
@@ -840,7 +841,9 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
           )
         );
       });
-    const filterFields = [...new Set(input.filters.map((filter) => filter.field))].toSorted();
+    const filterFields = [...new Set(input.filters.map((filter) => filter.field))].toSorted(
+      compareFieldNames,
+    );
     const rootFiltered =
       input.filters.length > 0 &&
       selections.every(({ segment, terms: requested }) => {

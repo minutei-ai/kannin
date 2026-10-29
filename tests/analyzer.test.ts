@@ -124,7 +124,6 @@ test("word_v4 stemming runs in workerd with the same WASM and no platform bindin
     target: "browser",
     format: "esm",
     minify: true,
-    write: false,
     plugins: [
       {
         name: "wasm",

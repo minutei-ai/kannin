@@ -304,19 +304,31 @@ export const DocumentColumnId = Schema.Union([
   }),
   Schema.Struct({ source: Schema.Literal("attribute"), name: FieldName }),
 ]);
-const CanonicalUintIdValue = Schema.String.check(
+export const Int64Text = Schema.String.check(
+  Schema.isPattern(/^(0|-?[1-9][0-9]{0,18})(?![\s\S])/),
+  Schema.makeFilter((value) => {
+    if (value.startsWith("-")) {
+      const magnitude = value.slice(1);
+      return (
+        magnitude.length < 19 || magnitude <= "9223372036854775808" || "Value exceeds int64 range"
+      );
+    }
+    return value.length < 19 || value <= "9223372036854775807" || "Value exceeds int64 range";
+  }),
+);
+export const Uint64Text = Schema.String.check(
   Schema.isPattern(/^(0|[1-9][0-9]{0,19})(?![\s\S])/),
   Schema.makeFilter(
     (value) => value.length < 20 || value <= "18446744073709551615" || "ID exceeds uint64 range",
   ),
 );
-const CanonicalUuidIdValue = Schema.String.check(
+export const UuidText = Schema.String.check(
   Schema.isPattern(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\s\S])/),
 );
 export const CanonicalId = Schema.Union([
   Id,
-  Schema.Struct({ kind: Schema.Literal("uint"), value: CanonicalUintIdValue }),
-  Schema.Struct({ kind: Schema.Literal("uuid"), value: CanonicalUuidIdValue }),
+  Schema.Struct({ kind: Schema.Literal("uint"), value: Uint64Text }),
+  Schema.Struct({ kind: Schema.Literal("uuid"), value: UuidText }),
 ]);
 export const BloomValue = Schema.Union([Schema.String, CanonicalId]);
 export const IdType = Schema.Literals(["string", "uint", "uuid"]);

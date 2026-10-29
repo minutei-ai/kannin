@@ -1936,7 +1936,7 @@ impl Header {
         let documents = self.documents.rows.capacity()
             * size_of::<DocumentMeta<std::ops::Range<usize>, (), (), ()>>()
             + self.documents.ids.capacity()
-            + std::mem::size_of_val(self.documents.typed_ids.as_ref())
+            + size_of_val(self.documents.typed_ids.as_ref())
             + self.documents.attributes.heap_bytes()
             + self.documents.lengths.capacity() * size_of::<ScalarColumn<u32>>()
             + 16

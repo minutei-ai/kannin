@@ -53,7 +53,8 @@ jobs:
           RAIO_BENCH_CACHE_MODE=empty bun tooling/benchmark-cold.ts > "$RUNNER_TEMP/cache-cold.json"
           bun tooling/benchmark.ts > "$RUNNER_TEMP/warm.json"
           RAIO_BENCH_CACHE_MODE=retained bun tooling/benchmark-container.ts > "$RUNNER_TEMP/docker.json"
-          bun tooling/verify-benchmarks.ts "$RUNNER_TEMP/process-cold.json" "$RUNNER_TEMP/cache-cold.json" "$RUNNER_TEMP/warm.json" "$RUNNER_TEMP/docker.json"
+          RAIO_BENCH_CACHE_MODE=empty bun tooling/benchmark-container.ts > "$RUNNER_TEMP/docker-cache-cold.json"
+          bun tooling/verify-benchmarks.ts "$RUNNER_TEMP/process-cold.json" "$RUNNER_TEMP/cache-cold.json" "$RUNNER_TEMP/warm.json" "$RUNNER_TEMP/docker.json" "$RUNNER_TEMP/docker-cache-cold.json"
       - name: Retain successful measurement reports and gate provenance
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -63,6 +64,7 @@ jobs:
             ${{ runner.temp }}/cache-cold.json
             ${{ runner.temp }}/warm.json
             ${{ runner.temp }}/docker.json
+            ${{ runner.temp }}/docker-cache-cold.json
             ${{ runner.temp }}/gate.json
             dist/validation.json
           if-no-files-found: error

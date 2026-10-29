@@ -74,7 +74,8 @@ jobs:
           RAIO_BENCH_CACHE_MODE=empty bun tooling/benchmark-cold.ts > "$RUNNER_TEMP/kannin-cache-cold.json"
           bun tooling/benchmark.ts > "$RUNNER_TEMP/kannin-warm.json"
           RAIO_BENCH_CACHE_MODE=retained bun tooling/benchmark-container.ts > "$RUNNER_TEMP/kannin-docker.json"
-          bun tooling/verify-benchmarks.ts "$RUNNER_TEMP/kannin-process-cold.json" "$RUNNER_TEMP/kannin-cache-cold.json" "$RUNNER_TEMP/kannin-warm.json" "$RUNNER_TEMP/kannin-docker.json"
+          RAIO_BENCH_CACHE_MODE=empty bun tooling/benchmark-container.ts > "$RUNNER_TEMP/kannin-docker-cache-cold.json"
+          bun tooling/verify-benchmarks.ts "$RUNNER_TEMP/kannin-process-cold.json" "$RUNNER_TEMP/kannin-cache-cold.json" "$RUNNER_TEMP/kannin-warm.json" "$RUNNER_TEMP/kannin-docker.json" "$RUNNER_TEMP/kannin-docker-cache-cold.json"
       - name: Retain bounded local backend measurement reports
         if: github.event_name == 'workflow_dispatch' && inputs.measure_workerd
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -85,6 +86,7 @@ jobs:
             ${{ runner.temp }}/kannin-warm.json
             ${{ runner.temp }}/kannin-cache-cold.json
             ${{ runner.temp }}/kannin-docker.json
+            ${{ runner.temp }}/kannin-docker-cache-cold.json
             dist/validation.json
           if-no-files-found: error
           retention-days: 1

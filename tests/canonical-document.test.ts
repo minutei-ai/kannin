@@ -59,6 +59,7 @@ test("canonical native roles remain distinct from same-name attribute columns", 
   });
   expect(canonicalToQueryRow(query, 0.75)).toEqual({
     ...Struct.omit(document, ["vector"]),
+    title: document.title ?? "",
     revision: 7,
     score: 0.75,
   });

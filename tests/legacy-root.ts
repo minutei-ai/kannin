@@ -288,6 +288,7 @@ export function migrationRootFacts(root: typeof Root.Type) {
   const { bloomPacks: _bloomPacks, segments, ...fields } = root;
   return {
     ...fields,
+    idType: root.idType ?? "string",
     segments: segments.map(
       ({
         key: _key,

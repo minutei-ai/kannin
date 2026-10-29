@@ -1050,10 +1050,32 @@ fn shared_global_statistics_make_split_segments_bit_identical_to_one_segment() -
         assert!(!expected.is_empty());
         assert_eq!(expected, scored(&whole, &query(&fields, text, None))?);
         let mut merged = Vec::new();
+        let mut aggregated = global.clone();
+        aggregated.documents = 0;
+        for field in &mut aggregated.fields {
+            field.tokens = 0;
+            field
+                .frequencies
+                .values_mut()
+                .for_each(|frequency| *frequency = 0);
+        }
         for range in [0..13, 13..60, 60..90] {
             let part = mixed_segment(documents[range].to_vec())?;
+            let local = local_field_statistics(&part, &fields, text, "any", &[])?;
+            aggregated.documents += local.documents;
+            for (total, field) in aggregated.fields.iter_mut().zip(local.fields) {
+                assert_eq!(total.id, field.id);
+                total.tokens += field.tokens;
+                for (term, frequency) in field.frequencies {
+                    *total
+                        .frequencies
+                        .get_mut(&term)
+                        .ok_or("Missing aggregate term")? += frequency;
+                }
+            }
             merged.extend(scored(&part, &query(&fields, text, Some(&global)))?);
         }
+        assert_eq!(aggregated, global);
         assert_eq!(merged_order(merged), expected);
         let isolated = mixed_segment(documents[..13].to_vec())?;
         assert_ne!(

@@ -4,6 +4,7 @@ import {
   initSync,
   aggregate_field_statistics,
   Directory,
+  FieldStatisticsTotal,
   directory_compress,
   segment_fields,
   Segment,
@@ -376,6 +377,14 @@ test("directory statistics passes count live named fields without reading fully 
   expect(removed.documents).toBe(2);
   const encode = Schema.encodeSync(Schema.fromJsonString(Schema.Array(CorpusStatistics)));
   const total = decodeStats(aggregate_field_statistics(encode([live, removed])));
+  using accumulator = new FieldStatisticsTotal();
+  expect(() => accumulator.finish()).toThrow("required");
+  const encodePart = Schema.encodeSync(Schema.fromJsonString(CorpusStatistics));
+  accumulator.add(encodePart(live));
+  accumulator.add(encodePart(removed));
+  expect(decodeStats(accumulator.finish())).toEqual(total);
+  expect(() => accumulator.add("{}")).toThrow();
+  expect(decodeStats(accumulator.finish())).toEqual(total);
   expect(total.documents).toBe(5);
   expect(total.fields.map(({ frequencies }) => frequencies)).toEqual([{ red: 5, fox: 5 }]);
   expect(aggregate_field_statistics(encode([removed, live]))).toBe(
@@ -389,4 +398,13 @@ test("directory statistics passes count live named fields without reading fully 
       1024,
     ),
   ).toThrow();
+});
+
+test("incremental field statistics preserve their total when transport bounds overflow", () => {
+  using total = new FieldStatisticsTotal();
+  const part = JSON.stringify({ documents: Number.MAX_SAFE_INTEGER, fields: [] });
+  total.add(part);
+  const before = total.finish();
+  expect(() => total.add(part)).toThrow("safe JSON");
+  expect(total.finish()).toBe(before);
 });

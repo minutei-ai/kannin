@@ -6719,6 +6719,54 @@ pub mod wasm {
     }
 
     #[wasm_bindgen]
+    pub struct FieldStatisticsTotal {
+        total: Option<CorpusStatistics>,
+    }
+
+    impl Default for FieldStatisticsTotal {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    #[wasm_bindgen]
+    impl FieldStatisticsTotal {
+        #[wasm_bindgen(constructor)]
+        #[must_use]
+        pub const fn new() -> Self {
+            Self { total: None }
+        }
+
+        #[doc = "# Errors\nRejects malformed or oversized input, mismatching fields or terms and unsafe count totals. Failed additions preserve the previous total."]
+        pub fn add(&mut self, json: &str) -> Result<(), JsValue> {
+            check_field_json(json)?;
+            let dto: CorpusStatisticsDto = serde_json::from_str(json)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            let part: CorpusStatistics = dto
+                .try_into()
+                .map_err(|cause: String| JsValue::from_str(&cause))?;
+            let parts = match &self.total {
+                Some(total) => vec![total.clone(), part],
+                None => vec![part],
+            };
+            let total =
+                super::aggregate_statistics(&parts).map_err(|cause| JsValue::from_str(&cause))?;
+            encode_field_statistics(&total)?;
+            self.total = Some(total);
+            Ok(())
+        }
+
+        #[doc = "# Errors\nRejects an empty accumulator and unsafe count serialization."]
+        pub fn finish(&self) -> Result<String, JsValue> {
+            let total = self
+                .total
+                .as_ref()
+                .ok_or_else(|| JsValue::from_str("Statistics parts are required"))?;
+            encode_field_statistics(total)
+        }
+    }
+
+    #[wasm_bindgen]
     #[doc = "# Errors\nRejects malformed or oversized statistics, mismatching fields or terms, unsafe JSON counts and addition overflow."]
     pub fn aggregate_field_statistics(json: &str) -> Result<String, JsValue> {
         check_field_json(json)?;

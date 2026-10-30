@@ -145,7 +145,7 @@ test("typed identities survive the real object-store writer, restart, ranking an
         );
         if (rootObject === null) throw new Error("Typed Root is missing");
         const rootText = yield* Effect.tryPromise(() => rootObject.text());
-        expect(rootText).toContain('"version":7');
+        expect(rootText).toContain('"version":8');
         expect(rootText).toContain('"idType":"uint"');
         expect(rootText).toContain('"value":"2"');
         const root = decodeRoot(rootText);
@@ -365,7 +365,7 @@ test("typed identities survive the real object-store writer, restart, ranking an
         const checkpoint = yield* Effect.tryPromise(() => bucket.get(checkpointKey));
         if (checkpoint === null) throw new Error("Migrated checkpoint missing");
         expect(checkpoint.customMetadata?.expiresAt).toBe(expiresAt);
-        expect(yield* Effect.tryPromise(() => checkpoint.text())).toContain('"version":7');
+        expect(yield* Effect.tryPromise(() => checkpoint.text())).toContain('"version":8');
         yield* Effect.promise(restarted.dispose);
         yield* Effect.tryPromise(() => bucket.put(rootKey, legacyWire));
         const booted = yield* portableApplication({ token, scope: namespace, module }).pipe(

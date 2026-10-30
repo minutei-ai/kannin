@@ -128,6 +128,67 @@ const emptyWrite = (
   ...extra,
 });
 
+test("typed cells retain uint64 and UUID identities through compaction and rebuild", async () => {
+  const cases = [
+    {
+      policy: "uint",
+      values: [
+        { kind: "uint", value: "9007199254740993" },
+        { kind: "uint", value: MAX_U64 },
+      ],
+    },
+    {
+      policy: "uuid",
+      values: [
+        { kind: "uuid", value: "00000000-0000-0000-0000-000000000001" },
+        { kind: "uuid", value: "ffffffff-ffff-ffff-ffff-ffffffffffff" },
+      ],
+    },
+  ] as const;
+  const attributes = { count: { u64: MAX_U64 } };
+  for (const entry of cases) {
+    const namespace = `typed-identity-${entry.policy}`;
+    for (const [index, id] of entry.values.entries()) {
+      await ok(
+        await request(worker, namespace, "write", {
+          kind: "typed",
+          requestId: `row${index}`,
+          idType: entry.policy,
+          declaration: {
+            vectorDimensions: 2,
+            columns: [{ name: "count", type: "u64", filterable: true }],
+          },
+          upserts: [{ id, roles: { title: "", text: "identity" }, attributes, vector: [1, 0] }],
+          deletes: [],
+        }),
+      );
+    }
+    for (const operation of ["compact", "rebuild", "vector-rebuild"]) {
+      await ok(await request(worker, namespace, operation, {}));
+    }
+    for (const ranking of [
+      { kind: "text", text: "identity" },
+      { kind: "vector", vector: [1, 0] },
+    ]) {
+      const result = Schema.decodeUnknownSync(QueryResult)(
+        await (
+          await ok(
+            await request(worker, namespace, "query", {
+              ...ranking,
+              topK: 2,
+              filters: [{ field: "count", op: "eq", value: attributes.count }],
+            }),
+          )
+        ).json(),
+      );
+      expect(ids(result)).toEqual(entry.values);
+      for (const row of result.rows) {
+        expect(row.attributes).toEqual(expectedAttributes(attributes));
+      }
+    }
+  }
+});
+
 test("1024 typed columns commit while overflowing declarations write no namespace objects", async () => {
   const columns = Array.from({ length: 1024 }, (_, index) => ({
     name: `column${index}`,

@@ -77,8 +77,10 @@ Authenticated namespace endpoints support atomic writes, text/vector/hybrid quer
 
 [API and durability](docs/api.md) · [architecture](docs/architecture.md) · [search research](docs/search-research.md) · [lint](docs/lint.md)
 
+The current source introduces an explicit internal canonical write envelope for string, uint64 and UUID identities through the same object-storage writer. Root v7 owns one ID-type policy, typed rows retain tagged IDs, and native write/log/receipt contracts remain available. Root v6 requires envelope-only migration; segment/log/receipt objects are retained. This cut passed the [complete gate at `9367a54`](https://github.com/minutei-ai/kannin/actions/runs/40974573962); hosted validation remains open. Public Turbopuffer typed schemas, row codecs, attribute predicates, inference and null semantics remain delivery gates; the internal extension does not establish public v2 compatibility.
+
+The candidate Rust/WASM engine also contains exact typed attribute cells in RAIOSEG6, with matching TypeScript cell contracts. This later cut is unvalidated and is not connected to application writes, Root schemas or public v2 routes. Its presence does not establish typed-attribute API compatibility.
+
 ## License
 
 MIT. Third-party licenses remain with their packages. [Declared Alchemy patch](docs/alchemy-patch.md).
-
-The current source introduces an explicit internal canonical write envelope for string, uint64 and UUID identities through the same object-storage writer. Root v7 owns one ID-type policy, typed rows retain tagged IDs, and native write/log/receipt contracts remain available. Root v6 requires envelope-only migration; segment/log/receipt objects are retained. This cut awaits its complete gate and hosted validation. Public Turbopuffer typed schemas, row codecs, attribute predicates, inference and null semantics remain delivery gates; the internal extension does not establish public v2 compatibility.

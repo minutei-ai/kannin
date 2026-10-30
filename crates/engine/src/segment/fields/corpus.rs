@@ -133,7 +133,7 @@ pub fn plan_statistics_pages(
 }
 
 // Adapter over complete segment bytes with `FieldBudget::UNBOUNDED`.
-pub(super) fn local_statistics(
+pub(in crate::segment) fn local_statistics(
     header: &Header,
     bytes: &[u8],
     base: usize,

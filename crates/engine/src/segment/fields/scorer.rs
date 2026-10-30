@@ -219,7 +219,7 @@ pub fn plan_rank_pages(
 // Adapter over complete segment bytes. It passes `FieldBudget::UNBOUNDED`, so
 // it keeps the original unbounded behavior; budgets apply to the page entry
 // points only.
-pub(super) fn rank(
+pub(in crate::segment) fn rank(
     header: &Header,
     bytes: &[u8],
     base: usize,

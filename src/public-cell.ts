@@ -2,11 +2,15 @@ import { Effect, Schema } from "effect";
 import type { Cause } from "effect";
 import {
   NativeJsonNumeric,
+  PublicAttributesInput,
+  PublicAttributesRejection,
   PublicCellAliasType,
   PublicCellRejection,
   PublicCellType,
   TypedCell,
+  TypedAttributes,
   TypedColumnType,
+  TypedDeclaration,
 } from "./protocol";
 
 type ColumnType = typeof TypedColumnType.Type;
@@ -198,4 +202,59 @@ export const encodePublicCell = Effect.fn("kannin.public.encodeCell")(function* 
   if (!shape.array) return yield* reject("type-mismatch", shape.type);
   const items: ReadonlyArray<Element> = typed;
   return yield* Effect.forEach(items, (item) => encodeElement(item, shape.type));
+});
+
+const declaredColumns = (declaration: unknown) =>
+  Schema.decodeUnknownEffect(TypedDeclaration, { onExcessProperty: "error" })(declaration).pipe(
+    Effect.map(
+      (decoded) => new Map(decoded.columns.map((column) => [column.name, column] as const)),
+    ),
+  );
+
+export const decodePublicAttributes = Effect.fn("kannin.public.decodeAttributes")(function* (
+  declaration: unknown,
+  input: unknown,
+) {
+  const columns = yield* declaredColumns(declaration);
+  const attributes = yield* Schema.decodeUnknownEffect(PublicAttributesInput)(input);
+  const entries = yield* Effect.forEach(Object.entries(attributes), ([name, value]) =>
+    Effect.gen(function* () {
+      const column = columns.get(name);
+      if (column === undefined)
+        return yield* Effect.fail(
+          new PublicAttributesRejection({ field: name, reason: "undeclared-attribute" }),
+        );
+      const cell = yield* decodePublicCell(column.type, value, {
+        nullable: column.nullable === true,
+      });
+      return [name, cell] as const;
+    }),
+  );
+  return yield* Schema.decodeUnknownEffect(TypedAttributes, { onExcessProperty: "error" })(
+    Object.fromEntries(entries),
+  );
+});
+
+export const encodePublicAttributes = Effect.fn("kannin.public.encodeAttributes")(function* (
+  declaration: unknown,
+  input: unknown,
+) {
+  const columns = yield* declaredColumns(declaration);
+  const attributes = yield* Schema.decodeUnknownEffect(TypedAttributes, {
+    onExcessProperty: "error",
+  })(input);
+  const entries = yield* Effect.forEach(Object.entries(attributes), ([name, cell]) =>
+    Effect.gen(function* () {
+      const column = columns.get(name);
+      if (column === undefined)
+        return yield* Effect.fail(
+          new PublicAttributesRejection({ field: name, reason: "undeclared-attribute" }),
+        );
+      const value = yield* encodePublicCell(column.type, cell, {
+        nullable: column.nullable === true,
+      });
+      return [name, value] as const;
+    }),
+  );
+  return Object.fromEntries(entries);
 });

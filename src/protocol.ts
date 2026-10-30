@@ -505,6 +505,14 @@ export const TypedCell = Schema.Union([
   TypedCellArray,
 ]);
 export const TypedAttributes = Schema.Record(FieldName, TypedCell);
+export const PublicAttributesInput = Schema.Record(FieldName, Schema.Unknown);
+export class PublicAttributesRejection extends Schema.TaggedError<
+  PublicAttributesRejection,
+  { readonly brand: unique symbol }
+>()("PublicAttributesRejection", {
+  field: FieldName,
+  reason: Schema.Literal("undeclared-attribute"),
+}) {}
 const StoredAttributes = Schema.Record(FieldName, Schema.Union([AttributeValue, TypedCell]));
 export const TypedTag = Schema.Union([
   TypedIntCell,

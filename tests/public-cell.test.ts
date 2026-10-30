@@ -2,7 +2,12 @@ import { expect, test } from "bun:test";
 import { Cause, Effect, Exit, Option, Schema } from "effect";
 import { Miniflare } from "miniflare";
 import { Float64BitsText, TypedCell } from "../src/protocol";
-import { decodePublicCell, encodePublicCell } from "../src/public-cell";
+import {
+  decodePublicAttributes,
+  decodePublicCell,
+  encodePublicAttributes,
+  encodePublicCell,
+} from "../src/public-cell";
 import { decodePublicJson, encodePublicJson } from "../src/public-json";
 
 const strict = { nullable: false };
@@ -40,6 +45,74 @@ const bitsOf = (value: number) => {
 
 const repeated = (item: string, count: number) =>
   `[${Array.from({ length: count }, () => item).join(",")}]`;
+
+test("attribute maps preserve exact cells, explicit null and absent columns", () => {
+  const declaration = {
+    columns: [
+      { name: "count", type: "u64" },
+      { name: "note", type: "string", nullable: true },
+      { name: "missing", type: "bool", nullable: true },
+      { name: "payload", type: "bytes" },
+    ],
+  };
+  const text = '{"count":18446744073709551615,"note":null,"payload":"AP8="}';
+  const attributes = Effect.runSync(
+    decodePublicJson(text).pipe(
+      Effect.flatMap((wire) => decodePublicAttributes(declaration, wire)),
+    ),
+  );
+  expect(attributes).toEqual({
+    count: { u64: "18446744073709551615" },
+    note: null,
+    payload: { bytes: "AP8=" },
+  });
+  expect(Object.hasOwn(attributes, "missing")).toBe(false);
+  expect(
+    Effect.runSync(
+      encodePublicAttributes(declaration, attributes).pipe(Effect.flatMap(encodePublicJson)),
+    ),
+  ).toBe(text);
+  expect(Effect.runSync(decodePublicAttributes(declaration, {}))).toEqual({});
+  expect(Effect.runSync(encodePublicAttributes(declaration, {}))).toEqual({});
+});
+
+test("attribute maps reject undeclared fields and validate declarations and cells", () => {
+  const declaration = { columns: [{ name: "count", type: "u64" }] };
+  const undeclared = {
+    _tag: "PublicAttributesRejection",
+    field: "extra",
+    reason: "undeclared-attribute",
+  };
+  expect(failureOf(decodePublicAttributes(declaration, { extra: "value" }))).toMatchObject(
+    undeclared,
+  );
+  expect(failureOf(encodePublicAttributes(declaration, { extra: "value" }))).toMatchObject(
+    undeclared,
+  );
+  for (const input of [null, [], true, "value", { count: null }, { count: "1" }]) {
+    expect(rejected(decodePublicAttributes(declaration, input))).toBe(true);
+    expect(rejected(encodePublicAttributes(declaration, input))).toBe(true);
+  }
+  for (const invalid of [
+    { columns: [{ name: "count", type: "u64", ignored: true }] },
+    { columns: [{ name: "count", type: "u64" }], ignored: true },
+    {
+      columns: [
+        { name: "count", type: "u64" },
+        { name: "count", type: "u64" },
+      ],
+    },
+    { columns: [{ name: "$reserved", type: "string" }] },
+  ]) {
+    expect(rejected(decodePublicAttributes(invalid, {}))).toBe(true);
+    expect(rejected(encodePublicAttributes(invalid, {}))).toBe(true);
+  }
+  expect(rejected(decodePublicAttributes(declaration, { count: { u64: "1" } }))).toBe(true);
+  expect(rejected(encodePublicAttributes(declaration, { count: JSON.rawJSON("1") }))).toBe(true);
+  expect(
+    rejected(encodePublicAttributes(declaration, { count: { u64: "1", ignored: true } })),
+  ).toBe(true);
+});
 
 test("signed and unsigned integers keep exact endpoints from raw numeric tokens", () => {
   for (const value of [

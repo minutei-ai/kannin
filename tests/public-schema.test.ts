@@ -219,7 +219,11 @@ test("prototype-related attribute names remain ordinary own properties", () => {
       encodePublicAttributes(declaration, cells).pipe(Effect.flatMap(encodePublicJson)),
     ),
   ).toBe(text);
-  expect(Effect.runSync(encodePublicSchema(declaration))).toEqual(schema);
+  const projected = Effect.runSync(encodePublicSchema(declaration));
+  expect(Object.hasOwn(projected, "__proto__")).toBe(true);
+  expect(projected["__proto__"]).toEqual({ type: "string", filterable: true });
+  expect(Object.keys(projected)).toEqual(["__proto__", "constructor", "prototype"]);
+  expect(Object.getPrototypeOf(projected)).toBe(Object.prototype);
 });
 
 test("a parsed object has already lost duplicate keys so the last declaration wins", () => {

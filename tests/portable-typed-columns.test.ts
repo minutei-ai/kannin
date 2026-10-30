@@ -17,16 +17,19 @@ const invoke = Effect.fn("test.portableTypedColumns.invoke")(function* (
   operation: string,
   body: unknown = {},
 ) {
+  const init: RequestInit = {
+    method: "GET",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+  };
+  if (operation !== "metadata") {
+    init.method = "POST";
+    init.body = JSON.stringify(body);
+  }
   const response = yield* Effect.tryPromise(() =>
-    fetcher(
-      new Request(`http://localhost/v1/namespaces/${namespace}/${operation}`, {
-        method: "POST",
-        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-        body: JSON.stringify(body),
-      }),
-    ),
+    fetcher(new Request(`http://localhost/v1/namespaces/${namespace}/${operation}`, init)),
   );
-  expect(response.status).toBe(200);
+  const diagnostic = yield* Effect.tryPromise(() => response.clone().text());
+  expect(response.status, `${operation}: ${diagnostic}`).toBe(200);
   return yield* Effect.tryPromise(() => response.json());
 });
 

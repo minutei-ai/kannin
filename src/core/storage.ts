@@ -47,6 +47,10 @@ import {
   canonicalToQueryRow,
   CanonicalDocument,
   CanonicalQueryDocument,
+  TypedCanonicalDocument,
+  TypedCanonicalQueryDocument,
+  typedEngineColumns,
+  type TypedColumn,
   SegmentHeader,
   CommonTerms,
   CommonTermProjection,
@@ -351,6 +355,17 @@ export function createStorage(runtime: SearchRuntime) {
     Schema.fromJsonString(Schema.Array(CanonicalQueryDocument)),
     { onExcessProperty: "error" },
   );
+  const decodeTypedCanonicalDocument = Schema.decodeSync(
+    Schema.fromJsonString(TypedCanonicalDocument),
+    { onExcessProperty: "error" },
+  );
+  const typedQueryDocumentJson = Schema.fromJsonString(TypedCanonicalQueryDocument);
+  const decodeTypedCanonicalQueryDocument = Schema.decodeSync(typedQueryDocumentJson, {
+    onExcessProperty: "error",
+  });
+  const decodeTypedCanonicalQueryDocumentEffect = Schema.decodeEffect(typedQueryDocumentJson, {
+    onExcessProperty: "error",
+  });
 
   function evictFor(bytes: number) {
     while (budget.bytes + frequencyBudget.bytes + bytes > MAX_CACHE_BYTES) {
@@ -517,8 +532,8 @@ export function createStorage(runtime: SearchRuntime) {
     common = false,
   ) {
     const format = Match.value(common).pipe(
-      Match.when(true, () => "directory-common-v5"),
-      Match.orElse(() => "directory-v7"),
+      Match.when(true, () => "directory-common-v6"),
+      Match.orElse(() => "directory-v8"),
     );
     const admissionIdentity = `${identity}/0/${headerBytes}/${format}`;
     const bytes = directory.heap_bytes();
@@ -582,11 +597,11 @@ export function createStorage(runtime: SearchRuntime) {
     (key: string, length: number, common: boolean = false) =>
       Effect.gen(function* () {
         const format = Match.value(common).pipe(
-          Match.when(true, () => "directory-common-v5"),
-          Match.orElse(() => "directory-v7"),
+          Match.when(true, () => "directory-common-v6"),
+          Match.orElse(() => "directory-v8"),
         );
         const identity = Match.value(common).pipe(
-          Match.when(true, () => `${env.STORAGE_CACHE_SCOPE}:${key}/common-v5`),
+          Match.when(true, () => `${env.STORAGE_CACHE_SCOPE}:${key}/common-v6`),
           Match.orElse(() => `${env.STORAGE_CACHE_SCOPE}:${key}`),
         );
         const failures = Match.value(common).pipe(
@@ -709,8 +724,8 @@ export function createStorage(runtime: SearchRuntime) {
     )
       return false;
     const format = Match.value(common).pipe(
-      Match.when(true, () => "directory-common-v5"),
-      Match.orElse(() => "directory-v7"),
+      Match.when(true, () => "directory-common-v6"),
+      Match.orElse(() => "directory-v8"),
     );
     const identity = `cache/${format}/${key}/${length}`;
     const published = publishQueryCache(
@@ -797,12 +812,12 @@ export function createStorage(runtime: SearchRuntime) {
   ) {
     signal?.throwIfAborted();
     const resource = Match.value(compressedDirectory).pipe(
-      Match.when(true, () => "directory-v7"),
+      Match.when(true, () => "directory-v8"),
       Match.orElse(() => "range"),
     );
     const rawIdentity = `${env.STORAGE_CACHE_SCOPE}:${key}/${offset}/${length}`;
     const cacheKey = Match.value(compressedDirectory).pipe(
-      Match.when(true, () => `${rawIdentity}/directory-v7`),
+      Match.when(true, () => `${rawIdentity}/directory-v8`),
       Match.orElse(() => rawIdentity),
     );
     const cached = Match.value(compressedDirectory).pipe(
@@ -1052,10 +1067,10 @@ export function createStorage(runtime: SearchRuntime) {
     ) =>
       Effect.gen(function* () {
         const commonMiss = { value: false, observed: false };
-        const commonAdmission = `${env.STORAGE_CACHE_SCOPE}:${key}/common-v5/0/${headerBytes}/directory-common-v5`;
+        const commonAdmission = `${env.STORAGE_CACHE_SCOPE}:${key}/common-v6/0/${headerBytes}/directory-common-v6`;
         const directory = yield* Effect.gen(function* () {
           const identity = `${env.STORAGE_CACHE_SCOPE}:${key}`;
-          const admissionIdentity = `${identity}/0/${headerBytes}/directory-v7`;
+          const admissionIdentity = `${identity}/0/${headerBytes}/directory-v8`;
           const cached = directories.get(identity);
           if (cached !== undefined) {
             noteDirectoryRequest(admissionIdentity);
@@ -1070,7 +1085,7 @@ export function createStorage(runtime: SearchRuntime) {
             return fullActive.retain();
           }
           if (documentLookup && query === undefined && !canonical) {
-            const commonIdentity = `${identity}/common-v5`;
+            const commonIdentity = `${identity}/common-v6`;
             const commonActive = activeDirectories.get(commonAdmission);
             const projected = directories.get(commonIdentity);
             const available = projected?.directory ?? commonActive?.directory;
@@ -1091,7 +1106,7 @@ export function createStorage(runtime: SearchRuntime) {
             headerBytes <= MAX_DIRECTORY_CACHE_LENGTH &&
             !encodedDirectories.has(admissionIdentity)
           ) {
-            const commonIdentity = `${identity}/common-v5`;
+            const commonIdentity = `${identity}/common-v6`;
             const projected = directories.get(commonIdentity);
             const commonActive = activeDirectories.get(commonAdmission);
             const available = projected?.directory ?? commonActive?.directory;
@@ -1214,7 +1229,7 @@ export function createStorage(runtime: SearchRuntime) {
                   offset: 0,
                   length: headerBytes,
                 });
-                const url = new URL("https://segments.internal/directory-v7");
+                const url = new URL("https://segments.internal/directory-v8");
                 url.searchParams.set("key", input.key);
                 url.searchParams.set("offset", String(input.offset));
                 url.searchParams.set("length", String(input.length));
@@ -1450,7 +1465,7 @@ export function createStorage(runtime: SearchRuntime) {
           }
           return yield* acquire;
         });
-        const publication = `${env.STORAGE_CACHE_SCOPE}:cache/directory-common-v5/${key}/${headerBytes}`;
+        const publication = `${env.STORAGE_CACHE_SCOPE}:cache/directory-common-v6/${key}/${headerBytes}`;
         if (
           commonMiss.value &&
           !pendingQueryPublications.has(publication) &&
@@ -1483,11 +1498,11 @@ export function createStorage(runtime: SearchRuntime) {
     ) =>
       Effect.acquireUseRelease(
         Effect.sync(() => {
-          const fullIdentity = `${env.STORAGE_CACHE_SCOPE}:${key}/0/${headerBytes}/directory-v7`;
+          const fullIdentity = `${env.STORAGE_CACHE_SCOPE}:${key}/0/${headerBytes}/directory-v8`;
           const identities = [fullIdentity];
           if (query !== undefined)
             identities.push(
-              `${env.STORAGE_CACHE_SCOPE}:${key}/common-v5/0/${headerBytes}/directory-common-v5`,
+              `${env.STORAGE_CACHE_SCOPE}:${key}/common-v6/0/${headerBytes}/directory-common-v6`,
             );
           return identities.map((identity) => {
             const existing = activeDirectories.get(identity);
@@ -2730,6 +2745,47 @@ export function createStorage(runtime: SearchRuntime) {
       ),
   );
 
+  const buildTypedSegment = Effect.fn("kannin.buildTypedSegment")(
+    (
+      documents: ReadonlyArray<typeof TypedCanonicalDocument.Type>,
+      columns: ReadonlyArray<TypedColumn>,
+    ) =>
+      Effect.acquireUseRelease(
+        Effect.all([
+          Schema.encodeEffect(Schema.fromJsonString(Schema.Array(TypedCanonicalDocument)))(
+            documents,
+          ),
+          Effect.succeed(JSON.stringify(typedEngineColumns(columns))),
+        ]).pipe(Effect.map(([encoded, declared]) => Segment.with_columns(encoded, declared))),
+        (segment) =>
+          Effect.gen(function* () {
+            const header = yield* Schema.decodeEffect(Schema.fromJsonString(SegmentHeader))(
+              segment.header_json(),
+            );
+            const commonTerms = yield* Schema.decodeEffect(Schema.fromJsonString(CommonTerms))(
+              segment.common_terms(),
+            );
+            const commonProjection = yield* Schema.decodeEffect(
+              Schema.NullOr(Schema.fromJsonString(CommonTermProjection)),
+            )(segment.common_projection() ?? null);
+            const commonLeaders = yield* Schema.decodeEffect(Schema.fromJsonString(CommonLeaders))(
+              segment.common_leaders(),
+            );
+            const constantAttributes: typeof ConstantAttributes.Type = {};
+            return {
+              bytes: segment.bytes(),
+              header,
+              commonTerms,
+              commonProjection,
+              commonLeaders,
+              constantAttributes,
+              eligibility: null,
+            };
+          }),
+        (segment) => Effect.sync(() => segment.free()),
+      ),
+  );
+
   const rebuildEligibility = Effect.fn("kannin.rebuildEligibility")(
     (
       segment: Pick<typeof UnpackedSegment.Type, "key" | "headerBytes" | "bytes">,
@@ -3512,7 +3568,12 @@ export function createStorage(runtime: SearchRuntime) {
     objectBytes: number,
     vectorData: typeof LocatedDocument.Type.vectorData,
     payload?: Uint8Array,
+    typed: boolean = false,
   ) {
+    const decode = Match.value(typed).pipe(
+      Match.when(true, () => decodeTypedCanonicalDocument),
+      Match.orElse(() => decodeCanonicalDocument),
+    );
     if (vectorData !== null) {
       if (
         vectorData.offset < data.offset + data.length ||
@@ -3532,12 +3593,13 @@ export function createStorage(runtime: SearchRuntime) {
       payload,
     );
     if (vectorData === null)
-      return decodeCanonicalDocument(segment_document(await metadata, new Uint8Array()));
+      return decode(segment_document(await metadata, new Uint8Array(), typed));
     if (payload !== undefined) {
-      return decodeCanonicalDocument(
+      return decode(
         segment_document(
           await metadata,
           payload.subarray(vectorData.offset, vectorData.offset + vectorData.length),
+          typed,
         ),
       );
     }
@@ -3545,7 +3607,7 @@ export function createStorage(runtime: SearchRuntime) {
       metadata,
       range(key, headerBytes + vectorData.offset, vectorData.length),
     ]);
-    return decodeCanonicalDocument(segment_document(frame, vector));
+    return decode(segment_document(frame, vector, typed));
   }
 
   const MAX_DOCUMENT_BATCH_PAGES = 16;
@@ -3560,6 +3622,7 @@ export function createStorage(runtime: SearchRuntime) {
       ]
     >,
     signal?: AbortSignal,
+    typed: boolean = false,
   ) {
     const indexed = locations.map((location, index) => [index, location] as const);
     const grouped = new Map<string, (typeof indexed)[number][]>();
@@ -3747,6 +3810,7 @@ export function createStorage(runtime: SearchRuntime) {
               payload,
               physical.start,
               signal,
+              typed,
             );
             for (const [index, document] of documents.entries()) {
               const hit = window[index];
@@ -3778,7 +3842,16 @@ export function createStorage(runtime: SearchRuntime) {
     payload?: Uint8Array,
     payloadOffset: number = 0,
     signal?: AbortSignal,
+    typed: boolean = false,
   ) {
+    const decodeOne = Match.value(typed).pipe(
+      Match.when(true, () => decodeTypedCanonicalQueryDocument),
+      Match.orElse(() => decodeCanonicalQueryDocument),
+    );
+    const decodeOneEffect = Match.value(typed).pipe(
+      Match.when(true, () => decodeTypedCanonicalQueryDocumentEffect),
+      Match.orElse(() => decodeCanonicalQueryDocumentEffect),
+    );
     const identity = `${env.STORAGE_CACHE_SCOPE}:${key}`;
     const cached = directories.get(identity);
     if (cached !== undefined) {
@@ -3841,7 +3914,7 @@ export function createStorage(runtime: SearchRuntime) {
           return yield* new Cause.UnknownError("Cached document range disappeared");
         frames.push(frame);
       }
-      if (pages.length >= 2 && !span.overlap && span.requested <= 64 * 1024) {
+      if (!typed && pages.length >= 2 && !span.overlap && span.requested <= 64 * 1024) {
         const packed = new Uint8Array(span.requested);
         const ranges = new Uint32Array(pages.length * 2);
         const cursor = { offset: 0 };
@@ -3863,10 +3936,10 @@ export function createStorage(runtime: SearchRuntime) {
       return yield* Effect.forEach(frames, (frame) =>
         Effect.gen(function* () {
           const encoded = yield* Effect.try({
-            try: () => segment_query_document(frame),
+            try: () => segment_query_document(frame, typed),
             catch: (cause) => new Cause.UnknownError(cause),
           });
-          return yield* decodeCanonicalQueryDocumentEffect(encoded).pipe(
+          return yield* decodeOneEffect(encoded).pipe(
             Effect.mapError((cause) => new Cause.UnknownError(cause)),
           );
         }),
@@ -3889,7 +3962,7 @@ export function createStorage(runtime: SearchRuntime) {
               const start = page.offset - payloadOffset;
               const frame = cachedFrame ?? payload.subarray(start, start + page.length);
               const document = yield* Effect.try({
-                try: () => decodeCanonicalQueryDocument(segment_query_document(frame)),
+                try: () => decodeOne(segment_query_document(frame, typed)),
                 catch: (cause) => {
                   if (Schema.is(Rejected)(cause)) return cause;
                   return new Cause.UnknownError(cause);
@@ -3901,7 +3974,7 @@ export function createStorage(runtime: SearchRuntime) {
             return yield* permits.withPermit(
               Effect.tryPromise({
                 try: async (fiberSignal) =>
-                  decodeCanonicalQueryDocument(
+                  decodeOne(
                     segment_query_document(
                       await readDocumentFrame(
                         key,
@@ -3912,6 +3985,7 @@ export function createStorage(runtime: SearchRuntime) {
                         undefined,
                         rangeSignal(signal, fiberSignal),
                       ),
+                      typed,
                     ),
                   ),
                 catch: (cause) => {
@@ -3957,11 +4031,13 @@ export function createStorage(runtime: SearchRuntime) {
       );
     });
     const batchEncoded = yield* Effect.try({
-      try: () =>
-        segment_query_documents(
+      try: () => {
+        if (typed) return undefined;
+        return segment_query_documents(
           bytes,
           new Uint32Array(pages.flatMap((page) => [page.offset - first.offset, page.length])),
-        ),
+        );
+      },
       catch: (cause) => new Cause.UnknownError(cause),
     });
     if (batchEncoded !== undefined) {
@@ -3980,10 +4056,10 @@ export function createStorage(runtime: SearchRuntime) {
         const start = page.offset - first.offset;
         const frame = bytes.slice(start, start + page.length);
         const encoded = yield* Effect.try({
-          try: () => segment_query_document(frame),
+          try: () => segment_query_document(frame, typed),
           catch: (cause) => new Cause.UnknownError(cause),
         });
-        const document = yield* decodeCanonicalQueryDocumentEffect(encoded);
+        const document = yield* decodeOneEffect(encoded);
         remember(
           `${env.STORAGE_CACHE_SCOPE}:${key}/${headerBytes + page.offset}/${page.length}`,
           frame,
@@ -4161,6 +4237,7 @@ export function createStorage(runtime: SearchRuntime) {
     readTermCatalogs,
     storeSegmentCaches,
     buildSegment,
+    buildTypedSegment,
     rebuildEligibility,
     rebuildCommonProjection,
     bloom,

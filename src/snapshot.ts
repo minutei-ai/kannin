@@ -4,7 +4,7 @@ import { decodeRootEffect } from "./manifest";
 
 import type { Snapshot } from "./protocol";
 
-const magic = new TextEncoder().encode("KANSNP07");
+const magic = new TextEncoder().encode("KANSNP08");
 
 export function snapshotFrameHeader(snapshot: typeof Snapshot.Type) {
   const metadata = new TextEncoder().encode(

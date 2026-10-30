@@ -359,7 +359,7 @@ for (const version of [1, 2, 3, 4] as const)
     const response = await request(worker, namespace, "migrate-root", {});
     expect(response.status).toBe(200);
     expect(Schema.decodeUnknownSync(RootMigrationResult)(await response.json())).toMatchObject({
-      version: 7,
+      version: 8,
       rootRewritten: true,
       migratedSnapshots: 1,
       expiredSnapshots: 0,
@@ -392,7 +392,7 @@ for (const version of [1, 2, 3, 4] as const)
     const repeated = Schema.decodeUnknownSync(RootMigrationResult)(
       await (await request(worker, namespace, "migrate-root", {})).json(),
     );
-    expect(repeated).toMatchObject({ version: 7, rootRewritten: false, migratedSnapshots: 0 });
+    expect(repeated).toMatchObject({ version: 8, rootRewritten: false, migratedSnapshots: 0 });
     expect((await bucket.head(key))?.etag).toBe(migrated.etag);
     expect((await bucket.head(checkpointKey))?.etag).toBe(checkpoint.etag);
   }, 15000);

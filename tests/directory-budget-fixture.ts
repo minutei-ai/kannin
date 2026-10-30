@@ -91,7 +91,7 @@ export class Segments extends CachedSegments {
     if (
       state.corruptDirectory &&
       response.ok &&
-      new URL(request.url).pathname === "/directory-v7"
+      new URL(request.url).pathname === "/directory-v8"
     ) {
       const bytes = new Uint8Array(await response.arrayBuffer());
       new DataView(bytes.buffer, bytes.byteOffset).setUint32(12, 0xffffffff, true);
@@ -108,7 +108,7 @@ async function probe(request: Request, env: Env) {
     const put = env.STORAGE.put.bind(env.STORAGE);
     Object.defineProperty(env.STORAGE, "put", {
       value: (...args: Parameters<R2Bucket["put"]>) => {
-        if (state.failDirectoryWrites && args[0].startsWith("cache/directory-v7/")) {
+        if (state.failDirectoryWrites && args[0].startsWith("cache/directory-v8/")) {
           state.rejectedWrites += 1;
           return Promise.reject(new Error("Injected directory cache publication failure"));
         }
@@ -117,9 +117,9 @@ async function probe(request: Request, env: Env) {
     });
     Object.defineProperty(env.STORAGE, "get", {
       value: async (...args: Parameters<R2Bucket["get"]>) => {
-        if (state.directoryHeaderDelay > 0 && args[0].startsWith("cache/directory-v7/"))
+        if (state.directoryHeaderDelay > 0 && args[0].startsWith("cache/directory-v8/"))
           await Effect.runPromise(Effect.sleep(state.directoryHeaderDelay));
-        if (state.failDirectoryCache && args[0].startsWith("cache/directory-v7/"))
+        if (state.failDirectoryCache && args[0].startsWith("cache/directory-v8/"))
           return Promise.reject(new Error("Injected directory cache read failure"));
         if (args[0].startsWith("namespaces/")) state.canonicalReads += 1;
         const object = await get(...args);
@@ -132,7 +132,7 @@ async function probe(request: Request, env: Env) {
             state.peak = Math.max(state.peak, state.active);
             return Effect.runPromise(
               Match.value(
-                state.holdDirectoryBody && args[0].startsWith("cache/directory-v7/"),
+                state.holdDirectoryBody && args[0].startsWith("cache/directory-v8/"),
               ).pipe(
                 Match.when(true, () =>
                   Effect.sleep("10 millis").pipe(
@@ -141,7 +141,7 @@ async function probe(request: Request, env: Env) {
                 ),
                 Match.orElse(() =>
                   Effect.sleep(
-                    Match.value(args[0].startsWith("cache/directory-v7/")).pipe(
+                    Match.value(args[0].startsWith("cache/directory-v8/")).pipe(
                       Match.when(true, () => state.directoryBodyDelay),
                       Match.orElse(() => state.bodyDelay),
                     ),
@@ -298,7 +298,7 @@ async function probe(request: Request, env: Env) {
     return first;
   }
   if (new URL(request.url).pathname === "/origin") {
-    const url = new URL("https://segments.internal/directory-v7");
+    const url = new URL("https://segments.internal/directory-v8");
     url.searchParams.set("key", input.key);
     url.searchParams.set("offset", String(input.offset));
     url.searchParams.set("length", String(input.length));

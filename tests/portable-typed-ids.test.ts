@@ -352,7 +352,7 @@ test("typed identities survive the real object-store writer, restart, ranking an
           Effect.flatMap(Schema.decodeUnknownEffect(RootMigrationResult)),
         );
         expect(migrationResult).toMatchObject({
-          version: 7,
+          version: 8,
           rootRewritten: true,
           migratedSnapshots: 1,
           expiredSnapshots: 0,

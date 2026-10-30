@@ -175,10 +175,10 @@ test("document-only common reuse preserves projections, misses, active lifetimes
     const source = { key, headerBytes };
     const sourceJson = Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))(source);
     await bucket.put(key, bytes);
-    await bucket.put(`cache/directory-v7/${key}/${headerBytes}`, full, {
+    await bucket.put(`cache/directory-v8/${key}/${headerBytes}`, full, {
       customMetadata: { source: sourceJson },
     });
-    const cache = `cache/directory-common-v5/${key}/${headerBytes}`;
+    const cache = `cache/directory-common-v6/${key}/${headerBytes}`;
     if (mode === "pending-corrupt") {
       const corrupt = common.slice();
       corrupt[16] = (corrupt[16] ?? 0) ^ 1;
@@ -192,7 +192,7 @@ test("document-only common reuse preserves projections, misses, active lifetimes
           key: heldKey,
           headerBytes,
         });
-        await bucket.put(`cache/directory-v7/${heldKey}/${headerBytes}`, full, {
+        await bucket.put(`cache/directory-v8/${heldKey}/${headerBytes}`, full, {
           customMetadata: { source: heldSource },
         });
       }

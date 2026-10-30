@@ -54,7 +54,7 @@ for (const phase of ["prepared", "missing", "corrupt"] as const)
     if (canonical === null) throw new Error("Missing canonical segment");
     const canonicalEtag = canonical.etag;
     const bytes = new Uint8Array(await canonical.arrayBuffer());
-    const identity = `cache/directory-v7/${segment.key}/${segment.headerBytes}`;
+    const identity = `cache/directory-v8/${segment.key}/${segment.headerBytes}`;
     const source = Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))({
       key: segment.key,
       headerBytes: segment.headerBytes,
@@ -192,7 +192,7 @@ for (const [phase, title] of [
     if (canonical === null) throw new Error("Missing Cache API fixture canonical segment");
     const canonicalEtag = canonical.etag;
     const bytes = new Uint8Array(await canonical.arrayBuffer());
-    const identity = `cache/directory-v7/${segment.key}/${segment.headerBytes}`;
+    const identity = `cache/directory-v8/${segment.key}/${segment.headerBytes}`;
     const source = Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))({
       key: segment.key,
       headerBytes: segment.headerBytes,
@@ -219,7 +219,7 @@ for (const [phase, title] of [
         primeBefore.cache.directoryR2CacheOriginResponses,
     ).toBe(1);
     const cache = await (await worker.getCaches()).open("raio-segments-v1");
-    const cacheKey = new URL("https://raio-cache.internal/directory-v7");
+    const cacheKey = new URL("https://raio-cache.internal/directory-v8");
     cacheKey.searchParams.set("key", segment.key);
     cacheKey.searchParams.set("offset", "0");
     cacheKey.searchParams.set("length", String(segment.headerBytes));

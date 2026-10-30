@@ -130,9 +130,9 @@ test("create-only common fallback preserves existing generations and concurrent 
     const key = `namespaces/cache-publication/segments/${mode}.rsix`;
     const source = { key, headerBytes };
     const sourceJson = Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))(source);
-    const cache = `cache/directory-common-v5/${key}/${headerBytes}`;
+    const cache = `cache/directory-common-v6/${key}/${headerBytes}`;
     await bucket.put(key, bytes);
-    await bucket.put(`cache/directory-v7/${key}/${headerBytes}`, full, {
+    await bucket.put(`cache/directory-v8/${key}/${headerBytes}`, full, {
       customMetadata: { source: sourceJson },
     });
     if (mode !== "missing-race")
@@ -149,7 +149,7 @@ test("create-only common fallback preserves existing generations and concurrent 
           key: heldKey,
           headerBytes,
         });
-        await bucket.put(`cache/directory-v7/${heldKey}/${headerBytes}`, full, {
+        await bucket.put(`cache/directory-v8/${heldKey}/${headerBytes}`, full, {
           customMetadata: { source: heldSource },
         });
       }

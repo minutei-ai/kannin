@@ -95,7 +95,7 @@ const poolRoot = (root: typeof Root.Type) => {
   });
   return {
     ...root,
-    version: 7 as const,
+    version: 8 as const,
     segments,
     commonProjections: projections,
     commonTermDictionaries: dictionaries,
@@ -280,7 +280,13 @@ const migrationRoot = (stored: typeof RootMigrationInput.Type) => {
     return {
       kind: "schema" as const,
       sourceVersion: 6 as const,
-      root: expandRoot({ ...stored, version: 7 }),
+      root: expandRoot({ ...stored, version: 8 }),
+    };
+  if (stored.version === 7)
+    return {
+      kind: "schema" as const,
+      sourceVersion: 7 as const,
+      root: expandRoot({ ...stored, version: 8 }),
     };
   return { kind: "current" as const, root: expandRoot(stored) };
 };

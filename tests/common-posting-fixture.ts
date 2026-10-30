@@ -19,7 +19,7 @@ export async function useHeaderOnlyCommonFrames(worker: Miniflare, namespace: st
   for (const segment of root.segments) {
     if (segment.commonTerms === undefined || Object.keys(segment.commonTerms).length === 0)
       continue;
-    const key = `cache/directory-common-v5/${segment.key}/${segment.headerBytes}`;
+    const key = `cache/directory-common-v6/${segment.key}/${segment.headerBytes}`;
     for (const attempt of Array.from({ length: 100 }, (_, index) => index)) {
       if ((await bucket.head(key)) !== null) break;
       if (attempt === 99) throw new Error("Writer common frame did not settle");

@@ -165,7 +165,7 @@ const storedV2 = Schema.decodeSync(LegacyStoredRoot)({
   segments: storedV3.segments.map(({ eligibilityIndex: _eligibilityIndex, ...segment }) => segment),
 });
 
-test("Root v7 pools shared metadata and retains valid Bloom pack holes", () => {
+test("Root v8 pools shared metadata and retains valid Bloom pack holes", () => {
   const wire = encodeRoot(root);
   const expanded = decodeRoot(wire);
   expect(expanded).toEqual(root);
@@ -174,7 +174,7 @@ test("Root v7 pools shared metadata and retains valid Bloom pack holes", () => {
   expect(expanded.segments[0]?.commonTerms).toBe(expanded.segments[1]?.commonTerms);
   expect(expanded.segments[0]?.commonProjection).toBe(expanded.segments[1]?.commonProjection);
   expect(expanded.segments[0]?.eligibility).toBe(expanded.segments[1]?.eligibility);
-  expect(wire).toContain('"version":7');
+  expect(wire).toContain('"version":8');
   expect(wire).toContain('"bloomPacks"');
   expect(wire).toContain('"bloom":{"packIndex":0,"row":2}');
   expect(wire).not.toContain('"documentBloom":');
@@ -187,7 +187,7 @@ test("Root v7 pools shared metadata and retains valid Bloom pack holes", () => {
   ]);
 });
 
-test("Root v7 rejects invalid Bloom pack descriptors and segment references", () => {
+test("Root v8 rejects invalid Bloom pack descriptors and segment references", () => {
   const wire = encodeRoot(root);
   const invalidPackIndex = wire.replace('"packIndex":0', '"packIndex":2');
   expect(() => decodeRoot(invalidPackIndex)).toThrow();
@@ -277,7 +277,7 @@ test("migration decoder distinguishes current v7 from legacy v1, v2, v3, packed 
 test("rebuild snapshots retain their envelope and use the same migration classification", () => {
   const wire = new TextDecoder().decode(encodeVectorRebuildSnapshot(snapshot));
   expect(decodeVectorRebuildSnapshot(wire)).toEqual(snapshot);
-  expect(wire).toContain('"version":7');
+  expect(wire).toContain('"version":8');
   const legacy = Schema.encodeSync(
     Schema.fromJsonString(
       VectorRebuildSnapshot.mapFields((fields) => ({ ...fields, root: LegacyRoot })),

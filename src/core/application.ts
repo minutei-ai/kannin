@@ -53,6 +53,16 @@ import {
   CanonicalDocument,
   CanonicalId,
   CanonicalWrite,
+  TypedWrite,
+  TypedCanonicalDocument,
+  normalizeTypedWrite,
+  namespaceColumnsFromTyped,
+  sameNamespaceColumns,
+  typedColumns,
+  isTypedNamespace,
+  validateTypedAttributes,
+  validateTypedFilter,
+  hasTypedOperand,
   type WriteCommand,
   canonicalIdKey,
   canonicalIdType,
@@ -199,6 +209,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
     addFrequencyPosting,
     readTermProjections,
     buildSegment,
+    buildTypedSegment,
     rebuildEligibility,
     rebuildCommonProjection,
     storeSegmentCaches,
@@ -238,12 +249,12 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       if (
         decoded._tag === "Failure" ||
         directoryMiss._tag === "Failure" ||
-        (directoryMiss.value !== null && url.pathname !== "/directory-v7") ||
+        (directoryMiss.value !== null && url.pathname !== "/directory-v8") ||
         request.method !== "GET" ||
         props._tag === "Failure" ||
         props.value.bucket !== this.env.STORAGE_CACHE_SCOPE ||
-        (url.pathname !== "/range" && url.pathname !== "/directory-v7") ||
-        (url.pathname === "/directory-v7" && decoded.value.offset !== 0)
+        (url.pathname !== "/range" && url.pathname !== "/directory-v8") ||
+        (url.pathname === "/directory-v8" && decoded.value.offset !== 0)
       )
         return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });
       const input = decoded.value;
@@ -290,13 +301,13 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
                       });
                     const encoded = yield* Effect.try(() =>
                       Match.value(url.pathname).pipe(
-                        Match.when("/directory-v7", () =>
+                        Match.when("/directory-v8", () =>
                           directory_compress(new Uint8Array(bytes)).slice(),
                         ),
                         Match.orElse(() => bytes),
                       ),
                     );
-                    if (url.pathname === "/directory-v7")
+                    if (url.pathname === "/directory-v8")
                       publishDirectoryFrame(
                         input.key,
                         input.length,
@@ -317,7 +328,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
                   return Effect.tryPromise(() => object.body.cancel()).pipe(Effect.ignore);
                 },
               );
-              if (url.pathname !== "/directory-v7" || directoryMiss.value !== null)
+              if (url.pathname !== "/directory-v8" || directoryMiss.value !== null)
                 return yield* canonical;
               const reader = yield* acquireDirectoryFrame(input.key, input.length);
               const observed = yield* waitDirectoryFrame(reader);
@@ -856,7 +867,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       signal,
     );
     const unrestricted = new Map<string, string>();
-    if (input.filters.length > 0) {
+    if (input.filters.length > 0 && !isTypedNamespace(root.schema)) {
       const encodedFilters = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Filter)))(
         input.filters,
       );
@@ -1971,12 +1982,23 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
     if (manifest.sequence < (input.minimumSequence ?? 0))
       throw new Rejected({ status: 409, message: "Requested sequence is not committed" });
     const filterable = filterableNames(manifest.schema) ?? [];
-    for (const filter of input.filters)
+    const typed = typedColumns(manifest.schema);
+    for (const filter of input.filters) {
       if (!filterable.includes(filter.field))
         throw new Rejected({
           status: 400,
           message: `Attribute is not filterable: ${filter.field}`,
         });
+      if (typed === undefined && hasTypedOperand(filter.value))
+        throw new Rejected({
+          status: 400,
+          message: `Typed filter operands require a typed namespace: ${filter.field}`,
+        });
+      if (typed !== undefined) {
+        const invalid = validateTypedFilter(typed, filter);
+        if (invalid !== undefined) throw new Rejected({ status: 400, message: invalid });
+      }
+    }
     if (input.kind === "text") {
       const materialize = async (producerSignal?: AbortSignal) => {
         const hits = await rankText(input, manifest, timings, ctx, producerSignal);
@@ -1986,6 +2008,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
           readDocumentHits(
             hits.map((hit) => [hit.segment, hit.data, hit.score] as const),
             producerSignal,
+            typed !== undefined,
           ),
           producerSignal,
         );
@@ -2034,6 +2057,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       readDocumentHits(
         hits.map((hit) => [hit.segment, hit.data, hit.score] as const),
         signal,
+        typed !== undefined,
       ),
       signal,
     );
@@ -2394,7 +2418,8 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
             saved.sourceVersion === 3 ||
             saved.sourceVersion === 4 ||
             saved.sourceVersion === 5 ||
-            saved.sourceVersion === 6
+            saved.sourceVersion === 6 ||
+            saved.sourceVersion === 7
           )
             expiration.value = Schema.decodeUnknownSync(VectorRebuildCheckpointMetadata)(
               captured.customMetadata,
@@ -2434,7 +2459,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       }
       if (root === undefined || object === null)
         return Schema.encodeSync(RootMigrationResult)({
-          version: 7,
+          version: 8,
           sequence: 0,
           rootRewritten: false,
           migratedSnapshots: progress.migrated,
@@ -2457,7 +2482,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       this.namespacePublished = false;
       await this.publishNamespace();
       return Schema.encodeSync(RootMigrationResult)({
-        version: 7,
+        version: 8,
         sequence: root.root.sequence,
         rootRewritten: root.kind !== "current",
         migratedSnapshots: progress.migrated,
@@ -2558,8 +2583,22 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         await this.env.INDEX_JOBS.send(Schema.encodeSync(IndexMessage)({ namespace }));
     }
 
-    private async write(input: typeof WriteCommand.Type, namespace: string) {
+    private async write(requested: typeof WriteCommand.Type, namespace: string) {
+      const typedWrite = (() => {
+        if ("kind" in requested && requested.kind === "typed")
+          return normalizeTypedWrite(requested);
+        return undefined;
+      })();
+      const input = typedWrite ?? requested;
       const canonical = "kind" in input;
+      const legacySchema = (() => {
+        if ("schema" in input) return input.schema;
+        return undefined;
+      })();
+      const schemaGiven = (() => {
+        if (typedWrite !== undefined) return typedWrite.declaration !== undefined;
+        return legacySchema !== undefined;
+      })();
       const idType: (typeof CanonicalWrite.Type)["idType"] = (() => {
         if (canonical) return input.idType;
         return "string";
@@ -2568,13 +2607,17 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       const ids = [...input.upserts.map((document) => document.id), ...input.deletes];
       if (new Set(ids.map(canonicalIdKey)).size !== ids.length)
         throw new Rejected({ status: 400, message: "Duplicate ids within a write" });
-      if (!canonical && input.reset !== true && input.schema === undefined && ids.length === 0)
+      if (!canonical && input.reset !== true && !schemaGiven && ids.length === 0)
         throw new Rejected({ status: 400, message: "Empty write" });
       if (ids.some((id) => canonicalIdType(id) !== idType))
         throw new Rejected({ status: 400, message: "Write IDs must match the namespace ID type" });
       const encodedWrite = (() => {
-        if (canonical) return Schema.encodeSync(Schema.fromJsonString(CanonicalWrite))(input);
-        return Schema.encodeSync(Schema.fromJsonString(Write))(input);
+        if (typedWrite !== undefined)
+          return Schema.encodeSync(Schema.fromJsonString(TypedWrite))(typedWrite);
+        if ("kind" in input && input.kind === "canonical")
+          return Schema.encodeSync(Schema.fromJsonString(CanonicalWrite))(input);
+        if (!("kind" in input)) return Schema.encodeSync(Schema.fromJsonString(Write))(input);
+        throw new Rejected({ status: 400, message: "Unknown write kind" });
       })();
       const fingerprint = await sha256(encodedWrite);
       const current = await this.root();
@@ -2607,26 +2650,70 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         canonical &&
         current.manifest.sequence > 0 &&
         ids.length === 0 &&
-        input.schema === undefined &&
+        !schemaGiven &&
         input.reset !== true
       )
         throw new Rejected({ status: 400, message: "Empty write" });
+      const currentTyped = isTypedNamespace(current.manifest.schema);
+      if (typedWrite === undefined && currentTyped)
+        throw new Rejected({
+          status: 409,
+          message: "Typed namespaces accept only typed writes",
+        });
       if (
-        input.schema !== undefined &&
+        typedWrite !== undefined &&
+        !currentTyped &&
+        current.manifest.sequence > 0 &&
+        input.reset !== true
+      )
+        throw new Rejected({
+          status: 409,
+          message: "Declaring typed columns on an existing native namespace requires reset",
+        });
+      if (
+        typedWrite === undefined &&
+        legacySchema !== undefined &&
         current.manifest.schema !== undefined &&
         input.reset !== true
       ) {
         const encodeSchema = Schema.encodeSync(Schema.fromJsonString(NamespaceSchema));
         if (
-          encodeSchema(input.schema) !==
+          encodeSchema(legacySchema) !==
           encodeSchema(nativeSchemaFromColumns(current.manifest.schema))
         )
           throw new Rejected({ status: 409, message: "Changing namespace schema requires reset" });
       }
-      const columns = Option.match(Option.fromUndefinedOr(input.schema), {
-        onNone: () => current.manifest.schema,
-        onSome: namespaceColumnsFromNative,
-      });
+      const columns = (() => {
+        if (typedWrite !== undefined) {
+          const declared = Option.map(
+            Option.fromUndefinedOr(typedWrite.declaration),
+            namespaceColumnsFromTyped,
+          );
+          if (Option.isNone(declared)) {
+            if (!currentTyped || input.reset === true)
+              throw new Rejected({
+                status: 400,
+                message: "Typed writes require column declarations for a new or reset namespace",
+              });
+            return current.manifest.schema;
+          }
+          if (
+            currentTyped &&
+            input.reset !== true &&
+            current.manifest.schema !== undefined &&
+            !sameNamespaceColumns(declared.value, current.manifest.schema)
+          )
+            throw new Rejected({
+              status: 409,
+              message: "Changing namespace schema requires reset",
+            });
+          return declared.value;
+        }
+        return Option.match(Option.fromUndefinedOr(legacySchema), {
+          onNone: () => current.manifest.schema,
+          onSome: namespaceColumnsFromNative,
+        });
+      })();
       const dimensions = resolvedVectorDimensions(columns);
       if (
         current.manifest.sequence > 0 &&
@@ -2638,6 +2725,15 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       for (const document of input.upserts)
         if (document.vector !== undefined && document.vector.length !== dimensions)
           throw new Rejected({ status: 400, message: `Vector dimension must be ${dimensions}` });
+      const declaredTyped = typedColumns(columns);
+      if (typedWrite !== undefined) {
+        if (declaredTyped === undefined)
+          throw new Rejected({ status: 400, message: "Typed write has no typed columns" });
+        for (const document of typedWrite.upserts) {
+          const invalid = validateTypedAttributes(declaredTyped, document.attributes);
+          if (invalid !== undefined) throw new Rejected({ status: 400, message: invalid });
+        }
+      }
       const prior = await locate(ids, current.manifest);
       const sequence = current.manifest.sequence + 1;
       const dead = new Map<string, number[]>();
@@ -2655,10 +2751,15 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
           location.document.data,
           location.segment.bytes,
           location.vectorData,
+          undefined,
+          currentTyped,
         );
         const terms = Schema.decodeSync(strings)(
           segment_document_terms(
-            Schema.encodeSync(Schema.fromJsonString(CanonicalDocument))(source),
+            Schema.encodeSync(Schema.fromJsonString(CanonicalDocument))({
+              ...source,
+              attributes: {},
+            }),
           ),
         );
         const rows = dead.get(location.segment.key) ?? [];
@@ -2690,7 +2791,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         };
       });
       const epoch = { value: current.manifest.vectorEpoch };
-      if (input.schema !== undefined && current.manifest.schema === undefined)
+      if (schemaGiven && current.manifest.schema === undefined)
         epoch.value = await sha256(`${current.manifest.vectorEpoch}\0schema\0${sequence}`);
       if (input.reset === true) {
         segments.splice(0);
@@ -2713,19 +2814,36 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         vectorDeletes,
       } as const;
       const log: typeof Log.Type = (() => {
-        if (canonical) return { ...logFields, version: 2, write: input };
-        return { ...logFields, version: 1, write: input };
+        if (typedWrite !== undefined) return { ...logFields, version: 3, write: typedWrite };
+        if ("kind" in input && input.kind === "canonical")
+          return { ...logFields, version: 2, write: input };
+        if (!("kind" in input)) return { ...logFields, version: 1, write: input };
+        throw new Rejected({ status: 400, message: "Unknown write kind" });
       })();
       const encodedLog = pack(encodeLog(log));
       const logKey = `${this.prefix}/log/${sequence}-${runtime.immutableIdentity(await sha256Bytes(encodedLog))}.bin`;
       writes.push(() => this.env.STORAGE.put(logKey, encodedLog));
       if (input.upserts.length > 0) {
-        const documents = (() => {
-          if (canonical)
-            return input.upserts.map((document) => ({ ...document, revision: sequence }));
-          return input.upserts.map((document) => nativeToCanonicalDocument(document, sequence));
+        const built = await (async () => {
+          if (typedWrite !== undefined) {
+            if (declaredTyped === undefined)
+              throw new Rejected({ status: 400, message: "Typed write has no typed columns" });
+            return Effect.runPromise(
+              buildTypedSegment(
+                typedWrite.upserts.map((document) => ({ ...document, revision: sequence })),
+                declaredTyped,
+              ),
+            );
+          }
+          const documents = (() => {
+            if ("kind" in input && input.kind === "canonical")
+              return input.upserts.map((document) => ({ ...document, revision: sequence }));
+            if (!("kind" in input))
+              return input.upserts.map((document) => nativeToCanonicalDocument(document, sequence));
+            throw new Rejected({ status: 400, message: "Unknown write kind" });
+          })();
+          return Effect.runPromise(buildSegment(documents, filterableNames(columns)));
         })();
-        const built = await Effect.runPromise(buildSegment(documents, filterableNames(columns)));
         const key = `${this.prefix}/segments/${sequence}-${runtime.immutableIdentity(await sha256Bytes(built.bytes))}.rsix`;
         const headerBytes =
           16 + new DataView(built.bytes.buffer, built.bytes.byteOffset).getUint32(8, true);
@@ -2891,6 +3009,8 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
             location.document.data,
             location.segment.bytes,
             location.vectorData,
+            undefined,
+            isTypedNamespace(active.schema),
           );
           if (document.vector === undefined)
             throw new Rejected({ status: 503, message: "Rebuild vector payload missing" });
@@ -2951,6 +3071,8 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
             location.document.data,
             location.segment.bytes,
             location.vectorData,
+            undefined,
+            isTypedNamespace(current.manifest.schema),
           );
           const expected = candidate.vector;
           const actual = document.vector;
@@ -3155,11 +3277,17 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
       if (candidates.length < 2 && !candidates.some((segment) => segment.dead.length))
         return { compacted: 0, segments: current.manifest.segments.length };
       const selected: typeof ordered = [];
+      const compactColumns = typedColumns(current.manifest.schema);
       const documents: Array<typeof CanonicalDocument.Type> = [];
-      const encodeDocument = Schema.encodeSync(Schema.fromJsonString(CanonicalDocument));
+      const typedDocuments: Array<typeof TypedCanonicalDocument.Type> = [];
       const encoder = new TextEncoder();
       for (const segment of candidates) {
-        const window = { documents: documents.length, bytes: budget.bytes, exceeded: false };
+        const window = {
+          documents: documents.length,
+          typed: typedDocuments.length,
+          bytes: budget.bytes,
+          exceeded: false,
+        };
         const dead = new Set(segment.dead);
         const rows = Array.from({ length: segment.count }, (_, row) => row).filter(
           (row) => !dead.has(row),
@@ -3188,17 +3316,27 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
             segment.bytes,
             location.vectorData,
             payload,
+            compactColumns !== undefined,
           );
-          const bytes = encoder.encode(encodeDocument(source)).byteLength;
+          const bytes = encoder.encode(JSON.stringify(source)).byteLength;
           if (budget.bytes + bytes > 8 * 1024 * 1024) {
             window.exceeded = true;
             break;
           }
           budget.bytes += bytes;
-          documents.push(source);
+          if (compactColumns !== undefined && Schema.is(TypedCanonicalDocument)(source))
+            typedDocuments.push(source);
+          else if (compactColumns === undefined && Schema.is(CanonicalDocument)(source))
+            documents.push(source);
+          else
+            throw new Rejected({
+              status: 503,
+              message: "Compaction source document differs from its namespace schema",
+            });
         }
         if (window.exceeded) {
           documents.length = window.documents;
+          typedDocuments.length = window.typed;
           budget.bytes = window.bytes;
           continue;
         }
@@ -3214,10 +3352,15 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
           pruneBloomPacks({ ...current.manifest, segments: retained }),
         ),
       };
-      if (documents.length > 0) {
-        const built = await Effect.runPromise(
-          buildSegment(documents, filterableNames(current.manifest.schema)),
-        );
+      const compactedCount = documents.length + typedDocuments.length;
+      if (compactedCount > 0) {
+        const built = await (async () => {
+          if (compactColumns !== undefined)
+            return Effect.runPromise(buildTypedSegment(typedDocuments, compactColumns));
+          return Effect.runPromise(
+            buildSegment(documents, filterableNames(current.manifest.schema)),
+          );
+        })();
         const key = `${this.prefix}/segments/compact-${current.manifest.sequence}-${crypto.randomUUID()}.rsix`;
         const stored = await this.env.STORAGE.put(key, built.bytes);
         if (stored === null)
@@ -3260,12 +3403,12 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         );
       }
       await this.commit(projected.manifest, current.etag);
-      if (documents.length > 0)
+      if (compactedCount > 0)
         await Effect.runPromise(warmTermBatch(projected.manifest.segments, this.ctx));
       return {
         compacted: selected.length,
         segments: projected.manifest.segments.length,
-        documents: documents.length,
+        documents: compactedCount,
       };
     }
 
@@ -3409,11 +3552,21 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
                   current.manifestEncodedBytes ??
                   new TextEncoder().encode(encodeRoot(manifest)).byteLength;
                 current.manifestEncodedBytes = manifestEncodedBytes;
+                const typedSchema = isTypedNamespace(manifest.schema);
+                const declaredColumns = (() => {
+                  if (typedSchema && manifest.schema !== undefined)
+                    return { columns: manifest.schema };
+                  return {};
+                })();
                 return yield* Schema.encodeEffect(Metadata)({
                   schema: Option.match(Option.fromUndefinedOr(manifest.schema), {
                     onNone: () => null,
-                    onSome: nativeSchemaFromColumns,
+                    onSome: (columns) => {
+                      if (typedSchema) return null;
+                      return nativeSchemaFromColumns(columns);
+                    },
                   }),
+                  ...declaredColumns,
                   sequence: manifest.sequence,
                   documents: manifest.documents,
                   segments: manifest.segments.length,
@@ -4089,7 +4242,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
   async function acquireCachedSnapshot(cacheKey: URL, minimumSequence: number) {
     return Effect.runPromise(
       Effect.gen(function* () {
-        const cache = yield* Effect.tryPromise(() => caches.open("raio-snapshots-v7")).pipe(
+        const cache = yield* Effect.tryPromise(() => caches.open("raio-snapshots-v8")).pipe(
           Effect.orElseSucceed(() => undefined),
         );
         if (cache === undefined) return { cache, snapshot: undefined, rejected: false };
@@ -4168,7 +4321,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
     minimumSequence: number,
     timings: Headers,
   ) {
-    const cacheKey = new URL(`https://raio-cache.internal/snapshots-v7/${namespace}`);
+    const cacheKey = new URL(`https://raio-cache.internal/snapshots-v8/${namespace}`);
     cacheKey.searchParams.set("bucket", env.STORAGE_CACHE_SCOPE);
     const cache: { value: CachePort | undefined } = { value: undefined };
     const memory = warmSnapshots.get(cacheKey.href);
@@ -4248,7 +4401,7 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
         const refresh = yield* Effect.forkDetach(
           Effect.gen(function* () {
             const refreshCache = yield* Effect.tryPromise(() =>
-              caches.open("raio-snapshots-v7"),
+              caches.open("raio-snapshots-v8"),
             ).pipe(Effect.orElseSucceed(() => undefined));
             yield* refreshSnapshot(ctx, env, namespace, 0, cacheKey, refreshCache);
           }).pipe(

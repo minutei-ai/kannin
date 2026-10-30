@@ -79,7 +79,20 @@ Authenticated namespace endpoints support atomic writes, text/vector/hybrid quer
 
 The current source introduces an explicit internal canonical write envelope for string, uint64 and UUID identities through the same object-storage writer. Root v7 owns one ID-type policy, typed rows retain tagged IDs, and native write/log/receipt contracts remain available. Root v6 requires envelope-only migration; segment/log/receipt objects are retained. This cut passed the [complete gate at `9367a54`](https://github.com/minutei-ai/kannin/actions/runs/40974573962); hosted validation remains open. Public Turbopuffer typed schemas, row codecs, attribute predicates, inference and null semantics remain delivery gates; the internal extension does not establish public v2 compatibility.
 
-The candidate Rust/WASM engine also contains exact typed attribute cells in RAIOSEG6, with matching TypeScript cell contracts. This later cut is unvalidated and is not connected to application writes, Root schemas or public v2 routes. Its presence does not establish typed-attribute API compatibility.
+The candidate Rust/WASM engine also contains exact typed attribute cells in RAIOSEG6, with matching TypeScript cell contracts. The current uncommitted source connects them to the existing writer and query operation through Root.schema typed columns, StoredRoot v8, Log 3 and typed filters, with Root v7 migrating by envelope only. This work is unvalidated: it has not passed the complete gate or hosted validation, and public v2 routes, row codecs, schema inference/evolution and ANN/full-text column flags remain delivery gates. Its presence does not establish typed-attribute API compatibility.
+
+The following are internal candidate limits, not hosted Turbopuffer compatibility guarantees. The HTTP request-body budget still applies even when an individual cell permits a larger value.
+
+| Typed-column contract      | Candidate bound or behavior                                                       |
+| -------------------------- | --------------------------------------------------------------------------------- |
+| Declared attribute columns | 1,024 per namespace; zero-column typed mode is explicit                           |
+| Filterable attributes      | 64; at most 16 query predicates                                                   |
+| Typed arrays               | 4,096 homogeneous non-null scalar elements; no nested arrays or bytes arrays      |
+| Bytes                      | Canonical padded base64; at most 8 MiB decoded; not filterable                    |
+| Exact numeric cells        | Signed/unsigned 64-bit decimal tags and finite binary64 bit tags                  |
+| Missing and null           | Stored separately; internal null acceptance is declared per column                |
+| Schema changes             | Explicit declarations; changes require reset and reimport                         |
+| Public delivery gates      | v2 codecs/routes, inference/evolution/drop, indexing flags and hosted conformance |
 
 ## License
 

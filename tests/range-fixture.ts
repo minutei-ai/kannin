@@ -15,6 +15,7 @@ import {
   SegmentHeader,
   RankingInput,
   StoredDocument,
+  CanonicalQueryDocument,
   canonicalToNativeDocument,
 } from "../src/protocol";
 import {
@@ -41,7 +42,7 @@ export default {
       const response = await Effect.runPromise(
         Effect.gen(function* () {
           const permits = yield* Semaphore.make(documentReadConcurrency(input.pages));
-          return yield* readDocuments(
+          const documents = yield* readDocuments(
             input.source.key,
             input.source.headerBytes,
             input.pages,
@@ -49,6 +50,7 @@ export default {
             input.metadataEnd,
             permits,
           );
+          return yield* Schema.decodeUnknownEffect(Schema.Array(CanonicalQueryDocument))(documents);
         }).pipe(
           Effect.match({
             onFailure: () => new Response(null, { status: 503 }),

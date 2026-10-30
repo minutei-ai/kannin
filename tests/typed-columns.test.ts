@@ -13,6 +13,7 @@ import {
   QueryResult,
   RootMigrationResult,
   StoredRoot,
+  TypedAttributes,
   WriteResult,
 } from "../src/protocol";
 import { document, request, startWorker, textQuery, write } from "./harness";
@@ -85,6 +86,9 @@ const rows = {
     note: "present",
   }),
 };
+const expectedAttributes = Schema.decodeUnknownSync(TypedAttributes, {
+  onExcessProperty: "error",
+});
 const ok = async (response: Response) => {
   expect(response.status, await response.clone().text()).toBe(200);
   return response;
@@ -162,8 +166,8 @@ test("typed writes round-trip exact cells and expose canonical declarations in m
   const result = await query("typed-basic");
   expect(ids(result)).toEqual(["a", "b", "c"]);
   const byId = new Map(result.rows.map((row) => [row.id, row.attributes]));
-  expect(byId.get("a")).toEqual(rows.a.attributes);
-  expect(byId.get("b")).toEqual(rows.b.attributes);
+  expect(byId.get("a")).toEqual(expectedAttributes(rows.a.attributes));
+  expect(byId.get("b")).toEqual(expectedAttributes(rows.b.attributes));
   expect(Object.hasOwn(byId.get("b") ?? {}, "score")).toBe(false);
   expect(byId.get("c")).toMatchObject({ score: null, note: "present" });
   const described = await metadata("typed-basic");
@@ -467,7 +471,9 @@ test("restart, compaction and rebuild retain typed cells byte-exact", async () =
   await ok(await request(reader, namespace, "rebuild", {}));
   expect(await read()).toEqual(before);
   const result = await read();
-  expect(result.rows.find((row) => row.id === "a")?.attributes).toEqual(rows.a.attributes);
+  expect(result.rows.find((row) => row.id === "a")?.attributes).toEqual(
+    expectedAttributes(rows.a.attributes),
+  );
   const object = await (
     await reader.getR2Bucket("STORAGE")
   ).get(`namespaces/${namespace}/root.json`);

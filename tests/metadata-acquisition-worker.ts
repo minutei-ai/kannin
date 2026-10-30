@@ -1,4 +1,5 @@
 import { nativeQueryFixture } from "./segment-fixture";
+import { CanonicalQueryDocument } from "../src/protocol";
 import type { Env } from "../alchemy.run";
 import { Effect, Match, Schema, Semaphore } from "effect";
 import {
@@ -177,6 +178,7 @@ export default {
           }
           return documents;
         }).pipe(
+          Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(CanonicalQueryDocument))),
           Effect.match({
             onFailure: () => new Response(null, { status: 503 }),
             onSuccess: (rows) =>

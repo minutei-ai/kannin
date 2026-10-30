@@ -1,6 +1,13 @@
 import { expect, test } from "bun:test";
 import { Schema } from "effect";
-import { initSync, Segment, segment_header } from "../dist/wasm/raio_engine";
+import {
+  initSync,
+  Segment,
+  segment_header,
+  segment_document,
+  segment_query_document,
+} from "../dist/wasm/raio_engine";
+import { FieldName, TypedCell } from "../src/protocol";
 
 initSync({
   module: new WebAssembly.Module(
@@ -40,4 +47,27 @@ test("WASM rejects typed cells outside their declared columns without coercion",
       JSON.stringify([{ name: "count", type: "u64", ignored: true }]),
     ),
   ).toThrow();
+});
+
+test("WASM document reads retain exact cells with an explicit format policy", () => {
+  const attributes = { count: { u64: "18446744073709551615" } };
+  using segment = Segment.with_columns(documents(attributes), columns);
+  const bytes = segment.bytes();
+  const range = Schema.Struct({ offset: Schema.Int, length: Schema.Int });
+  const header = Schema.decodeSync(
+    Schema.fromJsonString(
+      Schema.Struct({ documents: Schema.Array(Schema.Struct({ data: range })) }),
+    ),
+  )(segment.header_json());
+  const row = header.documents[0];
+  if (row === undefined) throw new Error("Missing typed fixture row");
+  const base = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
+  const metadata = bytes.subarray(base + row.data.offset, base + row.data.offset + row.data.length);
+  const decode = Schema.decodeSync(
+    Schema.fromJsonString(Schema.Struct({ attributes: Schema.Record(FieldName, TypedCell) })),
+  );
+  expect(decode(segment_document(metadata, new Uint8Array(), true)).attributes).toEqual(attributes);
+  expect(decode(segment_query_document(metadata, true)).attributes).toEqual(attributes);
+  expect(() => segment_document(metadata, new Uint8Array())).toThrow("codec");
+  expect(() => segment_query_document(metadata)).toThrow("codec");
 });

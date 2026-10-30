@@ -9337,14 +9337,28 @@ pub mod wasm {
 
     #[wasm_bindgen]
     #[doc = "# Errors\nRejects corrupt pages or invalid document serialization."]
-    pub fn segment_document(bytes: &[u8], vector: &[u8]) -> Result<String, JsValue> {
-        super::full_document_from_frames(bytes, vector).map_err(|cause| JsValue::from_str(&cause))
+    pub fn segment_document(
+        bytes: &[u8],
+        vector: &[u8],
+        typed: Option<bool>,
+    ) -> Result<String, JsValue> {
+        let document = if typed == Some(true) {
+            super::full_typed_document_from_frames(bytes, vector)
+        } else {
+            super::full_document_from_frames(bytes, vector)
+        };
+        document.map_err(|cause| JsValue::from_str(&cause))
     }
 
     #[wasm_bindgen]
     #[doc = "# Errors\nRejects corrupt pages, invalid document serialization, or query projection errors."]
-    pub fn segment_query_document(bytes: &[u8]) -> Result<String, JsValue> {
-        super::query_document_from_metadata(bytes).map_err(|cause| JsValue::from_str(&cause))
+    pub fn segment_query_document(bytes: &[u8], typed: Option<bool>) -> Result<String, JsValue> {
+        let document = if typed == Some(true) {
+            super::query_typed_document_from_metadata(bytes)
+        } else {
+            super::query_document_from_metadata(bytes)
+        };
+        document.map_err(|cause| JsValue::from_str(&cause))
     }
 
     #[wasm_bindgen]

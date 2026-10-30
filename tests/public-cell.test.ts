@@ -498,6 +498,34 @@ test("public cells run through native raw JSON in workerd", async () => {
     body: '{"unknown":1}',
   });
   expect(undeclaredResponse.status).toBe(422);
+  const schemaResponse = await worker.dispatchFetch(new URL("?schema=true", origin), {
+    method: "POST",
+    body: JSON.stringify({
+      payload: { type: "bytes" },
+      note: { type: "string", filterable: false },
+      count: { type: "uint" },
+    }),
+  });
+  expect(schemaResponse.status).toBe(200);
+  expect(await schemaResponse.json()).toEqual({
+    declaration: {
+      columns: [
+        { name: "count", type: "u64", filterable: true, nullable: true },
+        { name: "note", type: "string", filterable: false, nullable: true },
+        { name: "payload", type: "bytes", filterable: false, nullable: true },
+      ],
+    },
+    schema: {
+      count: { type: "uint", filterable: true },
+      note: { type: "string", filterable: false },
+      payload: { type: "bytes", filterable: false },
+    },
+  });
+  const unsupportedSchema = await worker.dispatchFetch(new URL("?schema=true", origin), {
+    method: "POST",
+    body: '{"text":{"type":"string","full_text_search":true}}',
+  });
+  expect(unsupportedSchema.status).toBe(422);
   for (const [type, body] of [
     ["i64", "9223372036854775808"],
     ["i64", "1.0"],

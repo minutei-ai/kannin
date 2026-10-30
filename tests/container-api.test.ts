@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { Effect, Layer, Schema } from "effect";
-import { Metadata, QueryResult } from "../src/protocol";
+import { Metadata, QueryResult, WriteResult } from "../src/protocol";
 import {
   type ApiImageInspection,
   portableApiImage,
@@ -132,7 +132,9 @@ test("same OCI API image runs on Podman and Docker Engine with canonical state a
                 }),
               );
               expect(cellsWritten.status).toBe(200);
-              const cellReceipt = yield* Effect.tryPromise(() => cellsWritten.text());
+              const cellReceipt = yield* Effect.tryPromise(() => cellsWritten.json()).pipe(
+                Effect.flatMap(Schema.decodeUnknownEffect(WriteResult)),
+              );
               yield* api.restart;
               const cellRetry = yield* Effect.tryPromise(() =>
                 fetch(`${api.endpoint}/v1/namespaces/${namespace}-cells/write`, {
@@ -142,7 +144,10 @@ test("same OCI API image runs on Podman and Docker Engine with canonical state a
                 }),
               );
               expect(cellRetry.status).toBe(200);
-              expect(yield* Effect.tryPromise(() => cellRetry.text())).toBe(cellReceipt);
+              const retried = yield* Effect.tryPromise(() => cellRetry.json()).pipe(
+                Effect.flatMap(Schema.decodeUnknownEffect(WriteResult)),
+              );
+              expect(retried).toEqual(cellReceipt);
               for (const query of [
                 { kind: "text", text: "cells" },
                 { kind: "vector", vector: [1, 0] },

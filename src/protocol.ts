@@ -197,6 +197,32 @@ export const TypedColumnType = Schema.Literals([
   "[datetime_ms]",
 ]);
 const MAX_TYPED_COLUMNS = 1024;
+export const PublicCellAliasType = Schema.Literals([
+  "int",
+  "uint",
+  "float",
+  "datetime",
+  "[]string",
+  "[]bool",
+  "[]int",
+  "[]uint",
+  "[]float",
+  "[]uuid",
+  "[]datetime",
+]);
+export const PublicCellType = Schema.Union([TypedColumnType, PublicCellAliasType]);
+export class PublicCellRejection extends Schema.TaggedError<
+  PublicCellRejection,
+  { readonly brand: unique symbol }
+>()("PublicCellRejection", {
+  reason: Schema.Literals([
+    "null-not-allowed",
+    "unsupported-datetime",
+    "type-mismatch",
+    "non-finite-float",
+  ]),
+  declared: TypedColumnType,
+}) {}
 const MAX_TYPED_FILTERABLE = 64;
 const TypedAttributeColumn = Schema.Struct({
   source: Schema.Literal("attribute"),

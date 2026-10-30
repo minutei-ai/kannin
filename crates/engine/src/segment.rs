@@ -8586,6 +8586,21 @@ pub mod wasm {
 
     #[wasm_bindgen]
     impl Segment {
+        #[doc = "# Errors\nRejects invalid typed documents, undeclared attributes, mismatched cell types, unsupported column settings or segment bounds."]
+        pub fn with_columns(json: &str, columns: &str) -> Result<Self, JsValue> {
+            let schema = super::AttributeSchema::from_json(columns)
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            let documents = serde_json::from_str::<Vec<super::TypedDocumentDto>>(json)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?
+                .into_iter()
+                .map(Document::from_typed_dto)
+                .collect();
+            Ok(Self {
+                built: super::build_typed(documents, &schema, &[])
+                    .map_err(|cause| JsValue::from_str(&cause))?,
+            })
+        }
+
         #[wasm_bindgen(constructor)]
         #[doc = "# Errors\nRejects invalid input serialization or segment framing, size, and integrity constraints."]
         pub fn new(json: &str, filterable: Option<String>) -> Result<Self, JsValue> {

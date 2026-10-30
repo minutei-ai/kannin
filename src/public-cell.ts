@@ -173,24 +173,35 @@ const ENCODERS: Record<
   },
 };
 
+interface ResolvedShape {
+  readonly type: ColumnType;
+  readonly array: boolean;
+  readonly element: SupportedKind;
+}
+
+const decodeShapedCell = (shape: ResolvedShape, input: unknown, options: PublicCellOptions) =>
+  Effect.gen(function* () {
+    if (input === null) {
+      if (!options.nullable) return yield* reject("null-not-allowed", shape.type);
+      return yield* decodeTypedCell(null);
+    }
+    const decodeElement = DECODERS[shape.element];
+    if (!shape.array) {
+      const candidate = yield* decodeElement(input, shape.type);
+      return yield* decodeTypedCell(candidate);
+    }
+    const items = yield* decodeWireArray(input);
+    const candidates = yield* Effect.forEach(items, (item) => decodeElement(item, shape.type));
+    return yield* decodeTypedCell(candidates);
+  });
+
 export const decodePublicCell = Effect.fn("kannin.public.decodeCell")(function* (
   declared: unknown,
   input: unknown,
   options: PublicCellOptions,
 ) {
   const shape = yield* resolveShape(declared);
-  if (input === null) {
-    if (!options.nullable) return yield* reject("null-not-allowed", shape.type);
-    return yield* decodeTypedCell(null);
-  }
-  const decodeElement = DECODERS[shape.element];
-  if (!shape.array) {
-    const candidate = yield* decodeElement(input, shape.type);
-    return yield* decodeTypedCell(candidate);
-  }
-  const items = yield* decodeWireArray(input);
-  const candidates = yield* Effect.forEach(items, (item) => decodeElement(item, shape.type));
-  return yield* decodeTypedCell(candidates);
+  return yield* decodeShapedCell(shape, input, options);
 });
 
 export const encodePublicCell = Effect.fn("kannin.public.encodeCell")(function* (
@@ -220,6 +231,40 @@ const declaredColumns = (declaration: unknown) =>
       (decoded) => new Map(decoded.columns.map((column) => [column.name, column] as const)),
     ),
   );
+
+export type PublicCellDecoder = (
+  input: unknown,
+) => Effect.Effect<typeof TypedCell.Type, DecodeFailure>;
+
+export interface PublicAttributeDecoder {
+  readonly cell: (name: string) => Effect.Effect<PublicCellDecoder, PublicAttributesRejection>;
+}
+
+export const preparePublicAttributeDecoder = Effect.fn("kannin.public.prepareAttributeDecoder")(
+  function* (declaration: unknown) {
+    const columns = yield* declaredColumns(declaration);
+    const entries = yield* Effect.forEach([...columns.values()], (column) =>
+      resolveShape(column.type).pipe(
+        Effect.map((shape) => {
+          const options = { nullable: column.nullable === true };
+          const decoder: PublicCellDecoder = (input) => decodeShapedCell(shape, input, options);
+          return [column.name, decoder] as const;
+        }),
+      ),
+    );
+    const decoders = new Map(entries);
+    const cell = (name: string): Effect.Effect<PublicCellDecoder, PublicAttributesRejection> => {
+      const decoder = decoders.get(name);
+      if (decoder === undefined)
+        return Effect.fail(
+          new PublicAttributesRejection({ field: name, reason: "undeclared-attribute" }),
+        );
+      return Effect.succeed(decoder);
+    };
+    const prepared: PublicAttributeDecoder = { cell };
+    return prepared;
+  },
+);
 
 export const decodePublicAttributes = Effect.fn("kannin.public.decodeAttributes")(function* (
   declaration: unknown,

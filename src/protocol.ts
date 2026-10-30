@@ -770,12 +770,28 @@ export const TypedWriteDocument = CanonicalWriteDocument.mapFields((fields) => (
   ...fields,
   attributes: TypedAttributes,
 }));
+export const TypedWriteDocuments = Schema.Array(TypedWriteDocument).check(Schema.isMaxLength(1000));
+export const PublicRowsInput = Schema.Array(Schema.Record(FieldName, Schema.Unknown)).check(
+  Schema.isMaxLength(1000),
+);
+export const PublicColumnsInput = Schema.Record(
+  FieldName,
+  Schema.Array(Schema.Unknown).check(Schema.isMaxLength(1000)),
+);
+export class PublicRowsRejection extends Schema.TaggedError<
+  PublicRowsRejection,
+  { readonly brand: unique symbol }
+>()("PublicRowsRejection", {
+  reason: Schema.Literals(["missing-id", "unequal-columns"]),
+  row: Schema.optional(Schema.Int),
+  field: Schema.optional(FieldName),
+}) {}
 export const TypedWrite = Schema.Struct({
   kind: Schema.Literal("typed"),
   requestId: Id,
   idType: IdType,
   declaration: Schema.optional(TypedDeclaration),
-  upserts: Schema.Array(TypedWriteDocument).check(Schema.isMaxLength(1000)),
+  upserts: TypedWriteDocuments,
   deletes: Schema.Array(CanonicalId).check(Schema.isMaxLength(1000)),
   reset: Schema.optional(Schema.Boolean),
 }).check(

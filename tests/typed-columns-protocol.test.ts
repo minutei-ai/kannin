@@ -144,6 +144,18 @@ test("typed declarations normalize order once, make every flag explicit and comp
   expect(() => nativeSchemaFromColumns(columns)).toThrow("Typed columns");
 });
 
+test("FTS-free typed requests retain fixed receipt digest bytes", () => {
+  const encode = Schema.encodeSync(Schema.fromJsonString(TypedWrite));
+  const expected =
+    '{"kind":"typed","requestId":"request","idType":"string","declaration":{"vectorDimensions":4,"columns":[{"name":"count","type":"u64","filterable":true,"nullable":false},{"name":"payload","type":"bytes","filterable":false,"nullable":true},{"name":"score","type":"f64","filterable":false,"nullable":true},{"name":"tags","type":"[string]","filterable":true,"nullable":false}]},"upserts":[{"id":"a","roles":{"title":"","text":"rust"},"attributes":{"count":{"u64":"18446744073709551615"},"tags":["x"]}}],"deletes":[]}';
+  const withoutDeclaration =
+    '{"kind":"typed","requestId":"request","idType":"string","upserts":[{"id":"a","roles":{"title":"","text":"rust"},"attributes":{"count":{"u64":"18446744073709551615"},"tags":["x"]}}],"deletes":[]}';
+  expect(encode(normalizeTypedWrite(write()))).toBe(expected);
+  expect(encode(normalizeTypedWrite(Struct.omit(write(), ["declaration"])))).toBe(
+    withoutDeclaration,
+  );
+});
+
 test("reordered declarations yield one request digest input", () => {
   const encode = Schema.encodeSync(Schema.fromJsonString(TypedWrite));
   const forward = encode(normalizeTypedWrite(write()));

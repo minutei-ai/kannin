@@ -8982,6 +8982,15 @@ pub mod wasm {
 
     #[wasm_bindgen]
     impl Directory {
+        #[doc = "# Errors\nRejects partial common directories and field serialization failures."]
+        pub fn fields(&self) -> Result<String, JsValue> {
+            if self.partial {
+                return Err(JsValue::from_str("Operation requires a complete directory"));
+            }
+            serde_json::to_string(&self.header.fields)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))
+        }
+
         #[wasm_bindgen(constructor)]
         #[doc = "# Errors\nRejects invalid input serialization or segment framing, size, and integrity constraints."]
         pub fn new(bytes: &[u8]) -> Result<Self, JsValue> {

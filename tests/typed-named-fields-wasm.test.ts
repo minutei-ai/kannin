@@ -2,6 +2,9 @@ import { expect, test } from "bun:test";
 import { Schema } from "effect";
 import {
   initSync,
+  Directory,
+  directory_compress,
+  segment_fields,
   Segment,
   segment_build_text_fields,
   segment_local_field_statistics,
@@ -14,6 +17,7 @@ import {
   FieldRankHit,
   FieldStatisticsQuery,
   NamedTextFields,
+  SegmentTextFields,
 } from "../src/protocol";
 import type { DocumentColumnId } from "../src/protocol";
 import { canonicalFixtureDocuments } from "./segment-fixture";
@@ -281,4 +285,26 @@ test("with_columns rejects malformed, oversized, duplicate, undeclared and wrong
     expect(() => Segment.with_columns(phraseFixture, columns, declaration)).toThrow();
   using segment = Segment.with_columns(phraseFixture, columns, declarations);
   expect(new TextDecoder().decode(segment.bytes().subarray(0, 8))).toBe("RAIOSEG6");
+});
+
+test("complete directories expose the same typed named field table without posting payloads", () => {
+  using segment = Segment.with_columns(phraseFixture, columns, declarations);
+  const bytes = segment.bytes();
+  const length =
+    16 + new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(8, true);
+  const canonical = bytes.subarray(0, length);
+  const decode = Schema.decodeSync(Schema.fromJsonString(SegmentTextFields), {
+    onExcessProperty: "error",
+  });
+  const expected = decode(segment_fields(bytes));
+  using full = new Directory(bytes);
+  using header = Directory.canonical(canonical, length);
+  const frame = directory_compress(canonical);
+  using compressed = Directory.compressed(frame, length, 40 * 1024 * 1024);
+  using retained = compressed.retain();
+  expect(decode(full.fields())).toEqual(expected);
+  expect(decode(header.fields())).toEqual(expected);
+  expect(decode(compressed.fields())).toEqual(expected);
+  expect(decode(retained.fields())).toEqual(expected);
+  expect(expected.map((field) => field.name)).toEqual([null, null, "tags", "title"]);
 });

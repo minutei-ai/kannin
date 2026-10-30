@@ -181,7 +181,7 @@ test("typed cells retain uint64 and UUID identities through compaction and rebui
           )
         ).json(),
       );
-      expect(ids(result)).toEqual(entry.values);
+      expect(ids(result)).toEqual([...entry.values]);
       for (const row of result.rows) {
         expect(row.attributes).toEqual(expectedAttributes(attributes));
       }

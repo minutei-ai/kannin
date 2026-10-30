@@ -1,5 +1,6 @@
 import { Effect, Schema } from "effect";
 import type { Cause } from "effect";
+import type { TypedColumnType } from "./protocol";
 import {
   NativeJsonNumeric,
   PublicAttributesInput,
@@ -9,7 +10,6 @@ import {
   PublicCellType,
   TypedCell,
   TypedAttributes,
-  TypedColumnType,
   TypedDeclaration,
 } from "./protocol";
 
@@ -65,7 +65,9 @@ const SHAPES: Record<ColumnType, Shape> = {
 };
 
 const isAlias = Schema.is(PublicCellAliasType);
-const isArrayCell = Schema.is(Schema.Array(Schema.Unknown));
+const isArrayCell = (
+  cell: typeof TypedCell.Type,
+): cell is Extract<typeof TypedCell.Type, ReadonlyArray<unknown>> => Array.isArray(cell);
 const isSupported = (kind: ElementKind): kind is SupportedKind => kind !== "datetime_ms";
 const WireArray = Schema.Array(Schema.Unknown).check(Schema.isMaxLength(4096));
 const decodeTypedCell = Schema.decodeUnknownEffect(TypedCell, { onExcessProperty: "error" });
@@ -221,16 +223,17 @@ export const decodePublicAttributes = Effect.fn("kannin.public.decodeAttributes"
     Effect.gen(function* () {
       const column = columns.get(name);
       if (column === undefined)
-        return yield* Effect.fail(
-          new PublicAttributesRejection({ field: name, reason: "undeclared-attribute" }),
-        );
+        return yield* new PublicAttributesRejection({
+          field: name,
+          reason: "undeclared-attribute",
+        });
       const cell = yield* decodePublicCell(column.type, value, {
         nullable: column.nullable === true,
       });
       return [name, cell] as const;
     }),
   );
-  return yield* Schema.decodeUnknownEffect(TypedAttributes, { onExcessProperty: "error" })(
+  return yield* Schema.decodeEffect(TypedAttributes, { onExcessProperty: "error" })(
     Object.fromEntries(entries),
   );
 });
@@ -247,9 +250,10 @@ export const encodePublicAttributes = Effect.fn("kannin.public.encodeAttributes"
     Effect.gen(function* () {
       const column = columns.get(name);
       if (column === undefined)
-        return yield* Effect.fail(
-          new PublicAttributesRejection({ field: name, reason: "undeclared-attribute" }),
-        );
+        return yield* new PublicAttributesRejection({
+          field: name,
+          reason: "undeclared-attribute",
+        });
       const value = yield* encodePublicCell(column.type, cell, {
         nullable: column.nullable === true,
       });

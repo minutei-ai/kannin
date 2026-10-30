@@ -156,7 +156,16 @@ test("integer decoding rejects overflow, non-integer lexemes and every non-numer
     expect(rejected(decodeText("i64", text))).toBe(true);
   for (const text of ["-1", "18446744073709551616", "1.0", "-0", '"1"', '{"u64":"1"}'])
     expect(rejected(decodeText("u64", text))).toBe(true);
-  for (const wire of [1, 9007199254740993, 1n, -1, 1.5, Number.NaN, undefined, { rawJSON: "1" }]) {
+  for (const wire of [
+    1,
+    Number("9007199254740993"),
+    1n,
+    -1,
+    1.5,
+    Number.NaN,
+    undefined,
+    { rawJSON: "1" },
+  ]) {
     expect(rejected(decodePublicCell("i64", wire, permissive))).toBe(true);
     expect(rejected(decodePublicCell("u64", wire, permissive))).toBe(true);
     expect(rejected(decodePublicCell("f64", wire, permissive))).toBe(true);

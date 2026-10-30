@@ -481,6 +481,23 @@ test("public cells run through native raw JSON in workerd", async () => {
   }
   const nullResponse = await send("string", "null", true);
   expect(await nullResponse.text()).toBe(JSON.stringify({ cell: null, wire: "null" }));
+  const attributeText = '{"count":18446744073709551615,"note":null}';
+  const attributeResponse = await worker.dispatchFetch(new URL("?attributes=true", origin), {
+    method: "POST",
+    body: attributeText,
+  });
+  expect(attributeResponse.status).toBe(200);
+  expect(await attributeResponse.text()).toBe(
+    JSON.stringify({
+      cell: { count: { u64: "18446744073709551615" }, note: null },
+      wire: attributeText,
+    }),
+  );
+  const undeclaredResponse = await worker.dispatchFetch(new URL("?attributes=true", origin), {
+    method: "POST",
+    body: '{"unknown":1}',
+  });
+  expect(undeclaredResponse.status).toBe(422);
   for (const [type, body] of [
     ["i64", "9223372036854775808"],
     ["i64", "1.0"],

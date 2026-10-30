@@ -1211,3 +1211,32 @@ fn aggregated_statistics_are_exact_checked_and_order_independent() -> Result<(),
     );
     Ok(())
 }
+
+#[test]
+fn planning_rejects_dense_ranking_state_before_collecting_pages() -> Result<(), String> {
+    let bytes = segment(1_000)?;
+    let (header, _) = parse_header(&bytes)?;
+    let fields = [tags()];
+    for mode in ["any", "all", "phrase"] {
+        let case = Case {
+            fields: &fields,
+            text: "red fox",
+            mode,
+            top_k: 10,
+        };
+        let budget = FieldBudget {
+            workspace_bytes: 4_096,
+            page_bytes: u64::MAX,
+        };
+        assert_eq!(
+            rejection(plan_rank_pages(&header, &case.query(&[], None), &budget))?,
+            "Workspace budget exceeded"
+        );
+        assert!(
+            !plan_rank_pages(&header, &case.query(&[], None), &FieldBudget::UNBOUNDED)?
+                .ranges()
+                .is_empty()
+        );
+    }
+    Ok(())
+}

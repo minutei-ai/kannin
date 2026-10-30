@@ -110,6 +110,18 @@ impl Run<'_, '_> {
     }
 }
 
+fn initial_state(
+    prepared: &Prepared<'_>,
+    query: &FieldQuery<'_>,
+    workspace: &mut Workspace,
+) -> Result<(Matching, Vec<f64>), String> {
+    let rows = prepared.header.documents.len();
+    workspace.reserve_items::<f64>(rows)?;
+    workspace.reserve_items::<Hit>(query.top_k)?;
+    let matching = Matching::new(query.mode, &prepared.fields, rows, workspace)?;
+    Ok((matching, vec![0.0; rows]))
+}
+
 fn execute(
     prepared: &Prepared<'_>,
     scoring: &Scoring,
@@ -120,17 +132,14 @@ fn execute(
     if prepared.fields.iter().all(|field| field.unique.is_empty()) {
         return Ok(Vec::new());
     }
-    let rows = prepared.header.documents.len();
-    workspace.reserve_items::<f64>(rows)?;
-    workspace.reserve_items::<Hit>(query.top_k)?;
-    let matching = Matching::new(query.mode, &prepared.fields, rows, workspace)?;
+    let (matching, scores) = initial_state(prepared, query, workspace)?;
     let mut run = Run {
         prepared,
         scoring,
         pages,
         workspace,
         matching,
-        scores: vec![0.0; rows],
+        scores,
         entries: Vec::new(),
     };
     for index in 0..prepared.fields.len() {
@@ -201,6 +210,9 @@ pub fn plan_rank_pages(
     Scoring::build(&prepared, query, &mut workspace)?;
     let plan = prepared.plan(&mut workspace)?;
     plan.within(budget.page_bytes)?;
+    if prepared.fields.iter().any(|field| !field.unique.is_empty()) {
+        initial_state(&prepared, query, &mut workspace)?;
+    }
     Ok(plan)
 }
 

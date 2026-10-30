@@ -7,6 +7,7 @@ import { initSync, unpack } from "../dist/wasm/raio_engine";
 import { decodeRoot } from "../src/manifest";
 import {
   CompactResult,
+  compareCanonicalIds,
   Log,
   Metadata,
   QueryResult,
@@ -94,7 +95,8 @@ const query = async (namespace: string, filters: unknown[] = [], text = "rust") 
       await ok(await request(worker, namespace, "query", textQuery(text, 100, filters)))
     ).json(),
   );
-const ids = (result: typeof QueryResult.Type) => result.rows.map((row) => row.id).toSorted();
+const ids = (result: typeof QueryResult.Type) =>
+  result.rows.map((row) => row.id).toSorted(compareCanonicalIds);
 const metadata = async (namespace: string) =>
   Schema.decodeUnknownSync(Metadata)(await (await request(worker, namespace, "metadata")).json());
 const segmentKeys = async (namespace: string) =>
@@ -103,6 +105,54 @@ const segmentKeys = async (namespace: string) =>
       await worker.getR2Bucket("STORAGE")
     ).list({ prefix: `namespaces/${namespace}/segments/` })
   ).objects;
+
+const filtered = async (filter: unknown) => ids(await query("typed-filter", [filter]));
+
+const rejected = async (body: unknown, namespace = "typed-reject") =>
+  (await request(worker, namespace, "write", body)).status;
+
+const emptyWrite = (
+  requestId: string,
+  upserts: unknown[],
+  extra: Record<string, unknown> = {},
+) => ({
+  kind: "typed",
+  requestId,
+  idType: "string",
+  upserts,
+  deletes: [],
+  ...extra,
+});
+
+test("1024 typed columns commit while overflowing declarations write no namespace objects", async () => {
+  const columns = Array.from({ length: 1024 }, (_, index) => ({
+    name: `column${index}`,
+    type: "u64",
+  }));
+  await ok(
+    await request(
+      worker,
+      "typed-column-limit",
+      "write",
+      typedWrite("limit", [typedDocument("row", "rust", {})], [], {
+        declaration: { columns },
+      }),
+    ),
+  );
+  expect((await metadata("typed-column-limit")).columns?.columns).toHaveLength(1026);
+  expect(ids(await query("typed-column-limit"))).toEqual(["row"]);
+  const overflowResponse = await request(
+    worker,
+    "typed-column-overflow",
+    "write",
+    typedWrite("overflow", [typedDocument("row", "rust", {})], [], {
+      declaration: { columns: [...columns, { name: "overflow", type: "u64" }] },
+    }),
+  );
+  expect(overflowResponse.status).toBe(400);
+  const bucket = await worker.getR2Bucket("STORAGE");
+  expect((await bucket.list({ prefix: "namespaces/typed-column-overflow/" })).objects).toEqual([]);
+});
 
 test("typed writes round-trip exact cells and expose canonical declarations in metadata", async () => {
   const response = await ok(
@@ -141,7 +191,6 @@ test("typed writes round-trip exact cells and expose canonical declarations in m
 
 test("typed filters use exact masks for large numbers, arrays, null and missing before top-k", async () => {
   await ok(await request(worker, "typed-filter", "write", typedWrite("one", Object.values(rows))));
-  const filtered = async (filter: unknown) => ids(await query("typed-filter", [filter]));
   expect(await filtered({ field: "count", op: "eq", value: { u64: MAX_U64 } })).toEqual(["a"]);
   expect(await filtered({ field: "count", op: "eq", value: { u64: "9007199254740992" } })).toEqual(
     [],
@@ -173,7 +222,7 @@ test("typed filters use exact masks for large numbers, arrays, null and missing 
     ).json(),
   );
   expect(limited.rows).toHaveLength(1);
-  expect(["a", "b"]).toContain(limited.rows[0]?.id);
+  expect(limited.rows.every((row) => row.id === "a" || row.id === "b")).toBe(true);
 });
 
 test("typed vector queries apply filters before vector top-k and replay Log 3", async () => {
@@ -219,7 +268,7 @@ test("typed vector queries apply filters before vector top-k and replay Log 3", 
   });
   expect(logs.objects).toHaveLength(1);
   const object = await (await worker.getR2Bucket("STORAGE")).get(logs.objects[0]?.key ?? "");
-  const log = Schema.decodeUnknownSync(Schema.fromJsonString(Log), { onExcessProperty: "error" })(
+  const log = Schema.decodeSync(Schema.fromJsonString(Log), { onExcessProperty: "error" })(
     unpack(new Uint8Array((await object?.arrayBuffer()) ?? new ArrayBuffer(0))),
   );
   expect(log.version).toBe(3);
@@ -307,8 +356,6 @@ test("receipts are idempotent over normalized declarations and reject changed pa
 });
 
 test("typed ingress rejects unknown flags, undeclared and mistyped attributes", async () => {
-  const rejected = async (body: unknown, namespace = "typed-reject") =>
-    (await request(worker, namespace, "write", body)).status;
   for (const flag of ["fullText", "vector", "inference", "drop"])
     expect(
       await rejected(
@@ -457,12 +504,12 @@ test("native segments and logs keep their historical formats beside typed namesp
   for (const object of logs.objects) {
     const stored = await bucket.get(object.key);
     versions.push(
-      Schema.decodeUnknownSync(Schema.fromJsonString(Log), { onExcessProperty: "error" })(
+      Schema.decodeSync(Schema.fromJsonString(Log), { onExcessProperty: "error" })(
         unpack(new Uint8Array((await stored?.arrayBuffer()) ?? new ArrayBuffer(0))),
       ).version,
     );
   }
-  expect(versions.toSorted()).toEqual([1, 2]);
+  expect(versions.toSorted((left, right) => left - right)).toEqual([1, 2]);
   const described = await metadata("native-bytes");
   expect(described.columns).toBeUndefined();
   const result = await query("native-bytes", [{ field: "year", op: "gte", value: 2025 }]);
@@ -476,7 +523,7 @@ test("Root 7 migrates to Root 8 by envelope without rewriting segments", async (
   const bucket = await worker.getR2Bucket("STORAGE");
   const rootKey = "namespaces/root-seven/root.json";
   const current = await bucket.get(rootKey);
-  const stored = Schema.decodeUnknownSync(Schema.fromJsonString(StoredRoot))(
+  const stored = Schema.decodeSync(Schema.fromJsonString(StoredRoot))(
     (await current?.text()) ?? "",
   );
   const segmentsBefore = await segmentKeys("root-seven");
@@ -491,7 +538,7 @@ test("Root 7 migrates to Root 8 by envelope without rewriting segments", async (
     sequence: stored.sequence,
     rootRewritten: true,
   });
-  const rewritten = Schema.decodeUnknownSync(Schema.fromJsonString(StoredRoot))(
+  const rewritten = Schema.decodeSync(Schema.fromJsonString(StoredRoot))(
     (await (await bucket.get(rootKey))?.text()) ?? "",
   );
   expect(rewritten).toEqual(stored);
@@ -512,18 +559,6 @@ test("an empty typed namespace keeps its mode across restart, writes and migrati
   cleanup.defer(() => rm(persistence, { recursive: true, force: true }));
   const namespace = "typed-empty";
   const emptyDeclaration = { columns: [] };
-  const emptyWrite = (
-    requestId: string,
-    upserts: unknown[],
-    extra: Record<string, unknown> = {},
-  ) => ({
-    kind: "typed",
-    requestId,
-    idType: "string",
-    upserts,
-    deletes: [],
-    ...extra,
-  });
   {
     const writer = await startWorker(persistence);
     await using lifetime = new AsyncDisposableStack();

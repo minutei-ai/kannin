@@ -260,7 +260,7 @@ const validNamespaceColumns = (columns: ReadonlyArray<typeof ColumnDeclaration.T
 };
 export const NamespaceColumns = Schema.Struct({
   columns: Schema.Array(ColumnDeclaration).check(
-    Schema.isBetweenLength(1, MAX_TYPED_COLUMNS + 1),
+    Schema.isBetweenLength(1, MAX_TYPED_COLUMNS + 2),
     Schema.makeFilter(validNamespaceColumns),
   ),
 });
@@ -479,6 +479,7 @@ export const TypedCell = Schema.Union([
   TypedCellArray,
 ]);
 export const TypedAttributes = Schema.Record(FieldName, TypedCell);
+const StoredAttributes = Schema.Record(FieldName, Schema.Union([AttributeValue, TypedCell]));
 export const TypedTag = Schema.Union([
   TypedIntCell,
   TypedUintCell,
@@ -1158,7 +1159,7 @@ export const Row = Schema.Struct({
   id: CanonicalId,
   title: Schema.String,
   text: Schema.String,
-  attributes: Schema.Union([Attributes, TypedAttributes]),
+  attributes: StoredAttributes,
   revision: Schema.Int,
   score: Schema.Finite,
 });
@@ -1268,7 +1269,7 @@ export const SegmentDocument = Schema.Struct({
   revision: Schema.Int,
   title_length: Schema.Int,
   body_length: Schema.Int,
-  attributes: Schema.Union([Attributes, TypedAttributes]),
+  attributes: StoredAttributes,
   data: DataRange,
   vector: Schema.Boolean,
 });

@@ -24,7 +24,7 @@ import {
   filterableNames,
 } from "../src/protocol";
 
-const declaration = Schema.decodeUnknownSync(TypedDeclaration)({
+const declaration = Schema.decodeSync(TypedDeclaration)({
   vectorDimensions: 4,
   columns: [
     { name: "tags", type: "[string]", filterable: true },
@@ -48,13 +48,13 @@ const base = {
   bloomPacks: [],
   segments: [],
 } as const;
-const typedRoot = Schema.decodeUnknownSync(Root)({ ...base, schema: columns });
-const nativeRoot = Schema.decodeUnknownSync(Root)({
+const typedRoot = Schema.decodeSync(Root)({ ...base, schema: columns });
+const nativeRoot = Schema.decodeSync(Root)({
   ...base,
   schema: namespaceColumnsFromNative({ filterable: ["year"], vectorFilterFields: ["year"] }),
 });
 const write = (overrides: Record<string, unknown> = {}) =>
-  Schema.decodeUnknownSync(TypedWrite)({
+  Schema.decodeSync(TypedWrite)({
     kind: "typed",
     requestId: "request",
     idType: "string",
@@ -69,6 +69,34 @@ const write = (overrides: Record<string, unknown> = {}) =>
     deletes: [],
     ...overrides,
   });
+
+const valid = (attributes: Record<string, unknown>) => validateTypedAttributes(typed, attributes);
+
+const check = (filter: { field: string; op: string; value: unknown }) =>
+  validateTypedFilter(typed, filter);
+
+test("typed column limits exclude the vector and namespace marker from the attribute count", () => {
+  for (const count of [1023, 1024]) {
+    const declared = Schema.decodeSync(TypedDeclaration)({
+      columns: Array.from({ length: count }, (_, index) => ({
+        name: `column${index}`,
+        type: "u64" as const,
+      })),
+    });
+    const schema = Schema.decodeSync(NamespaceColumns)(namespaceColumnsFromTyped(declared));
+    expect(schema.columns).toHaveLength(count + 2);
+    const root = Schema.decodeSync(Root)({ ...base, schema });
+    expect(decodeRoot(encodeRoot(root)).schema?.columns).toHaveLength(count + 2);
+  }
+  expect(() =>
+    Schema.decodeSync(TypedDeclaration)({
+      columns: Array.from({ length: 1025 }, (_, index) => ({
+        name: `column${index}`,
+        type: "u64" as const,
+      })),
+    }),
+  ).toThrow();
+});
 
 test("typed declarations normalize order once, make every flag explicit and compare in full", () => {
   expect(columns.columns.map((column) => column.source)).toEqual([
@@ -176,7 +204,6 @@ test("declarations reject duplicates, filterable bytes, byte arrays, unknown typ
 });
 
 test("typed attributes are validated against exact declared types without coercion", () => {
-  const valid = (attributes: Record<string, unknown>) => validateTypedAttributes(typed, attributes);
   expect(
     valid({ count: { u64: "18446744073709551615" }, tags: ["a"], score: null }),
   ).toBeUndefined();
@@ -212,8 +239,6 @@ test("typed cells reject malformed exact tags and keep large numbers as text", (
 });
 
 test("typed filters validate declarations, operators and operand kinds before query", () => {
-  const check = (filter: { field: string; op: string; value: unknown }) =>
-    validateTypedFilter(typed, filter);
   expect(check({ field: "count", op: "eq", value: { u64: "1" } })).toBeUndefined();
   expect(check({ field: "count", op: "gte", value: { u64: "1" } })).toBeUndefined();
   expect(check({ field: "count", op: "in", value: [{ u64: "1" }, { u64: "2" }] })).toBeUndefined();
@@ -274,7 +299,11 @@ test("typed and legacy declarations cannot mix and typed columns stay sorted", (
   ).toThrow();
   expect(() =>
     decode({
-      columns: [vector, marker, ...attributes.map((column) => ({ ...column, fullText: true }))],
+      columns: [
+        vector,
+        marker,
+        ...attributes.map((column) => Object.assign({}, column, { fullText: true })),
+      ],
     }),
   ).toThrow();
   expect(decode(columns)).toEqual(columns);
@@ -371,9 +400,7 @@ test("metadata exposes canonical typed declarations without pretending to have n
 });
 
 test("an empty typed declaration keeps typed mode through an explicit persisted discriminant", () => {
-  const empty = namespaceColumnsFromTyped(
-    Schema.decodeUnknownSync(TypedDeclaration)({ columns: [] }),
-  );
+  const empty = namespaceColumnsFromTyped(Schema.decodeSync(TypedDeclaration)({ columns: [] }));
   expect(empty.columns).toEqual([{ source: "native-vector" }, { source: "typed-namespace" }]);
   expect(isTypedNamespace(empty)).toBe(true);
   expect(typedColumns(empty)).toEqual([]);
@@ -381,7 +408,7 @@ test("an empty typed declaration keeps typed mode through an explicit persisted 
   expect(typedColumns(undefined)).toBeUndefined();
   expect(sameNamespaceColumns(empty, { columns: [{ source: "native-vector" }] })).toBe(false);
   expect(filterableNames(empty)).toEqual([]);
-  const emptyRoot = Schema.decodeUnknownSync(Root)({ ...base, schema: empty });
+  const emptyRoot = Schema.decodeSync(Root)({ ...base, schema: empty });
   const wire = encodeRoot(emptyRoot);
   expect(decodeRoot(wire).schema).toEqual(empty);
   expect(isTypedNamespace(decodeRoot(wire).schema)).toBe(true);
@@ -392,7 +419,7 @@ test("an empty typed declaration keeps typed mode through an explicit persisted 
       decodeRootForMigration(JSON.stringify({ ...Struct.omit(stored, ["idType"]), version })),
     ).toThrow();
   expect(() =>
-    Schema.decodeUnknownSync(NamespaceColumns)({
+    Schema.decodeSync(NamespaceColumns)({
       columns: [{ source: "native-vector" }, ...typed],
     }),
   ).toThrow();

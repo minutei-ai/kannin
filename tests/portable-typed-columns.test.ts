@@ -91,10 +91,11 @@ test("typed columns persist through real S3 restart, exact ranking and compactio
             ...mutation.declaration,
             columns: mutation.declaration.columns.toReversed(),
           },
-          upserts: mutation.upserts.map((document) => ({
-            ...document,
-            attributes: Object.fromEntries(Object.entries(document.attributes).toReversed()),
-          })),
+          upserts: mutation.upserts.map((document) =>
+            Object.assign({}, document, {
+              attributes: Object.fromEntries(Object.entries(document.attributes).toReversed()),
+            }),
+          ),
         });
         expect(retry).toEqual(receipt);
         for (const query of [

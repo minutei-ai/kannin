@@ -2830,14 +2830,18 @@ export function createApplication(runtime: SearchRuntime, searchStorage: Storage
               throw new Rejected({ status: 400, message: "Typed write has no typed columns" });
             return Effect.runPromise(
               buildTypedSegment(
-                typedWrite.upserts.map((document) => ({ ...document, revision: sequence })),
+                typedWrite.upserts.map((document) =>
+                  Object.assign({}, document, { revision: sequence }),
+                ),
                 declaredTyped,
               ),
             );
           }
           const documents = (() => {
             if ("kind" in input && input.kind === "canonical")
-              return input.upserts.map((document) => ({ ...document, revision: sequence }));
+              return input.upserts.map((document) =>
+                Object.assign({}, document, { revision: sequence }),
+              );
             if (!("kind" in input))
               return input.upserts.map((document) => nativeToCanonicalDocument(document, sequence));
             throw new Rejected({ status: 400, message: "Unknown write kind" });

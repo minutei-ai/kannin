@@ -135,7 +135,7 @@ test("write and compaction publish pooled declared models while subset ranking m
   const object = await bucket.get(`namespaces/${namespaces[0]}/root.json`);
   if (object === null) throw new Error("Missing produced Root");
   const stored = Schema.decodeSync(Schema.fromJsonString(StoredRoot))(await object.text());
-  expect(stored.version).toBe(7);
+  expect(stored.version).toBe(8);
   expect(stored.eligibilityModels).toHaveLength(1);
   expect(stored.segments.every((segment) => segment.eligibilityIndex === 0)).toBe(true);
   const logical = decodeRoot(Schema.encodeSync(Schema.fromJsonString(StoredRoot))(stored));

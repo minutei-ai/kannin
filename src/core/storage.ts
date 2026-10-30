@@ -367,6 +367,27 @@ export function createStorage(runtime: SearchRuntime) {
     onExcessProperty: "error",
   });
 
+  function decodeFullDocument(encoded: string, typed: boolean) {
+    if (typed) return decodeTypedCanonicalDocument(encoded);
+    return decodeCanonicalDocument(encoded);
+  }
+
+  function decodeQueryDocument(encoded: string, typed: boolean) {
+    if (typed) return decodeTypedCanonicalQueryDocument(encoded);
+    return decodeCanonicalQueryDocument(encoded);
+  }
+
+  function decodeQueryDocumentEffect(
+    encoded: string,
+    typed: boolean,
+  ): Effect.Effect<
+    typeof CanonicalQueryDocument.Type | typeof TypedCanonicalQueryDocument.Type,
+    Schema.SchemaError
+  > {
+    if (typed) return decodeTypedCanonicalQueryDocumentEffect(encoded);
+    return decodeCanonicalQueryDocumentEffect(encoded);
+  }
+
   function evictFor(bytes: number) {
     while (budget.bytes + frequencyBudget.bytes + bytes > MAX_CACHE_BYTES) {
       const oldest = cacheOrder.entries().next().value;
@@ -3570,10 +3591,7 @@ export function createStorage(runtime: SearchRuntime) {
     payload?: Uint8Array,
     typed: boolean = false,
   ) {
-    const decode = Match.value(typed).pipe(
-      Match.when(true, () => decodeTypedCanonicalDocument),
-      Match.orElse(() => decodeCanonicalDocument),
-    );
+    const decode = (encoded: string) => decodeFullDocument(encoded, typed);
     if (vectorData !== null) {
       if (
         vectorData.offset < data.offset + data.length ||
@@ -3844,14 +3862,8 @@ export function createStorage(runtime: SearchRuntime) {
     signal?: AbortSignal,
     typed: boolean = false,
   ) {
-    const decodeOne = Match.value(typed).pipe(
-      Match.when(true, () => decodeTypedCanonicalQueryDocument),
-      Match.orElse(() => decodeCanonicalQueryDocument),
-    );
-    const decodeOneEffect = Match.value(typed).pipe(
-      Match.when(true, () => decodeTypedCanonicalQueryDocumentEffect),
-      Match.orElse(() => decodeCanonicalQueryDocumentEffect),
-    );
+    const decodeOne = (encoded: string) => decodeQueryDocument(encoded, typed);
+    const decodeOneEffect = (encoded: string) => decodeQueryDocumentEffect(encoded, typed);
     const identity = `${env.STORAGE_CACHE_SCOPE}:${key}`;
     const cached = directories.get(identity);
     if (cached !== undefined) {

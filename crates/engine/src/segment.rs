@@ -8910,7 +8910,7 @@ pub mod wasm {
         header: Rc<Header>,
         decoded: DecodedFieldQuery,
         plan: super::PagePlan,
-        collector: super::PageCollector,
+        collector: Option<super::PageCollector>,
         budget: super::FieldBudget,
         statistics: bool,
     }
@@ -8919,6 +8919,9 @@ pub mod wasm {
     impl FieldPass {
         #[doc = "# Errors\nRejects range serialization failures."]
         pub fn ranges(&self) -> Result<String, JsValue> {
+            if self.collector.is_none() {
+                return Err(JsValue::from_str("Field pass is finished"));
+            }
             serde_json::to_string(self.plan.ranges())
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))
         }
@@ -8928,14 +8931,18 @@ pub mod wasm {
             let length = u32::try_from(bytes.len())
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
             self.collector
+                .as_mut()
+                .ok_or_else(|| JsValue::from_str("Field pass is finished"))?
                 .accept(&Range { offset, length }, bytes)
                 .map_err(|cause| JsValue::from_str(&cause))
         }
 
-        #[doc = "# Errors\nRejects missing or corrupt pages, query budget violations and result serialization failures. Consumes the pass."]
-        pub fn finish(self) -> Result<String, JsValue> {
+        #[doc = "# Errors\nRejects missing or corrupt pages, query budget violations and result serialization failures. Releases collected pages on success or failure; the handle remains freeable."]
+        pub fn finish(&mut self) -> Result<String, JsValue> {
             let mut pages = self
                 .collector
+                .take()
+                .ok_or_else(|| JsValue::from_str("Field pass is finished"))?
                 .finish()
                 .map_err(|cause| JsValue::from_str(&cause))?;
             if self.statistics {
@@ -9121,7 +9128,7 @@ pub mod wasm {
                 header: Rc::clone(&self.header),
                 decoded,
                 plan,
-                collector,
+                collector: Some(collector),
                 budget,
                 statistics: true,
             })
@@ -9150,7 +9157,7 @@ pub mod wasm {
                 header: Rc::clone(&self.header),
                 decoded,
                 plan,
-                collector,
+                collector: Some(collector),
                 budget,
                 statistics: false,
             })

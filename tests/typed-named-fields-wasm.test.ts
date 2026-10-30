@@ -319,7 +319,7 @@ test("directory field passes rank exact typed posting ranges in arbitrary arriva
     16 + new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(8, true);
   using directory = Directory.canonical(bytes.subarray(0, base), base);
   const request = query([tags], "red fox", { mode: "phrase" });
-  const pass = directory.field_rank_pass(request, 16 * 1024 * 1024, 16 * 1024 * 1024);
+  using pass = directory.field_rank_pass(request, 16 * 1024 * 1024, 16 * 1024 * 1024);
   const ranges = Schema.decodeSync(Schema.fromJsonString(Schema.Array(DataRange)))(pass.ranges());
   expect(ranges.length).toBeGreaterThan(0);
   for (const range of [...ranges].reverse()) {
@@ -330,6 +330,9 @@ test("directory field passes rank exact typed posting ranges in arbitrary arriva
     decodeHits(segment_rank_fields(bytes, request)),
   );
   expect(hits.map(({ id }) => id)).toEqual(["c"]);
+  expect(() => pass.finish()).toThrow("finished");
+  expect(() => pass.ranges()).toThrow("finished");
+  expect(() => pass.add(0, new Uint8Array())).toThrow("finished");
   expect(() => directory.field_rank_pass(request, 0, 16 * 1024 * 1024)).toThrow("budget");
   expect(() => directory.field_rank_pass(request, 16 * 1024 * 1024, 0)).toThrow("budget");
   using invalid = directory.field_rank_pass(request, 16 * 1024 * 1024, 16 * 1024 * 1024);
@@ -340,8 +343,9 @@ test("directory field passes rank exact typed posting ranges in arbitrary arriva
     expect(() => invalid.add(range.offset, page)).toThrow("Duplicate");
   }
   expect(() => invalid.add(0xffffffff, new Uint8Array())).toThrow("Unplanned");
-  const missing = directory.field_rank_pass(request, 16 * 1024 * 1024, 16 * 1024 * 1024);
+  using missing = directory.field_rank_pass(request, 16 * 1024 * 1024, 16 * 1024 * 1024);
   expect(() => missing.finish()).toThrow("Missing");
+  expect(() => missing.finish()).toThrow("finished");
 });
 
 test("directory statistics passes count live named fields without reading fully live posting blocks", () => {
@@ -349,7 +353,7 @@ test("directory statistics passes count live named fields without reading fully 
   const bytes = segment.bytes();
   using directory = new Directory(bytes);
   const request = encodeStatisticsQuery({ fields: [tags], text: "red fox", mode: "all" });
-  const pass = directory.field_stats_pass(request, 16 * 1024 * 1024, 0);
+  using pass = directory.field_stats_pass(request, 16 * 1024 * 1024, 0);
   expect(pass.ranges()).toBe("[]");
   const live = decodeStats(pass.finish());
   expect(live).toEqual(decodeStats(segment_local_field_statistics(bytes, request)));
@@ -359,7 +363,7 @@ test("directory statistics passes count live named fields without reading fully 
     mode: "all",
     dead: [1],
   });
-  const dead = directory.field_stats_pass(deadRequest, 16 * 1024 * 1024, 16 * 1024 * 1024);
+  using dead = directory.field_stats_pass(deadRequest, 16 * 1024 * 1024, 16 * 1024 * 1024);
   const base =
     16 + new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(8, true);
   const ranges = Schema.decodeSync(Schema.fromJsonString(Schema.Array(DataRange)))(dead.ranges());

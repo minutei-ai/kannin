@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { Effect, Layer, Schema } from "effect";
-import { QueryResult } from "../src/protocol";
+import { Metadata, QueryResult } from "../src/protocol";
 import {
   type ApiImageInspection,
   portableApiImage,
@@ -88,7 +88,93 @@ test("same OCI API image runs on Podman and Docker Engine with canonical state a
               );
               expect(typedWritten.status).toBe(200);
               yield* Effect.tryPromise(() => typedWritten.arrayBuffer());
+              const cellId = { kind: "uint" as const, value: "9007199254740993" };
+              const cellAttributes = {
+                count: { u64: "18446744073709551615" },
+                signed: { i64: "-9223372036854775808" },
+                payload: { bytes: "AP8=" },
+                tags: ["oci", engine],
+              };
+              const cellWrite = {
+                kind: "typed",
+                idType: "uint",
+                requestId: "cells-container-write",
+                declaration: {
+                  vectorDimensions: 2,
+                  columns: [
+                    { name: "count", type: "u64", filterable: true },
+                    { name: "signed", type: "i64" },
+                    { name: "payload", type: "bytes" },
+                    { name: "tags", type: "[string]", filterable: true },
+                  ],
+                },
+                upserts: [
+                  {
+                    id: { kind: "uint", value: "9007199254740992" },
+                    roles: { title: "cells", text: "cells cells cells" },
+                    attributes: { count: { u64: "9007199254740992" } },
+                    vector: [1, 0],
+                  },
+                  {
+                    id: cellId,
+                    roles: { title: "", text: "cells" },
+                    attributes: cellAttributes,
+                    vector: [0.8, 0.2],
+                  },
+                ],
+                deletes: [],
+              };
+              const cellsWritten = yield* Effect.tryPromise(() =>
+                fetch(`${api.endpoint}/v1/namespaces/${namespace}-cells/write`, {
+                  method: "POST",
+                  headers,
+                  body: JSON.stringify(cellWrite),
+                }),
+              );
+              expect(cellsWritten.status).toBe(200);
+              const cellReceipt = yield* Effect.tryPromise(() => cellsWritten.text());
               yield* api.restart;
+              const cellRetry = yield* Effect.tryPromise(() =>
+                fetch(`${api.endpoint}/v1/namespaces/${namespace}-cells/write`, {
+                  method: "POST",
+                  headers,
+                  body: JSON.stringify(cellWrite),
+                }),
+              );
+              expect(cellRetry.status).toBe(200);
+              expect(yield* Effect.tryPromise(() => cellRetry.text())).toBe(cellReceipt);
+              for (const query of [
+                { kind: "text", text: "cells" },
+                { kind: "vector", vector: [1, 0] },
+              ]) {
+                const response = yield* Effect.tryPromise(() =>
+                  fetch(`${api.endpoint}/v1/namespaces/${namespace}-cells/query`, {
+                    method: "POST",
+                    headers,
+                    body: JSON.stringify({
+                      ...query,
+                      topK: 1,
+                      minimumSequence: 1,
+                      filters: [{ field: "count", op: "eq", value: cellAttributes.count }],
+                    }),
+                  }),
+                );
+                expect(response.status).toBe(200);
+                const cells = yield* Effect.tryPromise(() => response.json()).pipe(
+                  Effect.flatMap(Schema.decodeUnknownEffect(QueryResult)),
+                );
+                expect(cells.sequence).toBe(1);
+                expect(cells.rows.map((row) => row.id)).toEqual([cellId]);
+                expect(cells.rows[0]?.attributes).toEqual(cellAttributes);
+              }
+              const cellMetadata = yield* Effect.tryPromise(() =>
+                fetch(`${api.endpoint}/v1/namespaces/${namespace}-cells/metadata`, { headers }),
+              );
+              expect(cellMetadata.status).toBe(200);
+              const cells = yield* Effect.tryPromise(() => cellMetadata.json()).pipe(
+                Effect.flatMap(Schema.decodeUnknownEffect(Metadata)),
+              );
+              expect(cells).toMatchObject({ sequence: 1, documents: 2, schema: null });
               const response = yield* Effect.tryPromise(() =>
                 fetch(`${api.endpoint}/v1/namespaces/${namespace}/query`, {
                   method: "POST",

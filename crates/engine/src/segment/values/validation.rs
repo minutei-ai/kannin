@@ -113,9 +113,10 @@ pub(super) fn validate(raw: &str) -> Result<(), String> {
 }
 
 pub(super) const fn reservation(raw_bytes: usize) -> usize {
-    // Retain at most 64 bounded names. Array cells are consumed individually. Two
-    // raw lengths cover decoder scratch and the current escaped tag/value pair.
+    // Retain at most 64 bounded names. Array cells are consumed individually.
+    // Decoder scratch may grow geometrically to twice the current string length;
+    // the borrowed-or-owned tag/value pair can additionally retain one raw length.
     let names =
         MAX_FILTERABLE * (MAX_NAME_BYTES + 4 * size_of::<String>() + 8 * size_of::<usize>());
-    raw_bytes.saturating_mul(2).saturating_add(names)
+    raw_bytes.saturating_mul(3).saturating_add(names)
 }

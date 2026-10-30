@@ -117,6 +117,6 @@ pub(super) const fn reservation(raw_bytes: usize) -> usize {
     // Decoder scratch may grow geometrically to twice the current string length;
     // the borrowed-or-owned tag/value pair can additionally retain one raw length.
     let names =
-        MAX_FILTERABLE * (MAX_NAME_BYTES + 4 * size_of::<String>() + 8 * size_of::<usize>());
+        MAX_FILTERABLE * (MAX_NAME_BYTES + 4 * size_of::<String>() + size_of::<[usize; 8]>());
     raw_bytes.saturating_mul(3).saturating_add(names)
 }

@@ -260,8 +260,8 @@ fn arrays_are_homogeneous_flat_and_bounded() -> Check {
         r#"[{"i64":"1"},"1"]"#,
         r#"[["a"]]"#,
         r#"["a",null]"#,
-        r#"[null]"#,
-        r#"[1]"#,
+        "[null]",
+        "[1]",
         r#"[{"bytes":"Zg=="}]"#,
     ] {
         assert!(decode(text).is_err(), "{text}");
@@ -351,7 +351,7 @@ fn bytes_are_rejected_wherever_filtering_or_indexing_could_read_them() -> Check 
     );
     assert!(CellType::parse("[bytes]").is_err());
     let schema = AttributeSchema::from_json(r#"[{"name":"blob","type":"bytes"}]"#)?;
-    assert!(schema.filterable_names().is_empty());
+    assert_eq!(schema.filterable_names(), [] as [String; 0]);
     assert!(schema.validate_text_field("blob").is_err());
     Ok(())
 }
@@ -448,6 +448,11 @@ fn typed_equality_ranges_and_membership_are_exact_and_never_coerce() -> Check {
     assert!(!filter("in", &json!([{"i64": "7"}]), None)?);
     assert!(filter("notIn", &json!([{"i64": "7"}]), None)?);
 
+    Ok(())
+}
+
+#[test]
+fn typed_comparisons_never_coerce_kinds() -> Check {
     // Cross-kind operands never equal and never order: no widening, no float coercion.
     let signed = Cell::I64(1);
     let unsigned = json!({"u64": "1"});

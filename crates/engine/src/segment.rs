@@ -3116,6 +3116,28 @@ fn attribute_json(
         .map_err(|cause| cause.to_string())
 }
 
+fn validate_build_attributes(
+    documents: &[Document],
+    schema: Option<&AttributeSchema>,
+) -> Result<(), String> {
+    match schema {
+        Some(schema) => {
+            for document in documents {
+                schema.validate_attributes(document.columns().attributes())?;
+            }
+        }
+        None => {
+            if documents
+                .iter()
+                .any(|document| !document.columns().is_legacy())
+            {
+                return Err("Typed attributes require the typed segment builder".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn build_versioned(
     mut documents: Vec<Document>,
     filterable: Option<&[String]>,
@@ -3129,21 +3151,7 @@ fn build_versioned(
     if documents.len() > 10000 {
         return Err("Segment exceeds 10000 documents".into());
     }
-    match schema {
-        Some(schema) => {
-            for document in &documents {
-                schema.validate_attributes(document.columns().attributes())?;
-            }
-        }
-        None => {
-            if documents
-                .iter()
-                .any(|document| !document.columns().is_legacy())
-            {
-                return Err("Typed attributes require the typed segment builder".into());
-            }
-        }
-    }
+    validate_build_attributes(&documents, schema)?;
     let typed_ids = documents
         .iter()
         .any(|document| !matches!(document.id, DocumentId::String(_)));
@@ -4002,6 +4010,47 @@ fn decode_directory_payload(
         .map(|contents| contents.header)
 }
 
+fn validate_directory_header(
+    header: &Header,
+    expected: usize,
+    magic: [u8; 8],
+    reserved: usize,
+    max_heap_bytes: usize,
+    previously_validated: bool,
+) -> Result<(), String> {
+    if !frame_magic_matches(magic, header.version) {
+        return Err("Directory magic does not match its version".into());
+    }
+    header.documents.attributes.validate_expansion(expected)?;
+    if !previously_validated {
+        if header.version >= TYPED_VERSION {
+            // Typed attribute validation decodes one carrier at a time; its transient working
+            // set is charged against the same budget as the retained directory.
+            let widest = header
+                .documents
+                .attributes
+                .unique_values()
+                .iter()
+                .map(|attributes| attributes.get().len())
+                .max()
+                .unwrap_or(0);
+            if header
+                .heap_bytes()
+                .saturating_add(values::directory_validation_reservation(widest))
+                .saturating_add(reserved)
+                > max_heap_bytes
+            {
+                return Err("Typed directory validation exceeds memory budget".into());
+            }
+        }
+        validate_header(header)?;
+        if is_common_directory_magic(magic) {
+            validate_common_directory_header(header)?;
+        }
+    }
+    Ok(())
+}
+
 fn decode_directory_contents(
     bytes: &[u8],
     expected: usize,
@@ -4074,36 +4123,14 @@ fn decode_directory_contents(
         return Err("Common posting payload exceeds memory budget".into());
     }
     let header = binary_directory::decode(header_bytes, max_heap_bytes.saturating_sub(reserved))?;
-    if !frame_magic_matches(magic, header.version) {
-        return Err("Directory magic does not match its version".into());
-    }
-    header.documents.attributes.validate_expansion(expected)?;
-    if !previously_validated {
-        if header.version >= TYPED_VERSION {
-            // Typed attribute validation decodes one carrier at a time; its transient working
-            // set is charged against the same budget as the retained directory.
-            let widest = header
-                .documents
-                .attributes
-                .unique_values()
-                .iter()
-                .map(|attributes| attributes.get().len())
-                .max()
-                .unwrap_or(0);
-            if header
-                .heap_bytes()
-                .saturating_add(values::directory_validation_reservation(widest))
-                .saturating_add(reserved)
-                > max_heap_bytes
-            {
-                return Err("Typed directory validation exceeds memory budget".into());
-            }
-        }
-        validate_header(&header)?;
-        if is_common_directory_magic(magic) {
-            validate_common_directory_header(&header)?;
-        }
-    }
+    validate_directory_header(
+        &header,
+        expected,
+        magic,
+        reserved,
+        max_heap_bytes,
+        previously_validated,
+    )?;
     let hot = match hot_bytes {
         Some(bytes) => {
             let hot = decode_hot_postings(bytes, &header)?;
@@ -14604,13 +14631,13 @@ mod typed_cell_tests {
         let exact = [stamp_filter("eq", BOUNDARY + 1)];
         assert_eq!(header.vector_rows(&exact, &[])?, vec![1]);
         let neighbor = [stamp_filter("eq", BOUNDARY + 4)];
-        assert!(header.vector_rows(&neighbor, &[])?.is_empty());
+        assert_eq!(header.vector_rows(&neighbor, &[])?, [] as [u32; 0]);
         let wrong_kind = [Filter {
             field: "stamp".into(),
             op: "eq".into(),
             value: json!({"u64": (BOUNDARY + 1).to_string()}),
         }];
-        assert!(header.vector_rows(&wrong_kind, &[])?.is_empty());
+        assert_eq!(header.vector_rows(&wrong_kind, &[])?, [] as [u32; 0]);
         let raw_number = [Filter {
             field: "stamp".into(),
             op: "eq".into(),
@@ -14677,7 +14704,7 @@ mod typed_cell_tests {
             r#"{"blob":{"bytes":"Zg=="}}"#,
             r#"{"tags":[1]}"#,
             r#"{"tags":["a",true]}"#,
-            r#"[]"#,
+            "[]",
         ] {
             let mut tampered = typed_header.clone();
             tampered.documents.attributes.dense_mut()[0] =
@@ -14760,7 +14787,7 @@ mod typed_cell_tests {
         assert!(encode_canonical_metadata_page(&legacy, facts, true).is_err());
 
         // The codec byte decides the reading: the same JSON under the other codec differs.
-        let mut forged_page = page.clone();
+        let mut forged_page = page;
         forged_page[0] = METADATA_CODEC_CANONICAL;
         let (_, misread) = parse_document_metadata(&forged_page)?;
         assert!(misread.columns().is_legacy());

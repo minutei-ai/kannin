@@ -45,7 +45,7 @@ pub enum Cell {
     DatetimeMs(i64),
     /// Never filterable or indexable.
     Bytes(Vec<u8>),
-    Array(Vec<Cell>),
+    Array(Vec<Self>),
 }
 
 impl From<Value> for Cell {

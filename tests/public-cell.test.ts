@@ -526,6 +526,40 @@ test("public cells run through native raw JSON in workerd", async () => {
     body: '{"text":{"type":"string","full_text_search":true}}',
   });
   expect(unsupportedSchema.status).toBe(422);
+  const documents = [
+    {
+      id: { kind: "uint", value: "18446744073709551615" },
+      roles: { title: "", text: "" },
+      attributes: {
+        title: "Named title",
+        text: "Named text",
+        count: { i64: "-9223372036854775808" },
+        note: null,
+      },
+    },
+  ];
+  for (const [mode, body] of [
+    [
+      "rows",
+      '[{"id":18446744073709551615,"title":"Named title","text":"Named text","count":-9223372036854775808,"note":null}]',
+    ],
+    [
+      "columns",
+      '{"id":[18446744073709551615],"title":["Named title"],"text":["Named text"],"count":[-9223372036854775808],"note":[null]}',
+    ],
+  ] as const) {
+    const response = await worker.dispatchFetch(new URL(`?${mode}=true`, origin), {
+      method: "POST",
+      body,
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(documents);
+  }
+  const unequalColumns = await worker.dispatchFetch(new URL("?columns=true", origin), {
+    method: "POST",
+    body: '{"id":[1],"count":[]}',
+  });
+  expect(unequalColumns.status).toBe(422);
   for (const [type, body] of [
     ["i64", "9223372036854775808"],
     ["i64", "1.0"],

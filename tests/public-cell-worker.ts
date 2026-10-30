@@ -7,6 +7,7 @@ import {
 } from "../src/public-cell";
 import { decodePublicJson, encodePublicJson } from "../src/public-json";
 import { decodePublicSchema, encodePublicSchema } from "../src/public-schema";
+import { decodePublicColumns, decodePublicRows } from "../src/public-rows";
 
 export default {
   async fetch(request: Request): Promise<Response> {
@@ -15,6 +16,18 @@ export default {
     const text = await request.text();
     const program = Effect.gen(function* () {
       const input = yield* decodePublicJson(text);
+      const rows = url.searchParams.get("rows") === "true";
+      const columns = url.searchParams.get("columns") === "true";
+      if (rows || columns) {
+        const declaration = yield* decodePublicSchema({
+          title: { type: "string" },
+          text: { type: "string" },
+          count: { type: "int" },
+          note: { type: "string" },
+        });
+        if (columns) return JSON.stringify(yield* decodePublicColumns("uint", declaration, input));
+        return JSON.stringify(yield* decodePublicRows("uint", declaration, input));
+      }
       if (url.searchParams.get("schema") === "true") {
         const declaration = yield* decodePublicSchema(input);
         const schema = yield* encodePublicSchema(declaration);

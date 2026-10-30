@@ -4092,7 +4092,7 @@ fn decode_directory_contents(
                 .unwrap_or(0);
             if header
                 .heap_bytes()
-                .saturating_add(widest.saturating_mul(2))
+                .saturating_add(values::directory_validation_reservation(widest))
                 .saturating_add(reserved)
                 > max_heap_bytes
             {

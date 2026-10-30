@@ -8,6 +8,37 @@ use std::collections::BTreeMap;
 
 type Check = Result<(), Box<dyn std::error::Error>>;
 
+#[test]
+fn directory_validation_streams_large_arrays_and_bounds_attribute_names() -> Check {
+    let array = serde_json::to_string(&vec![""; MAX_ARRAY_ITEMS])?;
+    let entries = (0..64)
+        .map(|index| format!("\"field{index}\":{array}"))
+        .collect::<Vec<_>>();
+    let raw = format!("{{{}}}", entries.join(","));
+    validate_directory_attributes(&raw)?;
+    for invalid in [
+        format!("{{{},\"extra\":true}}", entries.join(",")),
+        format!("{{\"{}\":true}}", "a".repeat(129)),
+        r#"{"":true}"#.to_owned(),
+        r#"{"$reserved":true}"#.to_owned(),
+        r#"{"a":true,"\u0061":false}"#.to_owned(),
+        r#"{"a":[true,"text"]}"#.to_owned(),
+        r#"{"a":[null]}"#.to_owned(),
+        r#"{"a":[[]]}"#.to_owned(),
+        r#"{"a":1}"#.to_owned(),
+        r#"{"a":{"bytes":"AA=="}}"#.to_owned(),
+        r#"{"a":{"i64":"1","u64":"1"}}"#.to_owned(),
+        format!(
+            "{{\"a\":[{}]}}",
+            vec!["true"; MAX_ARRAY_ITEMS + 1].join(",")
+        ),
+    ] {
+        assert!(validate_directory_attributes(&invalid).is_err());
+    }
+    validate_directory_attributes(r#"{"\u0061":[{"u64":"18446744073709551615"}]}"#)?;
+    Ok(())
+}
+
 fn one(cell: &Cell) -> Result<String, serde_json::Error> {
     serde_json::to_string(&BTreeMap::from([("a", cell)]))
 }

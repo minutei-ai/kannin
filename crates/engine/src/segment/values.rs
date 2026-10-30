@@ -11,6 +11,8 @@
 //! `datetime_ms` and `bytes` are one-key objects holding a canonical string; arrays are
 //! homogeneous arrays of non-null, non-bytes scalars. Bare JSON numbers are rejected.
 
+mod validation;
+
 use super::ids::{format_uuid, parse_canonical_u64, parse_uuid};
 use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::ser::SerializeMap as _;
@@ -752,11 +754,11 @@ pub fn decode_typed_attributes(json: &str) -> Result<BTreeMap<String, Cell>, Str
 /// Validates a directory attribute object: the typed grammar without `bytes`, which is never
 /// filterable and therefore never part of a directory.
 pub(super) fn validate_directory_attributes(raw: &str) -> Result<(), String> {
-    let mut decoder = serde_json::Deserializer::from_str(raw);
-    TypedAttributesSeed { allow_bytes: false }
-        .deserialize(&mut decoder)
-        .map_err(|cause| cause.to_string())?;
-    decoder.end().map_err(|cause| cause.to_string())
+    validation::validate(raw)
+}
+
+pub(super) const fn directory_validation_reservation(raw_bytes: usize) -> usize {
+    validation::reservation(raw_bytes)
 }
 
 #[cfg(test)]

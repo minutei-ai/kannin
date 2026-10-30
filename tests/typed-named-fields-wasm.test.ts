@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { Schema } from "effect";
 import {
   initSync,
+  aggregate_field_statistics,
   Directory,
   directory_compress,
   segment_fields,
@@ -341,4 +342,47 @@ test("directory field passes rank exact typed posting ranges in arbitrary arriva
   expect(() => invalid.add(0xffffffff, new Uint8Array())).toThrow("Unplanned");
   const missing = directory.field_rank_pass(request, 16 * 1024 * 1024, 16 * 1024 * 1024);
   expect(() => missing.finish()).toThrow("Missing");
+});
+
+test("directory statistics passes count live named fields without reading fully live posting blocks", () => {
+  using segment = Segment.with_columns(phraseFixture, columns, declarations);
+  const bytes = segment.bytes();
+  using directory = new Directory(bytes);
+  const request = encodeStatisticsQuery({ fields: [tags], text: "red fox", mode: "all" });
+  const pass = directory.field_stats_pass(request, 16 * 1024 * 1024, 0);
+  expect(pass.ranges()).toBe("[]");
+  const live = decodeStats(pass.finish());
+  expect(live).toEqual(decodeStats(segment_local_field_statistics(bytes, request)));
+  const deadRequest = encodeStatisticsQuery({
+    fields: [tags],
+    text: "red fox",
+    mode: "all",
+    dead: [1],
+  });
+  const dead = directory.field_stats_pass(deadRequest, 16 * 1024 * 1024, 16 * 1024 * 1024);
+  const base =
+    16 + new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(8, true);
+  const ranges = Schema.decodeSync(Schema.fromJsonString(Schema.Array(DataRange)))(dead.ranges());
+  expect(ranges.length).toBeGreaterThan(0);
+  for (const range of ranges) {
+    dead.add(range.offset, bytes.subarray(base + range.offset, base + range.offset + range.length));
+  }
+  const removed = decodeStats(dead.finish());
+  expect(removed).toEqual(decodeStats(segment_local_field_statistics(bytes, deadRequest)));
+  expect(removed.documents).toBe(2);
+  const encode = Schema.encodeSync(Schema.fromJsonString(Schema.Array(CorpusStatistics)));
+  const total = decodeStats(aggregate_field_statistics(encode([live, removed])));
+  expect(total.documents).toBe(5);
+  expect(total.fields.map(({ frequencies }) => frequencies)).toEqual([{ red: 5, fox: 5 }]);
+  expect(aggregate_field_statistics(encode([removed, live]))).toBe(
+    aggregate_field_statistics(encode([live, removed])),
+  );
+  expect(() => aggregate_field_statistics("[]")).toThrow();
+  expect(() =>
+    directory.field_stats_pass(
+      JSON.stringify({ fields: [], text: "red", mode: "all", filters: [] }),
+      1024,
+      1024,
+    ),
+  ).toThrow();
 });

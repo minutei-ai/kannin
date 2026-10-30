@@ -129,6 +129,7 @@ test("common directory handles retain their coverage and reject complete-diction
   for (const operation of [
     () => retained.fields(),
     () => retained.field_rank_pass("{}", 1024, 1024),
+    () => retained.field_stats_pass("{}", 1024, 1024),
     () => retained.compressed_frame(base),
     () => retained.common_frame(base),
     () => retained.terms('["alpha"]'),

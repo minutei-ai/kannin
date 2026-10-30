@@ -6642,9 +6642,7 @@ pub mod wasm {
         serde_json::to_string(&hits).map_err(|cause| JsValue::from_str(&cause.to_string()))
     }
 
-    #[wasm_bindgen]
-    #[doc = "# Errors\nRejects malformed field query JSON, unsafe count transport, corrupt segments, and invalid tombstones."]
-    pub fn segment_local_field_statistics(bytes: &[u8], json: &str) -> Result<String, JsValue> {
+    fn decode_field_statistics_query(json: &str) -> Result<DecodedFieldQuery, JsValue> {
         check_field_json(json)?;
         let dto: FieldStatisticsQueryDto =
             serde_json::from_str(json).map_err(|cause| JsValue::from_str(&cause.to_string()))?;
@@ -6664,8 +6662,19 @@ pub mod wasm {
             .map(TryInto::try_into)
             .collect::<Result<Vec<_>, String>>()
             .map_err(|cause| JsValue::from_str(&cause))?;
-        let statistics = local_field_statistics(bytes, &fields, &dto.text, &dto.mode, &dto.dead)
-            .map_err(|cause| JsValue::from_str(&cause))?;
+        Ok(DecodedFieldQuery {
+            fields,
+            text: dto.text,
+            mode: dto.mode,
+            top_k: 1,
+            dead: dto.dead,
+            filters: Vec::new(),
+            bm25: Bm25Parameters::DEFAULT,
+            statistics: None,
+        })
+    }
+
+    fn encode_field_statistics(statistics: &CorpusStatistics) -> Result<String, JsValue> {
         if statistics.documents > SAFE_JSON_INTEGER
             || statistics.fields.iter().any(|field| {
                 field.tokens > SAFE_JSON_INTEGER
@@ -6692,6 +6701,37 @@ pub mod wasm {
                 .collect(),
         };
         serde_json::to_string(&output).map_err(|cause| JsValue::from_str(&cause.to_string()))
+    }
+
+    #[wasm_bindgen]
+    #[doc = "# Errors\nRejects malformed field query JSON, unsafe count transport, corrupt segments, and invalid tombstones."]
+    pub fn segment_local_field_statistics(bytes: &[u8], json: &str) -> Result<String, JsValue> {
+        let decoded = decode_field_statistics_query(json)?;
+        let statistics = local_field_statistics(
+            bytes,
+            &decoded.fields,
+            &decoded.text,
+            &decoded.mode,
+            &decoded.dead,
+        )
+        .map_err(|cause| JsValue::from_str(&cause))?;
+        encode_field_statistics(&statistics)
+    }
+
+    #[wasm_bindgen]
+    #[doc = "# Errors\nRejects malformed or oversized statistics, mismatching fields or terms, unsafe JSON counts and addition overflow."]
+    pub fn aggregate_field_statistics(json: &str) -> Result<String, JsValue> {
+        check_field_json(json)?;
+        let parts: Vec<CorpusStatisticsDto> =
+            serde_json::from_str(json).map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        let parts = parts
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<CorpusStatistics>, String>>()
+            .map_err(|cause| JsValue::from_str(&cause))?;
+        let total =
+            super::aggregate_statistics(&parts).map_err(|cause| JsValue::from_str(&cause))?;
+        encode_field_statistics(&total)
     }
 
     #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -8866,16 +8906,17 @@ pub mod wasm {
     }
 
     #[wasm_bindgen]
-    pub struct FieldRankPass {
+    pub struct FieldPass {
         header: Rc<Header>,
         decoded: DecodedFieldQuery,
         plan: super::PagePlan,
         collector: super::PageCollector,
         budget: super::FieldBudget,
+        statistics: bool,
     }
 
     #[wasm_bindgen]
-    impl FieldRankPass {
+    impl FieldPass {
         #[doc = "# Errors\nRejects range serialization failures."]
         pub fn ranges(&self) -> Result<String, JsValue> {
             serde_json::to_string(self.plan.ranges())
@@ -8897,6 +8938,19 @@ pub mod wasm {
                 .collector
                 .finish()
                 .map_err(|cause| JsValue::from_str(&cause))?;
+            if self.statistics {
+                let statistics = super::statistics_from_pages(
+                    &self.header,
+                    &mut pages,
+                    &self.decoded.fields,
+                    &self.decoded.text,
+                    &self.decoded.mode,
+                    &self.decoded.dead,
+                    &self.budget,
+                )
+                .map_err(|cause| JsValue::from_str(&cause))?;
+                return encode_field_statistics(&statistics);
+            }
             let hits = super::rank_from_pages(
                 &self.header,
                 &mut pages,
@@ -9037,13 +9091,49 @@ pub mod wasm {
 
     #[wasm_bindgen]
     impl Directory {
+        #[doc = "# Errors\nRejects partial directories, malformed statistics queries and planned estimates above caller budgets before retaining posting pages."]
+        pub fn field_stats_pass(
+            &self,
+            json: &str,
+            workspace_bytes: u32,
+            page_bytes: u32,
+        ) -> Result<FieldPass, JsValue> {
+            if self.partial {
+                return Err(JsValue::from_str("Operation requires a complete directory"));
+            }
+            let decoded = decode_field_statistics_query(json)?;
+            let budget = super::FieldBudget {
+                workspace_bytes: workspace_bytes as usize,
+                page_bytes: u64::from(page_bytes),
+            };
+            let plan = super::plan_statistics_pages(
+                &self.header,
+                &decoded.fields,
+                &decoded.text,
+                &decoded.mode,
+                &decoded.dead,
+                &budget,
+            )
+            .map_err(|cause| JsValue::from_str(&cause))?;
+            let collector = super::PageCollector::new(&plan, budget.page_bytes)
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            Ok(FieldPass {
+                header: Rc::clone(&self.header),
+                decoded,
+                plan,
+                collector,
+                budget,
+                statistics: true,
+            })
+        }
+
         #[doc = "# Errors\nRejects partial directories, malformed queries and planned workspace or page estimates above caller budgets before any page is retained."]
         pub fn field_rank_pass(
             &self,
             json: &str,
             workspace_bytes: u32,
             page_bytes: u32,
-        ) -> Result<FieldRankPass, JsValue> {
+        ) -> Result<FieldPass, JsValue> {
             if self.partial {
                 return Err(JsValue::from_str("Operation requires a complete directory"));
             }
@@ -9056,12 +9146,13 @@ pub mod wasm {
                 .map_err(|cause| JsValue::from_str(&cause))?;
             let collector = super::PageCollector::new(&plan, budget.page_bytes)
                 .map_err(|cause| JsValue::from_str(&cause))?;
-            Ok(FieldRankPass {
+            Ok(FieldPass {
                 header: Rc::clone(&self.header),
                 decoded,
                 plan,
                 collector,
                 budget,
+                statistics: false,
             })
         }
 

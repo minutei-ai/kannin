@@ -212,7 +212,8 @@ fn typed_builds_use_the_new_formats_while_native_builds_keep_theirs() -> Check {
     assert!(segment::parse_compressed_directory(&common, base, BUDGET).is_err());
 
     // A reader that only knows the older magics cannot be tricked into the typed reading.
-    let mut forged_segment = built.bytes.clone();
+    assert_eq!(segment::migrate_segment(&built.bytes)?, built.bytes);
+    let mut forged_segment = built.bytes;
     forged_segment[7] = b'5';
     assert!(segment::parse_header(&forged_segment).is_err());
 
@@ -252,7 +253,10 @@ fn typed_filters_and_tombstones_apply_before_text_top_k() -> Check {
         ["b"]
     );
     // Rows are ordered by id: a=0 b=1 c=2 d=3 e=4. A tombstone removes the only eligible row.
-    assert!(ranked(&built, "rust", &[1], std::slice::from_ref(&above), 5)?.is_empty());
+    assert_eq!(
+        ranked(&built, "rust", &[1], std::slice::from_ref(&above), 5)?,
+        [] as [String; 0]
+    );
     assert_eq!(
         ranked(&built, "rust", &[4, 0], &[], 1)?,
         ["d"],
@@ -284,7 +288,10 @@ fn typed_filters_and_tombstones_apply_before_text_top_k() -> Check {
         "eq",
         serde_json::json!({"u64": (BOUNDARY + 1).to_string()}),
     );
-    assert!(ranked(&built, "rust", &[], std::slice::from_ref(&wrong_kind), 5)?.is_empty());
+    assert_eq!(
+        ranked(&built, "rust", &[], std::slice::from_ref(&wrong_kind), 5)?,
+        [] as [String; 0]
+    );
     // Raw numbers and malformed tags are not typed operands.
     for invalid in [
         filter("stamp", "eq", serde_json::json!(BOUNDARY)),
@@ -296,7 +303,7 @@ fn typed_filters_and_tombstones_apply_before_text_top_k() -> Check {
         filter("stamp", "in", serde_json::json!([1, 2])),
         filter("stamp", "mystery", serde_json::json!({"i64": "1"})),
     ] {
-        assert!(ranked(&built, "rust", &[], std::slice::from_ref(&invalid), 5).is_err());
+        assert_eq!(ranked(&built, "rust", &[], std::slice::from_ref(&invalid), 5).is_err());
     }
     Ok(())
 }
@@ -383,7 +390,7 @@ fn typed_documents_cannot_cross_into_legacy_adapters_or_builders() -> Check {
     assert!(documents[0].to_native_json().is_err());
     assert!(documents[0].to_native_vec().is_err());
     assert!(segment::build(documents.clone(), None).is_err());
-    assert!(segment::build_text_fields(documents.clone(), None, &[]).is_err());
+    assert!(segment::build_text_fields(documents, None, &[]).is_err());
     // Legacy cells and undeclared or mistyped attributes are not typed ingress.
     let legacy = Document::native(
         "legacy",
@@ -463,7 +470,10 @@ fn legacy_objects_shaped_like_tags_remain_opaque_json() -> Check {
         serde_json::json!({"u64": "5"}),
     ] {
         let mismatch = filter("n", "eq", other);
-        assert!(ranked(&built, "rust", &[], std::slice::from_ref(&mismatch), 5)?.is_empty());
+        assert!(
+            ranked(&built, "rust", &[], std::slice::from_ref(&mismatch), 5)?,
+            [] as [String; 0]
+        );
     }
     let number = filter("w", "eq", serde_json::json!(5));
     assert_eq!(
@@ -554,8 +564,8 @@ fn attributes_named_like_roles_stay_distinct_from_roles_in_typed_segments() -> C
     let built = segment::build_typed(documents, &schema()?, &[])?;
     assert_eq!(ranked(&built, "beta", &[], &[], 5)?, ["a"]);
     // Attribute values are never indexed as role text.
-    assert!(ranked(&built, "yyy", &[], &[], 5)?.is_empty());
-    assert!(ranked(&built, "zzz", &[], &[], 5)?.is_empty());
+    assert_eq!(ranked(&built, "yyy", &[], &[], 5)?, [] as [String; 0]);
+    assert_eq!(ranked(&built, "zzz", &[], &[], 5)?, [] as [String; 0]);
     let by_title = filter("title", "eq", serde_json::json!("zzz"));
     assert_eq!(
         ranked(
@@ -568,15 +578,15 @@ fn attributes_named_like_roles_stay_distinct_from_roles_in_typed_segments() -> C
         ["a"]
     );
     let by_role_value = filter("title", "eq", serde_json::json!("alpha"));
-    assert!(
+    assert_eq!(
         ranked(
             &built,
             "beta delta",
             &[],
             std::slice::from_ref(&by_role_value),
             5
-        )?
-        .is_empty()
+        )?,
+        [] as [String; 0]
     );
     Ok(())
 }

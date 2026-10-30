@@ -3404,7 +3404,10 @@ fn migrate_v2_segment(bytes: &[u8]) -> Result<Vec<u8>, String> {
 #[doc = "# Errors\nRejects invalid legacy segments, corrupt documents or postings, and converted segments above sixteen MiB."]
 pub fn migrate_segment(bytes: &[u8]) -> Result<Vec<u8>, String> {
     if bytes.len() >= 8
-        && (&bytes[..8] == MAGIC_V3 || &bytes[..8] == MAGIC_V4 || &bytes[..8] == MAGIC_V5)
+        && (&bytes[..8] == MAGIC_V3
+            || &bytes[..8] == MAGIC_V4
+            || &bytes[..8] == MAGIC_V5
+            || &bytes[..8] == MAGIC_V6)
     {
         parse_header(bytes)?;
         return Ok(bytes.to_vec());

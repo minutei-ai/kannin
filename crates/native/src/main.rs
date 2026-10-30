@@ -3,6 +3,8 @@ pub mod error;
 pub mod protocol;
 pub mod rank;
 pub mod reader;
+#[cfg(test)]
+mod wire;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};

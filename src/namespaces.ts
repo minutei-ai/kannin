@@ -1,7 +1,9 @@
 import { Effect, Schema } from "effect";
+import type { Bucket, ObjectListOptions } from "./platform";
 import {
   NamespaceListCursor,
   NamespaceName,
+  NamespacePrefix,
   type NamespacesInput,
   NamespacesPage,
   Rejected,
@@ -9,16 +11,16 @@ import {
 
 export const namespaceCatalogPrefix = "namespace-catalog-v1/";
 export const namespaceCatalogReadyKey = "namespace-catalog-v1.ready";
-const readyBuckets = new WeakSet<R2Bucket>();
+const readyBuckets = new WeakSet<Bucket>();
 
 export const listNamespaces = Effect.fn("kannin.namespaces.list")(function* (
-  bucket: R2Bucket,
+  bucket: Bucket,
   scope: string,
   input: typeof NamespacesInput.Type,
 ) {
   const prefix = input.prefix ?? "";
   const physicalPrefix = `${namespaceCatalogPrefix}${prefix}`;
-  const options: R2ListOptions = {
+  const options: ObjectListOptions = {
     prefix: physicalPrefix,
     limit: input.page_size ?? 100,
   };
@@ -39,7 +41,7 @@ export const listNamespaces = Effect.fn("kannin.namespaces.list")(function* (
       });
     readyBuckets.add(bucket);
   }
-  if (prefix.length > 0 && !Schema.is(NamespaceName)(prefix))
+  if (prefix.length > 0 && !Schema.is(NamespacePrefix)(prefix))
     return yield* Schema.encodeEffect(NamespacesPage)({ namespaces: [] });
   const page = yield* Effect.tryPromise(() => bucket.list(options));
   if (page.truncated && page.objects.length === 0)

@@ -41,7 +41,7 @@ function instrument(bucket: R2Bucket) {
           return Promise.reject(new Error("Injected common R2 read failure"));
       }
       if (args[0] === state.segment) state.canonicalReads += 1;
-      if (args[0].startsWith("cache/directory-v5/")) state.fullReads += 1;
+      if (args[0].startsWith("cache/directory-v8/")) state.fullReads += 1;
       return get(...args);
     },
   });
@@ -100,7 +100,7 @@ export default {
     if (path === "/arm") {
       const input = Schema.decodeUnknownSync(DocumentDirectoryArm)(await request.json());
       state.segment = input.source.key;
-      state.key = `cache/directory-common-v3/${input.source.key}/${input.source.headerBytes}`;
+      state.key = `cache/directory-common-v6/${input.source.key}/${input.source.headerBytes}`;
       state.outcome = input.outcome;
       state.holdGet = input.holdGet;
       state.holdUse = input.holdUse;

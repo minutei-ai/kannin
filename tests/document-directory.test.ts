@@ -1,3 +1,4 @@
+import { encodeCanonicalDocuments } from "./segment-fixture";
 import { expect, test } from "bun:test";
 import { Effect, Match, Schema } from "effect";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -8,7 +9,6 @@ import {
   LocatedDocument,
   SegmentDocument,
   SegmentHeader,
-  StoredDocument,
   TermProjectionRange,
 } from "../src/protocol";
 import { startWorker } from "./harness";
@@ -88,7 +88,7 @@ test("document-only common reuse preserves projections, misses, active lifetimes
     return Schema.decodeUnknownSync(DocumentDirectoryState)(await response.json());
   };
   using segment = new Segment(
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))([
+    encodeCanonicalDocuments([
       {
         id: "a",
         revision: 3,
@@ -175,10 +175,10 @@ test("document-only common reuse preserves projections, misses, active lifetimes
     const source = { key, headerBytes };
     const sourceJson = Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))(source);
     await bucket.put(key, bytes);
-    await bucket.put(`cache/directory-v5/${key}/${headerBytes}`, full, {
+    await bucket.put(`cache/directory-v8/${key}/${headerBytes}`, full, {
       customMetadata: { source: sourceJson },
     });
-    const cache = `cache/directory-common-v3/${key}/${headerBytes}`;
+    const cache = `cache/directory-common-v6/${key}/${headerBytes}`;
     if (mode === "pending-corrupt") {
       const corrupt = common.slice();
       corrupt[16] = (corrupt[16] ?? 0) ^ 1;
@@ -192,7 +192,7 @@ test("document-only common reuse preserves projections, misses, active lifetimes
           key: heldKey,
           headerBytes,
         });
-        await bucket.put(`cache/directory-v5/${heldKey}/${headerBytes}`, full, {
+        await bucket.put(`cache/directory-v8/${heldKey}/${headerBytes}`, full, {
           customMetadata: { source: heldSource },
         });
       }

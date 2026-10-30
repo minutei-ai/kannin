@@ -2,6 +2,7 @@ import { decodeRoot, decodeRootForMigration, decodeVectorRebuildSnapshot } from 
 import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
 import {
+  Metadata,
   QueryResult,
   Root,
   RootMigrationResult,
@@ -11,6 +12,7 @@ import {
 } from "../src/protocol";
 import { request, startWorker, write, document } from "./harness";
 import { legacyRootText, legacySnapshotText, migrationRootFacts } from "./legacy-root";
+import { ageRetirementUploads, retentionFixture } from "./retention-fixture";
 
 const worker = await startWorker();
 afterAll(() => worker.dispose());
@@ -20,6 +22,60 @@ const checkpointKey = (namespace: string, snapshot: string) =>
   `namespaces/${namespace}/vector-rebuild/${snapshot}.json`;
 const vector = [1, ...Array.from({ length: 767 }, () => 0)];
 const vectorQuery = { kind: "vector", vector, topK: 10, filters: [] };
+test("migration never infers a v5 checkpoint expiry from its upload age", async () => {
+  await using fixture = await retentionFixture();
+  const scopedWorker = fixture.worker;
+  const namespace = "root-migration-required-expiry";
+  expect(
+    (await request(scopedWorker, namespace, "write", write([document("a", "retained")]))).status,
+  ).toBe(200);
+  const bucket = await scopedWorker.getR2Bucket("STORAGE", "raio");
+  const current = await bucket.get(rootKey(namespace));
+  if (current === null) throw new Error("Missing fixture Root");
+  const logical = decodeRoot(await current.text());
+  const key = checkpointKey(namespace, "00000000-0000-4000-8000-0000000000e5");
+  const checkpoint = await bucket.put(
+    key,
+    await legacySnapshotText(bucket, { root: logical, fields: [] }, 5),
+  );
+  if (checkpoint === null) throw new Error("Missing fixture checkpoint");
+  await ageRetirementUploads(scopedWorker, namespace);
+  const response = await request(scopedWorker, namespace, "migrate-root", {});
+  expect(response.status).toBe(503);
+  expect((await bucket.head(key))?.etag).toBe(checkpoint.etag);
+  expect((await bucket.head(rootKey(namespace)))?.etag).toBe(current.etag);
+});
+
+test("collection rejects a live legacy checkpoint before retiring any objects", async () => {
+  const namespace = "collection-legacy-checkpoint";
+  expect(
+    (await request(worker, namespace, "write", write([document("a", "retained")]))).status,
+  ).toBe(200);
+  const bucket = await bucketFor();
+  const current = await bucket.get(rootKey(namespace));
+  if (current === null) throw new Error("Missing current Root");
+  const root = decodeRoot(await current.text());
+  const key = checkpointKey(namespace, "00000000-0000-4000-8000-0000000000c1");
+  const checkpoint = await bucket.put(
+    key,
+    await legacySnapshotText(bucket, { root, fields: [] }, 1),
+    {
+      customMetadata: Schema.encodeSync(VectorRebuildCheckpointMetadata)({
+        expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+      }),
+    },
+  );
+  if (checkpoint === null) throw new Error("Missing legacy checkpoint");
+  const before = await bucket.list({ prefix: `namespaces/${namespace}/segments/`, limit: 1000 });
+  expect((await request(worker, namespace, "collect", {})).status).toBe(503);
+  const after = await bucket.list({ prefix: `namespaces/${namespace}/segments/`, limit: 1000 });
+  expect(after.objects.map((object) => [object.key, object.etag])).toEqual(
+    before.objects.map((object) => [object.key, object.etag]),
+  );
+  expect((await bucket.list({ prefix: `namespaces/${namespace}/retired/` })).objects).toEqual([]);
+  expect((await bucket.head(key))?.etag).toBe(checkpoint.etag);
+});
+
 test("migrates pooled Root and rebuild checkpoint without changing logical reads or expiry", async () => {
   const namespace = "root-migration-complete";
   const upserts = Array.from({ length: 205 }, (_, index) => ({
@@ -66,12 +122,14 @@ test("migrates pooled Root and rebuild checkpoint without changing logical reads
   if (legacyCheckpoint === null) throw new Error("Missing legacy checkpoint");
   await worker.unsafeEvictDurableObject("raio", "SearchNamespace", { name: namespace });
   expect((await request(worker, namespace, "query", vectorQuery)).status).toBe(503);
+  expect((await request(worker, namespace, "collect", {})).status).toBe(503);
+  expect((await bucket.list({ prefix: `namespaces/${namespace}/retired/` })).objects).toEqual([]);
 
   const migrated = Schema.decodeUnknownSync(RootMigrationResult)(
     await (await request(worker, namespace, "migrate-root", {})).json(),
   );
   expect(migrated).toEqual({
-    version: 5,
+    version: 8,
     sequence: logicalRoot.sequence,
     rootRewritten: true,
     migratedSnapshots: 1,
@@ -259,4 +317,106 @@ test("migration expires already-expired v2 checkpoints and distinguishes absent 
   expect(expiredResult.expiredSnapshots).toBe(1);
   expect(await bucket.head(expiredKey)).toBeNull();
   expect((await bucket.head(rootKey(expiredNamespace)))?.etag).toBe(expiredRootObject.etag);
+});
+
+test("v5 roots become column declarations without rewriting segments, logs, or receipts", async () => {
+  const namespace = "root-schema-v5";
+  const native = {
+    filterable: ["vector", "title", "text"],
+    vectorFilterFields: ["text", "vector"],
+  };
+  const input = {
+    requestId: "seed",
+    schema: native,
+    upserts: [
+      {
+        id: "one",
+        title: "native heading",
+        text: "native body",
+        attributes: {
+          vector: "metadata-vector",
+          title: "metadata-title",
+          text: "metadata-text",
+        },
+        vector,
+      },
+    ],
+    deletes: [],
+  };
+  expect((await request(worker, namespace, "write", input)).status).toBe(200);
+  const bucket = await bucketFor();
+  const current = await bucket.get(rootKey(namespace));
+  if (current === null) throw new Error("Missing current Root");
+  const logical = decodeRoot(await current.text());
+  const etags = await Promise.all(
+    logical.segments.map(async (segment) => ({
+      key: segment.key,
+      etag: (await bucket.head(segment.key))?.etag,
+    })),
+  );
+  const logKey = logical.head;
+  if (logKey === null) throw new Error("Missing write log");
+  const log = await bucket.get(logKey);
+  const receiptKey = `namespaces/${namespace}/receipts/`;
+  const receiptsBefore = await bucket.list({ prefix: receiptKey });
+  if (log === null) throw new Error("Missing immutable log");
+  const logBytes = new Uint8Array(await log.arrayBuffer());
+  const expiresAt = 9_000_000_000_000;
+  const snapshotId = "00000000-0000-4000-8000-0000000000a5";
+  await bucket.put(rootKey(namespace), await legacyRootText(bucket, logical, 5));
+  await bucket.put(
+    checkpointKey(namespace, snapshotId),
+    await legacySnapshotText(bucket, { root: logical, fields: ["text", "vector"] }, 5),
+    { customMetadata: Schema.encodeSync(VectorRebuildCheckpointMetadata)({ expiresAt }) },
+  );
+  await worker.unsafeEvictDurableObject("raio", "SearchNamespace", { name: namespace });
+  expect((await request(worker, namespace, "query", vectorQuery)).status).toBe(503);
+  const migrated = Schema.decodeUnknownSync(RootMigrationResult)(
+    await (await request(worker, namespace, "migrate-root", {})).json(),
+  );
+  expect(migrated).toMatchObject({
+    version: 8,
+    sequence: logical.sequence,
+    rootRewritten: true,
+    migratedSnapshots: 1,
+    expiredSnapshots: 0,
+  });
+  const stored = await bucket.get(rootKey(namespace));
+  const checkpoint = await bucket.get(checkpointKey(namespace, snapshotId));
+  const retainedLog = await bucket.get(logKey);
+  if (stored === null || checkpoint === null || retainedLog === null)
+    throw new Error("Missing migrated schema");
+  expect(decodeRoot(await stored.text()).schema).toEqual(logical.schema);
+  expect(new Uint8Array(await retainedLog.arrayBuffer())).toEqual(logBytes);
+  expect(await bucket.list({ prefix: receiptKey })).toEqual(receiptsBefore);
+  expect(
+    await Promise.all(
+      logical.segments.map(async (segment) => ({
+        key: segment.key,
+        etag: (await bucket.head(segment.key))?.etag,
+      })),
+    ),
+  ).toEqual(etags);
+  const decodedCheckpoint = decodeVectorRebuildSnapshot(await checkpoint.text());
+  expect(decodedCheckpoint.fields).toEqual(["text", "vector"]);
+  expect(decodedCheckpoint.root.schema).toEqual(logical.schema);
+  expect(
+    Schema.decodeUnknownSync(VectorRebuildCheckpointMetadata)(checkpoint.customMetadata).expiresAt,
+  ).toBe(expiresAt);
+  const metadata = Schema.decodeUnknownSync(Metadata)(
+    await (await request(worker, namespace, "metadata")).json(),
+  );
+  expect(metadata.schema).toEqual(native);
+  expect(JSON.stringify(metadata.schema)).not.toContain("vectorDimensions");
+  expect((await request(worker, namespace, "write", input)).status).toBe(200);
+  const replayed = Schema.decodeUnknownSync(Metadata)(
+    await (await request(worker, namespace, "metadata")).json(),
+  );
+  expect(replayed.sequence).toBe(logical.sequence);
+  expect(replayed.schema).toEqual(native);
+  const repeated = Schema.decodeUnknownSync(RootMigrationResult)(
+    await (await request(worker, namespace, "migrate-root", {})).json(),
+  );
+  expect(repeated).toMatchObject({ version: 8, rootRewritten: false, migratedSnapshots: 0 });
+  expect((await bucket.head(logKey))?.etag).toBe(log.etag);
 });

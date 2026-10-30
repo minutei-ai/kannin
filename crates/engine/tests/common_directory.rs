@@ -6,16 +6,18 @@ fn common_directory_matches_full_positional_search_and_rejects_uncovered_terms()
 -> Result<(), Box<dyn std::error::Error>> {
     let built = segment::build(
         (0_u32..512)
-            .map(|index| Document {
-                id: format!("row{index:04}"),
-                revision: u64::from(index),
-                title: "cloudflare rust".into(),
-                text: format!(
-                    "{} unique{index}",
-                    "rust cloudflare rust ".repeat(1 + (index % 5) as usize)
-                ),
-                attributes: BTreeMap::from([("group".into(), serde_json::json!(index % 3))]),
-                vector: None,
+            .map(|index| {
+                Document::native(
+                    format!("row{index:04}"),
+                    u64::from(index),
+                    "cloudflare rust",
+                    format!(
+                        "{} unique{index}",
+                        "rust cloudflare rust ".repeat(1 + (index % 5) as usize)
+                    ),
+                    BTreeMap::from([("group".into(), serde_json::json!(index % 3))]),
+                    None,
+                )
             })
             .collect(),
         None,
@@ -23,7 +25,7 @@ fn common_directory_matches_full_positional_search_and_rejects_uncovered_terms()
     let (header, base) = segment::parse_header(&built.bytes)?;
     let full_frame = segment::compress_directory(&built.bytes[..base])?;
     let frame = segment::compress_common_directory_segment(&built.bytes)?;
-    assert_eq!(&frame[..8], b"RAIOCOM3");
+    assert_eq!(&frame[..8], b"RAIOCOM4");
     assert!(frame.len() < full_frame.len());
     assert!(segment::parse_compressed_directory(&frame, base, 40 * 1024 * 1024).is_err());
     assert!(CommonDirectory::compressed(&full_frame, base, 40 * 1024 * 1024).is_err());
@@ -38,10 +40,10 @@ fn common_directory_matches_full_positional_search_and_rejects_uncovered_terms()
     assert!(CommonDirectory::compressed(&corrupt, base, 40 * 1024 * 1024).is_err());
     let statistics = || Statistics {
         documents: 512,
-        title_length: header.total_title_length,
-        body_length: header.total_body_length,
+        title_length: header.total_title_length(),
+        body_length: header.total_body_length(),
         frequencies: header
-            .terms
+            .terms()
             .iter()
             .map(|(term, meta)| (term.to_owned(), u64::from(meta.df)))
             .collect(),
@@ -70,7 +72,7 @@ fn common_directory_matches_full_positional_search_and_rejects_uncovered_terms()
                     let partial = projected.ranker(&query, &dead)?;
                     let words: BTreeSet<_> = full.words.iter().cloned().collect();
                     for term in words {
-                        let metadata = header.terms.get(&term).ok_or("Missing covered term")?;
+                        let metadata = header.terms().get(&term).ok_or("Missing covered term")?;
                         for block in &metadata.blocks {
                             let start = base + block.data.offset as usize;
                             let bytes = &built.bytes[start..start + block.data.length as usize];
@@ -97,13 +99,15 @@ fn covering_common_headers_keep_uncached_terms_in_remaining_spans()
 -> Result<(), Box<dyn std::error::Error>> {
     let built = segment::build(
         (0_u32..256)
-            .map(|index| Document {
-                id: format!("row{index:04}"),
-                revision: 1,
-                title: "common dense".into(),
-                text: "dense ".repeat(512),
-                attributes: BTreeMap::from([("group".into(), serde_json::json!(index % 2))]),
-                vector: None,
+            .map(|index| {
+                Document::native(
+                    format!("row{index:04}"),
+                    1,
+                    "common dense",
+                    "dense ".repeat(512),
+                    BTreeMap::from([("group".into(), serde_json::json!(index % 2))]),
+                    None,
+                )
             })
             .collect(),
         None,
@@ -120,10 +124,10 @@ fn covering_common_headers_keep_uncached_terms_in_remaining_spans()
             let query = PreparedQuery::new(
                 Statistics {
                     documents: 256,
-                    title_length: header.total_title_length,
-                    body_length: header.total_body_length,
+                    title_length: header.total_title_length(),
+                    body_length: header.total_body_length(),
                     frequencies: header
-                        .terms
+                        .terms()
                         .iter()
                         .map(|(term, metadata)| (term.to_owned(), u64::from(metadata.df)))
                         .collect(),
@@ -150,7 +154,7 @@ fn covering_common_headers_keep_uncached_terms_in_remaining_spans()
                 expected_missing
             );
             for term in ["common", "dense"] {
-                let metadata = header.terms.get(term).ok_or("Missing fixture term")?;
+                let metadata = header.terms().get(term).ok_or("Missing fixture term")?;
                 for block in &metadata.blocks {
                     let start = base + block.data.offset as usize;
                     let page = &built.bytes[start..start + block.data.length as usize];

@@ -1,0 +1,123 @@
+diff --git a/lib/Queues/LocalQueueGateway.js b/lib/Queues/LocalQueueGateway.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..1a2512edce63727e0a92ca1bd72f183aef8fa1c9
+--- /dev/null
++++ b/lib/Queues/LocalQueueGateway.js
+@@ -0,0 +1,25 @@
++import { Queue } from "@alchemy.run/cloudflare-runtime/core/bindings";
++import { open } from "@alchemy.run/cloudflare-runtime/core/platform-proxy";
++import * as Effect from "effect/Effect";
++import { gatewayName, localGatewayRuntime } from "../LocalGateway.js";
++import { SendError } from "./QueueTypes.js";
++const tryPromise = (fn) => Effect.tryPromise({
++  try: fn,
++  catch: (cause) => new SendError({ message: "Local queue operation failed", cause })
++});
++export const makeProxyQueueHelpers = (queueName, ambient) => {
++  const use = (fn) => {
++    const bindings = [Queue.local({ binding: "QUEUE", queueName })];
++    return Effect.scoped(Effect.gen(function* () {
++      const proxy = yield* open({
++        name: gatewayName("alchemy-queue-gateway", queueName),
++        bindings
++      });
++      return yield* tryPromise(() => fn(proxy.env.QUEUE));
++    })).pipe(Effect.provide(localGatewayRuntime), Effect.provideContext(ambient), Effect.mapError((cause) => new SendError({ message: "Local queue gateway failed", cause })));
++  };
++  const raw = Effect.die(new SendError({
++    message: "A local queue binding is scoped to its gateway; use send or sendBatch."
++  }));
++  return { raw, use, tryPromise };
++};
+diff --git a/src/Queues/LocalQueueGateway.ts b/src/Queues/LocalQueueGateway.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..b8a05ef9286f24ae144e8d8181ea49a0b6b56a0b
+--- /dev/null
++++ b/src/Queues/LocalQueueGateway.ts
+@@ -0,0 +1,44 @@
++import { Queue } from "@alchemy.run/cloudflare-runtime/core/bindings";
++import { open } from "@alchemy.run/cloudflare-runtime/core/platform-proxy";
++import type * as runtime from "@cloudflare/workers-types";
++import type * as Context from "effect/Context";
++import * as Effect from "effect/Effect";
++import { gatewayName, localGatewayRuntime } from "../LocalGateway.ts";
++import type { makeQueueHelpers } from "./QueueBinding.ts";
++import { SendError } from "./QueueTypes.ts";
++
++const tryPromise = <T>(fn: () => Promise<T>): Effect.Effect<T, SendError> =>
++  Effect.tryPromise({
++    try: fn,
++    catch: (cause) => new SendError({ message: "Local queue operation failed", cause }),
++  });
++
++export const makeProxyQueueHelpers = (
++  queueName: string,
++  ambient: Context.Context<never>,
++): ReturnType<typeof makeQueueHelpers> => {
++  const use = <T>(fn: (queue: runtime.Queue<unknown>) => Promise<T>): Effect.Effect<T, SendError> => {
++    const bindings = [Queue.local({ binding: "QUEUE", queueName })];
++    return Effect.scoped(
++      Effect.gen(function* () {
++        const proxy = yield* open<typeof bindings, { QUEUE: runtime.Queue<unknown> }>({
++          name: gatewayName("alchemy-queue-gateway", queueName),
++          bindings,
++        });
++        return yield* tryPromise(() => fn(proxy.env.QUEUE));
++      }),
++    ).pipe(
++      Effect.provide(localGatewayRuntime),
++      Effect.provideContext(ambient),
++      Effect.mapError((cause) => new SendError({ message: "Local queue gateway failed", cause })),
++    ) as Effect.Effect<T, SendError>;
++  };
++
++  const raw = Effect.die(
++    new SendError({
++      message: "A local queue binding is scoped to its gateway; use send or sendBatch.",
++    }),
++  );
++
++  return { raw, use, tryPromise };
++};
+diff --git a/lib/Workers/InferEnv.d.ts b/lib/Workers/InferEnv.d.ts
+--- a/lib/Workers/InferEnv.d.ts
++++ b/lib/Workers/InferEnv.d.ts
+@@ -20,6 +20,8 @@
+ import type * as PipelinesNs from "../Pipelines/index.ts";
+ import type * as Queues from "../Queues/index.ts";
+ import type * as R2 from "../R2/index.ts";
++import type { Secret as SecretsStoreBinding } from "../SecretsStore/Secret.ts";
++import type { Index as VectorizeIndex } from "../Vectorize/VectorizeIndex.ts";
+ import type * as StreamNs from "../Stream/index.ts";
+ import type { VpcService } from "../VpcService/VpcService.ts";
+ import type { VpcServiceLookup } from "../VpcService/VpcServiceLookup.ts";
+@@ -42,7 +44,7 @@
+ } ? InferEnv<Env> : {
+     [k in keyof W]: GetBindingType<W[k]>;
+ };
+-export type GetBindingType<T> = T extends WorkerEntrypointBinding<infer Entrypoint> ? Service<Entrypoint> : T extends Self ? Service : T extends Container.Decl<any, any, any, any, infer DOShape> ? DurableObjectNamespace<DOShape & Rpc.DurableObjectBranded> : T extends WorkerOnlyBinding.BindingEffect<infer B> ? GetBindingType<B> : T extends R2.S3Credentials ? string : T extends Output<infer A, infer _Req> | Effect.Effect<infer A, infer _E, infer _R> ? GetBindingType<A> : T extends FlagshipNs.App ? Flagship : T extends Assets ? Service : T extends AlchemyRpc<infer Shape extends object> ? RpcWireShape<Shape> & Service : T extends D1.Database ? D1Database : T extends R2.Bucket ? R2Bucket : T extends KV.InstantNamespace ? KV.InstantNamespaceBindingClient : T extends KV.Namespace ? KVNamespace : T extends DispatchNamespaceResource ? DispatchNamespace : T extends Queues.Queue ? Queue<unknown> : T extends AI.Gateway ? Ai : T extends AIBinding ? Ai : T extends AI.Search ? AiSearchInstance : T extends AI.SearchNamespace ? AiSearchNamespace : T extends Email.SendEmail ? SendEmail : T extends AnalyticsEngine.Dataset ? AnalyticsEngineDataset : T extends ArtifactsNs.Namespace ? Artifacts : T extends RateLimitBinding ? RateLimit : T extends SecretKeyBinding ? CryptoKey : T extends ImagesNs.ImagesBinding ? ImagesBinding : T extends BrowserBinding ? BrowserRun : T extends StreamNs.StreamBinding ? StreamBinding : T extends HyperdriveNs.Connection | HyperdriveNs.ConnectionLookup ? Hyperdrive : T extends VersionMetadataBinding ? WorkerVersionMetadata : T extends WorkerLoaderResource ? WorkerLoader : T extends WorkflowLike<infer Params> | WorkflowBinding<infer Params> ? Workflow<Params> : T extends DurableObjectLike ? DurableObjectNamespace<Exclude<T["Shape"], undefined>> : T extends VpcService | VpcServiceLookup | MtlsCertificate ? Fetcher : T extends PipelinesNs.Stream | PipelinesNs.LegacyPipeline ? Pipeline : T extends K2Ns.Stream ? K2StreamBinding : T extends Redacted<any> ? string : T;
++export type GetBindingType<T> = T extends WorkerEntrypointBinding<infer Entrypoint> ? Service<Entrypoint> : T extends Self ? Service : T extends Container.Decl<any, any, any, any, infer DOShape> ? DurableObjectNamespace<DOShape & Rpc.DurableObjectBranded> : T extends WorkerOnlyBinding.BindingEffect<infer B> ? GetBindingType<B> : T extends R2.S3Credentials ? string : T extends Output<infer A, infer _Req> | Effect.Effect<infer A, infer _E, infer _R> ? GetBindingType<A> : T extends FlagshipNs.App ? Flagship : T extends Assets ? Service : T extends AlchemyRpc<infer Shape extends object> ? RpcWireShape<Shape> & Service : T extends D1.Database ? D1Database : T extends SecretsStoreBinding ? SecretsStoreSecret : T extends VectorizeIndex ? Vectorize : T extends R2.Bucket ? R2Bucket : T extends KV.InstantNamespace ? KV.InstantNamespaceBindingClient : T extends KV.Namespace ? KVNamespace : T extends DispatchNamespaceResource ? DispatchNamespace : T extends Queues.Queue ? Queue<unknown> : T extends AI.Gateway ? Ai : T extends AIBinding ? Ai : T extends AI.Search ? AiSearchInstance : T extends AI.SearchNamespace ? AiSearchNamespace : T extends Email.SendEmail ? SendEmail : T extends AnalyticsEngine.Dataset ? AnalyticsEngineDataset : T extends ArtifactsNs.Namespace ? Artifacts : T extends RateLimitBinding ? RateLimit : T extends SecretKeyBinding ? CryptoKey : T extends ImagesNs.ImagesBinding ? ImagesBinding : T extends BrowserBinding ? BrowserRun : T extends StreamNs.StreamBinding ? StreamBinding : T extends HyperdriveNs.Connection | HyperdriveNs.ConnectionLookup ? Hyperdrive : T extends VersionMetadataBinding ? WorkerVersionMetadata : T extends WorkerLoaderResource ? WorkerLoader : T extends WorkflowLike<infer Params> | WorkflowBinding<infer Params> ? Workflow<Params> : T extends DurableObjectLike ? DurableObjectNamespace<Exclude<T["Shape"], undefined>> : T extends VpcService | VpcServiceLookup | MtlsCertificate ? Fetcher : T extends PipelinesNs.Stream | PipelinesNs.LegacyPipeline ? Pipeline : T extends K2Ns.Stream ? K2StreamBinding : T extends Redacted<any> ? string : T;
+ /**
+  * Cloudflare service-binding wire shape for an Effect-native Worker.
+  *
+diff --git a/src/Workers/InferEnv.ts b/src/Workers/InferEnv.ts
+--- a/src/Workers/InferEnv.ts
++++ b/src/Workers/InferEnv.ts
+@@ -30,6 +30,8 @@
+ import type * as PipelinesNs from "../Pipelines/index.ts";
+ import type * as Queues from "../Queues/index.ts";
+ import type * as R2 from "../R2/index.ts";
++import type { Secret as SecretsStoreBinding } from "../SecretsStore/Secret.ts";
++import type { Index as VectorizeIndex } from "../Vectorize/VectorizeIndex.ts";
+ import type * as StreamNs from "../Stream/index.ts";
+ import type { VpcService } from "../VpcService/VpcService.ts";
+ import type { VpcServiceLookup } from "../VpcService/VpcServiceLookup.ts";
+@@ -100,7 +102,7 @@
+                     ? RpcWireShape<Shape> & Service
+                     : T extends D1.Database
+                       ? D1Database
+-                      : T extends R2.Bucket
++                      : T extends SecretsStoreBinding ? SecretsStoreSecret : T extends VectorizeIndex ? Vectorize : T extends R2.Bucket
+                         ? R2Bucket
+                         : T extends KV.InstantNamespace
+                           ? KV.InstantNamespaceBindingClient

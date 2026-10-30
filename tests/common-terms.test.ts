@@ -1,3 +1,4 @@
+import { encodeCanonicalDocuments } from "./segment-fixture";
 import { decodeRoot, encodeRoot } from "../src/manifest";
 import { afterAll, expect, test } from "bun:test";
 import { Schema, Struct } from "effect";
@@ -9,11 +10,13 @@ import {
   CommonTerms,
   QueryResult,
   SegmentHeader,
-  StoredDocument,
   RankingInput,
   PostingSpans,
   SegmentHits,
   SearchStatistics,
+  Id,
+  canonicalIdKey,
+  compareCanonicalIds,
 } from "../src/protocol";
 import { document, request, startWorker, textQuery, write } from "./harness";
 
@@ -48,9 +51,7 @@ test("common-term prefixes are bounded, deterministic and conservative for compl
     ].join(" "),
     attributes: {},
   }));
-  using segment = new Segment(
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(documents),
-  );
+  using segment = new Segment(encodeCanonicalDocuments(documents));
   const bytes = segment.bytes();
   const base = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
   using directory = Directory.canonical(bytes.subarray(0, base), base);
@@ -199,7 +200,7 @@ test("manifest prefixes preserve global scores, tombstones, filters and partial 
     expect(control.timing).not.toContain("catalog_rpc_sum");
   }
   const all = await read(name, textQuery("constructor rust", 100));
-  const byId = new Map(all.result.rows.map((row) => [row.id, row]));
+  const byId = new Map(all.result.rows.map((row) => [canonicalIdKey(row.id), row]));
   const filtered = await read(
     name,
     textQuery("constructor rust", 10, [{ field: "group", op: "eq", value: 2 }]),
@@ -209,7 +210,7 @@ test("manifest prefixes preserve global scores, tombstones, filters and partial 
   expect(filtered.timing).not.toContain("catalog_rpc_sum");
   expect(filtered.result.rows).toHaveLength(10);
   for (const row of filtered.result.rows) {
-    const expected = byId.get(row.id);
+    const expected = byId.get(canonicalIdKey(row.id));
     if (expected === undefined) throw new Error("Filtered winner missing from unfiltered ranking");
     expect(row.attributes.group).toBe(2);
     expect(row).toEqual(expected);
@@ -221,7 +222,11 @@ test("manifest prefixes preserve global scores, tombstones, filters and partial 
     (await read(name, textQuery("constructor rust", 10, [{ field: "group", op: "ne", value: -1 }])))
       .result,
   );
-  expect(deleted.result.rows.every((row) => !["0-0", "1-0", "2-0"].includes(row.id))).toBe(true);
+  expect(
+    deleted.result.rows.every(
+      (row) => !["0-0", "1-0", "2-0"].includes(Schema.decodeUnknownSync(Id)(row.id)),
+    ),
+  ).toBe(true);
   expect(
     (
       await request(
@@ -304,7 +309,7 @@ test("unfiltered phrase Root fallback leaves later correlated projections visibl
   await bucket.delete(
     manifest.segments.flatMap((segment) => [
       `cache/correlated-pool-v3/${segment.key}`,
-      `cache/directory-v5/${segment.key}/${segment.headerBytes}`,
+      `cache/directory-v8/${segment.key}/${segment.headerBytes}`,
     ]),
   );
   await writer.dispose();
@@ -318,15 +323,20 @@ test("unfiltered phrase Root fallback leaves later correlated projections visibl
   });
   expect(first.status).toBe(200);
   const firstResult = Schema.decodeUnknownSync(QueryResult)(await first.json());
-  expect(firstResult.rows.map((row) => row.id).toSorted()).toEqual(
+  expect(firstResult.rows.map((row) => row.id).toSorted(compareCanonicalIds)).toEqual(
     [
       ...Array.from({ length: 24 }, (_, index) => `target-0-${index}`),
       ...Array.from({ length: 24 }, (_, index) => `target-2-${index}`),
-    ].toSorted(),
+    ].toSorted(compareCanonicalIds),
   );
   expect(
-    firstResult.rows.map(({ id, score }) => ({ id: id.replace(/^target-/u, "control-"), score })),
-  ).toEqual(controlResult.rows.map(({ id, score }) => ({ id, score })));
+    firstResult.rows.map(({ id, score }) => ({
+      id: Schema.decodeUnknownSync(Id)(id).replace(/^target-/u, "control-"),
+      score,
+    })),
+  ).toEqual(
+    controlResult.rows.map(({ id, score }) => ({ id: Schema.decodeUnknownSync(Id)(id), score })),
+  );
   expect(first.headers.get("server-timing")).toContain("catalog_rpc_sum");
   expect(first.headers.get("server-timing")).toContain("directories=0");
   for (const source of correlated) await readerBucket.put(source.key, source.body);
@@ -336,8 +346,8 @@ test("unfiltered phrase Root fallback leaves later correlated projections visibl
   });
   expect(second.status).toBe(200);
   const secondResult = Schema.decodeUnknownSync(QueryResult)(await second.json());
-  expect(secondResult.rows.map((row) => row.id).toSorted()).toEqual(
-    Array.from({ length: 24 }, (_, index) => `target-1-${index}`).toSorted(),
+  expect(secondResult.rows.map((row) => row.id).toSorted(compareCanonicalIds)).toEqual(
+    Array.from({ length: 24 }, (_, index) => `target-1-${index}`).toSorted(compareCanonicalIds),
   );
   const secondTiming = second.headers.get("server-timing") ?? "";
   expect(secondTiming).toContain("catalog_rpc_sum");
@@ -426,7 +436,7 @@ test("phrase term-frequency bounds skip impossible segments and preserve exact g
   ];
   const sources = [impossibleDocuments, phraseDocuments, splitDocuments];
   const encodeDocuments = (documents: typeof impossibleDocuments) =>
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(
+    encodeCanonicalDocuments(
       documents.map((doc) => ({
         ...doc,
         revision: 0,

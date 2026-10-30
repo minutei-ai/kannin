@@ -1,3 +1,4 @@
+import { encodeCanonicalDocuments } from "./segment-fixture";
 import { decodeRoot, encodeRoot } from "../src/manifest";
 import { afterAll, expect, test } from "bun:test";
 import { Schema, Struct } from "effect";
@@ -15,9 +16,9 @@ import {
   CompactTermBounds,
   QueryResult,
   SegmentHeader,
-  StoredDocument,
   TermCatalog,
   SearchStatistics,
+  Id,
 } from "../src/protocol";
 import { document, request, startWorker, textQuery, write, evictWrittenOverviews } from "./harness";
 
@@ -53,9 +54,7 @@ const adversarial = [
 
 test("compact common projections preserve full correlated bounds and physical segment bytes", () => {
   using segment = new Segment(
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(
-      documents.map((source) => Object.assign({}, source, { revision: 1 })),
-    ),
+    encodeCanonicalDocuments(documents.map((source) => Object.assign({}, source, { revision: 1 }))),
   );
   const bytes = segment.bytes();
   const encoded = segment.common_projection();
@@ -130,7 +129,7 @@ test("compact common projections preserve full correlated bounds and physical se
 
 test("compact projections preserve block bounds when quantile groups merge length classes", () => {
   using segment = new Segment(
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(
+    encodeCanonicalDocuments(
       adversarial.map((source) => Object.assign({}, source, { title: "", revision: 1 })),
     ),
   );
@@ -332,7 +331,9 @@ test("Worker joint proofs preserve adversarial multi-block phrase ranking", asyn
   expect(compact.headers.get("server-timing")).toContain("catalog_root_joint");
   const expected = Schema.decodeUnknownSync(QueryResult)(await compact.json());
   expect(expected.rows).toHaveLength(10);
-  expect(expected.rows.every((row) => row.id.includes("-b"))).toBe(true);
+  expect(expected.rows.every((row) => Schema.decodeUnknownSync(Id)(row.id).includes("-b"))).toBe(
+    true,
+  );
   const bucket = await worker.getR2Bucket("STORAGE");
   const key = `namespaces/${namespace}/root.json`;
   const object = await bucket.get(key);
@@ -607,8 +608,14 @@ test("joint bounds retain tombstones, selective filters and compaction semantics
         namespace,
         "write",
         write(
-          [document(replaced.id, "replacement without the original phrase", { group: 0 })],
-          [deleted.id],
+          [
+            document(
+              Schema.decodeUnknownSync(Id)(replaced.id),
+              "replacement without the original phrase",
+              { group: 0 },
+            ),
+          ],
+          [Schema.decodeUnknownSync(Id)(deleted.id)],
         ),
       )
     ).status,

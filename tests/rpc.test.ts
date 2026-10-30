@@ -8,6 +8,7 @@ import { workerOptions } from "./harness";
 import {
   CollectionResult,
   CompactResult,
+  CacheWarmHintResult,
   Metadata,
   NamespacesPage,
   QueryResult,
@@ -97,6 +98,11 @@ test("Effect SDK performs native binding RPC with Worker and coordinator HTTP di
   const written = await call({ namespace: "rpc", operation: "write", input });
   expect(written.status, await written.clone().text()).toBe(200);
   expect(Schema.decodeUnknownSync(WriteResult)(await written.json()).sequence).toBe(1);
+  const hinted = await call({ namespace: "rpc", operation: "hint_cache_warm" });
+  expect(hinted.status).toBe(200);
+  expect(Schema.decodeUnknownSync(CacheWarmHintResult)(await hinted.json()).status).toBe(
+    "ACCEPTED",
+  );
   expect(
     Schema.decodeUnknownSync(WriteResult)(
       await (await call({ namespace: "rpc", operation: "write", input })).json(),
@@ -128,7 +134,7 @@ test("Effect SDK performs native binding RPC with Worker and coordinator HTTP di
     await (await call({ namespace: "rpc", operation: "migrate-root" })).json(),
   );
   expect(migrated).toEqual({
-    version: 5,
+    version: 8,
     sequence: 1,
     rootRewritten: false,
     migratedSnapshots: 0,
@@ -193,7 +199,7 @@ test("Effect SDK performs native binding RPC with Worker and coordinator HTTP di
     Schema.decodeUnknownSync(VectorSyncResult)(
       await (await call({ namespace: "rpc", operation: "vector-sync" })).json(),
     ).visibility,
-  ).toBe("vectorize-eventual");
+  ).toBe("strong");
   const vectorResponse = await call({
     namespace: "rpc",
     operation: "query",
@@ -201,7 +207,7 @@ test("Effect SDK performs native binding RPC with Worker and coordinator HTTP di
   });
   expect(vectorResponse.status).toBe(200);
   const vectorResult = Schema.decodeUnknownSync(QueryResult)(await vectorResponse.json());
-  expect(vectorResult.consistency).toBe("vectorize-eventual");
+  expect(vectorResult.consistency).toBe("strong");
   expect(vectorResult.sequence).toBe(1);
   expect(vectorResult.rows.map((row) => row.id)).toEqual(["a"]);
   expect(vectorResult.rows[0]?.attributes).toEqual({ group: 1 });
@@ -213,7 +219,7 @@ test("Effect SDK performs native binding RPC with Worker and coordinator HTTP di
   });
   expect(hybridResponse.status).toBe(200);
   const hybridResult = Schema.decodeUnknownSync(QueryResult)(await hybridResponse.json());
-  expect(hybridResult.consistency).toBe("vectorize-eventual");
+  expect(hybridResult.consistency).toBe("strong");
   expect(hybridResult.sequence).toBe(1);
   expect(hybridResult.rows.map((row) => row.id)).toEqual(["a", "b"]);
   expect(hybridResult.rows[0]?.score).toBeCloseTo(2 / 61, 12);
@@ -368,7 +374,7 @@ test("SDK resolves a valid success payload by the requested operation", async ()
     _tag: "Success",
     value: {
       ...value,
-      version: 5,
+      version: 8,
       rootRewritten: false,
       migratedSnapshots: 0,
       expiredSnapshots: 0,

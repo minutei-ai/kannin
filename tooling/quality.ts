@@ -12,6 +12,7 @@ import {
   QueryResult,
   Rejected,
   RpcCommand,
+  sameCanonicalId,
 } from "../src/protocol";
 import { Miniflare } from "miniflare";
 import { workerOptions, write } from "../tests/harness";
@@ -183,10 +184,13 @@ const evaluated = await Effect.runPromise(
         const result = yield* Effect.tryPromise(() => response.json()).pipe(
           Effect.flatMap(Schema.decodeUnknownEffect(QueryResult)),
         );
-        const ids = result.rows
-          .filter((row) => row.id !== id)
-          .slice(0, 10)
-          .map((row) => row.id);
+        const ids = yield* Effect.forEach(
+          result.rows
+            .filter((row) => !sameCanonicalId(row.id, id))
+            .slice(0, 10)
+            .map((row) => row.id),
+          (rowId) => Schema.decodeUnknownEffect(Id)(rowId),
+        );
         progress.completed += 1;
         if (progress.completed % 100 === 0)
           yield* Console.error(`Evaluated ${progress.completed}/${judgments.size} queries`);

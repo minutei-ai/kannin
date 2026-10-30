@@ -1,7 +1,7 @@
 import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
 import { decodeRoot, encodeRoot } from "../src/manifest";
-import { Metadata, StoredRoot } from "../src/protocol";
+import { Metadata, StoredRoot, namespaceColumnsFromNative } from "../src/protocol";
 import { document, request, startWorker, write } from "./harness";
 
 const worker = await startWorker();
@@ -123,7 +123,7 @@ test("metadata reloads canonical size after a stale Root ETag rejects a write", 
   const changedRoot = decodeRoot(
     encodeRoot({
       ...oldRoot,
-      schema: { filterable: ["group"], vectorFilterFields: [] },
+      schema: namespaceColumnsFromNative({ filterable: ["group"], vectorFilterFields: [] }),
     }),
   );
   const replaced = await bucket.put(key, encodeRoot(changedRoot), {

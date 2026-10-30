@@ -11,7 +11,7 @@ The package root exports Effect operations; `kannin/protocol` owns their Schemas
 Bind the deployed Search Worker's **KanninRpc** entrypoint. With Alchemy, resolve the existing Worker from its owning stack and state store:
 
 ```ts
-import * as Cloudflare from "alchemy/Cloudflare";
+import * as Cloudflare from "@alchemy.run/cloudflare";
 import type { Entrypoint } from "kannin/rpc";
 
 const search =
@@ -24,7 +24,7 @@ const search =
 KANNIN: Cloudflare.WorkerEntrypoint<Entrypoint>(search, "KanninRpc");
 ```
 
-The Alchemy example requires the declared [entrypoint patch](../patches/alchemy@2.0.0-beta.83.patch) for beta.83. Its original guard recognizes only objects, while a lazy `Worker.ref` is a callable proxy. Without the fix, a foreign named binding silently becomes a binding to the consumer's default entrypoint. The patch accepts callable resource references in both the TypeScript and emitted runtime entry points. Carry the same fix at the consumer's package-manager patch owner when using an affected Alchemy version; installing the SDK does not patch the consumer's infrastructure dependencies. Remove this patch section when the resolved upstream implementation passes `entrypoint.test.ts` without it. Minutei's Alchemy version must be checked independently before configuring its production binding.
+The example targets `@alchemy.run/cloudflare@2.0.0-beta.84`. Its native resource guard recognizes lazy callable `Worker.ref` values; no package patch is needed. The regression is covered by `tests/entrypoint.test.ts`. Consumers on older Alchemy versions must independently check their resolved provider before configuring production bindings.
 
 Use the consumer's existing process runtime and native environment. For example, at the service Layer that owns the binding:
 
@@ -51,6 +51,8 @@ const page = Search.namespaces({ prefix: "legal-", page_size: 100 }).pipe(
 
 The result contains `namespaces` and an optional `next_cursor`. Pass it back as `cursor` with the same prefix. The same migration readiness, catalog validation and page limits as the public listing apply; the namespace coordinator is not acquired for this global operation.
 
+Request the same bounded asynchronous directory warming through `Search.hintCacheWarm("legal-corpus")`, provided with `Search.Kannin` as above. It returns the decoded `ACCEPTED` acknowledgement through the native binding, without Worker-to-Worker HTTP. See the resource limits and error behavior in [the API contract](api.md).
+
 Declare filterable attributes through the same binding before querying them:
 
 ```ts
@@ -71,9 +73,11 @@ The namespace owns this schema in R2. Other attributes remain stored and returne
 
 The SDK decodes reply framing and declared failures, then validates a successful payload once against the invoked operation's concrete result Schema. It does not normalize the payload through the union of every operation result first. If an extended payload satisfies more than one operation shape, the invoked operation determines the returned fields; union member order does not select the result. Invalid framing, invalid operation payloads and malformed declared failures remain Schema errors. The wire contract is unchanged. The server validates query results through QueryResult before wrapping RPC success, so it does not traverse those rows again through the generic result union. Both strong coordinator and edge-eventual query paths retain that concrete validation; maintenance and failure encoding keep their existing contracts.
 
-`migrateRoot(namespace)` returns `RootMigrationResult` with `version: 5` through the same native binding. It converts legacy Root v1–v4 data and unexpired rebuild checkpoints, including converted immutable segments, remapped common-leader ranges and Bloom segment keys. Versions 1/2 derive eligibility once; versions 3/4 preserve existing models. Inline Bloom versions publish verified packs; v4 reuses pack bytes and digests. Sequence, document revisions, vector epochs, jobs and absolute checkpoint expiry survive conversion. Checkpoint ETag commits precede Root activation. Ordinary reads require the current persisted format. See [migration ownership](architecture.md).
+The candidate internal `TypedWrite` envelope uses the existing `write` operation with `kind: "typed"`, an ID-type policy, optional normalized `declaration`, canonical role documents and exact typed attribute cells. It writes Log 3 and StoredRoot8; legacy Write/Log1 and CanonicalWrite/Log2 retain their contracts. Attribute names and column declarations are normalized for typed request fingerprints. Use the existing `query` operation with typed filter operands; typed result attributes retain their tags. Metadata exposes `columns` for typed namespaces and keeps the native-only `schema` projection null. These internal changes are unvalidated and do not implement public Turbopuffer v2 routes or wire codecs.
 
-Both Worker-to-Worker and Worker-to-coordinator calls use native RPC, with structured records rather than Request/Response transport. The namespace coordinator owns the same mutation lock, read leases, sequence barriers, ranking and R2 persistence as the HTTP API. Explicit edge-eventual text queries retain the bounded-age snapshot path and recover through coordinator RPC. Vector visibility remains eventual.
+`migrateRoot(namespace)` returns `RootMigrationResult` with `version: 8` through the same native binding. It converts legacy Root v1–v7 data and unexpired rebuild checkpoints. Versions 5, 6 and 7 convert only schema/Root envelopes without rewriting segments, logs or receipts. Versions 1–4 migrate segment data, including converted immutable segments, remapped common-leader ranges and Bloom segment keys. Versions 1/2 derive eligibility once; versions 3/4 preserve existing models. Inline Bloom versions publish verified packs; v4 reuses pack bytes and digests. Sequence, document revisions, vector epochs, jobs and absolute checkpoint expiry survive conversion. Checkpoint ETag commits precede Root activation. Ordinary reads require the current persisted format. See [migration ownership](architecture.md).
+
+Both Worker-to-Worker and Worker-to-coordinator calls use native RPC, with structured records rather than Request/Response transport. The namespace coordinator owns the same mutation lock, read leases, sequence barriers, ranking and R2 persistence as the HTTP API. Explicit edge-eventual text queries retain the bounded-age snapshot path and recover through coordinator RPC. Vector and hybrid queries use the captured canonical Root with strong consistency.
 
 A service binding is an account-controlled capability granting access to all Kannin namespaces. It does not use the public HTTP bearer token. Minutei must authorize the actor and workspace and select the permitted namespace on the server before invoking the SDK. Do not expose the binding or arbitrary namespace selection to a browser. The public HTTP API retains its existing authentication.
 

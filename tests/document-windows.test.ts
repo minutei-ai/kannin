@@ -1,3 +1,4 @@
+import { canonicalFixtureDocuments } from "./segment-fixture";
 import { expect, test } from "bun:test";
 import { Effect, Schema } from "effect";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -53,13 +54,15 @@ test("nearby document reads reuse byte windows without decoding an unselected co
   await using active = await fixture();
   using segment = new Segment(
     JSON.stringify(
-      [0, 1, 2].map((index) => ({
-        id: String(index),
-        revision: 1,
-        title: "",
-        text: `alpha unique${index}`,
-        attributes: { group: index },
-      })),
+      canonicalFixtureDocuments(
+        [0, 1, 2].map((index) => ({
+          id: String(index),
+          revision: 1,
+          title: "",
+          text: `alpha unique${index}`,
+          attributes: { group: index },
+        })),
+      ),
     ),
   );
   const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
@@ -120,16 +123,18 @@ test("a document crossing a byte-window boundary retains its complete frame and 
   };
   for (const attempt of Array.from({ length: 8 }, (_, index) => index)) {
     using segment = new Segment(
-      JSON.stringify([
-        {
-          id: "0-filler",
-          revision: 1,
-          title: "",
-          text: "unused",
-          attributes: { padding: padding.slice(0, layout.padding) },
-        },
-        { id: "edge", revision: 1, title: "", text: "alpha beta", attributes: {} },
-      ]),
+      JSON.stringify(
+        canonicalFixtureDocuments([
+          {
+            id: "0-filler",
+            revision: 1,
+            title: "",
+            text: "unused",
+            attributes: { padding: padding.slice(0, layout.padding) },
+          },
+          { id: "edge", revision: 1, title: "", text: "alpha beta", attributes: {} },
+        ]),
+      ),
     );
     const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
     const document = header.documents[1];
@@ -173,13 +178,15 @@ test("sparse document batches preserve input order and retain only requested fra
   await using active = await fixture("document-window-slow-fixture.ts");
   using segment = new Segment(
     JSON.stringify(
-      [0, 1, 2].map((index) => ({
-        id: String(index),
-        revision: 1,
-        title: `title${index}`,
-        text: `alpha unique${index}`,
-        attributes: { group: index },
-      })),
+      canonicalFixtureDocuments(
+        [0, 1, 2].map((index) => ({
+          id: String(index),
+          revision: 1,
+          title: `title${index}`,
+          text: `alpha unique${index}`,
+          attributes: { group: index },
+        })),
+      ),
     ),
   );
   const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
@@ -302,13 +309,15 @@ for (const sample of [
     await using active = await fixture();
     using segment = new Segment(
       JSON.stringify(
-        [0, 1].map((index) => ({
-          id: String(index),
-          revision: 1,
-          title: "",
-          text: `alpha unique${index}`,
-          attributes: {},
-        })),
+        canonicalFixtureDocuments(
+          [0, 1].map((index) => ({
+            id: String(index),
+            revision: 1,
+            title: "",
+            text: `alpha unique${index}`,
+            attributes: {},
+          })),
+        ),
       ),
     );
     const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
@@ -361,7 +370,7 @@ test("sixteen document pages preserve caller order and a seventeenth fails befor
     text: `alpha unique${index}`,
     attributes: { group: index },
   }));
-  using segment = new Segment(JSON.stringify(documents));
+  using segment = new Segment(JSON.stringify(canonicalFixtureDocuments(documents)));
   const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
   const bytes = segment.bytes();
   const headerBytes = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
@@ -397,16 +406,18 @@ test("sixteen document pages preserve caller order and a seventeenth fails befor
 test("metadata boundaries remain enforced on cache hits and vector bytes stay unread", async () => {
   await using active = await fixture();
   using segment = new Segment(
-    JSON.stringify([
-      {
-        id: "vector",
-        revision: 1,
-        title: "",
-        text: "alpha",
-        attributes: {},
-        vector: [1, ...Array<number>(767).fill(0)],
-      },
-    ]),
+    JSON.stringify(
+      canonicalFixtureDocuments([
+        {
+          id: "vector",
+          revision: 1,
+          title: "",
+          text: "alpha",
+          attributes: {},
+          vector: [1, ...Array<number>(767).fill(0)],
+        },
+      ]),
+    ),
   );
   const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
   const bytes = segment.bytes();
@@ -458,7 +469,7 @@ test("large decoded metadata batches preserve the scalar fallback through R2 and
     text: "x".repeat(70000),
     attributes: { group: index },
   }));
-  using segment = new Segment(JSON.stringify(documents));
+  using segment = new Segment(JSON.stringify(canonicalFixtureDocuments(documents)));
   const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
   const bytes = segment.bytes();
   const headerBytes = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
@@ -487,13 +498,15 @@ test("a corrupt sparse metadata batch admits no valid sibling page before whole-
   await using active = await fixture();
   using segment = new Segment(
     JSON.stringify(
-      Array.from({ length: 3 }, (_, index) => ({
-        id: String(index),
-        revision: 1,
-        title: "",
-        text: `alpha unique${index}`,
-        attributes: {},
-      })),
+      canonicalFixtureDocuments(
+        Array.from({ length: 3 }, (_, index) => ({
+          id: String(index),
+          revision: 1,
+          title: "",
+          text: `alpha unique${index}`,
+          attributes: {},
+        })),
+      ),
     ),
   );
   const header = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(segment.header_json());
@@ -542,7 +555,7 @@ test("cached metadata batches preserve the exact decoded limit and count each pa
       text: "",
       attributes: { flag: true, empty: null, number: 1.25 },
     }));
-    using emptySegment = new Segment(JSON.stringify(emptyDocuments));
+    using emptySegment = new Segment(JSON.stringify(canonicalFixtureDocuments(emptyDocuments)));
     const emptyBytes = emptySegment.bytes();
     const emptyHeader = Schema.decodeSync(Schema.fromJsonString(SegmentHeader))(
       emptySegment.header_json(),
@@ -556,7 +569,7 @@ test("cached metadata batches preserve the exact decoded limit and count each pa
     const first = emptyDocuments[0];
     if (first === undefined) throw new Error("Missing decoded boundary fixture");
     first.text = "x".repeat(decodedBytes - overhead);
-    using segment = new Segment(JSON.stringify(emptyDocuments));
+    using segment = new Segment(JSON.stringify(canonicalFixtureDocuments(emptyDocuments)));
     const bytes = segment.bytes();
     const view = new DataView(bytes.buffer, bytes.byteOffset);
     const headerBytes = 16 + view.getUint32(8, true);

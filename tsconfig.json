@@ -111,6 +111,6 @@
     "allowUnusedLabels": false,
     "noUncheckedSideEffectImports": true
   },
-  "include": ["src", "tooling", "tests", "alchemy.run.ts"],
+  "include": ["src", "infra", "runtime", "tooling", "tests", "alchemy.run.ts"],
   "$schema": "./node_modules/@effect/tsgo/schema.json"
 }

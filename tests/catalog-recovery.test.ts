@@ -1,3 +1,4 @@
+import { canonicalFixtureDocuments } from "./segment-fixture";
 import { expect, test } from "bun:test";
 import { Schema } from "effect";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -60,15 +61,17 @@ for (const sample of [
         const padding = { bytes: sample.bytes - 512, complete: false };
         for (const attempt of [0, 1, 2]) {
           using segment = new Segment(
-            JSON.stringify([
-              {
-                id: String(index),
-                revision: 1,
-                title: "",
-                text: "alpha ".repeat(index + 1),
-                attributes: { padding: "x".repeat(padding.bytes) },
-              },
-            ]),
+            JSON.stringify(
+              canonicalFixtureDocuments([
+                {
+                  id: String(index),
+                  revision: 1,
+                  title: "",
+                  text: "alpha ".repeat(index + 1),
+                  attributes: { padding: "x".repeat(padding.bytes) },
+                },
+              ]),
+            ),
           );
           const bytes = segment.bytes();
           const headerBytes = 16 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);

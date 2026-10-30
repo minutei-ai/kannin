@@ -40,6 +40,6 @@ console.log(
   JSON.stringify({
     namespaces: page.namespaces,
     submitted: page.submitted,
-    visibility: "vectorize-eventual",
+    visibility: "strong",
   }),
 );

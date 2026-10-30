@@ -1,4 +1,4 @@
-import { Effect, Schema } from "effect";
+import { Effect, Option, Schema } from "effect";
 import {
   CommonTermProjection,
   Rejected,
@@ -6,18 +6,20 @@ import {
   CommonTerms,
   EligibilityProjection,
   RootMigrationInput,
+  LegacyInlineRoot,
+  LegacyPackedRoot,
   StoredRoot,
   StoredVectorRebuildSnapshot,
   VectorRebuildSnapshotMigrationInput,
+  namespaceColumnsFromNative,
 } from "./protocol";
 import type {
   Root,
   VectorRebuildSnapshot,
-  LegacyInlineRoot,
   LegacyStoredRoot,
   LegacyStoredRootV3,
   LegacyStoredRootV4,
-  LegacyPackedRoot,
+  LegacyStoredRootV5,
 } from "./protocol";
 
 const projectionJson = Schema.fromJsonString(CommonTermProjection);
@@ -29,9 +31,9 @@ const snapshotMigrationJson = Schema.fromJsonString(VectorRebuildSnapshotMigrati
 const encodeProjection = Schema.encodeSync(projectionJson);
 const encodeTerms = Schema.encodeSync(termsJson);
 const encodeEligibility = Schema.encodeSync(Schema.fromJsonString(EligibilityProjection));
-const decodeStoredRoot = Schema.decodeSync(storedRootJson);
+const decodeStoredRoot = Schema.decodeSync(storedRootJson, { onExcessProperty: "error" });
 const decodeMigrationRoot = Schema.decodeSync(rootMigrationJson, { onExcessProperty: "error" });
-const decodeStoredSnapshot = Schema.decodeSync(storedSnapshotJson);
+const decodeStoredSnapshot = Schema.decodeSync(storedSnapshotJson, { onExcessProperty: "error" });
 const decodeMigrationSnapshot = Schema.decodeSync(snapshotMigrationJson, {
   onExcessProperty: "error",
 });
@@ -93,7 +95,7 @@ const poolRoot = (root: typeof Root.Type) => {
   });
   return {
     ...root,
-    version: 5 as const,
+    version: 8 as const,
     segments,
     commonProjections: projections,
     commonTermDictionaries: dictionaries,
@@ -152,9 +154,28 @@ const expandRoot = (root: typeof StoredRoot.Type): typeof Root.Type => {
   };
 };
 
+const expandStoredSchema = (root: typeof LegacyStoredRootV5.Type): typeof Root.Type => {
+  const { commonProjections, commonTermDictionaries, eligibilityModels, schema, ...fields } = root;
+  const schemaFields = Option.match(Option.fromUndefinedOr(schema), {
+    onNone: () => ({}),
+    onSome: (native) => ({ schema: namespaceColumnsFromNative(native) }),
+  });
+  return {
+    ...fields,
+    version: 1 as const,
+    ...schemaFields,
+    segments: expandSharedSegments(
+      fields.segments,
+      commonProjections,
+      commonTermDictionaries,
+      eligibilityModels,
+    ),
+  };
+};
+
 const expandPackedRoot = (root: typeof LegacyStoredRootV4.Type): typeof LegacyPackedRoot.Type => {
   const { commonProjections, commonTermDictionaries, eligibilityModels, ...fields } = root;
-  return {
+  return Schema.decodeSync(LegacyPackedRoot)({
     ...fields,
     version: 1 as const,
     segments: expandSharedSegments(
@@ -163,7 +184,7 @@ const expandPackedRoot = (root: typeof LegacyStoredRootV4.Type): typeof LegacyPa
       commonTermDictionaries,
       eligibilityModels,
     ),
-  };
+  });
 };
 
 const poolSnapshot = (snapshot: typeof VectorRebuildSnapshot.Type) => ({
@@ -185,7 +206,9 @@ export function decodeRoot(text: string) {
 }
 
 export const decodeRootEffect = Effect.fn("kannin.decodeRoot")(function* (text: string) {
-  return expandRoot(yield* Schema.decodeEffect(storedRootJson)(text));
+  return expandRoot(
+    yield* Schema.decodeEffect(storedRootJson, { onExcessProperty: "error" })(text),
+  );
 });
 
 const expandLegacyStoredRoot = (
@@ -202,7 +225,7 @@ const expandLegacyStoredRoot = (
       })),
     });
   const { commonProjections, commonTermDictionaries, eligibilityModels, ...fields } = stored;
-  return {
+  return Schema.decodeSync(LegacyInlineRoot)({
     ...fields,
     version: 1,
     segments: expandSharedSegments(
@@ -211,7 +234,7 @@ const expandLegacyStoredRoot = (
       commonTermDictionaries,
       eligibilityModels,
     ),
-  };
+  });
 };
 
 const migrationRoot = (stored: typeof RootMigrationInput.Type) => {
@@ -247,6 +270,24 @@ const migrationRoot = (stored: typeof RootMigrationInput.Type) => {
       sourceVersion: 4 as const,
       root: expandPackedRoot(stored),
     };
+  if (stored.version === 5)
+    return {
+      kind: "schema" as const,
+      sourceVersion: 5 as const,
+      root: expandStoredSchema(stored),
+    };
+  if (stored.version === 6)
+    return {
+      kind: "schema" as const,
+      sourceVersion: 6 as const,
+      root: expandRoot({ ...stored, version: 8 }),
+    };
+  if (stored.version === 7)
+    return {
+      kind: "schema" as const,
+      sourceVersion: 7 as const,
+      root: expandRoot({ ...stored, version: 8 }),
+    };
   return { kind: "current" as const, root: expandRoot(stored) };
 };
 
@@ -280,6 +321,12 @@ export function decodeVectorRebuildSnapshotForMigration(text: string) {
   if (converted.kind === "packed")
     return {
       kind: "packed" as const,
+      sourceVersion: converted.sourceVersion,
+      snapshot: { ...stored, root: converted.root },
+    };
+  if (converted.kind === "schema")
+    return {
+      kind: "schema" as const,
       sourceVersion: converted.sourceVersion,
       snapshot: { ...stored, root: converted.root },
     };

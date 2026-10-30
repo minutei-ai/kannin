@@ -12,15 +12,17 @@ workspace = true
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-bit-vec = "=0.9.1"
-crc32fast = "1.5.0"
-hashbrown = "0.16.1"
-miniz_oxide = { version = "0.9.0", features = ["simd"] }
-unicode-normalization = "0.1.25"
+bit-vec = "=0.10.1"
+crc32fast = "1.5.3"
+hashbrown = "0.17.1"
+miniz_oxide = { version = "0.9.1", features = ["simd"] }
+unicode-normalization = "0.1.26"
 unicode-segmentation = "1.13.3"
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = { version = "1", features = ["raw_value"] }
+serde_json = { version = "1", features = ["float_roundtrip", "raw_value"] }
 zlib-rs = { version = "0.6.8", default-features = false, features = ["std"] }
+alyze = { version = "=0.2.0", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
 wasm-bindgen = "=0.2.129"

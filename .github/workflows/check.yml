@@ -1,29 +1,92 @@
 name: Check
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      measure_workerd:
+        description: Measure bounded workerd and Docker cold/warm workloads after the full gate
+        type: boolean
+        default: false
 permissions:
   contents: read
+concurrency:
+  group: check-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
-          bun-version: 1.4.3
+          bun-version: 1.4.4
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
         with:
-          toolchain: 1.96.0
+          toolchain: 1.99.1
           targets: wasm32-unknown-unknown
           components: rustfmt, clippy
-      - run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        id: wasm-bindgen-cli
+        with:
+          path: ~/.cargo/bin/wasm-bindgen
+          key: ${{ runner.os }}-${{ runner.arch }}-rust-1.99.1-wasm-bindgen-cli-0.2.129
+      - if: steps.wasm-bindgen-cli.outputs.cache-hit != 'true'
+        run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
+      - run: ~/.cargo/bin/wasm-bindgen --version
+      - if: steps.wasm-bindgen-cli.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ~/.cargo/bin/wasm-bindgen
+          key: ${{ steps.wasm-bindgen-cli.outputs.cache-primary-key }}
       - run: bun install --frozen-lockfile
+      - run: sudo apt-get update && sudo apt-get install -y podman
       - run: bun run check
+      - name: Record validated source provenance
+        run: |
+          jq --null-input \
+            --arg commit "$(git rev-parse HEAD)" \
+            --arg tree "$(git rev-parse 'HEAD^{tree}')" \
+            --arg run "$GITHUB_RUN_ID" \
+            '{commit: $commit, tree: $tree, run: $run}' > dist/validation.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: worker
           path: |
             dist/worker/
             dist/wasm/
+            dist/server/
+            dist/cache/
+            dist/validation.json
+          retention-days: 1
+      - name: Measure local workerd and Docker after the passing gate
+        if: github.event_name == 'workflow_dispatch' && inputs.measure_workerd
+        timeout-minutes: 10
+        env:
+          RAIO_BENCH_DOCUMENTS: "1000"
+          RAIO_BENCH_COLD_SAMPLES: "3"
+        run: |
+          RAIO_BENCH_CACHE_MODE=retained bun tooling/benchmark-cold.ts > "$RUNNER_TEMP/kannin-process-cold.json"
+          RAIO_BENCH_CACHE_MODE=empty bun tooling/benchmark-cold.ts > "$RUNNER_TEMP/kannin-cache-cold.json"
+          bun tooling/benchmark.ts > "$RUNNER_TEMP/kannin-warm.json"
+          RAIO_BENCH_CACHE_MODE=retained bun tooling/benchmark-container.ts > "$RUNNER_TEMP/kannin-docker.json"
+          RAIO_BENCH_CACHE_MODE=empty bun tooling/benchmark-container.ts > "$RUNNER_TEMP/kannin-docker-cache-cold.json"
+          bun tooling/verify-benchmarks.ts "$RUNNER_TEMP/kannin-process-cold.json" "$RUNNER_TEMP/kannin-cache-cold.json" "$RUNNER_TEMP/kannin-warm.json" "$RUNNER_TEMP/kannin-docker.json" "$RUNNER_TEMP/kannin-docker-cache-cold.json"
+      - name: Retain bounded local backend measurement reports
+        if: github.event_name == 'workflow_dispatch' && inputs.measure_workerd
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: local-backend-measurements
+          path: |
+            ${{ runner.temp }}/kannin-process-cold.json
+            ${{ runner.temp }}/kannin-warm.json
+            ${{ runner.temp }}/kannin-cache-cold.json
+            ${{ runner.temp }}/kannin-docker.json
+            ${{ runner.temp }}/kannin-docker-cache-cold.json
+            dist/validation.json
+          if-no-files-found: error
           retention-days: 1

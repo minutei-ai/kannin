@@ -1,6 +1,6 @@
 import { afterAll, expect, test } from "bun:test";
 import { Schema } from "effect";
-import { Metadata, QueryResult } from "../src/protocol";
+import { Metadata, QueryResult, canonicalIdKey } from "../src/protocol";
 import { document, request, startWorker, textQuery, write, evictWrittenOverviews } from "./harness";
 
 const worker = await startWorker();
@@ -11,7 +11,7 @@ test("tied score certificates prune misleading minima and preserve UTF-16 winner
   for (const [order, ids] of [suffixes, suffixes.toReversed()].entries()) {
     const namespace = `tied-bound-${order}`;
     const oracle = `tied-oracle-${order}`;
-    const revisions = new Map(ids.map((id, index) => [`hit-${id}`, index + 1]));
+    const revisions = new Map(ids.map((id, index) => [canonicalIdKey(`hit-${id}`), index + 1]));
     const groups = ids.map((id, index) => [
       document(`00-${index}`, "other words", { group: 0 }),
       document(`hit-${id}`, "alpha beta", { group: 1 }),
@@ -41,7 +41,7 @@ test("tied score certificates prune misleading minima and preserve UTF-16 winner
           const unpruned = Schema.decodeUnknownSync(QueryResult)(await complete.json());
           expect(actual.rows).toEqual(
             unpruned.rows.map((row) => {
-              const revision = revisions.get(row.id);
+              const revision = revisions.get(canonicalIdKey(row.id));
               if (revision === undefined) throw new Error("Missing source revision");
               return Object.assign({}, row, { revision });
             }),

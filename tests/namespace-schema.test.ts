@@ -10,6 +10,8 @@ import {
   NamespaceSchema,
   QueryResult,
   WriteResult,
+  FieldName,
+  compareFieldNames,
 } from "../src/protocol";
 import { request, startWorker, textQuery } from "./harness";
 
@@ -238,7 +240,7 @@ test("namespace schema rejects duplicate, excessive and undeclared vector fields
     expect(Schema.is(NamespaceSchema)(input)).toBe(false);
 });
 
-test("each namespace assigns its own Vectorize slots and schema-only migration isolates old metadata", async () => {
+test("namespace-local canonical filters are immediately visible after schema-only configuration", async () => {
   const vector = [1, ...Array.from({ length: 767 }, () => 0)];
   for (const field of ["customer", "region"]) {
     const namespace = `schema-${field}`;
@@ -303,10 +305,377 @@ test("each namespace assigns its own Vectorize slots and schema-only migration i
   const before = Schema.decodeUnknownSync(QueryResult)(
     await (await request(worker, "schema-migrate", "query", input)).json(),
   );
-  expect(before.rows).toEqual([]);
+  expect(before.rows.map((row) => row.id)).toEqual(["a"]);
+  expect(before.consistency).toBe("strong");
   expect((await request(worker, "schema-migrate", "vector-rebuild", {})).status).toBe(200);
   const after = Schema.decodeUnknownSync(QueryResult)(
     await (await request(worker, "schema-migrate", "query", input)).json(),
   );
-  expect(after.rows.map((row) => row.id)).toEqual(["a"]);
+  expect(after).toEqual(before);
+});
+
+test("native document fields remain distinct from attributes with the same names", async () => {
+  const namespace = "native-column-identities";
+  const vector = [1, 0];
+  const schema = {
+    filterable: ["vector", "title", "text"],
+    vectorFilterFields: ["text", "vector"],
+    vectorDimensions: 2,
+  };
+  const attributes = { vector: "metadata-vector", title: "metadata-title", text: "metadata-text" };
+  expect(
+    (
+      await request(worker, namespace, "write", {
+        requestId: "seed",
+        schema,
+        upserts: [{ id: "one", title: "native heading", text: "native body", attributes, vector }],
+        deletes: [],
+      })
+    ).status,
+  ).toBe(200);
+  expect((await request(worker, namespace, "vector-sync", {})).status).toBe(200);
+  for (const input of [
+    textQuery("native"),
+    { kind: "vector", vector, topK: 10, filters: [] },
+    { kind: "hybrid", text: "native", vector, topK: 10, filters: [] },
+  ]) {
+    const response = await request(worker, namespace, "query", {
+      ...input,
+      filters: Object.entries(attributes).map(([field, value]) => ({ field, op: "eq", value })),
+    });
+    expect(response.status).toBe(200);
+    const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+    expect(result.rows.map((row) => row.id)).toEqual(["one"]);
+    expect(result.rows[0]?.title).toBe("native heading");
+    expect(result.rows[0]?.text).toBe("native body");
+    expect(result.rows[0]?.attributes).toEqual(attributes);
+  }
+  const response = await request(worker, namespace, "metadata");
+  expect(response.status).toBe(200);
+  expect(Schema.decodeUnknownSync(Metadata)(await response.json()).schema).toEqual(schema);
+});
+
+test("attribute names enforce UTF-8 byte bounds and native field ordering", () => {
+  for (const name of [
+    "1year",
+    "a-b",
+    "ação",
+    "a/b",
+    "x".repeat(128),
+    "é".repeat(64),
+    "😀".repeat(32),
+  ])
+    expect(Schema.is(FieldName)(name)).toBe(true);
+  for (const name of [
+    "",
+    "$reserved",
+    "x".repeat(129),
+    `${"é".repeat(64)}x`,
+    `${"😀".repeat(32)}x`,
+    "\uD800",
+  ])
+    expect(Schema.is(FieldName)(name)).toBe(false);
+  expect(["😀", "\uE000", "é", "a", "aa", ""].toSorted(compareFieldNames)).toEqual([
+    "",
+    "a",
+    "aa",
+    "é",
+    "\uE000",
+    "😀",
+  ]);
+});
+
+test("Unicode attribute names survive canonical restart and multi-field filtering", async () => {
+  const persistence = await mkdtemp(join(tmpdir(), "kannin-unicode-fields-"));
+  await using cleanup = new AsyncDisposableStack();
+  cleanup.defer(() => rm(persistence, { recursive: true, force: true }));
+  const namespace = "unicode-fields";
+  const fields = ["1year", "a-b", "ação", "😀", "\uE000", 'quote"\\field', "a/b", "😀".repeat(32)];
+  const vector = [1, 0];
+  const attributes = Object.fromEntries(fields.map((field) => [field, "selected"]));
+  {
+    const writer = await startWorker(persistence);
+    await using lifetime = new AsyncDisposableStack();
+    lifetime.defer(() => writer.dispose());
+    expect(
+      (
+        await request(writer, namespace, "write", {
+          requestId: "seed",
+          schema: { filterable: fields, vectorFilterFields: [], vectorDimensions: 2 },
+          upserts: [
+            { id: "a", text: "names record", attributes, vector },
+            {
+              id: "b",
+              text: "names record",
+              vector,
+              attributes: Object.fromEntries(fields.map((field) => [field, "other"])),
+            },
+          ],
+          deletes: [],
+        })
+      ).status,
+    ).toBe(200);
+  }
+  const reader = await startWorker(persistence);
+  cleanup.defer(() => reader.dispose());
+  for (const input of [
+    textQuery("names"),
+    { kind: "vector", vector, topK: 10, filters: [] },
+    { kind: "hybrid", text: "names", vector, topK: 10, filters: [] },
+  ]) {
+    const response = await request(reader, namespace, "query", {
+      ...input,
+      minimumSequence: 1,
+      filters: fields.map((field) => ({ field, op: "eq", value: "selected" })),
+    });
+    expect(response.status).toBe(200);
+    const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+    expect(result.rows.map((row) => row.id)).toEqual(["a"]);
+    expect(result.rows[0]?.attributes).toEqual(attributes);
+  }
+  for (const [index, field] of ["$reserved", `${"😀".repeat(32)}x`].entries()) {
+    const invalid = `invalid-field-${index}`;
+    expect(
+      (
+        await request(reader, invalid, "write", {
+          requestId: "invalid",
+          schema: { filterable: [field], vectorFilterFields: [] },
+          upserts: [{ id: "a", text: "invalid", attributes: { [field]: "value" } }],
+          deletes: [],
+        })
+      ).status,
+    ).toBe(400);
+    expect(
+      await (await reader.getR2Bucket("STORAGE")).get(`namespaces/${invalid}/root.json`),
+    ).toBeNull();
+  }
+});
+
+test("string ranges preserve binary order and exact types across native query kinds", async () => {
+  const namespace = "string-ranges";
+  const vector = [1, 0];
+  const values = [
+    { id: "a", attributes: { label: "a" } },
+    { id: "aa", attributes: { label: "aa" } },
+    { id: "bmp", attributes: { label: "\uE000" } },
+    { id: "emoji", attributes: { label: "😀" } },
+    { id: "empty", attributes: { label: "" } },
+    { id: "null", attributes: { label: null } },
+    { id: "missing", attributes: {} },
+    { id: "number", attributes: { label: 1 } },
+  ];
+  expect(
+    (
+      await request(worker, namespace, "write", {
+        requestId: "seed",
+        schema: { filterable: ["label"], vectorFilterFields: [], vectorDimensions: 2 },
+        upserts: values.map(({ id, attributes }) => ({
+          id,
+          attributes,
+          text: "ordered record",
+          vector,
+        })),
+        deletes: [],
+      })
+    ).status,
+  ).toBe(200);
+  for (const input of [
+    textQuery("ordered"),
+    { kind: "vector", vector, topK: 10, filters: [] },
+    { kind: "hybrid", text: "ordered", vector, topK: 10, filters: [] },
+  ])
+    for (const [op, value, ids] of [
+      ["gt", "a", ["aa", "bmp", "emoji"]],
+      ["gte", "a", ["a", "aa", "bmp", "emoji"]],
+      ["lt", "aa", ["a", "empty"]],
+      ["lte", "aa", ["a", "aa", "empty"]],
+      ["gte", "\uE000", ["bmp", "emoji"]],
+      ["lt", "😀", ["a", "aa", "bmp", "empty"]],
+      ["lt", "1", ["empty"]],
+      ["gt", 0, ["number"]],
+    ] as const) {
+      const response = await request(worker, namespace, "query", {
+        ...input,
+        filters: [{ field: "label", op, value }],
+      });
+      expect(response.status).toBe(200);
+      expect(
+        Schema.decodeUnknownSync(QueryResult)(await response.json()).rows.map((row) => row.id),
+      ).toEqual([...ids]);
+    }
+  for (const value of [true, null, ["a"]])
+    expect(
+      (
+        await request(worker, namespace, "query", {
+          ...textQuery("ordered"),
+          filters: [{ field: "label", op: "gt", value }],
+        })
+      ).status,
+    ).toBe(400);
+  expect(
+    (
+      await request(worker, namespace, "write", {
+        requestId: "replace-and-delete",
+        upserts: [{ id: "a", text: "ordered record", attributes: { label: "z" }, vector }],
+        deletes: ["emoji"],
+      })
+    ).status,
+  ).toBe(200);
+  for (const phase of ["before", "after"]) {
+    if (phase === "after")
+      for (const operation of ["compact", "rebuild"])
+        expect((await request(worker, namespace, operation, {})).status).toBe(200);
+    const response = await request(worker, namespace, "query", {
+      kind: "vector",
+      vector,
+      topK: 10,
+      minimumSequence: 2,
+      filters: [{ field: "label", op: "gte", value: "\uE000" }],
+    });
+    expect(response.status).toBe(200);
+    const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+    expect(result.rows.map((row) => row.id)).toEqual(["bmp"]);
+    expect(result.sequence).toBe(2);
+  }
+});
+
+test("scalar arrays survive queries, replacement and canonical maintenance", async () => {
+  const namespace = "array-attributes";
+  const vector = [1, 0];
+  const attributes = {
+    tags: ["ação", "😀"],
+    scores: [0, 1.5, -2],
+    empty: [],
+    mixed: [null, true, "x", 1],
+  };
+  expect(
+    (
+      await request(worker, namespace, "write", {
+        requestId: "seed",
+        schema: {
+          filterable: ["tags", "scores", "empty", "mixed"],
+          vectorFilterFields: [],
+          vectorDimensions: 2,
+        },
+        upserts: [
+          { id: "a", text: "arrays record", attributes, vector },
+          { id: "b", text: "arrays record", attributes: { tags: null }, vector },
+          { id: "c", text: "arrays record", attributes: {}, vector },
+        ],
+        deletes: [],
+      })
+    ).status,
+  ).toBe(200);
+  const inputs = [
+    textQuery("arrays"),
+    { kind: "vector", vector, topK: 10, filters: [] },
+    { kind: "hybrid", text: "arrays", vector, topK: 10, filters: [] },
+  ];
+  for (const input of inputs) {
+    const response = await request(worker, namespace, "query", input);
+    expect(response.status).toBe(200);
+    const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
+    expect(result.rows.map((row) => row.id)).toEqual(["a", "b", "c"]);
+    expect(result.rows[0]?.attributes).toEqual(attributes);
+    for (const [filter, ids] of [
+      [{ field: "tags", op: "exists", value: true }, ["a", "b"]],
+      [{ field: "tags", op: "eq", value: null }, ["b"]],
+      [{ field: "tags", op: "ne", value: null }, ["a", "c"]],
+      [{ field: "tags", op: "notIn", value: [null] }, ["a", "c"]],
+      [{ field: "tags", op: "notIn", value: [] }, ["a", "b", "c"]],
+      [{ field: "tags", op: "contains", value: "ação" }, ["a"]],
+      [{ field: "tags", op: "notContains", value: "ação" }, ["b", "c"]],
+      [{ field: "tags", op: "containsAny", value: ["absent", "😀"] }, ["a"]],
+      [{ field: "tags", op: "notContainsAny", value: ["absent", "😀"] }, ["b", "c"]],
+      [{ field: "tags", op: "containsAny", value: [] }, []],
+      [{ field: "tags", op: "notContainsAny", value: [] }, ["a", "b", "c"]],
+    ] as const) {
+      const filtered = await request(worker, namespace, "query", { ...input, filters: [filter] });
+      expect(filtered.status).toBe(200);
+      expect(
+        Schema.decodeUnknownSync(QueryResult)(await filtered.json()).rows.map((row) => row.id),
+      ).toEqual([...ids]);
+    }
+  }
+  for (const filter of [
+    { field: "tags", op: "containsAny", value: Array.from({ length: 33 }, () => "ação") },
+    { field: "tags", op: "notIn", value: Array.from({ length: 33 }, () => null) },
+    { field: "tags", op: "notIn", value: null },
+    { field: "tags", op: "contains", value: [] },
+    { field: "tags", op: "in", value: [] },
+  ])
+    expect(
+      (
+        await request(worker, namespace, "query", {
+          kind: "vector",
+          vector,
+          topK: 1,
+          filters: [filter],
+        })
+      ).status,
+    ).toBe(400);
+  expect(
+    (
+      await request(worker, namespace, "write", {
+        requestId: "replace",
+        upserts: [
+          {
+            id: "a",
+            text: "arrays record",
+            attributes: { tags: ["changed"], scores: [8, 9] },
+            vector,
+          },
+        ],
+        deletes: ["b"],
+      })
+    ).status,
+  ).toBe(200);
+  const before = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", textQuery("arrays"))).json(),
+  );
+  expect(before.rows.map((row) => row.id)).toEqual(["a", "c"]);
+  expect(before.rows[0]?.attributes).toEqual({ tags: ["changed"], scores: [8, 9] });
+  const retired = {
+    kind: "vector",
+    vector,
+    topK: 10,
+    filters: [{ field: "tags", op: "contains", value: "ação" }],
+  };
+  const removed = await request(worker, namespace, "query", retired);
+  expect(removed.status).toBe(200);
+  expect(Schema.decodeUnknownSync(QueryResult)(await removed.json()).rows).toEqual([]);
+  for (const operation of ["compact", "rebuild", "vector-sync", "vector-rebuild"])
+    expect((await request(worker, namespace, operation, {})).status).toBe(200);
+  const after = Schema.decodeUnknownSync(QueryResult)(
+    await (await request(worker, namespace, "query", textQuery("arrays"))).json(),
+  );
+  expect(after.rows).toEqual(before.rows);
+  expect(after.sequence).toBe(2);
+  const selected = await request(worker, namespace, "query", {
+    ...retired,
+    filters: [{ field: "tags", op: "contains", value: "changed" }],
+  });
+  expect(selected.status).toBe(200);
+  expect(
+    Schema.decodeUnknownSync(QueryResult)(await selected.json()).rows.map((row) => row.id),
+  ).toEqual(["a"]);
+  const collected = await request(worker, namespace, "query", retired);
+  expect(collected.status).toBe(200);
+  expect(Schema.decodeUnknownSync(QueryResult)(await collected.json()).rows).toEqual([]);
+});
+
+test("oversized, nested and object-valued arrays fail before persistence", async () => {
+  const namespace = "invalid-array-attributes";
+  for (const values of [Array.from({ length: 4097 }, () => 1), [[1]], [{}]])
+    expect(
+      (
+        await request(worker, namespace, "write", {
+          requestId: crypto.randomUUID(),
+          upserts: [{ id: "a", text: "arrays", attributes: { values } }],
+          deletes: [],
+        })
+      ).status,
+    ).toBe(400);
+  const bucket = await worker.getR2Bucket("STORAGE");
+  expect(await bucket.head(`namespaces/${namespace}/root.json`)).toBeNull();
 });

@@ -1,10 +1,11 @@
+import { encodeCanonicalDocuments } from "./segment-fixture";
 import { expect, test } from "bun:test";
 import { Effect, Schema } from "effect";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Directory, initSync, Segment } from "../dist/wasm/raio_engine";
-import { RankingInput, SegmentHeader, StoredDocument, TermProjectionRange } from "../src/protocol";
+import { RankingInput, SegmentHeader, TermProjectionRange } from "../src/protocol";
 import { startWorker } from "./harness";
 
 initSync({
@@ -74,7 +75,7 @@ test("create-only common fallback preserves existing generations and concurrent 
     expect((await call("/release")).status).toBe(204);
   });
   using segment = new Segment(
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(
+    encodeCanonicalDocuments(
       Array.from({ length: 96 }, (_, index) => ({
         id: String(index).padStart(3, "0"),
         revision: 1,
@@ -129,9 +130,9 @@ test("create-only common fallback preserves existing generations and concurrent 
     const key = `namespaces/cache-publication/segments/${mode}.rsix`;
     const source = { key, headerBytes };
     const sourceJson = Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))(source);
-    const cache = `cache/directory-common-v3/${key}/${headerBytes}`;
+    const cache = `cache/directory-common-v6/${key}/${headerBytes}`;
     await bucket.put(key, bytes);
-    await bucket.put(`cache/directory-v5/${key}/${headerBytes}`, full, {
+    await bucket.put(`cache/directory-v8/${key}/${headerBytes}`, full, {
       customMetadata: { source: sourceJson },
     });
     if (mode !== "missing-race")
@@ -148,7 +149,7 @@ test("create-only common fallback preserves existing generations and concurrent 
           key: heldKey,
           headerBytes,
         });
-        await bucket.put(`cache/directory-v5/${heldKey}/${headerBytes}`, full, {
+        await bucket.put(`cache/directory-v8/${heldKey}/${headerBytes}`, full, {
           customMetadata: { source: heldSource },
         });
       }

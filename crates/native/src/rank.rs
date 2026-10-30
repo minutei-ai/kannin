@@ -205,6 +205,12 @@ impl Ranker {
                 .map_err(|error| Rc::new(Error::Acquire(error)))?;
             let started = Instant::now();
             let header = self.reader.header(bucket, segment, &metrics).await?;
+            for document in header.documents.iter() {
+                document
+                    .id
+                    .native_str()
+                    .map_err(|cause| Rc::new(Error::Invalid(cause)))?;
+            }
             let mut search = query
                 .ranker(header.clone(), &segment.dead)
                 .map_err(|error| Rc::new(Error::Invalid(error)))?;
@@ -259,14 +265,18 @@ impl Ranker {
                 .into_iter()
                 .map(|hit| {
                     let document = header.documents.row(hit.row as usize);
-                    Hit {
+                    Ok(Hit {
                         row: hit.row,
-                        id: document.id.to_string(),
+                        id: document
+                            .id
+                            .native_str()
+                            .map_err(|cause| Rc::new(Error::Invalid(cause)))?
+                            .to_owned(),
                         score: hit.score,
                         data: document.data,
-                    }
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>, Rc<Error>>>()?;
             {
                 let mut measured = metrics.borrow_mut();
                 measured.score_ms = started
@@ -289,19 +299,22 @@ mod tests {
     fn distant_posting_offsets_do_not_overflow_gap_accounting()
     -> Result<(), Box<dyn std::error::Error>> {
         let built = build(
-            vec![Document {
-                id: String::from("document"),
-                revision: 1,
-                title: String::new(),
-                text: String::from("alpha beta gamma"),
-                attributes: BTreeMap::new(),
-                vector: None,
-            }],
+            vec![Document::native(
+                String::from("document"),
+                1,
+                String::new(),
+                String::from("alpha beta gamma"),
+                BTreeMap::new(),
+                None,
+            )],
             None,
         )?;
         let mut header = built.header;
         for (term, offset) in [("alpha", 0), ("beta", 10), ("gamma", u32::MAX - 5)] {
-            let metadata = header.terms.get_mut(term).ok_or("Missing fixture term")?;
+            let metadata = header
+                .terms_mut()
+                .get_mut(term)
+                .ok_or("Missing fixture term")?;
             let block = metadata.blocks.first_mut().ok_or("Missing fixture block")?;
             block.data.offset = offset;
             block.data.length = 1;
@@ -311,7 +324,7 @@ mod tests {
             title_length: 0,
             body_length: 3,
             frequencies: header
-                .terms
+                .terms()
                 .keys()
                 .map(|term| (term.to_owned(), 1))
                 .collect(),

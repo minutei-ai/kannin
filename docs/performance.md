@@ -1,5 +1,107 @@
 # Deployed BM25 comparison
 
+## Local process-cold measurement protocol
+
+`tooling/benchmark-cold.ts` shares the exact corpus generator and query definitions with the existing warm workerd benchmark. It ingests into an owned temporary R2 emulator store, stops the ingestion process, and starts a fresh workerd process before every measured strong query. Startup and query/body-decode time are reported separately, with raw samples, acknowledged sequence checks, identical rows/scores across restarts and corpus/Worker/WASM hashes. Both drivers now include a Schema-encoded query hash and an exact row/score hash per query; their strong requests use the same final acknowledged `minimumSequence`. These hashes matched across five reports and eleven strong workloads in runs 40902599601 and 40955889009. Queue consumers are disabled. Temporary state and each owned process are disposed on success and failure.
+
+The default `RAIO_BENCH_CACHE_MODE=retained` is process-cold measurement: canonical data, derived objects and any persisted Cache API state remain available. `RAIO_BENCH_CACHE_MODE=empty` creates fresh Cache API and coordination state for every sample, linking only the same canonical R2 directory. Both modes retain derived objects in R2 and leave OS/backend caches uncontrolled. The latter isolates application cache loss without copying canonical data or clearing host caches. It does not flush host caches, establish physically cold storage, emulate the Railway control plane, compare Docker, or measure hosted latency. Five samples per query are the default; no tail percentile claim follows from that sample count. The drivers passed the complete gate and executed at `a4a1b3f`; the bounded observations below do not establish physically cold storage or hosted performance.
+
+After a passing gate, run through the shared-host resource wrapper when its budget permits:
+
+```sh
+RAIO_BENCH_DOCUMENTS=10000 RAIO_BENCH_COLD_SAMPLES=5 /home/yorizel/.local/bin/resource-run bun tooling/benchmark-cold.ts
+```
+
+The existing `Check` workflow also accepts the explicit `measure_workerd` dispatch input. After its complete gate passes, it runs retained-cache cold, empty-cache cold and warm workerd drivers plus the Docker/S3/Varnish driver serially on 1,000 documents with three cold samples per query, with a ten-minute measurement timeout and one-day report retention. It is disabled for ordinary PR checks. This path avoids using the shared development host for measurements; its optional measurement steps completed successfully in the run below. The default branch currently lacks the dispatch trigger, but dispatch against the candidate ref was accepted in run [40877887921](https://github.com/minutei-ai/kannin/actions/runs/40877887921). That execution completed successfully.
+
+The separate `Measure validated runtime` workflow accepts a successful `Check` run ID for the exact selected commit. It verifies the run conclusion and workflow path, then requires artifact provenance to match the exact checked-out commit, Git tree and gate run ID. The gate checks out the candidate head explicitly, rather than an implicit PR merge. It downloads that gate's generated artifacts on the isolated runner, installs the frozen Bun dependencies, and runs retained-cache cold, empty-cache cold and warm workerd measurements plus retained-CDN and empty-CDN Docker/S3/Varnish workloads serially. It does not rebuild Rust or download artifacts to the development host. Reports and gate provenance expire after one day. This workflow is not yet on the default branch and has not executed; matched resource limits for cross-backend comparison remain pending.
+
+`tooling/verify-benchmarks.ts` rejects reports with different corpus, engine WASM, acknowledged sequence, query hashes or exact row/score hashes. It requires every strong benchmark query exactly once; duplicated or omitted cases fail. The measurement workflow runs this integrity check before retaining successful reports. It also decodes runtime-specific measurement records: 50 finite nonnegative warm samples, percentiles matching their raw order statistics, and complete ordered cold repetitions matching `RAIO_BENCH_COLD_SAMPLES` (verifier default 3). Container records require both restart/read and warm groups. Run 40902599601 executed this complete verifier successfully after the full gate. Matching these fields establishes workload/result integrity only; equivalent resource budgets and cache phases must still be checked separately before comparing timings.
+
+The prepared Docker driver reuses the OCI API image, S3 fixture and Varnish fixture. It builds images before starting the disposable backend, so image pulls cannot consume that backend's bounded lifetime. Its API, S3 and CDN containers have explicit limits; workerd currently inherits runner limits. Reports identify this difference. Matching output hashes alone does not establish a fair resource-budget comparison. Docker restarts measure shutdown plus readiness separately from read latency; that duration is not interchangeable with workerd startup time. Cold samples and completed warm groups also capture native cache-hit and canonical-fallback counters through authenticated metadata reads outside the timed query. This exposes fallback-only runs instead of inferring CDN use from configuration. The Docker driver, verifier and scoped subprocess cleanup executed successfully in run 40902599601.
+
+`RAIO_BENCH_COLD_SAMPLES` accepts 1–20 in the workerd and direct HTTP drivers, and 1–5 in the container driver. Both workflows select 3. The corpus size matches the warm driver. Comparable Docker/workerd cold and warm measurements and hosted Railway validation remain delivery gates.
+
+The workflow matrix includes a fifth report for Docker with Varnish restarted before each cold sample. It uses the same native empty-cache mode, result hashes, resource caps and scoped cleanup as the retained-CDN arm. All five workloads executed serially in run 40902599601 after a successful complete gate, within the ten-minute measurement timeout and with one-day report retention.
+
+## Bounded local observations at a7fc13f
+
+[Run 40955889009](https://github.com/minutei-ai/kannin/actions/runs/40955889009) passed the complete gate and all five serial measurement arms, followed by the full report verifier. It measured commit `a7fc13f1d5cd529011d5936b98b1a310e8d46b02`, tree `f3ca8aa324a3665936ddde1e3c649cfae085feab`, on 1,000 documents at strong sequence 2. All five reports match corpus `3b99a137c63f0a06c33e55477d6f5d1cefdc1c3d1c75a1b00f968ccdb835cdd6`, WASM `10dd0ed0f0cd2d7743c04098ee1c77219d3a6ec5892be3c98abe8bbb87d39c72`, and the query and exact row/score hashes for all eleven strong workloads. Independent inspection of the downloaded records also checked repetition order, finite timings, 50-sample warm groups and nearest-rank percentiles.
+
+Cold values are median read milliseconds from three fresh-process samples, excluding startup/shutdown/readiness. Warm columns use fifty reads after five warmups; Docker warm values come from the retained-CDN arm. Empty-cache modes retain canonical and derived object-store objects and do not flush OS/backend caches.
+
+| Query           | workerd cold ms | workerd empty ms | Docker cold ms | Docker empty ms | workerd warm p50/p95 ms | Docker warm p50/p95 ms |
+| --------------- | --------------: | ---------------: | -------------: | --------------: | ----------------------: | ---------------------: |
+| rare            |           73.80 |            85.77 |          85.64 |           91.68 |             2.83 / 3.65 |           4.34 / 55.72 |
+| selective       |          110.72 |           133.48 |         132.80 |          156.95 |             3.60 / 4.92 |           5.93 / 61.38 |
+| common          |           51.63 |            58.37 |          43.50 |           49.59 |             2.73 / 4.23 |           5.68 / 57.56 |
+| filtered        |           82.18 |            96.66 |          68.72 |          117.08 |             3.58 / 5.55 |           5.43 / 61.48 |
+| common-all      |           49.74 |            59.97 |          41.97 |           49.75 |             2.65 / 3.47 |           5.01 / 61.44 |
+| common-phrase   |           72.39 |            78.49 |          58.59 |           62.84 |             2.83 / 4.38 |           5.53 / 57.15 |
+| filtered-all    |           84.30 |            94.96 |          67.31 |           97.85 |             3.68 / 5.45 |           5.45 / 66.43 |
+| filtered-phrase |           89.62 |            95.61 |          81.99 |          117.43 |             3.86 / 6.19 |           6.07 / 61.26 |
+| rare-64-terms   |           90.39 |           105.32 |         123.72 |          110.37 |             3.30 / 5.21 |           5.79 / 65.42 |
+| rare-256-terms  |          107.67 |           118.20 |         101.23 |          165.40 |             5.42 / 7.46 |           7.38 / 61.19 |
+| rare-512-terms  |          135.04 |           139.25 |         226.49 |          234.62 |            9.01 / 10.14 |          11.22 / 66.22 |
+
+The runner reported AMD EPYC 7763 and four available logical CPUs. workerd inherited runner limits. Docker API and RustFS each had 1 CPU/512 MiB, while Varnish had 0.5 CPU/512 MiB, all without swap. These unequal budgets prevent platform ranking or performance-parity claims. The first Docker rare read was 817.00 ms with retained CDN and 804.23 ms with empty CDN; the three-sample medians above include those costs. Cold application counters totalled 58 immutable-cache hits with retained CDN and zero with empty CDN; these are application counters rather than Varnish server counters.
+
+Railway's control plane and hosted Railway/Cloudflare latency were not measured. This run also does not measure hosted Turbopuffer or the later typed-ID/Root7 candidate. The compressed report artifact was 32,979 bytes (130,324 bytes of expanded JSON). Only these reports and provenance were downloaded to `/home/yorizel/.t3/scratch/kannin/benchmarks/40955889009/`; no local build, image, backend or benchmark was started. The GitHub artifact has one-day retention.
+
+## Bounded local observations at ae683d1
+
+[Run 40902599601](https://github.com/minutei-ai/kannin/actions/runs/40902599601) passed the complete gate, then executed all five measurement arms and the full raw-measurement verifier. The reports match 1,000 documents, strong sequence 2, corpus and WASM hashes, and query and exact row/score hashes for all 11 strong workloads. Provenance identifies commit `ae683d11b7d028ea3f5453e4694f46ccb9e0c9af` and tree `4e9ae3777b19009f795b439fadf0e09076853d41`. The downloaded reports independently pass raw sample-count, finite-timing, repetition-order and warm-percentile checks.
+
+Cold values below are median read milliseconds across three fresh-process samples, excluding startup/shutdown and readiness. Warm values are p50/p95 milliseconds across 50 reads after five warmups. Three cold samples do not establish tail latency. Docker empty means both API and Varnish restart before each cold sample; canonical and derived S3 objects remain available.
+
+| Query           | workerd cold ms | workerd empty ms | Docker cold ms | Docker empty ms | workerd warm p50/p95 ms | Docker warm p50/p95 ms |
+| --------------- | --------------: | ---------------: | -------------: | --------------: | ----------------------: | ---------------------: |
+| rare            |           67.25 |            77.07 |          87.83 |          117.40 |             2.36 / 3.52 |           5.25 / 51.86 |
+| selective       |          101.17 |           125.65 |         124.82 |          150.66 |             3.11 / 4.46 |           6.06 / 57.36 |
+| common          |           44.61 |            52.14 |          44.86 |           48.66 |             2.46 / 4.21 |           5.33 / 59.43 |
+| filtered        |           71.95 |            82.91 |          74.38 |          119.91 |             3.24 / 5.74 |           6.36 / 60.65 |
+| common-all      |           44.86 |            52.87 |          44.51 |           45.03 |             2.29 / 3.06 |           5.49 / 55.27 |
+| common-phrase   |           62.79 |            71.25 |          62.20 |           65.49 |             2.52 / 4.11 |           6.02 / 52.66 |
+| filtered-all    |           73.52 |            84.71 |          82.42 |           76.41 |             3.09 / 4.28 |           6.07 / 63.76 |
+| filtered-phrase |           76.42 |            85.09 |          72.95 |           93.86 |             3.56 / 4.83 |           5.65 / 61.44 |
+| rare-64-terms   |           80.39 |            91.29 |          99.29 |          142.57 |             3.29 / 4.54 |           7.70 / 62.97 |
+| rare-256-terms  |          100.55 |           110.21 |         190.08 |          151.19 |             5.50 / 7.83 |          10.53 / 58.20 |
+| rare-512-terms  |          122.25 |           137.83 |         245.05 |          215.31 |            9.01 / 10.39 |          11.56 / 53.70 |
+
+The runner reported AMD EPYC 9V74 and four available logical CPUs. workerd inherited runner limits. Docker API and RustFS each had 1 CPU/512 MiB, while Varnish had 0.5 CPU/512 MiB, all without swap. Unequal budgets prevent platform ranking or performance-parity claims. OS and backend caches were uncontrolled. The first rare-query Docker read took 803.95 ms with retained CDN and 782.80 ms with empty CDN; the table medians retain all three samples and do not hide these first-run costs.
+
+Across Docker cold records, the application reported 58 immutable-cache hits in retained mode and zero in empty mode. These are application counters, not Varnish server counters. Warm values shown are from the retained-CDN report; the separate empty-CDN report also retains its raw warm groups.
+
+Railway hosted behavior, hosted Cloudflare latency, equal-resource comparisons and Turbopuffer performance remain unmeasured by this run. Only the 32,998-byte report artifact was downloaded to the development host; no local benchmark or build was run for these measurements. Raw reports and provenance are retained outside the repository at `/home/yorizel/.t3/scratch/kannin/benchmarks/40902599601/`; the GitHub artifact expires after one day.
+
+## Bounded local observations at a4a1b3f
+
+[Run 40877887921](https://github.com/minutei-ai/kannin/actions/runs/40877887921) passed the complete gate (110 Rust, 493 Bun/workerd tests), then measured 1,000 documents at strong sequence 2. All four reports match corpus, WASM, queries and exact row/score hashes for 11 workloads. The artifact provenance matches commit `a4a1b3f09e41ed729b9f6552660ad41d5ab35fb1` and tree `5096cb513576f04fb9c563070b0a7e4e4ba4795f`. Raw counts, finite timings, repetition order and warm percentiles were checked independently from the downloaded JSON; the newer TypeScript measurement decoder is not validated by this run.
+
+Cold numbers are medians of three first-query samples, excluding startup/shutdown. Warm numbers are p50/p95 of fifty reads after five warmups. There is no cold-tail claim.
+
+| Query           | workerd cold ms | workerd empty Cache API ms | Docker cold ms | workerd warm p50/p95 ms | Docker warm p50/p95 ms |
+| --------------- | --------------: | -------------------------: | -------------: | ----------------------: | ---------------------: |
+| rare            |           68.57 |                      80.94 |          70.20 |             2.60 / 3.51 |           4.57 / 50.63 |
+| selective       |          101.42 |                     127.61 |         114.48 |             3.16 / 4.40 |           4.82 / 60.58 |
+| common          |           45.48 |                      55.43 |          41.89 |             2.47 / 3.01 |           5.20 / 65.16 |
+| filtered        |           73.37 |                      82.79 |          70.57 |             3.27 / 4.71 |           5.26 / 66.36 |
+| common-all      |           45.94 |                      54.59 |          42.29 |             2.21 / 3.14 |           4.75 / 58.79 |
+| common-phrase   |           68.71 |                      75.08 |          63.52 |             2.58 / 3.82 |           5.12 / 62.15 |
+| filtered-all    |           79.84 |                      88.42 |          66.50 |             3.15 / 4.49 |           4.89 / 62.49 |
+| filtered-phrase |           78.78 |                      92.93 |         114.26 |             3.60 / 5.08 |           5.79 / 61.23 |
+| rare-64-terms   |           79.75 |                      97.45 |          84.96 |             3.29 / 4.86 |           5.72 / 68.01 |
+| rare-256-terms  |          103.22 |                     113.74 |         102.46 |             5.16 / 6.44 |           7.47 / 59.78 |
+| rare-512-terms  |          123.92 |                     142.75 |         211.15 |            8.67 / 11.61 |          11.85 / 48.59 |
+
+The runner reported AMD EPYC 7763 and four available logical CPUs. workerd inherited runner limits; the Docker API had 1 CPU/512 MiB, RustFS 1 CPU/512 MiB and Varnish 0.5 CPU/512 MiB, all without swap. Resource budgets are unequal. These are descriptive observations of two local arrangements, not a platform ranking or performance-parity proof. The cause of the Docker warm-tail observations has not been established.
+
+Canonical objects, derived objects and uncontrolled OS/backend caches remained available. The empty-cache workerd arm created fresh Cache API and coordination state while linking the same R2 directory. Docker retained Varnish across API restarts; its empty-CDN mode was not measured. Later Docker cold samples report immutable Cache API hits through native app counters; these are not Varnish server counters.
+
+Railway uses the same OCI application target locally; its control plane and hosted latency were not measured. workerd observations do not measure hosted Cloudflare. No Turbopuffer performance comparison was executed. Raw reports, source provenance, hashes and a standalone report are retained outside the tracked tree at `/home/yorizel/.t3/scratch/kannin/benchmarks/40877887921/`; the original compressed report download was 24,802 bytes. GitHub artifacts expire after one day.
+
+## Historical deployed BM25 comparison
+
 This is a bounded synthetic measurement, not a general parity claim. Both services received the same 10,000 documents. The client ran in Brazil; Cloudflare HTTP responses came from GRU, and Turbopuffer used aws-sa-east-1. At the time of this measurement, Kannin strong reads used a coordinator outside South America. An experiment fetching the canonical R2 manifest directly in the edge Worker was evaluated separately below and reverted after it regressed latency. Kannin edge reads use the explicit less-than-one-second snapshot contract, with minimumSequence set to the final acknowledged write. Turbopuffer reads are strong. Those guarantees differ even when the static corpus produces identical Kannin rows.
 
 Each case has five warmups followed by 50 sequential measured requests per engine. Each iteration runs Kannin strong, Kannin edge, then Turbopuffer. The report records the first request separately; it does not prove a cold process. Timings include HTTP, response body consumption and decoding. No query-result cache is used. Fifty observations provide limited evidence about tail latency; raw samples and operational targets stay outside this public repository.

@@ -4,6 +4,7 @@ import {
   type Collection,
   CollectionResult,
   CompactResult,
+  CacheWarmHintResult,
   Metadata,
   type NamespacesInput,
   NamespacesPage,
@@ -16,7 +17,7 @@ import {
   type VectorRebuild,
   VectorRebuildResult,
   VectorSyncResult,
-  type Write,
+  type WriteCommand,
   WriteResult,
 } from "./protocol";
 
@@ -55,12 +56,15 @@ export const query = Effect.fn("kannin.query")(function* (
 });
 export const write = Effect.fn("kannin.write")(function* (
   namespace: string,
-  input: typeof Write.Type,
+  input: typeof WriteCommand.Type,
 ) {
   return yield* invoke({ namespace, operation: "write", input }, WriteResult);
 });
 export const metadata = Effect.fn("kannin.metadata")(function* (namespace: string) {
   return yield* invoke({ namespace, operation: "metadata" }, Metadata);
+});
+export const hintCacheWarm = Effect.fn("kannin.hintCacheWarm")(function* (namespace: string) {
+  return yield* invoke({ namespace, operation: "hint_cache_warm" }, CacheWarmHintResult);
 });
 export const compact = Effect.fn("kannin.compact")(function* (namespace: string) {
   return yield* invoke({ namespace, operation: "compact" }, CompactResult);

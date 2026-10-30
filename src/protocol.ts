@@ -1,14 +1,94 @@
 import { Effect, Schema, SchemaGetter, SchemaIssue, Struct } from "effect";
 
+const textEncoder = new TextEncoder();
 const Unicode = Schema.String.check(
   Schema.makeFilter((text) => text.isWellFormed() || "Expected well-formed Unicode"),
 );
+export const DistanceMetric = Schema.Literals(["cosine_distance", "euclidean_squared"]);
+export const VectorDistanceHits = Schema.Array(
+  Schema.Tuple([
+    Unicode.check(
+      Schema.makeFilter(
+        (key) =>
+          (key.length > 0 && textEncoder.encode(key).byteLength <= 512) ||
+          "Vector candidate key exceeds its byte budget",
+      ),
+    ),
+    Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0)),
+  ]),
+).check(Schema.isMaxLength(10_000));
+const AnalysisLanguage = Schema.Literals([
+  "arabic",
+  "danish",
+  "dutch",
+  "english",
+  "finnish",
+  "french",
+  "german",
+  "greek",
+  "hungarian",
+  "italian",
+  "norwegian",
+  "portuguese",
+  "romanian",
+  "russian",
+  "spanish",
+  "swedish",
+  "tamil",
+  "turkish",
+]);
+export const WordV4Config = Schema.Struct({
+  max_token_length: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 255 })),
+  case_sensitive: Schema.Boolean,
+  stopwords: Schema.NullOr(
+    AnalysisLanguage.check(
+      Schema.makeFilter(
+        (language) =>
+          !["arabic", "greek", "romanian", "tamil", "turkish"].includes(language) ||
+          "Stopword removal is unavailable for this language",
+      ),
+    ),
+  ),
+  stemming: Schema.NullOr(AnalysisLanguage),
+  ascii_folding: Schema.Boolean,
+}).check(
+  Schema.makeFilter(
+    (config) =>
+      !config.case_sensitive ||
+      (config.stopwords === null && config.stemming === null) ||
+      "Case-sensitive analysis cannot remove stopwords or apply stemming",
+  ),
+);
+const AnalysisOffset = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
+export const AnalyzedTokens = Schema.Array(
+  Schema.Struct({
+    text: Unicode,
+    position: AnalysisOffset,
+    position_length: Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)),
+    input_index: AnalysisOffset,
+    byte_start: AnalysisOffset,
+    byte_end: AnalysisOffset,
+  }).check(
+    Schema.makeFilter((token) => token.byte_end > token.byte_start || "Invalid token byte range"),
+  ),
+).check(Schema.isMaxLength(65_536));
 export const Id = Unicode.check(Schema.isBetweenLength(1, 128));
-export const NamespaceName = Schema.String.check(Schema.isPattern(/^[a-zA-Z0-9_-]{1,64}$/));
+export const PublicStringId = Id.check(
+  Schema.makeFilter(
+    (id) => textEncoder.encode(id).byteLength <= 64 || "Public string ID exceeds 64 UTF-8 bytes",
+  ),
+);
+export const NamespacePrefix = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9_.-]{1,128}$/));
+export const NamespaceName = NamespacePrefix.check(
+  Schema.makeFilter(
+    (name) => (name !== "." && name !== "..") || "Namespace cannot be a URL dot segment",
+  ),
+);
 export const Operation = Schema.Literals([
   "write",
   "query",
   "metadata",
+  "hint_cache_warm",
   "vector-sync",
   "vector-rebuild",
   "rebuild",
@@ -17,13 +97,36 @@ export const Operation = Schema.Literals([
   "migrate-root",
 ]);
 export const Scalar = Schema.Union([Unicode, Schema.Finite, Schema.Boolean, Schema.Null]);
-export const FieldName = Schema.String.check(Schema.isPattern(/^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/));
-export const Attributes = Schema.Record(FieldName, Scalar);
-const textEncoder = new TextEncoder();
+export const FieldName = Unicode.check(
+  Schema.isBetweenLength(1, 128),
+  Schema.makeFilter(
+    (name) =>
+      (!name.startsWith("$") && textEncoder.encode(name).byteLength <= 128) ||
+      "Attribute names must fit 128 UTF-8 bytes and cannot start with $",
+  ),
+);
+export function compareFieldNames(left: string, right: string): number {
+  const cursor = { offset: 0 };
+  const length = Math.min(left.length, right.length);
+  while (cursor.offset < length) {
+    const a = left.codePointAt(cursor.offset);
+    const b = right.codePointAt(cursor.offset);
+    if (a === undefined || b === undefined) break;
+    if (a !== b) return a - b;
+    cursor.offset += 1;
+    if (a > 0xffff) cursor.offset += 1;
+  }
+  return left.length - right.length;
+}
+export const AttributeValue = Schema.Union([
+  Scalar,
+  Schema.Array(Scalar).check(Schema.isMaxLength(4096)),
+]);
+export const Attributes = Schema.Record(FieldName, AttributeValue);
 const encodeAttributes = Schema.encodeSync(Schema.fromJsonString(Attributes), {
   disableChecks: true,
 });
-export const ConstantAttributes = Attributes.check(
+export const ConstantAttributes = Schema.Record(FieldName, Scalar).check(
   Schema.makeFilter(
     (attributes) =>
       Object.values(attributes).every(
@@ -42,7 +145,14 @@ export const VectorFilterFields = Schema.Array(FieldName).check(
     (fields) => new Set(fields).size === fields.length || "Duplicate indexed field",
   ),
 );
+const MIN_VECTOR_DIMENSIONS = 1;
+const MAX_VECTOR_DIMENSIONS = 10_752;
+export const DEFAULT_VECTOR_DIMENSIONS = 768;
+const VectorDimensions = Schema.Int.check(
+  Schema.isBetween({ minimum: MIN_VECTOR_DIMENSIONS, maximum: MAX_VECTOR_DIMENSIONS }),
+);
 export const NamespaceSchema = Schema.Struct({
+  vectorDimensions: Schema.optional(VectorDimensions),
   filterable: Schema.Array(FieldName).check(
     Schema.isMaxLength(64),
     Schema.makeFilter(
@@ -57,8 +167,249 @@ export const NamespaceSchema = Schema.Struct({
       "Vector filter fields must be filterable",
   ),
 );
-const MIN_VECTOR_DIMENSIONS = 1;
-const MAX_VECTOR_DIMENSIONS = 4096;
+const NativeVectorColumn = Schema.Struct({
+  source: Schema.Literal("native-vector"),
+  dimensions: Schema.optional(VectorDimensions),
+});
+const LegacyAttributeColumn = Schema.Struct({
+  source: Schema.Literal("attribute"),
+  name: FieldName,
+  value: Schema.Literal("legacy-untyped"),
+  vectorFilterOrder: Schema.optional(
+    Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 4 })),
+  ),
+});
+export const TypedColumnType = Schema.Literals([
+  "string",
+  "bool",
+  "i64",
+  "u64",
+  "f64",
+  "uuid",
+  "datetime_ms",
+  "bytes",
+  "[string]",
+  "[bool]",
+  "[i64]",
+  "[u64]",
+  "[f64]",
+  "[uuid]",
+  "[datetime_ms]",
+]);
+const MAX_TYPED_COLUMNS = 1024;
+export const PublicCellAliasType = Schema.Literals([
+  "int",
+  "uint",
+  "float",
+  "datetime",
+  "[]string",
+  "[]bool",
+  "[]int",
+  "[]uint",
+  "[]float",
+  "[]uuid",
+  "[]datetime",
+]);
+export const PublicCellType = Schema.Union([TypedColumnType, PublicCellAliasType]);
+export class PublicCellRejection extends Schema.TaggedError<
+  PublicCellRejection,
+  { readonly brand: unique symbol }
+>()("PublicCellRejection", {
+  reason: Schema.Literals([
+    "null-not-allowed",
+    "unsupported-datetime",
+    "type-mismatch",
+    "non-finite-float",
+  ]),
+  declared: TypedColumnType,
+}) {}
+export const PublicSchemaType = Schema.Union([
+  Schema.Literals(["string", "bool", "uuid", "bytes"]),
+  PublicCellAliasType,
+]);
+export const PublicSchemaVectorType = Schema.Union([
+  Schema.String.check(Schema.isPattern(/^(?:\[\])?\[[0-9]+\](?:f16|f32|i8)$/)),
+  Schema.Literal("{}f16"),
+]);
+export const PublicSchemaUnsupportedOption = Schema.Literals([
+  "full_text_search",
+  "ann",
+  "embed",
+  "regex",
+  "glob",
+  "fuzzy",
+  "sparse_knn",
+]);
+export const PublicSchemaAttribute = Schema.Struct({
+  type: PublicSchemaType,
+  filterable: Schema.optional(Schema.Boolean),
+});
+export const PublicSchemaInput = Schema.Record(FieldName, Schema.Unknown);
+export const PublicSchemaOptions = Schema.Record(Schema.String, Schema.Unknown);
+export const PublicSchema = Schema.Record(FieldName, PublicSchemaAttribute);
+export class PublicSchemaRejection extends Schema.TaggedError<
+  PublicSchemaRejection,
+  { readonly brand: unique symbol }
+>()("PublicSchemaRejection", {
+  field: Schema.optional(FieldName),
+  reason: Schema.Literals([
+    "reserved-id",
+    "unsupported-vector",
+    "unsupported-option",
+    "unsupported-datetime",
+    "bytes-filterable",
+    "non-nullable",
+    "vector-dimensions",
+  ]),
+}) {}
+const MAX_TYPED_FILTERABLE = 64;
+const TypedAttributeColumn = Schema.Struct({
+  source: Schema.Literal("attribute"),
+  name: FieldName,
+  value: Schema.Literal("typed"),
+  type: TypedColumnType,
+  filterable: Schema.Boolean,
+  nullable: Schema.Boolean,
+});
+const TypedNamespaceColumn = Schema.Struct({ source: Schema.Literal("typed-namespace") });
+const ColumnDeclaration = Schema.Union([
+  NativeVectorColumn,
+  TypedNamespaceColumn,
+  LegacyAttributeColumn,
+  TypedAttributeColumn,
+]);
+const validNamespaceColumns = (columns: ReadonlyArray<typeof ColumnDeclaration.Type>) => {
+  const vector = columns[0];
+  if (vector === undefined || vector.source !== "native-vector")
+    return "Native vector column must lead the namespace schema";
+  if (columns.some((column, index) => index > 0 && column.source === "native-vector"))
+    return "Namespace schema has one native vector column";
+  const names = new Set<string>();
+  const orders: Array<number> = [];
+  const typed: Array<typeof TypedAttributeColumn.Type> = [];
+  const legacy: Array<typeof LegacyAttributeColumn.Type> = [];
+  const markers = columns.filter((column) => column.source === "typed-namespace").length;
+  if (markers > 1) return "Namespace schema has one typed namespace marker";
+  if (markers === 1 && columns[1]?.source !== "typed-namespace")
+    return "Typed namespace marker must follow the native vector column";
+  for (const column of columns) {
+    if (column.source !== "attribute") continue;
+    if (names.has(column.name)) return "Duplicate filterable field";
+    names.add(column.name);
+    if (column.value === "typed") typed.push(column);
+    else {
+      legacy.push(column);
+      if (column.vectorFilterOrder !== undefined) orders.push(column.vectorFilterOrder);
+    }
+  }
+  if (markers === 1) {
+    if (legacy.length > 0) return "Namespace schema cannot mix typed and legacy attribute columns";
+    if (typed.length > MAX_TYPED_COLUMNS) return "Typed columns exceed 1024";
+    if (typed.filter((column) => column.filterable).length > MAX_TYPED_FILTERABLE)
+      return "Filterable typed columns exceed 64";
+    for (const [index, column] of typed.entries()) {
+      const previous = typed[index - 1];
+      if (previous !== undefined && compareFieldNames(previous.name, column.name) >= 0)
+        return "Typed columns must be sorted by name";
+      if (column.type === "bytes" && column.filterable) return "Bytes columns cannot be filterable";
+    }
+    return true;
+  }
+  if (typed.length > 0) return "Typed attribute columns require the typed namespace marker";
+  if (legacy.length > MAX_TYPED_FILTERABLE) return "Legacy attribute columns exceed 64";
+  orders.sort((left, right) => left - right);
+  return (
+    orders.every((order, index) => order === index) ||
+    "Vector filter order must be dense and unique"
+  );
+};
+export const NamespaceColumns = Schema.Struct({
+  columns: Schema.Array(ColumnDeclaration).check(
+    Schema.isBetweenLength(1, MAX_TYPED_COLUMNS + 2),
+    Schema.makeFilter(validNamespaceColumns),
+  ),
+});
+export function namespaceColumnsFromNative(
+  schema: typeof NamespaceSchema.Type,
+): typeof NamespaceColumns.Type {
+  const orders = new Map(schema.vectorFilterFields.map((name, index) => [name, index]));
+  const columns: Array<typeof ColumnDeclaration.Type> = [{ source: "native-vector" }];
+  if (schema.vectorDimensions !== undefined)
+    columns[0] = { source: "native-vector", dimensions: schema.vectorDimensions };
+  for (const name of schema.filterable) {
+    const vectorFilterOrder = orders.get(name);
+    if (vectorFilterOrder === undefined)
+      columns.push({ source: "attribute", name, value: "legacy-untyped" });
+    else columns.push({ source: "attribute", name, value: "legacy-untyped", vectorFilterOrder });
+  }
+  return { columns };
+}
+export function nativeSchemaFromColumns(
+  schema: typeof NamespaceColumns.Type,
+): typeof NamespaceSchema.Type {
+  if (isTypedNamespace(schema))
+    throw new TypeError("Typed columns cannot be projected as native schema");
+  const attributes = schema.columns.filter((column) => column.source === "attribute");
+  const legacy = attributes.flatMap((column) => {
+    if (column.value === "legacy-untyped") return [column];
+    return [];
+  });
+  const vector = schema.columns[0];
+  const native = {
+    filterable: legacy.map((column) => column.name),
+    vectorFilterFields: legacy
+      .flatMap((column) => {
+        if (column.vectorFilterOrder === undefined) return [];
+        return [[column.vectorFilterOrder, column.name] as const];
+      })
+      .sort((left, right) => left[0] - right[0])
+      .map(([, name]) => name),
+  };
+  if (vector?.source === "native-vector" && vector.dimensions !== undefined)
+    return { ...native, vectorDimensions: vector.dimensions };
+  return native;
+}
+export type TypedColumn = typeof TypedAttributeColumn.Type;
+export function typedColumns(
+  schema: typeof NamespaceColumns.Type | undefined,
+): ReadonlyArray<TypedColumn> | undefined {
+  if (schema === undefined) return undefined;
+  if (!schema.columns.some((column) => column.source === "typed-namespace")) return undefined;
+  return schema.columns.flatMap((column) => {
+    if (column.source === "attribute" && column.value === "typed") return [column];
+    return [];
+  });
+}
+export function isTypedNamespace(schema: typeof NamespaceColumns.Type | undefined) {
+  return typedColumns(schema) !== undefined;
+}
+export function typedEngineColumns(columns: ReadonlyArray<TypedColumn>) {
+  return columns.map((column) => ({
+    name: column.name,
+    type: column.type,
+    filterable: column.filterable,
+    nullable: column.nullable,
+  }));
+}
+export function filterableNames(schema: typeof NamespaceColumns.Type | undefined) {
+  if (schema === undefined) return undefined;
+  return schema.columns.flatMap((column) => {
+    if (column.source !== "attribute") return [];
+    if (column.value === "typed" && !column.filterable) return [];
+    return [column.name];
+  });
+}
+export function vectorFilterNames(schema: typeof NamespaceColumns.Type | undefined) {
+  if (schema === undefined) return undefined;
+  if (isTypedNamespace(schema)) return [];
+  return nativeSchemaFromColumns(schema).vectorFilterFields;
+}
+export function resolvedVectorDimensions(schema: typeof NamespaceColumns.Type | undefined) {
+  const vector = schema?.columns[0];
+  if (vector?.source === "native-vector" && vector.dimensions !== undefined)
+    return vector.dimensions;
+  return DEFAULT_VECTOR_DIMENSIONS;
+}
 export const Vector = Schema.Array(
   Schema.Finite.check(
     Schema.isBetween({ minimum: -3.4028234663852886e38, maximum: 3.4028234663852886e38 }),
@@ -71,9 +422,10 @@ export const Vector = Schema.Array(
       "A cosine vector must have nonzero float32 magnitude",
   ),
 );
+const NativeTitle = Unicode.check(Schema.isMaxLength(8192));
 export const Document = Schema.Struct({
   id: Id,
-  title: Schema.optional(Unicode.check(Schema.isMaxLength(8192))),
+  title: Schema.optional(NativeTitle),
   text: Unicode.check(Schema.isMaxLength(262144)),
   attributes: Attributes,
   vector: Schema.optional(Vector),
@@ -98,21 +450,481 @@ export const QueryDocument = StoredDocument.mapFields((fields) => ({
     ]),
   ),
 }));
+export const DocumentColumnId = Schema.Union([
+  Schema.Struct({
+    source: Schema.Literal("native"),
+    role: Schema.Literals(["title", "text", "vector"]),
+  }),
+  Schema.Struct({ source: Schema.Literal("attribute"), name: FieldName }),
+]);
+export const Int64Text = Schema.String.check(
+  Schema.isPattern(/^(0|-?[1-9][0-9]{0,18})(?![\s\S])/),
+  Schema.makeFilter((value) => {
+    if (value.startsWith("-")) {
+      const magnitude = value.slice(1);
+      return (
+        magnitude.length < 19 || magnitude <= "9223372036854775808" || "Value exceeds int64 range"
+      );
+    }
+    return value.length < 19 || value <= "9223372036854775807" || "Value exceeds int64 range";
+  }),
+);
+export const Uint64Text = Schema.String.check(
+  Schema.isPattern(/^(0|[1-9][0-9]{0,19})(?![\s\S])/),
+  Schema.makeFilter(
+    (value) => value.length < 20 || value <= "18446744073709551615" || "ID exceeds uint64 range",
+  ),
+);
+export const Float64BitsText = Schema.String.check(
+  Schema.makeFilter((value) => {
+    if (!/^[0-9a-f]{16}(?![\s\S])/.test(value)) return "Expected 16 lowercase hexadecimal digits";
+    return ((BigInt(`0x${value}`) >> 52n) & 0x7ffn) !== 0x7ffn || "Typed float must be finite";
+  }),
+);
+function base64Digit(code: number): number {
+  if (code >= 65 && code <= 90) return code - 65;
+  if (code >= 97 && code <= 122) return code - 71;
+  if (code >= 48 && code <= 57) return code + 4;
+  if (code === 43) return 62;
+  if (code === 47) return 63;
+  return -1;
+}
+export const BytesBase64Text = Schema.String.check(
+  Schema.makeFilter((value) => {
+    if (value.length % 4 !== 0 || value.length > 11_184_812)
+      return "Expected padded base64 within the decoded 8 MiB bound";
+    const state = { padding: 0, offset: 0 };
+    if (value.endsWith("==")) state.padding = 2;
+    else if (value.endsWith("=")) state.padding = 1;
+    if ((value.length / 4) * 3 - state.padding > 8_388_608)
+      return "Bytes exceed the decoded 8 MiB bound";
+    const end = value.length - state.padding;
+    while (state.offset < end) {
+      if (base64Digit(value.charCodeAt(state.offset)) < 0) return "Invalid base64 alphabet";
+      state.offset += 1;
+    }
+    if (state.padding === 2 && base64Digit(value.charCodeAt(end - 1)) % 16 !== 0)
+      return "Non-canonical base64 padding bits";
+    if (state.padding === 1 && base64Digit(value.charCodeAt(end - 1)) % 4 !== 0)
+      return "Non-canonical base64 padding bits";
+    return true;
+  }),
+);
+export const UuidText = Schema.String.check(
+  Schema.isPattern(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\s\S])/),
+);
+const TypedIntCell = Schema.Struct({ i64: Int64Text });
+const TypedUintCell = Schema.Struct({ u64: Uint64Text });
+const TypedFloatCell = Schema.Struct({ f64: Float64BitsText });
+const TypedUuidCell = Schema.Struct({ uuid: UuidText });
+const TypedDatetimeCell = Schema.Struct({ datetime_ms: Int64Text });
+const TypedBytesCell = Schema.Struct({ bytes: BytesBase64Text });
+export const TypedCellScalar = Schema.Union([
+  Unicode,
+  Schema.Boolean,
+  TypedIntCell,
+  TypedUintCell,
+  TypedFloatCell,
+  TypedUuidCell,
+  TypedDatetimeCell,
+]);
+const TypedCellArray = Schema.Union([
+  Schema.Array(Unicode),
+  Schema.Array(Schema.Boolean),
+  Schema.Array(TypedIntCell),
+  Schema.Array(TypedUintCell),
+  Schema.Array(TypedFloatCell),
+  Schema.Array(TypedUuidCell),
+  Schema.Array(TypedDatetimeCell),
+]).check(Schema.isMaxLength(4096));
+export const TypedCell = Schema.Union([
+  Schema.Null,
+  TypedCellScalar,
+  TypedBytesCell,
+  TypedCellArray,
+]);
+export const TypedAttributes = Schema.Record(FieldName, TypedCell);
+export const PublicAttributesInput = Schema.Record(FieldName, Schema.Unknown);
+export class PublicAttributesRejection extends Schema.TaggedError<
+  PublicAttributesRejection,
+  { readonly brand: unique symbol }
+>()("PublicAttributesRejection", {
+  field: FieldName,
+  reason: Schema.Literal("undeclared-attribute"),
+}) {}
+const StoredAttributes = Schema.Record(FieldName, Schema.Union([AttributeValue, TypedCell]));
+export const TypedTag = Schema.Union([
+  TypedIntCell,
+  TypedUintCell,
+  TypedFloatCell,
+  TypedUuidCell,
+  TypedDatetimeCell,
+]);
+type CellKind =
+  | "null"
+  | "string"
+  | "bool"
+  | "i64"
+  | "u64"
+  | "f64"
+  | "uuid"
+  | "datetime_ms"
+  | "bytes"
+  | "array"
+  | "invalid";
+const TAG_KINDS = ["i64", "u64", "f64", "uuid", "datetime_ms", "bytes"] as const;
+function cellKind(cell: unknown): CellKind {
+  if (cell === null) return "null";
+  if (typeof cell === "string") return "string";
+  if (typeof cell === "boolean") return "bool";
+  if (Array.isArray(cell)) return "array";
+  if (typeof cell !== "object") return "invalid";
+  const keys = Object.keys(cell);
+  const [only] = keys;
+  if (keys.length !== 1) return "invalid";
+  return TAG_KINDS.find((kind) => kind === only) ?? "invalid";
+}
+function cellConforms(type: typeof TypedColumnType.Type, cell: unknown, nullable: boolean) {
+  const kind = cellKind(cell);
+  if (kind === "null") return nullable;
+  if (type.startsWith("[")) {
+    if (kind !== "array" || !Array.isArray(cell)) return false;
+    const element = type.slice(1, -1);
+    return cell.every((item) => cellKind(item) === element);
+  }
+  return kind === type;
+}
+export function validateTypedAttributes(
+  columns: ReadonlyArray<TypedColumn>,
+  attributes: Readonly<Record<string, unknown>>,
+): string | undefined {
+  const declared = new Map(columns.map((column) => [column.name, column] as const));
+  for (const [name, cell] of Object.entries(attributes)) {
+    const column = declared.get(name);
+    if (column === undefined) return `Undeclared attribute ${name}`;
+    if (!cellConforms(column.type, cell, column.nullable))
+      return `Attribute ${name} does not match its declared ${column.type} type`;
+  }
+  return undefined;
+}
+const ORDERED_KINDS = new Set<string>(["string", "i64", "u64", "f64", "uuid", "datetime_ms"]);
+export function validateTypedFilter(
+  columns: ReadonlyArray<TypedColumn>,
+  filter: { readonly field: string; readonly op: string; readonly value: unknown },
+): string | undefined {
+  const column = columns.find((candidate) => candidate.name === filter.field);
+  if (column === undefined || !column.filterable)
+    return `Attribute is not filterable: ${filter.field}`;
+  const array = column.type.startsWith("[");
+  const element = column.type.replace(/^\[|\]$/g, "");
+  const incompatible = `Filter ${filter.op} is incompatible with ${filter.field} (${column.type})`;
+  const scalarOperand = (value: unknown) => cellKind(value) === element;
+  const single = (value: unknown) =>
+    cellConforms(column.type, value, false) || (value === null && column.nullable);
+  const list = (check: (value: unknown) => boolean) =>
+    Array.isArray(filter.value) && filter.value.every(check);
+  const ordered = () => !array && ORDERED_KINDS.has(column.type) && scalarOperand(filter.value);
+  const rules: Record<string, () => boolean> = {
+    exists: () => typeof filter.value === "boolean",
+    eq: () => single(filter.value),
+    ne: () => single(filter.value),
+    in: () => list(single),
+    notIn: () => list(single),
+    contains: () => array && scalarOperand(filter.value),
+    notContains: () => array && scalarOperand(filter.value),
+    containsAny: () => array && list(scalarOperand),
+    notContainsAny: () => array && list(scalarOperand),
+    gt: ordered,
+    gte: ordered,
+    lt: ordered,
+    lte: ordered,
+  };
+  const rule = rules[filter.op];
+  if (Object.hasOwn(rules, filter.op) && rule !== undefined && rule()) return undefined;
+  return incompatible;
+}
+export const TypedColumnInput = Schema.Struct({
+  name: FieldName,
+  type: TypedColumnType,
+  filterable: Schema.optional(Schema.Boolean),
+  nullable: Schema.optional(Schema.Boolean),
+});
+export const TypedDeclaration = Schema.Struct({
+  vectorDimensions: Schema.optional(VectorDimensions),
+  columns: Schema.Array(TypedColumnInput).check(
+    Schema.isMaxLength(MAX_TYPED_COLUMNS),
+    Schema.makeFilter(
+      (columns) =>
+        new Set(columns.map((column) => column.name)).size === columns.length ||
+        "Duplicate typed column",
+    ),
+    Schema.makeFilter(
+      (columns) =>
+        columns.filter((column) => column.filterable === true).length <= MAX_TYPED_FILTERABLE ||
+        "Filterable typed columns exceed 64",
+    ),
+    Schema.makeFilter(
+      (columns) =>
+        columns.every((column) => column.type !== "bytes" || column.filterable !== true) ||
+        "Bytes columns cannot be filterable",
+    ),
+  ),
+});
+export function namespaceColumnsFromTyped(
+  declaration: typeof TypedDeclaration.Type,
+): typeof NamespaceColumns.Type {
+  const attributes = declaration.columns
+    .map((column): TypedColumn => ({
+      source: "attribute",
+      name: column.name,
+      value: "typed",
+      type: column.type,
+      filterable: column.filterable === true,
+      nullable: column.nullable === true,
+    }))
+    .toSorted((left, right) => compareFieldNames(left.name, right.name));
+  const vector: typeof NativeVectorColumn.Type = { source: "native-vector" };
+  const marker: typeof TypedNamespaceColumn.Type = { source: "typed-namespace" };
+  if (declaration.vectorDimensions !== undefined)
+    return {
+      columns: [{ ...vector, dimensions: declaration.vectorDimensions }, marker, ...attributes],
+    };
+  return { columns: [vector, marker, ...attributes] };
+}
+export function sameNamespaceColumns(
+  left: typeof NamespaceColumns.Type,
+  right: typeof NamespaceColumns.Type,
+) {
+  const encode = Schema.encodeSync(Schema.fromJsonString(NamespaceColumns));
+  return encode(left) === encode(right);
+}
+export const CanonicalId = Schema.Union([
+  Id,
+  Schema.Struct({ kind: Schema.Literal("uint"), value: Uint64Text }),
+  Schema.Struct({ kind: Schema.Literal("uuid"), value: UuidText }),
+]);
+export const BloomValue = Schema.Union([Schema.String, CanonicalId]);
+export const IdType = Schema.Literals(["string", "uint", "uuid"]);
+export function canonicalIdType(id: typeof CanonicalId.Type): typeof IdType.Type {
+  if (typeof id === "string") return "string";
+  return id.kind;
+}
+export function canonicalIdKey(id: typeof CanonicalId.Type): string {
+  if (typeof id === "string") return `string:${id}`;
+  return `${id.kind}:${id.value}`;
+}
+function canonicalIdValue(id: typeof CanonicalId.Type): string {
+  if (typeof id === "string") return id;
+  return id.value;
+}
+export function compareCanonicalIds(
+  left: typeof CanonicalId.Type,
+  right: typeof CanonicalId.Type,
+): number {
+  const a = canonicalIdType(left);
+  const b = canonicalIdType(right);
+  if (a !== b) {
+    if (a < b) return -1;
+    return 1;
+  }
+  const x = canonicalIdValue(left);
+  const y = canonicalIdValue(right);
+  if (a === "uint" && x.length !== y.length) return x.length - y.length;
+  if (x < y) return -1;
+  if (x > y) return 1;
+  return 0;
+}
+export function sameCanonicalId(
+  left: typeof CanonicalId.Type,
+  right: typeof CanonicalId.Type,
+): boolean {
+  return compareCanonicalIds(left, right) === 0;
+}
+export const CanonicalDocument = Schema.Struct({
+  id: CanonicalId,
+  revision: StoredDocument.fields.revision,
+  roles: Schema.Struct({ title: NativeTitle, text: Document.fields.text }),
+  attributes: Attributes,
+  vector: Document.fields.vector,
+});
+export const CanonicalWriteDocument = CanonicalDocument.mapFields((fields) =>
+  Struct.omit(fields, ["revision"]),
+);
+export const CanonicalWrite = Schema.Struct({
+  kind: Schema.Literal("canonical"),
+  requestId: Id,
+  idType: IdType,
+  schema: Schema.optional(NamespaceSchema),
+  upserts: Schema.Array(CanonicalWriteDocument).check(Schema.isMaxLength(1000)),
+  deletes: Schema.Array(CanonicalId).check(Schema.isMaxLength(1000)),
+  reset: Schema.optional(Schema.Boolean),
+}).check(
+  Schema.makeFilter(
+    (write) =>
+      [...write.upserts.map((document) => document.id), ...write.deletes].every(
+        (id) => canonicalIdType(id) === write.idType,
+      ) || "Canonical write IDs differ from declared type",
+  ),
+);
+export const TypedWriteDocument = CanonicalWriteDocument.mapFields((fields) => ({
+  ...fields,
+  attributes: TypedAttributes,
+}));
+export const TypedWriteDocuments = Schema.Array(TypedWriteDocument).check(Schema.isMaxLength(1000));
+export const PublicRowsInput = Schema.Array(Schema.Record(FieldName, Schema.Unknown)).check(
+  Schema.isMaxLength(1000),
+);
+export const PublicColumnsInput = Schema.Record(
+  FieldName,
+  Schema.Array(Schema.Unknown).check(Schema.isMaxLength(1000)),
+);
+export class PublicRowsRejection extends Schema.TaggedError<
+  PublicRowsRejection,
+  { readonly brand: unique symbol }
+>()("PublicRowsRejection", {
+  reason: Schema.Literals(["missing-id", "unequal-columns"]),
+  row: Schema.optional(Schema.Int),
+  field: Schema.optional(FieldName),
+}) {}
+export const TypedWrite = Schema.Struct({
+  kind: Schema.Literal("typed"),
+  requestId: Id,
+  idType: IdType,
+  declaration: Schema.optional(TypedDeclaration),
+  upserts: TypedWriteDocuments,
+  deletes: Schema.Array(CanonicalId).check(Schema.isMaxLength(1000)),
+  reset: Schema.optional(Schema.Boolean),
+}).check(
+  Schema.makeFilter(
+    (write) =>
+      [...write.upserts.map((document) => document.id), ...write.deletes].every(
+        (id) => canonicalIdType(id) === write.idType,
+      ) || "Typed write IDs differ from declared type",
+  ),
+);
+export const WriteCommand = Schema.Union([TypedWrite, CanonicalWrite, Write]);
+export function normalizeTypedWrite(write: typeof TypedWrite.Type): typeof TypedWrite.Type {
+  const upserts = write.upserts.map((document) => ({
+    ...document,
+    attributes: Object.fromEntries(
+      Object.entries(document.attributes).toSorted(([left], [right]) =>
+        compareFieldNames(left, right),
+      ),
+    ),
+  }));
+  const declaration = write.declaration;
+  if (declaration === undefined) return { ...write, upserts };
+  return {
+    ...write,
+    upserts,
+    declaration: {
+      ...declaration,
+      columns: declaration.columns
+        .map((column) => ({
+          name: column.name,
+          type: column.type,
+          filterable: column.filterable === true,
+          nullable: column.nullable === true,
+        }))
+        .toSorted((left, right) => compareFieldNames(left.name, right.name)),
+    },
+  };
+}
+export function hasTypedOperand(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(hasTypedOperand);
+  return typeof value === "object" && value !== null;
+}
+export const CanonicalDocumentMetadata = CanonicalDocument.mapFields((fields) =>
+  Struct.omit(fields, ["vector"]),
+);
+export const CanonicalQueryDocument = CanonicalDocumentMetadata.mapFields((fields) => ({
+  ...fields,
+  vectorSummary: QueryDocument.fields.vectorSummary,
+}));
+export const TypedCanonicalDocument = CanonicalDocument.mapFields((fields) => ({
+  ...fields,
+  attributes: TypedAttributes,
+}));
+export const TypedCanonicalQueryDocument = CanonicalQueryDocument.mapFields((fields) => ({
+  ...fields,
+  attributes: TypedAttributes,
+}));
+export function nativeToCanonicalDocument(
+  document: typeof Document.Type,
+  revision: number,
+): typeof CanonicalDocument.Type {
+  return {
+    id: document.id,
+    revision,
+    roles: { title: document.title ?? "", text: document.text },
+    attributes: document.attributes,
+    ...(document.vector !== undefined && { vector: document.vector }),
+  };
+}
+export function canonicalToNativeDocument(
+  document: typeof CanonicalDocument.Type,
+): typeof StoredDocument.Type {
+  return {
+    id: nativeProjectionId(document.id),
+    revision: document.revision,
+    title: document.roles.title,
+    text: document.roles.text,
+    attributes: document.attributes,
+    ...(document.vector !== undefined && { vector: document.vector }),
+  };
+}
+export function canonicalToQueryRow(
+  document: typeof CanonicalQueryDocument.Type | typeof TypedCanonicalQueryDocument.Type,
+  score: number,
+): typeof Row.Type {
+  return {
+    id: document.id,
+    revision: document.revision,
+    title: document.roles.title,
+    text: document.roles.text,
+    attributes: document.attributes,
+    score,
+  };
+}
+function nativeProjectionId(id: typeof CanonicalId.Type): typeof Id.Type {
+  if (typeof id !== "string")
+    throw new TypeError("Native document projection requires a string ID");
+  return id;
+}
+export function readCanonicalColumn(
+  document: typeof CanonicalDocument.Type,
+  column: typeof DocumentColumnId.Type,
+) {
+  if (column.source === "attribute") return document.attributes[column.name];
+  if (column.role === "vector") return document.vector;
+  return document.roles[column.role];
+}
+const FilterOperand = Schema.Union([Scalar, TypedTag]);
 export const Filter = Schema.Union([
   Schema.Struct({
     field: FieldName,
-    op: Schema.Literals(["eq", "ne"]),
-    value: Scalar,
+    op: Schema.Literals(["eq", "ne", "contains", "notContains"]),
+    value: FilterOperand,
   }),
   Schema.Struct({
     field: FieldName,
     op: Schema.Literals(["gt", "gte", "lt", "lte"]),
-    value: Schema.Finite,
+    value: Schema.Union([Schema.Finite, Unicode, TypedTag]),
   }),
   Schema.Struct({
     field: FieldName,
     op: Schema.Literal("in"),
-    value: Schema.Array(Scalar).check(Schema.isBetweenLength(1, 32)),
+    value: Schema.Array(FilterOperand).check(Schema.isBetweenLength(1, 32)),
+  }),
+  Schema.Struct({
+    field: FieldName,
+    op: Schema.Literal("notIn"),
+    value: Schema.Array(FilterOperand).check(Schema.isMaxLength(32)),
+  }),
+  Schema.Struct({
+    field: FieldName,
+    op: Schema.Literals(["containsAny", "notContainsAny"]),
+    value: Schema.Array(FilterOperand).check(Schema.isMaxLength(32)),
   }),
   Schema.Struct({
     field: FieldName,
@@ -120,6 +932,67 @@ export const Filter = Schema.Union([
     value: Schema.Boolean,
   }),
 ]);
+export const FieldBm25Parameters = Schema.Struct({
+  k1: Schema.Finite.check(Schema.isGreaterThan(0)),
+  b: Schema.Finite.check(Schema.isBetween({ minimum: 0, maximum: 1 })),
+});
+export const DEFAULT_FIELD_BM25 = { k1: 1.2, b: 0.75 } as const;
+const SafeCount = Schema.Finite.check(
+  Schema.makeFilter(
+    (value) => Number.isSafeInteger(value) || "Expected a nonnegative safe integer",
+  ),
+  Schema.isGreaterThanOrEqualTo(0),
+);
+const TextColumnId = DocumentColumnId.check(
+  Schema.makeFilter(
+    (column) =>
+      column.source === "attribute" || column.role !== "vector" || "Vector is not a text field",
+  ),
+);
+export const FieldStatistics = Schema.Struct({
+  id: TextColumnId,
+  tokens: SafeCount,
+  frequencies: Schema.Record(Unicode, SafeCount).check(
+    Schema.makeFilter(
+      (frequencies) => Object.keys(frequencies).length <= 512 || "Too many query term frequencies",
+    ),
+  ),
+});
+export const CorpusStatistics = Schema.Struct({
+  documents: SafeCount,
+  fields: Schema.Array(FieldStatistics).check(Schema.isMaxLength(66)),
+});
+export const FieldStatisticsQuery = Schema.Struct({
+  fields: Schema.Array(TextColumnId).check(Schema.isBetweenLength(1, 66)),
+  text: Unicode.check(Schema.isBetweenLength(1, 8192)),
+  mode: Schema.Literals(["any", "all", "phrase"]),
+  dead: Schema.optional(
+    Schema.Array(Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 4_294_967_295 }))).check(
+      Schema.isMaxLength(100_000),
+    ),
+  ),
+});
+export const FieldQuery = FieldStatisticsQuery.mapFields((fields) => ({
+  ...fields,
+  top_k: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 100 }))),
+  filters: Schema.optional(Schema.Array(Filter).check(Schema.isMaxLength(64))),
+  bm25: Schema.optional(FieldBm25Parameters),
+  statistics: Schema.optional(CorpusStatistics),
+}));
+export const NamedTextField = Schema.Struct({
+  name: FieldName,
+  config: Schema.optional(WordV4Config),
+});
+export const NamedTextFields = Schema.Array(NamedTextField).check(Schema.isMaxLength(64));
+export const FieldBuild = Schema.Struct({
+  documents: Schema.Array(CanonicalDocument).check(Schema.isBetweenLength(1, 10_000)),
+  text_fields: NamedTextFields,
+  filterable: Schema.optional(Schema.Array(FieldName).check(Schema.isMaxLength(64))),
+});
+export const FieldRankHit = Schema.Struct({
+  row: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  score: Schema.Finite,
+});
 const QueryFields = {
   consistency: Schema.optional(Schema.Literals(["strong", "edge-eventual"])),
   minimumSequence: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
@@ -145,6 +1018,7 @@ export const Query = Schema.Union([
   }),
 ]);
 const RootFields = {
+  collectionFence: Schema.optional(Schema.String.check(Schema.isUUID())),
   schema: Schema.optional(NamespaceSchema),
   version: Schema.Literal(1),
   sequence: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
@@ -170,9 +1044,9 @@ const LegacyInlineSegment = Schema.Struct({
   termBloom: Schema.String,
   dead: Schema.Array(Schema.Int),
   removedFrequencies: Schema.Record(Schema.String, Schema.Int),
-  commonTerms: Schema.optional(Schema.suspend(() => CommonTerms)),
+  commonTerms: Schema.optional(Schema.suspend(() => LegacyCommonTerms)),
   commonProjection: Schema.optional(Schema.NullOr(Schema.suspend(() => CommonTermProjection))),
-  commonLeaders: Schema.optional(Schema.suspend(() => CommonLeaders)),
+  commonLeaders: Schema.optional(Schema.suspend(() => LegacyCommonLeaders)),
   constantAttributes: Schema.optional(ConstantAttributes),
   eligibility: Schema.NullOr(Schema.suspend(() => EligibilityProjection)),
 });
@@ -189,7 +1063,10 @@ const PackedRootValue = Schema.Struct({
   bloomPacks: Schema.Array(Schema.suspend(() => BloomPack)),
   segments: Schema.Array(LegacyPackedSegment),
 });
-const validBloomReferences = (root: typeof PackedRootValue.Type) =>
+const validBloomReferences = (root: {
+  readonly bloomPacks: typeof PackedRootValue.Type.bloomPacks;
+  readonly segments: ReadonlyArray<Pick<typeof LegacyPackedSegment.Type, "key" | "bloom">>;
+}) =>
   root.segments.every(
     (segment) =>
       root.bloomPacks[segment.bloom.packIndex]?.segmentKeys[segment.bloom.row] === segment.key,
@@ -204,10 +1081,36 @@ const validMetadataBoundary = (
 ) =>
   (segment.metadataEnd >= segment.headerBytes && segment.metadataEnd <= segment.bytes) ||
   "Invalid segment metadata boundary";
+const CurrentMetadataSegment = MetadataSegment.mapFields((fields) => ({
+  ...fields,
+  minimumId: CanonicalId,
+  commonTerms: Schema.optional(Schema.suspend(() => CommonTerms)),
+  commonLeaders: Schema.optional(Schema.suspend(() => CommonLeaders)),
+}));
 export const Root = PackedRootValue.mapFields((fields) => ({
   ...fields,
-  segments: Schema.Array(MetadataSegment.check(Schema.makeFilter(validMetadataBoundary))),
-})).check(Schema.makeFilter(validBloomReferences));
+  schema: Schema.optional(NamespaceColumns),
+  idType: Schema.optional(IdType),
+  segments: Schema.Array(CurrentMetadataSegment.check(Schema.makeFilter(validMetadataBoundary))),
+})).check(
+  Schema.makeFilter(validBloomReferences),
+  Schema.makeFilter((root) => {
+    const valid = (id: typeof CanonicalId.Type) =>
+      canonicalIdType(id) === (root.idType ?? "string");
+    return (
+      root.segments.every(
+        (segment) =>
+          valid(segment.minimumId) &&
+          (segment.commonLeaders ?? []).every((leader) =>
+            leader.documents.every((document) => valid(document.id)),
+          ) &&
+          Object.values(segment.commonTerms ?? {}).every(
+            (term) => term.single === undefined || valid(term.single.id),
+          ),
+      ) || "Root metadata ID type differs from namespace policy"
+    );
+  }),
+);
 export const UnpackedSegment = Root.fields.segments.value
   .mapFields((fields) => Struct.omit(fields, ["bloom"]))
   .check(Schema.makeFilter(validMetadataBoundary));
@@ -320,7 +1223,7 @@ export const NamespaceListCursor = Schema.StringFromBase64Url.pipe(
     ),
   ),
 );
-export const Log = Schema.Struct({
+const NativeLog = Schema.Struct({
   version: Schema.Literal(1),
   sequence: Schema.Int.check(Schema.isGreaterThan(0)),
   previous: Schema.Union([Schema.String, Schema.Null]),
@@ -329,18 +1232,31 @@ export const Log = Schema.Struct({
   vectorDeletes: Schema.Array(Schema.String),
   write: Write,
 });
+export const Log = Schema.Union([
+  NativeLog,
+  NativeLog.mapFields((fields) => ({
+    ...fields,
+    version: Schema.Literal(2),
+    write: CanonicalWrite,
+  })),
+  NativeLog.mapFields((fields) => ({
+    ...fields,
+    version: Schema.Literal(3),
+    write: TypedWrite,
+  })),
+]);
 export const Row = Schema.Struct({
-  id: Id,
+  id: CanonicalId,
   title: Schema.String,
   text: Schema.String,
-  attributes: Attributes,
+  attributes: StoredAttributes,
   revision: Schema.Int,
   score: Schema.Finite,
 });
 export const QueryResult = Schema.Struct({
   rows: Schema.Array(Row),
   sequence: Schema.Int,
-  consistency: Schema.Literals(["strong", "edge-eventual", "vectorize-eventual"]),
+  consistency: Schema.Literals(["strong", "edge-eventual"]),
 });
 export const WriteResult = Schema.Struct({
   sequence: Schema.Int,
@@ -403,6 +1319,7 @@ export const CacheMetrics = Schema.Struct({
 });
 export const Metadata = Schema.Struct({
   schema: Schema.NullOr(NamespaceSchema),
+  columns: Schema.optional(NamespaceColumns),
   sequence: Schema.Int,
   documents: Schema.Int,
   segments: Schema.Int,
@@ -426,8 +1343,8 @@ export const Health = Schema.Struct({
   snapshotCachePutSkipped: Schema.Int,
   name: Schema.Literal("kannin"),
   version: Schema.Literal("0.1.0"),
-  engine: Schema.Literal("rust-wasm-r2"),
-  vectors: Schema.Literal("cloudflare-vectorize"),
+  engine: Schema.Literals(["rust-wasm-r2", "rust-wasm-object-storage"]),
+  vectors: Schema.Literal("rust-wasm-object-storage"),
   wasmMemoryBytes: Schema.Int,
   ...CacheMetrics.fields,
 });
@@ -438,11 +1355,11 @@ export const Receipt = Schema.Struct({
 });
 export const DataRange = Schema.Struct({ offset: Schema.Int, length: Schema.Int });
 export const SegmentDocument = Schema.Struct({
-  id: Id,
+  id: CanonicalId,
   revision: Schema.Int,
   title_length: Schema.Int,
   body_length: Schema.Int,
-  attributes: Attributes,
+  attributes: StoredAttributes,
   data: DataRange,
   vector: Schema.Boolean,
 });
@@ -470,7 +1387,7 @@ export const EligibleMinimum = Schema.Union([
 ]);
 const TermDocument = Schema.Struct({
   row: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 9999 })),
-  id: Id,
+  id: CanonicalId,
   data: DataRange,
 });
 export const TermSummary = Schema.Struct({
@@ -507,6 +1424,20 @@ export const CommonTerms = Schema.Record(
     ),
   ),
 ).check(Schema.isMaxProperties(16));
+const LegacyTermDocument = TermDocument.mapFields((fields) => ({ ...fields, id: Id }));
+const LegacyTermSummary = TermSummary.mapFields((fields) => ({
+  ...fields,
+  single: Schema.optional(LegacyTermDocument),
+}));
+const LegacyCommonTerms = Schema.Record(CommonTerms.key, LegacyTermSummary).check(
+  Schema.makeFilter((value) => Schema.is(CommonTerms)(value) || "Invalid legacy common terms"),
+);
+const LegacyCommonLeaders = Schema.Array(
+  CommonLeaders.value.mapFields((fields) => ({
+    ...fields,
+    documents: Schema.Array(LegacyTermDocument).check(Schema.isMaxLength(16)),
+  })),
+).check(Schema.isMaxLength(2));
 const CommonTermBound = TermSummary.fields.bounds.value.check(
   Schema.makeFilter(
     (bound) =>
@@ -597,7 +1528,9 @@ const BloomColumn = Schema.Struct({
 );
 export const BloomPack = Schema.Struct({
   key: Schema.String.check(
-    Schema.isPattern(/^namespaces\/[a-zA-Z0-9_-]{1,64}\/bloom-packs\/[a-f0-9]{64}\.bin$/),
+    Schema.isPattern(
+      /^namespaces\/[A-Za-z0-9_.-]{1,128}\/bloom-packs\/[a-f0-9]{64}(?:-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})?\.bin$/,
+    ),
   ),
   bytes: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(32 * 1024 * 1024)),
   segmentKeys: Schema.Array(Schema.suspend(() => SegmentRange.fields.key)).check(
@@ -624,7 +1557,7 @@ const PackedStoredRoot = LegacyPackedRoot.mapFields((fields) => ({
   ...fields,
   version: Schema.Literal(4),
   commonProjections: Schema.Array(CommonTermProjection),
-  commonTermDictionaries: Schema.Array(CommonTerms),
+  commonTermDictionaries: Schema.Array(LegacyCommonTerms),
   eligibilityModels: Schema.Array(Schema.suspend(() => EligibilityProjection)),
   segments: Schema.Array(
     fields.segments.value.mapFields((segment) => ({
@@ -637,12 +1570,18 @@ const PackedStoredRoot = LegacyPackedRoot.mapFields((fields) => ({
     })),
   ),
 }));
-const validStoredRootMetadata = (
-  root: Pick<
-    typeof PackedStoredRoot.Type,
-    "bloomPacks" | "segments" | "commonProjections" | "commonTermDictionaries" | "eligibilityModels"
-  >,
-) => {
+const validStoredRootMetadata = (root: {
+  readonly bloomPacks: typeof PackedStoredRoot.Type.bloomPacks;
+  readonly segments: ReadonlyArray<
+    Pick<
+      (typeof PackedStoredRoot.Type.segments)[number],
+      "key" | "bloom" | "commonProjectionIndex" | "commonTermsIndex" | "eligibilityIndex"
+    >
+  >;
+  readonly commonProjections: ReadonlyArray<unknown>;
+  readonly commonTermDictionaries: ReadonlyArray<unknown>;
+  readonly eligibilityModels: ReadonlyArray<unknown>;
+}) => {
   const packedSegmentKeys = root.bloomPacks.flatMap((pack) => pack.segmentKeys);
   return (
     (new Set(packedSegmentKeys).size === packedSegmentKeys.length &&
@@ -664,7 +1603,7 @@ const validStoredRootMetadata = (
 export const LegacyStoredRootV4 = PackedStoredRoot.check(
   Schema.makeFilter(validStoredRootMetadata),
 );
-export const StoredRoot = PackedStoredRoot.mapFields((fields) => ({
+export const LegacyStoredRootV5 = PackedStoredRoot.mapFields((fields) => ({
   ...fields,
   version: Schema.Literal(5),
   segments: Schema.Array(
@@ -676,6 +1615,62 @@ export const StoredRoot = PackedStoredRoot.mapFields((fields) => ({
       .check(Schema.makeFilter(validMetadataBoundary)),
   ),
 })).check(Schema.makeFilter(validStoredRootMetadata));
+export const LegacyStoredRootV6 = LegacyStoredRootV5.mapFields((fields) => ({
+  ...fields,
+  version: Schema.Literal(6),
+  schema: Schema.optional(NamespaceColumns),
+})).check(
+  Schema.makeFilter(validStoredRootMetadata),
+  Schema.makeFilter(
+    (root) => !isTypedNamespace(root.schema) || "Typed declarations require StoredRoot 8",
+  ),
+);
+const StoredRootV7Value = LegacyStoredRootV6.mapFields((fields) => ({
+  ...fields,
+  version: Schema.Literal(7),
+  idType: Schema.optional(IdType),
+  commonTermDictionaries: Schema.Array(CommonTerms),
+  segments: Schema.Array(
+    fields.segments.value
+      .mapFields((segment) => ({
+        ...segment,
+        minimumId: CanonicalId,
+        commonLeaders: Schema.optional(CommonLeaders),
+      }))
+      .check(Schema.makeFilter(validMetadataBoundary)),
+  ),
+}));
+const validStoredIdPolicy = (
+  root: Pick<typeof StoredRootV7Value.Type, "idType" | "segments" | "commonTermDictionaries">,
+) => {
+  const valid = (id: typeof CanonicalId.Type) => canonicalIdType(id) === (root.idType ?? "string");
+  return (
+    (root.segments.every(
+      (segment) =>
+        valid(segment.minimumId) &&
+        (segment.commonLeaders ?? []).every((leader) =>
+          leader.documents.every((document) => valid(document.id)),
+        ),
+    ) &&
+      root.commonTermDictionaries.every((dictionary) =>
+        Object.values(dictionary).every(
+          (term) => term.single === undefined || valid(term.single.id),
+        ),
+      )) ||
+    "Stored Root metadata ID type differs from namespace policy"
+  );
+};
+export const LegacyStoredRootV7 = StoredRootV7Value.check(
+  Schema.makeFilter(validStoredRootMetadata),
+  Schema.makeFilter(validStoredIdPolicy),
+  Schema.makeFilter(
+    (root) => !isTypedNamespace(root.schema) || "Typed declarations require StoredRoot 8",
+  ),
+);
+export const StoredRoot = StoredRootV7Value.mapFields((fields) => ({
+  ...fields,
+  version: Schema.Literal(8),
+})).check(Schema.makeFilter(validStoredRootMetadata), Schema.makeFilter(validStoredIdPolicy));
 export const StoredVectorRebuildSnapshot = VectorRebuildSnapshot.mapFields((fields) => ({
   ...fields,
   root: StoredRoot,
@@ -691,7 +1686,7 @@ export const LegacyStoredRootV3 = LegacyInlineRoot.mapFields((fields) => ({
   ...fields,
   version: Schema.Literal(3),
   commonProjections: Schema.Array(CommonTermProjection),
-  commonTermDictionaries: Schema.Array(CommonTerms),
+  commonTermDictionaries: Schema.Array(LegacyCommonTerms),
   eligibilityModels: Schema.Array(Schema.suspend(() => EligibilityProjection)),
   segments: Schema.Array(
     fields.segments.value.mapFields((segment) => ({
@@ -743,6 +1738,9 @@ export const RootMigrationInput = Schema.Union([
   LegacyStoredRoot,
   LegacyStoredRootV3,
   LegacyStoredRootV4,
+  LegacyStoredRootV5,
+  LegacyStoredRootV6,
+  LegacyStoredRootV7,
   StoredRoot,
 ]);
 export const VectorRebuildSnapshotMigrationInput = Schema.Union([
@@ -751,6 +1749,9 @@ export const VectorRebuildSnapshotMigrationInput = Schema.Union([
   VectorRebuildSnapshot.mapFields((fields) => ({ ...fields, root: LegacyStoredRoot })),
   VectorRebuildSnapshot.mapFields((fields) => ({ ...fields, root: LegacyStoredRootV3 })),
   VectorRebuildSnapshot.mapFields((fields) => ({ ...fields, root: LegacyStoredRootV4 })),
+  VectorRebuildSnapshot.mapFields((fields) => ({ ...fields, root: LegacyStoredRootV5 })),
+  VectorRebuildSnapshot.mapFields((fields) => ({ ...fields, root: LegacyStoredRootV6 })),
+  VectorRebuildSnapshot.mapFields((fields) => ({ ...fields, root: LegacyStoredRootV7 })),
   StoredVectorRebuildSnapshot,
 ]);
 export const VECTOR_REBUILD_CHECKPOINT_BYTES = 8 * 1024 * 1024;
@@ -797,7 +1798,7 @@ const EligibilityProjectionValue = Schema.Struct({
       (fields) =>
         fields.every((field, index) => {
           const previous = fields[index - 1];
-          return previous === undefined || previous < field;
+          return previous === undefined || compareFieldNames(previous, field) < 0;
         }) || "Eligibility fields must be sorted and unique",
     ),
   ),
@@ -939,8 +1940,44 @@ export const OverviewBatch = Schema.Array(OverviewSource)
         "Overview batch exceeds three MiB",
     ),
   );
+const SegmentTextCounts = {
+  total: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  terms: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+};
+export const SegmentTextField = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literals(["title", "text"]),
+    name: Schema.Null,
+    analysis: Schema.Null,
+    ...SegmentTextCounts,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("attribute"),
+    name: FieldName,
+    analysis: WordV4Config,
+    ...SegmentTextCounts,
+  }),
+]);
+export const SegmentTextFields = Schema.Array(SegmentTextField).check(
+  Schema.isBetweenLength(2, 66),
+  Schema.makeFilter((fields) => {
+    if (fields[0]?.kind !== "title" || fields[1]?.kind !== "text")
+      return "Native title and text fields must lead the text field table";
+    const named = fields.slice(2);
+    return (
+      named.every((field, index) => {
+        if (field.kind !== "attribute") return false;
+        const previous = named[index - 1];
+        return (
+          previous === undefined ||
+          (previous.kind === "attribute" && compareFieldNames(previous.name, field.name) < 0)
+        );
+      }) || "Named text fields must be distinct and strictly sorted"
+    );
+  }),
+);
 export const SegmentHeader = Schema.Struct({
-  version: Schema.Literal(2),
+  version: Schema.Literals([2, 3, 4, 5, 6]),
   documents: Schema.NonEmptyArray(SegmentDocument),
   terms: SegmentTerms,
   total_title_length: Schema.Int,
@@ -953,6 +1990,16 @@ export const LocatedDocument = Schema.Struct({
   row: Schema.Int,
   document: SegmentDocument,
   vectorData: Schema.NullOr(DataRange),
+});
+export const NativeVectorLocation = Schema.Struct({
+  row: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  id: CanonicalId,
+  data: DataRange,
+  vectorData: DataRange,
+});
+export const NativeVectorPage = Schema.Struct({
+  complete: Schema.Boolean,
+  rows: Schema.Array(NativeVectorLocation).check(Schema.isMaxLength(64)),
 });
 export const SearchStatistics = Schema.Struct({
   documents: Schema.Int,
@@ -1019,11 +2066,11 @@ export const SharedTextPlanCacheHeaders = Schema.Struct({
   ),
 });
 export const SegmentHits = Schema.Array(
-  Schema.Struct({ row: Schema.Int, id: Id, score: Schema.Finite, data: DataRange }),
+  Schema.Struct({ row: Schema.Int, id: CanonicalId, score: Schema.Finite, data: DataRange }),
 );
 export const VectorSyncResult = Schema.Struct({
   submitted: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 16 })),
-  visibility: Schema.Literal("vectorize-eventual"),
+  visibility: Schema.Literal("strong"),
 });
 export const VectorMessage = Schema.Struct({
   namespace: NamespaceName,
@@ -1033,7 +2080,7 @@ export const VectorMessage = Schema.Struct({
 export const IndexMessage = Schema.Struct({ namespace: NamespaceName });
 export const SegmentRange = Schema.Struct({
   key: Schema.String.check(
-    Schema.isPattern(/^namespaces\/[A-Za-z0-9_-]+\/segments\/[A-Za-z0-9-]+\.rsix$/),
+    Schema.isPattern(/^namespaces\/[A-Za-z0-9_.-]{1,128}\/segments\/[A-Za-z0-9-]+\.rsix$/),
   ),
   offset: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   length: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 16777216 })),
@@ -1055,7 +2102,7 @@ export const TermFilters = Schema.fromJsonString(QueryFields.filters);
 export const TermFilterHeader = Schema.StringFromBase64.pipe(Schema.decodeTo(TermFilters));
 export const TextTerms = Schema.Array(Schema.String).check(Schema.isMaxLength(512));
 export const TermProjectionProps = Schema.Struct({
-  bucket: Schema.String.check(Schema.isBetweenLength(1, 63)),
+  bucket: Schema.String.check(Schema.isBetweenLength(1, 128)),
   terms: Schema.fromJsonString(TextTerms),
   prefixes: Schema.optional(Schema.Array(CommonTerms).check(Schema.isBetweenLength(1, 16))),
   selection: Schema.Union([
@@ -1121,32 +2168,19 @@ export const NativeRankingResult = Schema.Struct({
     blocks: Schema.Int,
   }),
 });
-export class Rejected extends Schema.TaggedError<Rejected>()("Rejected", {
-  status: Schema.Int,
-  message: Schema.String,
-  upstreamStatus: Schema.optional(Schema.Int),
-  upstreamRay: Schema.optional(Schema.NullOr(Schema.String)),
-}) {}
+export class Rejected extends Schema.TaggedError<Rejected, { readonly brand: unique symbol }>()(
+  "Rejected",
+  {
+    status: Schema.Int,
+    message: Schema.String,
+    upstreamStatus: Schema.optional(Schema.Int),
+    upstreamRay: Schema.optional(Schema.NullOr(Schema.String)),
+  },
+) {}
 
-export const VectorSelection = Schema.Struct({
-  epoch: Root.fields.vectorEpoch,
-  sequence: Root.fields.sequence,
-  pending: Root.fields.vectorJobs,
-  vector: Vector,
-  filters: Schema.Array(Filter),
-  fields: VectorFilterFields,
-});
-export const VectorCandidates = Schema.Array(
-  Schema.Struct({
-    id: Schema.String,
-    score: Schema.Finite,
-    metadata: Schema.Struct({ id: Id, revision: Schema.Int }),
-  }),
-).check(Schema.isMaxLength(50));
-export const VectorCandidateFrame = Schema.Struct({
-  observedAt: Schema.Finite,
-  candidates: VectorCandidates.check(Schema.isMinLength(1)),
-});
+export const NativeVectorHits = Schema.Array(Schema.Tuple([CanonicalId, Schema.Finite])).check(
+  Schema.isMaxLength(100),
+);
 
 export const CompactResult = Schema.Struct({
   compacted: Schema.Int,
@@ -1157,13 +2191,26 @@ export const RebuildResult = Schema.Struct({
   sequence: Schema.Int,
   rebuilt: Schema.Literal(true),
 });
+export const CacheWarmHintResult = Schema.Struct({
+  status: Schema.Literal("ACCEPTED"),
+  message: Schema.optional(Unicode),
+});
 export const NamespaceRpcCommand = Schema.Union([
+  Schema.Struct({
+    namespace: NamespaceName,
+    operation: Schema.Literal("hint_cache_warm"),
+    input: Schema.optional(Schema.Struct({})),
+  }),
   Schema.Struct({
     namespace: NamespaceName,
     operation: Schema.Literal("migrate-root"),
     input: Schema.optional(Schema.Struct({})),
   }),
-  Schema.Struct({ namespace: NamespaceName, operation: Schema.Literal("write"), input: Write }),
+  Schema.Struct({
+    namespace: NamespaceName,
+    operation: Schema.Literal("write"),
+    input: WriteCommand,
+  }),
   Schema.Struct({ namespace: NamespaceName, operation: Schema.Literal("query"), input: Query }),
   Schema.Struct({
     namespace: NamespaceName,
@@ -1217,13 +2264,14 @@ export const NamespaceCommand = Schema.Union([
   }),
 ]);
 export const RootMigrationResult = Schema.Struct({
-  version: Schema.Literal(5),
+  version: Schema.Literal(8),
   sequence: Root.fields.sequence,
   rootRewritten: Schema.Boolean,
   migratedSnapshots: Schema.Int,
   expiredSnapshots: Schema.Int,
 });
 export const RpcValue = Schema.Union([
+  CacheWarmHintResult,
   NamespacesPage,
   RootMigrationResult,
   QueryResult,
@@ -1239,3 +2287,155 @@ export const RpcReply = Schema.Union([
   Schema.TaggedStruct("Success", { value: RpcValue }),
   Schema.TaggedStruct("Failure", { error: Rejected }),
 ]);
+
+export const ObjectKey = Schema.String.check(Schema.isMinLength(1));
+export const ObjectVersion = Schema.Struct({ etag: Schema.String.check(Schema.isMinLength(1)) });
+export const ObjectMetadata = Schema.Struct({
+  key: ObjectKey,
+  etag: ObjectVersion.fields.etag,
+  size: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  uploaded: Schema.Date,
+  customMetadata: Schema.Record(Schema.String, Schema.String),
+  sha256: Schema.optional(Schema.Uint8Array),
+});
+export const ObjectWriteCondition = Schema.Struct({
+  ifMatch: Schema.optional(Schema.String),
+  ifNoneMatch: Schema.optional(Schema.String),
+  customMetadata: Schema.optional(Schema.Record(Schema.String, Schema.String)),
+  sha256: Schema.optional(Schema.Uint8Array),
+  contentType: Schema.optional(Schema.String),
+});
+export class ObjectStoreFailure extends Schema.TaggedError<
+  ObjectStoreFailure,
+  { readonly brand: unique symbol }
+>()("ObjectStoreFailure", {
+  operation: Schema.Literals(["read", "write", "head", "list", "remove"]),
+  key: Schema.String,
+  cause: Schema.Defect(),
+}) {}
+
+export const S3StoreConfig = Schema.Struct({
+  bucket: Schema.String.check(Schema.isMinLength(1)),
+  endpoint: Schema.String.check(Schema.isPattern(/^https?:\/\//)),
+  region: Schema.String.check(Schema.isMinLength(1)),
+  accessKeyId: Schema.Redacted(Schema.String),
+  secretAccessKey: Schema.Redacted(Schema.String),
+  urlStyle: Schema.optional(Schema.Literals(["path", "virtual"])),
+});
+
+export const ObjectReadOptions = Schema.Struct({
+  range: Schema.optional(
+    Schema.Struct({
+      offset: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER })),
+      length: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER })),
+    }).check(
+      Schema.makeFilter(
+        (range) =>
+          Number.isSafeInteger(range.offset + range.length) || "Range overflows integer precision",
+      ),
+    ),
+  ),
+});
+export const ObjectContentRange = Schema.String.check(Schema.isPattern(/^bytes \d+-\d+\/\d+$/));
+
+export const ObjectCatalogMetadata = ObjectMetadata.mapFields((fields) => ({
+  ...fields,
+  customMetadata: Schema.optional(fields.customMetadata),
+}));
+export const ObjectListInput = Schema.Struct({
+  prefix: Schema.optional(Schema.String),
+  limit: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 1000 }))),
+  delimiter: Schema.optional(Schema.String),
+  cursor: Schema.optional(Schema.String),
+  includeMetadata: Schema.optional(Schema.Boolean),
+});
+export const ObjectPage = Schema.Union([
+  Schema.Struct({
+    objects: Schema.Array(ObjectCatalogMetadata),
+    delimitedPrefixes: Schema.Array(Schema.String),
+    truncated: Schema.Literal(true),
+    cursor: Schema.String.check(Schema.isMinLength(1)),
+  }),
+  Schema.Struct({
+    objects: Schema.Array(ObjectCatalogMetadata),
+    delimitedPrefixes: Schema.Array(Schema.String),
+    truncated: Schema.Literal(false),
+  }),
+]);
+
+export const ObjectUserMetadata = Schema.Record(Unicode, Unicode);
+export const ObjectUserMetadataJson = Schema.fromJsonString(ObjectUserMetadata);
+
+export const DeploymentTarget = Schema.Literals(["railway", "docker", "cloudflare"]);
+
+export const ImmutableCacheName = Schema.Literals([
+  "raio-segments-v1",
+  "raio-overview-batches-v8",
+  "kannin-text-plans-v1",
+  "kannin-vectors-v2",
+]);
+export const CacheObjectId = Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/));
+export const CacheGeneration = Schema.String.check(Schema.isPattern(/^[a-f0-9-]{36}$/));
+export const CacheHeaders = Schema.Record(
+  Schema.String.check(Schema.isPattern(/^[a-z0-9-]{1,128}$/)),
+  Unicode.check(Schema.isMaxLength(8192)),
+).check(
+  Schema.makeFilter(
+    (headers) => Object.keys(headers).length <= 64 || "Too many cached response headers",
+  ),
+  Schema.makeFilter(
+    (headers) =>
+      !["authorization", "cookie", "set-cookie", "proxy-authorization"].some(
+        (name) => headers[name] !== undefined,
+      ) || "Authenticated response headers cannot enter a shared cache",
+  ),
+);
+export const CacheHeadersJson = Schema.fromJsonString(CacheHeaders);
+export const CacheTtlSeconds = Schema.Int.check(
+  Schema.isBetween({ minimum: 1, maximum: 31536000 }),
+);
+export const CacheEntryBytes = Schema.Int.check(
+  Schema.isBetween({ minimum: 1, maximum: 16 * 1024 * 1024 }),
+);
+export const CacheClientConfig = Schema.Struct({
+  endpoint: S3StoreConfig.fields.endpoint,
+  token: Schema.Redacted(Unicode.check(Schema.isMinLength(1))),
+  timeoutMillis: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 5000 })),
+  maxEntryBytes: CacheEntryBytes,
+});
+export const CacheServerConfig = Schema.Struct({
+  token: CacheClientConfig.fields.token,
+  host: Unicode.check(Schema.isMinLength(1)),
+  port: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 65535 })),
+  edgeEndpoint: S3StoreConfig.fields.endpoint,
+  maxEntries: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 65536 })),
+  maxMetadataBytes: Schema.Int.check(
+    Schema.isBetween({ minimum: 1024, maximum: 64 * 1024 * 1024 }),
+  ),
+  maxStagingBytes: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 128 * 1024 * 1024 })),
+  maxEntryBytes: CacheEntryBytes,
+  maxTtlSeconds: CacheTtlSeconds,
+});
+export const CacheDeleteResult = Schema.Struct({ deleted: Schema.Boolean });
+export const CacheDeleteResultJson = Schema.fromJsonString(CacheDeleteResult);
+export class CacheFailure extends Schema.TaggedError<
+  CacheFailure,
+  { readonly brand: unique symbol }
+>()("CacheFailure", {
+  operation: Schema.Literals(["initialize", "match", "put", "delete"]),
+  cause: Schema.Defect(),
+}) {}
+
+export const PortableServerConfig = Schema.Struct({
+  token: Schema.Redacted(Unicode.check(Schema.isMinLength(1))),
+  host: Unicode.check(Schema.isMinLength(1)),
+  port: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 65535 })),
+  wasmPath: Unicode.check(Schema.isMinLength(1)),
+  objectStore: S3StoreConfig,
+  cache: Schema.optional(CacheClientConfig),
+});
+
+export const NativeJsonNumeric = Schema.declare<ReturnType<typeof JSON.rawJSON>>(
+  (value): value is ReturnType<typeof JSON.rawJSON> =>
+    JSON.isRawJSON(value) && /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(value.rawJSON),
+);

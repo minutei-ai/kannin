@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
 import { availableParallelism, cpus } from "node:os";
 import { Schema } from "effect";
-import { QueryResult, Health, Row } from "../src/protocol";
-import { request, startWorker, textQuery, write } from "../tests/harness";
+import { Query, QueryResult, Health, Row } from "../src/protocol";
+import { request, startWorker, write } from "../tests/harness";
 import { corpus } from "./corpus";
+import { benchmarkQueries } from "./benchmark-queries";
 
 const size = Schema.decodeSync(
   Schema.Int.check(Schema.isBetween({ minimum: 1000, maximum: 1000000 })),
@@ -33,38 +34,15 @@ for (const offset of Array.from({ length: Math.ceil(size / 500) }, (_, ordinal) 
 const ingestMs = performance.now() - ingestion;
 const reports = [];
 const baselines = new Map<string, string>();
-const queries = [
-  ["rare", textQuery("unique42")],
-  ["selective", textQuery("group42")],
-  ["common", textQuery("cloudflare rust")],
-  ["filtered", textQuery("cloudflare", 10, [{ field: "group", op: "eq", value: 42 }])],
-  ["common-all", { ...textQuery("cloudflare rust"), match: "all" }],
-  ["common-phrase", { ...textQuery("cloudflare rust"), match: "phrase" }],
-  [
-    "filtered-all",
-    {
-      ...textQuery("cloudflare rust", 10, [{ field: "group", op: "eq", value: 42 }]),
-      match: "all",
-    },
-  ],
-  [
-    "filtered-phrase",
-    {
-      ...textQuery("cloudflare rust", 10, [{ field: "group", op: "eq", value: 42 }]),
-      match: "phrase",
-    },
-  ],
-  ...[64, 256, 512].map(
-    (count) =>
-      [
-        `rare-${count}-terms`,
-        textQuery(Array.from({ length: count }, (_, index) => `unique${42 + index}`).join(" ")),
-      ] as const,
-  ),
-] as const;
+const encodeQuery = Schema.encodeSync(Schema.fromJsonString(Query));
+
 for (const consistency of ["strong", "edge-eventual"] as const)
-  for (const [name, selected] of queries) {
-    const query = { ...selected, consistency };
+  for (const [name, selected] of benchmarkQueries) {
+    const query = Schema.decodeUnknownSync(Query, { onExcessProperty: "error" })({
+      ...selected,
+      consistency,
+      minimumSequence: Math.ceil(size / 500),
+    });
     for (const _warmup of Array.from({ length: 5 }, (_, ordinal) => ordinal)) {
       const response = await request(worker, "benchmark", "query", query);
       if (!response.ok) throw new Error(`Warmup failed ${response.status}`);
@@ -74,6 +52,8 @@ for (const consistency of ["strong", "edge-eventual"] as const)
     for (const _iteration of Array.from({ length: 50 }, (_, ordinal) => ordinal)) {
       const start = performance.now();
       const response = await request(worker, "benchmark", "query", query);
+      if (!response.ok)
+        throw new Error(`Measured query failed: ${response.status} ${await response.text()}`);
       const result = Schema.decodeUnknownSync(QueryResult)(await response.json());
       if (result.rows.length === 0) throw new Error("Empty benchmark result");
       if (result.consistency !== consistency)
@@ -88,10 +68,14 @@ for (const consistency of ["strong", "edge-eventual"] as const)
         throw new Error("Benchmark ranking changed across requests or consistency modes");
       samples.push(elapsed);
     }
+    const baseline = baselines.get(name);
+    if (baseline === undefined) throw new Error("Missing verified benchmark rows");
     const ordered = [...samples].sort((a, b) => a - b);
     reports.push({
       name,
       consistency,
+      querySha256: Bun.CryptoHasher.hash("sha256", encodeQuery(query), "hex"),
+      rowsSha256: Bun.CryptoHasher.hash("sha256", baseline, "hex"),
       p50: ordered[24],
       p95: ordered[47],
       p99: ordered[49],
@@ -108,10 +92,13 @@ console.log(
       runtime: "local-workerd",
       cpu: cpus()[0]?.model,
       availableParallelism: availableParallelism(),
+      resourceConditions:
+        "workerd and R2 emulator inherit runner limits; no per-service CPU or memory cap; resource equivalence with containers not established",
       bun: Bun.version,
       bundleSha256,
       wasmSha256,
       documents: size,
+      sequence: Math.ceil(size / 500),
       corpusSha256: corpusHash.digest("hex"),
       resultCheck:
         "identical rows and scores across requests and consistency modes; acknowledged sequence verified",

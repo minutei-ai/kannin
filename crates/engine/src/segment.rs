@@ -1,5 +1,19 @@
 mod binary_directory;
+mod fields;
+mod ids;
+mod numbers;
+mod values;
+pub use ids::{DocumentId, DocumentIdRef};
+pub use values::{
+    AttributeSchema, Cell, CellType, ColumnSpec, ScalarType, decode_typed_attributes,
+};
 
+pub use fields::{
+    Bm25Parameters, CorpusStatistics, FieldAnalysis, FieldMeta, FieldQuery, FieldStatistics,
+    FieldTable, NamedTextField,
+};
+
+use crate::analysis::WordV4Config;
 use crate::normalize_text;
 use bit_vec::BitVec;
 use serde::{Deserialize, Serialize};
@@ -8,18 +22,48 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::rc::Rc;
 
-const MAGIC: &[u8; 8] = b"RAIOSEG2";
+const MAGIC_V2: &[u8; 8] = b"RAIOSEG2";
+const MAGIC_V3: &[u8; 8] = b"RAIOSEG3";
+const MAGIC_V4: &[u8; 8] = b"RAIOSEG4";
+const MAGIC_V5: &[u8; 8] = b"RAIOSEG5";
+const MAGIC_V6: &[u8; 8] = b"RAIOSEG6";
+/// The first segment version whose attribute cells are typed. Older versions carry opaque
+/// legacy JSON attributes; the version, never the value shape, selects the reading.
+const TYPED_VERSION: u32 = 6;
+const METADATA_CODEC_FACTS: u8 = 2;
+const METADATA_CODEC_CANONICAL: u8 = 3;
+const METADATA_CODEC_TYPED: u8 = 4;
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 const BLOCK_SIZE: usize = 128;
 const FILTER_CACHE_BYTES: usize = 32 * 1024;
 const MAX_QUERY_TERMS: usize = 512;
+const LANES: usize = 2;
 
-fn compare_document_ids(left: &str, right: &str) -> Ordering {
-    if left.is_ascii() {
-        left.cmp(right)
-    } else {
-        left.encode_utf16().cmp(right.encode_utf16())
+fn segment_magic(version: u32) -> Result<&'static [u8; 8], String> {
+    match version {
+        2 => Ok(MAGIC_V2),
+        3 => Ok(MAGIC_V3),
+        4 => Ok(MAGIC_V4),
+        5 => Ok(MAGIC_V5),
+        6 => Ok(MAGIC_V6),
+        _ => Err("Invalid segment version".into()),
     }
+}
+
+pub(crate) fn compare_document_ids<'a, 'b>(
+    left: impl Into<DocumentIdRef<'a>>,
+    right: impl Into<DocumentIdRef<'b>>,
+) -> Ordering {
+    ids::compare(left.into(), right.into())
+}
+
+#[doc = "# Errors\nRejects malformed canonical ID JSON, noncanonical integer/UUID tags or native string IDs outside 1..=128 UTF-16 code units."]
+pub(crate) fn decode_document_id(encoded: &str) -> Result<DocumentId, String> {
+    let id: DocumentId = serde_json::from_str(encoded).map_err(|cause| cause.to_string())?;
+    if !id.is_valid() {
+        return Err("Invalid canonical document ID".into());
+    }
+    Ok(id)
 }
 
 #[derive(Clone, Default)]
@@ -50,6 +94,7 @@ impl FilterMasks {
         &mut self,
         documents: &DocumentTable,
         fields: &BTreeSet<&str>,
+        typed: bool,
     ) -> Result<(), String> {
         use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 
@@ -89,7 +134,7 @@ impl FilterMasks {
             let mut shared_groups = hashbrown::HashMap::new();
             let mut groups = std::collections::HashMap::new();
             let mut group_bytes = 0;
-            let mut values: BTreeMap<_, Option<serde_json::Value>> =
+            let mut values: BTreeMap<_, Option<Cell>> =
                 fields.iter().map(|field| (*field, None)).collect();
             let representatives = documents
                 .metadata()
@@ -109,19 +154,16 @@ impl FilterMasks {
                     }
                     let mut decoder = serde_json::Deserializer::from_str(doc.attributes.get());
                     serde::de::DeserializeSeed::deserialize(
-                        FilterAttributes {
+                        CellAttributes {
                             fields: &fields,
                             values: &mut values,
+                            typed,
                         },
                         &mut decoder,
                     )
                     .map_err(|cause| cause.to_string())?;
                     decoder.end().map_err(|cause| cause.to_string())?;
-                    let representative = if values.values().flatten().all(|value| {
-                        !value.is_array()
-                            && !value.is_object()
-                            && value.as_str().is_none_or(|text| text.len() <= 256)
-                    }) {
+                    let representative = if values.values().flatten().all(Cell::is_small_scalar) {
                         let projected: Vec<_> = values.values().map(Option::as_slice).collect();
                         let key =
                             serde_json::to_string(&projected).map_err(|cause| cause.to_string())?;
@@ -153,65 +195,301 @@ impl FilterMasks {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Document {
-    pub id: String,
-    #[serde(default)]
-    pub revision: u64,
-    #[serde(default)]
-    pub title: String,
-    pub text: String,
-    pub attributes: BTreeMap<String, serde_json::Value>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "DocumentVectorSerialization::serialize_document_vector"
-    )]
-    pub vector: Option<Vec<f32>>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeRole {
+    Title,
+    Text,
+    Vector,
 }
 
-trait DocumentVectorSerialization {
-    fn serialize_document_vector<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColumnId<'a> {
+    Role(NativeRole),
+    Attribute(&'a str),
 }
 
-impl DocumentVectorSerialization for Option<Vec<f32>> {
-    fn serialize_document_vector<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeSeq as _;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DocumentColumnId {
+    Role(NativeRole),
+    Attribute(String),
+}
 
-        let Some(values) = self else {
-            return serializer.serialize_none();
-        };
-        if !values
-            .iter()
-            .any(|value| value.abs().to_bits() == f32::MAX.to_bits())
-        {
-            return values.serialize(serializer);
+impl DocumentColumnId {
+    #[must_use]
+    pub fn attribute(name: impl Into<String>) -> Self {
+        Self::Attribute(name.into())
+    }
+
+    #[must_use]
+    pub fn as_column(&self) -> ColumnId<'_> {
+        match self {
+            Self::Role(role) => ColumnId::Role(*role),
+            Self::Attribute(name) => ColumnId::Attribute(name),
         }
-        let mut sequence = serializer.serialize_seq(Some(values.len()))?;
-        for value in values {
-            if value.abs().to_bits() == f32::MAX.to_bits() {
-                sequence.serialize_element(&f64::from(*value))?;
-            } else {
-                sequence.serialize_element(value)?;
-            }
-        }
-        sequence.end()
     }
 }
 
+impl From<ColumnId<'_>> for DocumentColumnId {
+    fn from(id: ColumnId<'_>) -> Self {
+        match id {
+            ColumnId::Role(role) => Self::Role(role),
+            ColumnId::Attribute(name) => Self::Attribute(name.to_owned()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ColumnValue<'a> {
+    Text(&'a str),
+    Vector(&'a [f32]),
+    Attribute(&'a Cell),
+}
+
+#[derive(Clone)]
+pub struct Columns {
+    title: String,
+    text: String,
+    vector: Option<Vec<f32>>,
+    attributes: BTreeMap<String, Cell>,
+}
+
+fn legacy_cells(attributes: BTreeMap<String, serde_json::Value>) -> BTreeMap<String, Cell> {
+    attributes
+        .into_iter()
+        .map(|(name, value)| (name, Cell::Legacy(value)))
+        .collect()
+}
+
+impl Columns {
+    const fn new(
+        title: String,
+        text: String,
+        attributes: BTreeMap<String, Cell>,
+        vector: Option<Vec<f32>>,
+    ) -> Self {
+        Self {
+            title,
+            text,
+            vector,
+            attributes,
+        }
+    }
+
+    #[must_use]
+    pub fn get(&self, id: ColumnId<'_>) -> Option<ColumnValue<'_>> {
+        match id {
+            ColumnId::Role(NativeRole::Title) => Some(ColumnValue::Text(&self.title)),
+            ColumnId::Role(NativeRole::Text) => Some(ColumnValue::Text(&self.text)),
+            ColumnId::Role(NativeRole::Vector) => self.vector.as_deref().map(ColumnValue::Vector),
+            ColumnId::Attribute(name) => self.attributes.get(name).map(ColumnValue::Attribute),
+        }
+    }
+
+    #[must_use]
+    pub const fn attributes(&self) -> &BTreeMap<String, Cell> {
+        &self.attributes
+    }
+
+    #[must_use]
+    pub const fn attributes_mut(&mut self) -> &mut BTreeMap<String, Cell> {
+        &mut self.attributes
+    }
+
+    /// True when no attribute is a typed cell, which is the only state the historical
+    /// native and canonical adapters can represent.
+    #[must_use]
+    pub fn is_legacy(&self) -> bool {
+        self.attributes.values().all(Cell::is_legacy)
+    }
+
+    /// True when no attribute is an opaque legacy value, which is the only state a typed
+    /// segment can store.
+    #[must_use]
+    pub fn is_typed(&self) -> bool {
+        self.attributes.values().all(|cell| !cell.is_legacy())
+    }
+
+    /// The attributes for a legacy adapter, which refuses typed cells instead of
+    /// stringifying or rounding them.
+    fn legacy_attributes(&self) -> Result<&BTreeMap<String, Cell>, String> {
+        if self.is_legacy() {
+            Ok(&self.attributes)
+        } else {
+            Err("Typed attributes require the typed adapter".into())
+        }
+    }
+
+    /// The attributes for a typed adapter, which refuses opaque legacy values.
+    fn typed_attributes(&self) -> Result<&BTreeMap<String, Cell>, String> {
+        if self.is_typed() {
+            Ok(&self.attributes)
+        } else {
+            Err("Legacy attributes require the legacy adapter".into())
+        }
+    }
+
+    #[doc = "# Errors\nRejects the native vector role because it is not stored as text."]
+    pub fn set_text(&mut self, role: NativeRole, value: String) -> Result<(), String> {
+        match role {
+            NativeRole::Title => {
+                self.title = value;
+                Ok(())
+            }
+            NativeRole::Text => {
+                self.text = value;
+                Ok(())
+            }
+            NativeRole::Vector => Err("Native vector role is not text".into()),
+        }
+    }
+
+    pub fn set_vector(&mut self, vector: Option<Vec<f32>>) {
+        self.vector = vector;
+    }
+}
+
+#[derive(Clone)]
+pub struct Document {
+    pub id: DocumentId,
+    pub revision: u64,
+    columns: Columns,
+}
+
 #[derive(Serialize)]
-struct QueryDocument<'a> {
-    #[serde(flatten)]
-    document: &'a Document,
+struct CanonicalRolesRef<'a> {
+    title: &'a str,
+    text: &'a str,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalRoles {
+    title: String,
+    text: String,
+}
+
+#[derive(Serialize)]
+struct CanonicalDocumentRef<'a> {
+    id: DocumentIdRef<'a>,
+    revision: u64,
+    roles: CanonicalRolesRef<'a>,
+    attributes: &'a BTreeMap<String, Cell>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vector: Option<DocumentVectorRef<'a>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalDocumentDto {
+    id: DocumentId,
+    revision: u64,
+    roles: CanonicalRoles,
+    attributes: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    vector: Option<Vec<f32>>,
+}
+
+#[derive(Serialize)]
+struct StoredCanonicalRef<'a> {
+    id: DocumentIdRef<'a>,
+    revision: u64,
+    roles: CanonicalRolesRef<'a>,
+    attributes: &'a BTreeMap<String, Cell>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredCanonicalDocument {
+    id: DocumentId,
+    revision: u64,
+    roles: CanonicalRoles,
+    attributes: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypedDocumentDto {
+    id: DocumentId,
+    revision: u64,
+    roles: CanonicalRoles,
+    attributes: values::TypedAttributes,
+    #[serde(default)]
+    vector: Option<Vec<f32>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredTypedDocument {
+    id: DocumentId,
+    revision: u64,
+    roles: CanonicalRoles,
+    attributes: values::TypedAttributes,
+}
+
+#[derive(Serialize)]
+struct NativeDocumentRef<'a> {
+    id: &'a str,
+    revision: u64,
+    title: &'a str,
+    text: &'a str,
+    attributes: &'a BTreeMap<String, Cell>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vector: Option<DocumentVectorRef<'a>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeDocumentDto {
+    id: String,
+    #[serde(default)]
+    revision: u64,
+    #[serde(default)]
+    title: String,
+    text: String,
+    attributes: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    vector: Option<Vec<f32>>,
+}
+
+#[derive(Serialize)]
+struct CanonicalQueryRef<'a> {
+    id: DocumentIdRef<'a>,
+    revision: u64,
+    roles: CanonicalRolesRef<'a>,
+    attributes: &'a BTreeMap<String, Cell>,
     #[serde(rename = "vectorSummary")]
     vector_summary: Option<(usize, bool, bool)>,
+}
+
+fn serialize_f32_slice<S: serde::Serializer>(
+    values: &[f32],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq as _;
+
+    if !values
+        .iter()
+        .any(|value| value.abs().to_bits() == f32::MAX.to_bits())
+    {
+        return values.serialize(serializer);
+    }
+    let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+    for value in values {
+        if value.abs().to_bits() == f32::MAX.to_bits() {
+            sequence.serialize_element(&f64::from(*value))?;
+        } else {
+            sequence.serialize_element(value)?;
+        }
+    }
+    sequence.end()
+}
+
+struct DocumentVectorRef<'a>(&'a [f32]);
+
+impl Serialize for DocumentVectorRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serialize_f32_slice(self.0, serializer)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -239,12 +517,12 @@ fn vector_facts(vector: Option<&[f32]>) -> Result<VectorFacts, String> {
 }
 
 fn write_vector_facts(facts: VectorFacts, output: &mut Vec<u8>) {
-    output.extend_from_slice(&[2, facts.flags]);
+    output.extend_from_slice(&[METADATA_CODEC_FACTS, facts.flags]);
     output.extend_from_slice(&facts.dimensions.to_le_bytes());
 }
 
 fn read_vector_facts(bytes: &[u8]) -> Result<(VectorFacts, &[u8]), String> {
-    if bytes.len() < 6 || bytes[0] != 2 {
+    if bytes.len() < 6 || bytes[0] != METADATA_CODEC_FACTS {
         return Err("Invalid separated document metadata prefix".into());
     }
     let flags = bytes[1];
@@ -262,115 +540,409 @@ fn read_vector_facts(bytes: &[u8]) -> Result<(VectorFacts, &[u8]), String> {
     Ok((VectorFacts { flags, dimensions }, &bytes[6..]))
 }
 
-impl<'a> QueryDocument<'a> {
-    fn with_facts(document: &'a Document, facts: VectorFacts) -> Self {
+impl Document {
+    #[must_use]
+    pub fn native(
+        id: impl Into<String>,
+        revision: u64,
+        title: impl Into<String>,
+        text: impl Into<String>,
+        attributes: BTreeMap<String, serde_json::Value>,
+        vector: Option<Vec<f32>>,
+    ) -> Self {
         Self {
-            document,
+            id: DocumentId::String(id.into()),
+            revision,
+            columns: Columns::new(title.into(), text.into(), legacy_cells(attributes), vector),
+        }
+    }
+
+    #[doc = "# Errors\nRejects legacy cells and invalid typed cells. Declared types are checked against an `AttributeSchema` when a typed segment is built."]
+    pub fn typed(
+        id: DocumentId,
+        revision: u64,
+        title: impl Into<String>,
+        text: impl Into<String>,
+        attributes: BTreeMap<String, Cell>,
+        vector: Option<Vec<f32>>,
+    ) -> Result<Self, String> {
+        if !id.is_valid() {
+            return Err("Invalid document id".into());
+        }
+        for cell in attributes.values() {
+            cell.validate()?;
+        }
+        Ok(Self {
+            id,
+            revision,
+            columns: Columns::new(title.into(), text.into(), attributes, vector),
+        })
+    }
+
+    #[must_use]
+    pub const fn columns(&self) -> &Columns {
+        &self.columns
+    }
+
+    #[must_use]
+    pub const fn columns_mut(&mut self) -> &mut Columns {
+        &mut self.columns
+    }
+
+    #[must_use]
+    pub fn column(&self, id: ColumnId<'_>) -> Option<ColumnValue<'_>> {
+        self.columns.get(id)
+    }
+
+    fn role_text(&self, role: NativeRole) -> Result<&str, String> {
+        match self.column(ColumnId::Role(role)) {
+            Some(ColumnValue::Text(text)) => Ok(text),
+            Some(ColumnValue::Vector(_) | ColumnValue::Attribute(_)) => {
+                Err("Native text role is not text".into())
+            }
+            None => Err("Missing native text role".into()),
+        }
+    }
+
+    fn vector_values(&self) -> Result<Option<&[f32]>, String> {
+        match self.column(ColumnId::Role(NativeRole::Vector)) {
+            Some(ColumnValue::Vector(values)) => Ok(Some(values)),
+            None => Ok(None),
+            Some(ColumnValue::Text(_) | ColumnValue::Attribute(_)) => {
+                Err("Native vector role is not a vector".into())
+            }
+        }
+    }
+
+    fn roles_ref(&self) -> Result<CanonicalRolesRef<'_>, String> {
+        Ok(CanonicalRolesRef {
+            title: self.role_text(NativeRole::Title)?,
+            text: self.role_text(NativeRole::Text)?,
+        })
+    }
+
+    const fn from_parts(
+        id: DocumentId,
+        revision: u64,
+        title: String,
+        text: String,
+        attributes: BTreeMap<String, Cell>,
+        vector: Option<Vec<f32>>,
+    ) -> Self {
+        Self {
+            id,
+            revision,
+            columns: Columns::new(title, text, attributes, vector),
+        }
+    }
+
+    fn from_native_dto(dto: NativeDocumentDto) -> Self {
+        Self::from_parts(
+            dto.id.into(),
+            dto.revision,
+            dto.title,
+            dto.text,
+            legacy_cells(dto.attributes),
+            dto.vector,
+        )
+    }
+
+    fn from_canonical_dto(dto: CanonicalDocumentDto) -> Self {
+        Self::from_parts(
+            dto.id,
+            dto.revision,
+            dto.roles.title,
+            dto.roles.text,
+            legacy_cells(dto.attributes),
+            dto.vector,
+        )
+    }
+
+    fn from_stored_dto(dto: StoredCanonicalDocument) -> Self {
+        Self::from_parts(
+            dto.id,
+            dto.revision,
+            dto.roles.title,
+            dto.roles.text,
+            legacy_cells(dto.attributes),
+            None,
+        )
+    }
+
+    fn from_typed_dto(dto: TypedDocumentDto) -> Self {
+        Self::from_parts(
+            dto.id,
+            dto.revision,
+            dto.roles.title,
+            dto.roles.text,
+            dto.attributes.0,
+            dto.vector,
+        )
+    }
+
+    fn from_stored_typed_dto(dto: StoredTypedDocument) -> Self {
+        Self::from_parts(
+            dto.id,
+            dto.revision,
+            dto.roles.title,
+            dto.roles.text,
+            dto.attributes.0,
+            None,
+        )
+    }
+
+    #[doc = "# Errors\nRejects JSON that is not the historical native document wire."]
+    pub fn from_native_slice(bytes: &[u8]) -> Result<Self, String> {
+        let dto: NativeDocumentDto =
+            serde_json::from_slice(bytes).map_err(|cause| cause.to_string())?;
+        Ok(Self::from_native_dto(dto))
+    }
+
+    #[doc = "# Errors\nRejects JSON that is not the historical native document wire."]
+    pub fn from_native_json(json: &str) -> Result<Self, String> {
+        Self::from_native_slice(json.as_bytes())
+    }
+
+    #[doc = "# Errors\nRejects JSON that is not the historical native document wire."]
+    pub fn from_native_value(value: serde_json::Value) -> Result<Self, serde_json::Error> {
+        Ok(Self::from_native_dto(serde_json::from_value(value)?))
+    }
+
+    #[doc = "# Errors\nRejects a document that cannot be encoded on the historical native wire."]
+    pub fn to_native_vec(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(&self.native_ref()?).map_err(|cause| cause.to_string())
+    }
+
+    #[doc = "# Errors\nRejects a document that cannot be encoded on the historical native wire."]
+    pub fn to_native_json(&self) -> Result<String, String> {
+        serde_json::to_string(&self.native_ref()?).map_err(|cause| cause.to_string())
+    }
+
+    #[cfg(test)]
+    fn to_native_metadata_vec(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(&NativeDocumentRef {
+            id: self.id.native_str()?,
+            revision: self.revision,
+            title: self.role_text(NativeRole::Title)?,
+            text: self.role_text(NativeRole::Text)?,
+            attributes: self.columns.legacy_attributes()?,
+            vector: None,
+        })
+        .map_err(|cause| cause.to_string())
+    }
+
+    fn native_ref(&self) -> Result<NativeDocumentRef<'_>, String> {
+        Ok(NativeDocumentRef {
+            id: self.id.native_str()?,
+            revision: self.revision,
+            title: self.role_text(NativeRole::Title)?,
+            text: self.role_text(NativeRole::Text)?,
+            attributes: self.columns.legacy_attributes()?,
+            vector: self.vector_values()?.map(DocumentVectorRef),
+        })
+    }
+
+    #[doc = "# Errors\nRejects JSON that is not the canonical document interchange."]
+    pub fn from_canonical_slice(bytes: &[u8]) -> Result<Self, String> {
+        let dto: CanonicalDocumentDto =
+            serde_json::from_slice(bytes).map_err(|cause| cause.to_string())?;
+        Ok(Self::from_canonical_dto(dto))
+    }
+
+    #[doc = "# Errors\nRejects JSON that is not the canonical document interchange."]
+    pub fn from_canonical_json(json: &str) -> Result<Self, String> {
+        Self::from_canonical_slice(json.as_bytes())
+    }
+
+    #[doc = "# Errors\nRejects a document that cannot be encoded as canonical interchange, including any document with typed cells."]
+    pub fn to_canonical_json(&self) -> Result<String, String> {
+        serde_json::to_string(&self.canonical_ref(false)?).map_err(|cause| cause.to_string())
+    }
+
+    #[doc = "# Errors\nRejects a document that cannot be encoded as canonical interchange, including any document with typed cells."]
+    pub fn to_canonical_vec(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(&self.canonical_ref(false)?).map_err(|cause| cause.to_string())
+    }
+
+    #[doc = "# Errors\nRejects a document holding opaque legacy attributes."]
+    pub fn to_typed_canonical_json(&self) -> Result<String, String> {
+        serde_json::to_string(&self.canonical_ref(true)?).map_err(|cause| cause.to_string())
+    }
+
+    #[doc = "# Errors\nRejects a document holding opaque legacy attributes."]
+    pub fn to_typed_canonical_vec(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(&self.canonical_ref(true)?).map_err(|cause| cause.to_string())
+    }
+
+    #[doc = "# Errors\nRejects JSON that is not the typed canonical interchange: bare numbers, malformed or unknown tags, duplicate names, heterogeneous arrays and attributes missing from or mismatching the schema."]
+    pub fn from_typed_canonical_slice(
+        bytes: &[u8],
+        schema: &AttributeSchema,
+    ) -> Result<Self, String> {
+        let dto: TypedDocumentDto =
+            serde_json::from_slice(bytes).map_err(|cause| cause.to_string())?;
+        schema.validate_attributes(&dto.attributes.0)?;
+        if !dto.id.is_valid() {
+            return Err("Invalid document id".into());
+        }
+        Ok(Self::from_typed_dto(dto))
+    }
+
+    fn attributes_for(&self, typed: bool) -> Result<&BTreeMap<String, Cell>, String> {
+        if typed {
+            self.columns.typed_attributes()
+        } else {
+            self.columns.legacy_attributes()
+        }
+    }
+
+    fn canonical_ref(&self, typed: bool) -> Result<CanonicalDocumentRef<'_>, String> {
+        Ok(CanonicalDocumentRef {
+            id: self.id.borrowed(),
+            revision: self.revision,
+            roles: self.roles_ref()?,
+            attributes: self.attributes_for(typed)?,
+            vector: self.vector_values()?.map(DocumentVectorRef),
+        })
+    }
+
+    fn to_stored_canonical_vec(&self, typed: bool) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(&StoredCanonicalRef {
+            id: self.id.borrowed(),
+            revision: self.revision,
+            roles: self.roles_ref()?,
+            attributes: self.attributes_for(typed)?,
+        })
+        .map_err(|cause| cause.to_string())
+    }
+
+    fn query_ref(&self, facts: VectorFacts, typed: bool) -> Result<CanonicalQueryRef<'_>, String> {
+        Ok(CanonicalQueryRef {
+            id: self.id.borrowed(),
+            revision: self.revision,
+            roles: self.roles_ref()?,
+            attributes: self.attributes_for(typed)?,
             vector_summary: (facts.flags & 1 != 0).then_some((
                 facts.dimensions as usize,
                 facts.flags & 2 != 0,
                 facts.flags & 4 != 0,
             )),
-        }
+        })
     }
 }
 
 fn serialize_query_document_with_facts(
     document: &Document,
     facts: VectorFacts,
+    typed: bool,
 ) -> Result<String, String> {
-    serde_json::to_string(&QueryDocument::with_facts(document, facts))
-        .map_err(|cause| cause.to_string())
+    serde_json::to_string(&document.query_ref(facts, typed)?).map_err(|cause| cause.to_string())
 }
 
 #[cfg(test)]
-fn serialize_query_document(document: &mut Document) -> Result<String, String> {
-    let facts = vector_facts(document.vector.as_deref())?;
-    drop(document.vector.take());
-    serialize_query_document_with_facts(document, facts)
+fn serialize_query_document(document: &Document) -> Result<String, String> {
+    let facts = vector_facts(document.vector_values()?)?;
+    serialize_query_document_with_facts(document, facts, false)
 }
 
-struct SeparatedDocumentFrameBytes {
-    metadata: Vec<u8>,
-    vector: Option<Vec<u8>>,
+fn vector_frame_bytes(values: &[f32]) -> Result<Vec<u8>, String> {
+    let capacity = values
+        .len()
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| "Vector frame size overflow".to_owned())?;
+    let mut raw = Vec::with_capacity(capacity);
+    for value in values {
+        raw.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(raw)
 }
 
-fn split_document_frame_parts(
+fn f32_values(decoded: &[u8]) -> Result<Vec<f32>, String> {
+    let (chunks, remainder) = decoded.as_chunks::<4>();
+    if !remainder.is_empty() {
+        return Err("Vector frame length is not divisible by four".into());
+    }
+    Ok(chunks
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
+        .collect())
+}
+
+fn attach_vector_frame(
+    document: &mut Document,
+    vector_bytes: &[u8],
+    facts: VectorFacts,
+) -> Result<(), String> {
+    let vector = if vector_bytes.is_empty() {
+        None
+    } else {
+        Some(f32_values(&decode_page(vector_bytes)?)?)
+    };
+    let actual = vector_facts(vector.as_deref())?;
+    if actual != facts {
+        return Err("Vector frame does not match metadata vector summary".into());
+    }
+    document.columns_mut().set_vector(vector);
+    Ok(())
+}
+
+fn parse_native_metadata(
     bytes: &[u8],
-    decoded: &[u8],
-    mut document: Document,
-) -> Result<SeparatedDocumentFrameBytes, String> {
-    if document.vector.is_none() {
-        drop(document);
-        return Ok(SeparatedDocumentFrameBytes {
-            metadata: bytes.to_vec(),
-            vector: None,
-        });
+    facts: VectorFacts,
+) -> Result<(VectorFacts, Document), String> {
+    let dto: NativeDocumentDto =
+        serde_json::from_slice(bytes).map_err(|cause| cause.to_string())?;
+    if dto.vector.is_some() {
+        return Err("Separated document metadata contains a vector".into());
     }
-    let vector_frame = document
-        .vector
-        .as_ref()
-        .map(|vector| -> Result<Vec<u8>, String> {
-            let capacity = vector
-                .len()
-                .checked_mul(size_of::<f32>())
-                .ok_or_else(|| "Vector frame size overflow".to_owned())?;
-            let mut raw = Vec::with_capacity(capacity);
-            for value in vector {
-                raw.extend_from_slice(&value.to_le_bytes());
-            }
-            let mut frame = Vec::new();
-            append(&mut frame, &raw)?;
-            Ok(frame)
-        })
-        .transpose()?;
-    let vector = document.vector.take();
-    let facts = vector_facts(vector.as_deref())?;
-    drop(vector);
-    drop(document);
-    let mut fields: BTreeMap<String, &serde_json::value::RawValue> =
-        serde_json::from_slice(decoded).map_err(|cause| cause.to_string())?;
-    if fields.remove("vector").is_none() {
-        return Err("Vector field disappeared after document validation".into());
-    }
-    let document_json = serde_json::to_vec(&fields).map_err(|cause| cause.to_string())?;
-    let mut metadata_bytes = Vec::with_capacity(6 + document_json.len());
-    write_vector_facts(facts, &mut metadata_bytes);
-    metadata_bytes.extend_from_slice(&document_json);
-    let mut metadata_frame = Vec::new();
-    append(&mut metadata_frame, &metadata_bytes)?;
-    Ok(SeparatedDocumentFrameBytes {
-        metadata: metadata_frame,
-        vector: vector_frame,
-    })
+    Ok((facts, Document::from_native_dto(dto)))
 }
 
 fn parse_document_metadata(decoded: &[u8]) -> Result<(VectorFacts, Document), String> {
-    let (facts, document_bytes) = if decoded.first() == Some(&b'{') {
-        (
+    match decoded.first().copied() {
+        Some(b'{') => parse_native_metadata(
+            decoded,
             VectorFacts {
                 flags: 0,
                 dimensions: 0,
             },
-            decoded,
-        )
-    } else {
-        read_vector_facts(decoded)?
-    };
-    let document: Document =
-        serde_json::from_slice(document_bytes).map_err(|cause| cause.to_string())?;
-    if document.vector.is_some() {
-        return Err("Separated document metadata contains a vector".into());
+        ),
+        Some(METADATA_CODEC_FACTS) => {
+            let (facts, document_bytes) = read_vector_facts(decoded)?;
+            parse_native_metadata(document_bytes, facts)
+        }
+        Some(METADATA_CODEC_CANONICAL) => {
+            let (facts, document_bytes) = read_vector_facts(decoded.get(1..).unwrap_or(&[]))?;
+            let dto: StoredCanonicalDocument =
+                serde_json::from_slice(document_bytes).map_err(|cause| cause.to_string())?;
+            Ok((facts, Document::from_stored_dto(dto)))
+        }
+        Some(METADATA_CODEC_TYPED) => {
+            let (facts, document_bytes) = read_vector_facts(decoded.get(1..).unwrap_or(&[]))?;
+            let dto: StoredTypedDocument =
+                serde_json::from_slice(document_bytes).map_err(|cause| cause.to_string())?;
+            Ok((facts, Document::from_stored_typed_dto(dto)))
+        }
+        _ => Err("Unknown document metadata codec".into()),
     }
-    Ok((facts, document))
 }
 
-#[doc = "# Errors\nRejects invalid metadata framing, vector summaries, or document JSON."]
+#[doc = "# Errors\nRejects invalid metadata framing, vector summaries, or document JSON, and typed metadata pages, which have their own projection."]
 pub fn query_document_from_metadata(bytes: &[u8]) -> Result<String, String> {
     let decoded = decode_page(bytes)?;
+    validate_metadata_mode(&decoded, false)?;
     let (facts, document) = parse_document_metadata(&decoded)?;
     drop(decoded);
-    serialize_query_document_with_facts(&document, facts)
+    serialize_query_document_with_facts(&document, facts, false)
+}
+
+#[doc = "# Errors\nRejects invalid metadata framing, vector summaries, or document JSON, and legacy metadata pages."]
+pub fn query_typed_document_from_metadata(bytes: &[u8]) -> Result<String, String> {
+    let decoded = decode_page(bytes)?;
+    validate_metadata_mode(&decoded, true)?;
+    let (facts, document) = parse_document_metadata(&decoded)?;
+    drop(decoded);
+    serialize_query_document_with_facts(&document, facts, true)
 }
 
 #[doc = "# Errors\nRejects invalid metadata ranges, corrupt frames, or document JSON. Returns None above sixty-four KiB declared decoded bytes for scalar fallback."]
@@ -385,7 +957,9 @@ pub fn query_documents_from_metadata(
         return Err("Invalid metadata batch framing".into());
     }
     let frames = ranges
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|range| {
             let offset = usize::try_from(range[0]).map_err(|cause| cause.to_string())?;
             let length = usize::try_from(range[1]).map_err(|cause| cause.to_string())?;
@@ -432,9 +1006,10 @@ pub fn query_documents_from_metadata(
         if crc32fast::hash(&decoded[..length]) != crc {
             return Err("Page integrity check failed".into());
         }
+        validate_metadata_mode(&decoded[..length], false)?;
         let (facts, document) = parse_document_metadata(&decoded[..length])?;
         sequence
-            .serialize_element(&QueryDocument::with_facts(&document, facts))
+            .serialize_element(&document.query_ref(facts, false)?)
             .map_err(|cause| cause.to_string())?;
     }
     sequence.end().map_err(|cause| cause.to_string())?;
@@ -443,38 +1018,37 @@ pub fn query_documents_from_metadata(
         .map_err(|cause| cause.to_string())
 }
 
-#[doc = "# Errors\nRejects mismatched or corrupt metadata and vector frames."]
+#[doc = "# Errors\nRejects mismatched or corrupt metadata and vector frames, and typed metadata pages, which have their own projection."]
 pub fn full_document_from_frames(
     metadata_bytes: &[u8],
     vector_bytes: &[u8],
 ) -> Result<String, String> {
     let decoded = decode_page(metadata_bytes)?;
+    validate_metadata_mode(&decoded, false)?;
     let (facts, mut document) = parse_document_metadata(&decoded)?;
     drop(decoded);
-    let vector = if vector_bytes.is_empty() {
-        None
-    } else {
-        let decoded = decode_page(vector_bytes)?;
-        let (chunks, remainder) = decoded.as_chunks::<4>();
-        if !remainder.is_empty() {
-            return Err("Vector frame length is not divisible by four".into());
-        }
-        if chunks.len() != facts.dimensions as usize {
-            return Err("Vector frame dimension mismatch".into());
-        }
-        Some(
-            chunks
-                .iter()
-                .map(|chunk| f32::from_le_bytes(*chunk))
-                .collect(),
-        )
-    };
-    let actual_facts = vector_facts(vector.as_deref())?;
-    if actual_facts != facts {
-        return Err("Vector frame does not match metadata vector summary".into());
+    attach_vector_frame(&mut document, vector_bytes, facts)?;
+    document.to_canonical_json()
+}
+
+#[doc = "# Errors\nRejects mismatched or corrupt metadata and vector frames, and legacy metadata pages."]
+pub fn full_typed_document_from_frames(
+    metadata_bytes: &[u8],
+    vector_bytes: &[u8],
+) -> Result<String, String> {
+    let decoded = decode_page(metadata_bytes)?;
+    validate_metadata_mode(&decoded, true)?;
+    let (facts, mut document) = parse_document_metadata(&decoded)?;
+    drop(decoded);
+    attach_vector_frame(&mut document, vector_bytes, facts)?;
+    document.to_typed_canonical_json()
+}
+
+fn validate_metadata_mode(decoded: &[u8], typed: bool) -> Result<(), String> {
+    if (decoded.first() == Some(&METADATA_CODEC_TYPED)) != typed {
+        return Err("Document metadata codec does not match typed projection".into());
     }
-    document.vector = vector;
-    serde_json::to_string(&document).map_err(|cause| cause.to_string())
+    Ok(())
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -526,8 +1100,12 @@ impl From<Box<serde_json::value::RawValue>> for DocumentAttributes {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct DocumentMeta<Id = Box<str>, Attributes = DocumentAttributes, Length = u32, Vector = bool>
-{
+pub struct DocumentMeta<
+    Id = DocumentId<Box<str>>,
+    Attributes = DocumentAttributes,
+    Length = u32,
+    Vector = bool,
+> {
     pub id: Id,
     pub revision: u64,
     pub title_length: Length,
@@ -671,6 +1249,13 @@ impl AttributeColumn {
         }
     }
 
+    /// Every distinct stored carrier once for a dictionary, every row for dense storage.
+    fn unique_values(&self) -> &[DocumentAttributes] {
+        match self {
+            Self::Dense(values) | Self::Dictionary { values, .. } => values,
+        }
+    }
+
     fn get(&self, row: usize) -> &DocumentAttributes {
         match self {
             Self::Dense(values) => &values[row],
@@ -714,12 +1299,18 @@ impl AttributeColumn {
     }
 }
 
+#[derive(Clone, Copy)]
+enum FixedId {
+    Uint(u64),
+    Uuid([u8; 16]),
+}
+
 #[derive(Clone)]
 pub struct DocumentTable {
     ids: String,
+    typed_ids: Box<[(usize, FixedId)]>,
     rows: Vec<DocumentMeta<std::ops::Range<usize>, (), (), ()>>,
-    title_lengths: ScalarColumn<u32>,
-    body_lengths: ScalarColumn<u32>,
+    lengths: Vec<ScalarColumn<u32>>,
     vectors: ScalarColumn<bool>,
     attributes: AttributeColumn,
 }
@@ -738,37 +1329,69 @@ impl DocumentTable {
         self.rows.is_empty()
     }
     #[must_use]
-    pub fn row(&self, index: usize) -> DocumentMeta<&str, &DocumentAttributes> {
+    pub fn row(&self, index: usize) -> DocumentMeta<DocumentIdRef<'_>, &DocumentAttributes> {
         let row = &self.rows[index];
         DocumentMeta {
-            id: &self.ids[row.id.clone()],
+            id: self.id(index),
             revision: row.revision,
-            title_length: self.title_lengths.get(index),
-            body_length: self.body_lengths.get(index),
+            title_length: self.field_length(fields::NATIVE_TITLE, index),
+            body_length: self.field_length(fields::NATIVE_TEXT, index),
             attributes: self.attributes.get(index),
             data: row.data.clone(),
             vector: self.vectors.get(index),
         }
     }
+    fn id(&self, index: usize) -> DocumentIdRef<'_> {
+        if let Ok(position) = self.typed_ids.binary_search_by_key(&index, |(row, _)| *row) {
+            return match self.typed_ids[position].1 {
+                FixedId::Uint(value) => DocumentId::Uint(value),
+                FixedId::Uuid(value) => DocumentId::Uuid(value),
+            };
+        }
+        DocumentId::String(&self.ids[self.rows[index].id.clone()])
+    }
+
+    fn field_length(&self, ordinal: usize, index: usize) -> u32 {
+        self.lengths
+            .get(ordinal)
+            .map_or(0, |column| column.get(index))
+    }
+    fn push_field_lengths(&mut self, lengths: impl IntoIterator<Item = u32>) {
+        let capacity = self.rows.len();
+        let mut column = ScalarColumn::new();
+        for length in lengths {
+            column.push(length, capacity);
+        }
+        self.lengths.push(column);
+    }
     #[must_use]
-    fn get(&self, index: usize) -> Option<DocumentMeta<&str, &DocumentAttributes>> {
+    fn get(&self, index: usize) -> Option<DocumentMeta<DocumentIdRef<'_>, &DocumentAttributes>> {
         self.rows.get(index).map(|_| self.row(index))
     }
     #[cfg(any(test, target_arch = "wasm32"))]
-    fn first(&self) -> Option<DocumentMeta<&str, &DocumentAttributes>> {
+    fn first(&self) -> Option<DocumentMeta<DocumentIdRef<'_>, &DocumentAttributes>> {
         self.get(0)
     }
-    #[must_use]
     pub fn iter(
         &self,
-    ) -> impl ExactSizeIterator<Item = DocumentMeta<&str, &DocumentAttributes>> + DoubleEndedIterator
-    {
+    ) -> impl ExactSizeIterator<Item = DocumentMeta<DocumentIdRef<'_>, &DocumentAttributes>>
+    + DoubleEndedIterator {
         (0..self.len()).map(|index| self.row(index))
     }
-    #[cfg(target_arch = "wasm32")]
-    fn find_id(&self, id: &str) -> Result<usize, usize> {
-        self.rows
-            .binary_search_by(|row| compare_document_ids(&self.ids[row.id.clone()], id))
+    #[doc = "# Errors\nReturns the insertion position when the canonical identity is absent."]
+    pub fn find_id<'a>(&self, id: impl Into<DocumentIdRef<'a>>) -> Result<usize, usize> {
+        let id = id.into();
+        let mut low = 0;
+        let mut high = self.len();
+        while low < high {
+            let middle = low + (high - low) / 2;
+            match compare_document_ids(self.id(middle), id) {
+                Ordering::Less => low = middle + 1,
+                Ordering::Equal => return Ok(middle),
+                Ordering::Greater => high = middle,
+            }
+        }
+        Err(low)
     }
     fn metadata(
         &self,
@@ -780,30 +1403,45 @@ impl DocumentTable {
             .map(|(index, row)| DocumentMeta {
                 id: row.id.clone(),
                 revision: row.revision,
-                title_length: self.title_lengths.get(index),
-                body_length: self.body_lengths.get(index),
+                title_length: self.field_length(fields::NATIVE_TITLE, index),
+                body_length: self.field_length(fields::NATIVE_TEXT, index),
                 attributes: self.attributes.get(index),
                 data: row.data.clone(),
                 vector: self.vectors.get(index),
             })
     }
     fn lengths(&self) -> impl ExactSizeIterator<Item = (u32, u32)> + DoubleEndedIterator {
-        self.title_lengths.iter().zip(self.body_lengths.iter())
+        (0..self.len()).map(|index| {
+            (
+                self.field_length(fields::NATIVE_TITLE, index),
+                self.field_length(fields::NATIVE_TEXT, index),
+            )
+        })
     }
     fn shrink_to_fit(&mut self) {
         self.ids.shrink_to_fit();
         self.rows.shrink_to_fit();
         self.attributes.shrink_to_fit();
-        self.title_lengths.shrink_to_fit();
-        self.body_lengths.shrink_to_fit();
+        for column in &mut self.lengths {
+            column.shrink_to_fit();
+        }
+        self.lengths.shrink_to_fit();
         self.vectors.shrink_to_fit();
     }
 }
 
 impl From<Vec<DocumentMeta>> for DocumentTable {
     fn from(documents: Vec<DocumentMeta>) -> Self {
-        let mut ids =
-            String::with_capacity(documents.iter().map(|document| document.id.len()).sum());
+        let mut ids = String::with_capacity(
+            documents
+                .iter()
+                .map(|document| match &document.id {
+                    DocumentId::String(value) => value.len(),
+                    DocumentId::Uint(_) | DocumentId::Uuid(_) => 0,
+                })
+                .sum(),
+        );
+        let mut typed_ids = Vec::new();
         let mut attributes = Vec::with_capacity(documents.len());
         let count = documents.len();
         let mut title_lengths = ScalarColumn::new();
@@ -811,9 +1449,14 @@ impl From<Vec<DocumentMeta>> for DocumentTable {
         let mut vectors = ScalarColumn::new();
         let rows = documents
             .into_iter()
-            .map(|document| {
+            .enumerate()
+            .map(|(index, document)| {
                 let start = ids.len();
-                ids.push_str(&document.id);
+                match &document.id {
+                    DocumentId::String(value) => ids.push_str(value),
+                    DocumentId::Uint(value) => typed_ids.push((index, FixedId::Uint(*value))),
+                    DocumentId::Uuid(value) => typed_ids.push((index, FixedId::Uuid(*value))),
+                }
                 let end = ids.len();
                 attributes.push(document.attributes);
                 title_lengths.push(document.title_length, count);
@@ -832,10 +1475,10 @@ impl From<Vec<DocumentMeta>> for DocumentTable {
             .collect();
         Self {
             ids,
+            typed_ids: typed_ids.into_boxed_slice(),
             rows,
             attributes: AttributeColumn::Dense(attributes),
-            title_lengths,
-            body_lengths,
+            lengths: vec![title_lengths, body_lengths],
             vectors,
         }
     }
@@ -854,15 +1497,54 @@ impl<'de> Deserialize<'de> for DocumentTable {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(from = "BlockWire", into = "BlockWire")]
 pub struct BlockMeta {
     pub first: u32,
     pub last: u32,
     pub count: u32,
-    pub max_title_tf: u32,
-    pub max_body_tf: u32,
-    pub min_title_length: u32,
-    pub min_body_length: u32,
+    pub max_tf: [u32; LANES],
+    pub min_length: [u32; LANES],
     pub data: Range,
+}
+
+#[derive(Serialize, Deserialize)]
+struct BlockWire {
+    first: u32,
+    last: u32,
+    count: u32,
+    max_title_tf: u32,
+    max_body_tf: u32,
+    min_title_length: u32,
+    min_body_length: u32,
+    data: Range,
+}
+
+impl From<BlockWire> for BlockMeta {
+    fn from(wire: BlockWire) -> Self {
+        Self {
+            first: wire.first,
+            last: wire.last,
+            count: wire.count,
+            max_tf: [wire.max_title_tf, wire.max_body_tf],
+            min_length: [wire.min_title_length, wire.min_body_length],
+            data: wire.data,
+        }
+    }
+}
+
+impl From<BlockMeta> for BlockWire {
+    fn from(block: BlockMeta) -> Self {
+        Self {
+            first: block.first,
+            last: block.last,
+            count: block.count,
+            max_title_tf: block.max_tf[0],
+            max_body_tf: block.max_tf[1],
+            min_title_length: block.min_length[0],
+            min_body_length: block.min_length[1],
+            data: block.data,
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -905,6 +1587,16 @@ impl TermDictionary {
         self.entries.is_empty()
     }
 
+    fn heap_bytes(&self) -> usize {
+        self.entries.len() * size_of::<(std::ops::Range<usize>, TermMeta)>()
+            + self.text.len()
+            + 16
+            + self
+                .values()
+                .map(|meta| meta.blocks.len() * size_of::<BlockMeta>())
+                .sum::<usize>()
+    }
+
     #[must_use]
     pub fn get(&self, term: &str) -> Option<&TermMeta> {
         self.entries
@@ -920,21 +1612,18 @@ impl TermDictionary {
             .map(|index| &mut self.entries[index].1)
     }
 
-    #[must_use]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (&str, &TermMeta)> {
         self.entries
             .iter()
             .map(|(term, metadata)| (&self.text[term.clone()], metadata))
     }
 
-    #[must_use]
     pub fn keys(&self) -> impl ExactSizeIterator<Item = &str> {
         self.entries
             .iter()
             .map(|(term, _)| &self.text[term.clone()])
     }
 
-    #[must_use]
     pub fn values(&self) -> impl ExactSizeIterator<Item = &TermMeta> {
         self.entries.iter().map(|(_, metadata)| metadata)
     }
@@ -979,20 +1668,65 @@ impl Serialize for TermDictionary {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct Header {
-    #[serde(skip)]
     filter_masks: RefCell<FilterMasks>,
     pub version: u32,
     pub documents: DocumentTable,
-    pub terms: TermDictionary,
-    pub total_title_length: u64,
-    pub total_body_length: u64,
+    pub fields: FieldTable,
     pub metadata_end: u32,
     pub vector_end: u32,
     pub vector_ranges: Vec<Range>,
-    #[serde(skip)]
     vector_prefix: Vec<u32>,
+}
+
+#[derive(Deserialize)]
+struct NativeHeader {
+    version: u32,
+    documents: DocumentTable,
+    terms: TermDictionary,
+    total_title_length: u64,
+    total_body_length: u64,
+    metadata_end: u32,
+    vector_end: u32,
+    vector_ranges: Vec<Range>,
+}
+
+impl<'de> Deserialize<'de> for Header {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let native = NativeHeader::deserialize(deserializer)?;
+        Self::from_parts(
+            native.version,
+            native.documents,
+            FieldTable::native(
+                native.total_title_length,
+                native.total_body_length,
+                native.terms,
+            ),
+            (native.metadata_end, native.vector_end),
+            native.vector_ranges,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+/// The only adapter from the generic field table to the legacy native wire shape.
+/// Root 6 consumers read this projection until the next public schema cut; named
+/// text fields are intentionally absent from it and are exposed through `FieldTable`.
+impl Serialize for Header {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("Header", 8)?;
+        state.serialize_field("version", &self.version)?;
+        state.serialize_field("documents", &self.documents)?;
+        state.serialize_field("terms", self.terms())?;
+        state.serialize_field("total_title_length", &self.total_title_length())?;
+        state.serialize_field("total_body_length", &self.total_body_length())?;
+        state.serialize_field("metadata_end", &self.metadata_end)?;
+        state.serialize_field("vector_end", &self.vector_end)?;
+        state.serialize_field("vector_ranges", &self.vector_ranges)?;
+        state.end()
+    }
 }
 
 impl<'de> Deserialize<'de> for TermDictionary {
@@ -1157,11 +1891,59 @@ impl<'de> serde::de::Visitor<'de> for SelectedAttributes<'_> {
     }
 }
 
+/// Selects filter fields from a directory attribute object under the segment's reading:
+/// typed cells for a typed segment, opaque legacy values otherwise.
+struct CellAttributes<'a, 'b> {
+    fields: &'a BTreeSet<&'a str>,
+    values: &'b mut BTreeMap<&'a str, Option<Cell>>,
+    typed: bool,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for CellAttributes<'_, '_> {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for CellAttributes<'_, '_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an attribute object")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        while let Some(field) = map.next_key_seed(SelectedAttribute(self.fields))? {
+            if let Some(field) = field {
+                let cell = if self.typed {
+                    map.next_value_seed(values::CellSeed {
+                        allow_bytes: false,
+                        element: false,
+                    })?
+                } else {
+                    Cell::Legacy(map.next_value()?)
+                };
+                self.values.insert(field, Some(cell));
+            } else {
+                map.next_value::<ValidatedDiscard>()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
 struct FilterAttributes<'a, 'b> {
     fields: &'a BTreeSet<&'a str>,
     values: &'b mut BTreeMap<&'a str, Option<serde_json::Value>>,
 }
 
+#[cfg(target_arch = "wasm32")]
 impl<'de> serde::de::DeserializeSeed<'de> for FilterAttributes<'_, '_> {
     type Value = ();
 
@@ -1173,6 +1955,7 @@ impl<'de> serde::de::DeserializeSeed<'de> for FilterAttributes<'_, '_> {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 impl<'de> serde::de::Visitor<'de> for FilterAttributes<'_, '_> {
     type Value = ();
 
@@ -1243,7 +2026,11 @@ fn validate_columns(header: &Header) -> Result<(), String> {
     if cursor != header.vector_end {
         return Err("Vector column does not match vector ranges".into());
     }
-    for term in header.terms.values() {
+    for term in header
+        .fields
+        .dictionaries()
+        .flat_map(TermDictionary::values)
+    {
         for block in &term.blocks {
             let end = block
                 .data
@@ -1263,7 +2050,108 @@ fn validate_columns(header: &Header) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(any(test, target_arch = "wasm32"))]
+struct VectorScan {
+    header: Rc<Header>,
+    allowed: BitVec,
+    position: usize,
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+#[derive(Serialize)]
+struct VectorLocation<'a> {
+    row: u32,
+    id: DocumentIdRef<'a>,
+    data: Range,
+    #[serde(rename = "vectorData")]
+    vector_data: Range,
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+#[derive(Serialize)]
+struct VectorPage<'a> {
+    complete: bool,
+    rows: Vec<VectorLocation<'a>>,
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+impl VectorScan {
+    fn new(header: Rc<Header>, filters: &[Filter], dead: &[u32]) -> Result<Self, String> {
+        let allowed = header.allowed(filters, dead)?;
+        Ok(Self {
+            header,
+            allowed,
+            position: 0,
+        })
+    }
+
+    fn page(&mut self) -> Result<VectorPage<'_>, String> {
+        let mut rows = Vec::with_capacity(64);
+        while self.position < self.header.documents.len() && rows.len() < 64 {
+            let index = self.position;
+            self.position += 1;
+            if !self.allowed[index] || !self.header.documents.vectors.get(index) {
+                continue;
+            }
+            let document = self.header.documents.row(index);
+            rows.push(VectorLocation {
+                row: u32::try_from(index).map_err(|cause| cause.to_string())?,
+                id: document.id,
+                data: document.data,
+                vector_data: self
+                    .header
+                    .vector_range(index)?
+                    .cloned()
+                    .ok_or("Missing canonical vector range")?,
+            });
+        }
+        Ok(VectorPage {
+            complete: self.position == self.header.documents.len(),
+            rows,
+        })
+    }
+}
+
 impl Header {
+    #[doc = "# Errors\nRejects documents whose vector presence overflows the vector prefix index."]
+    pub fn from_parts(
+        version: u32,
+        documents: DocumentTable,
+        fields: FieldTable,
+        (metadata_end, vector_end): (u32, u32),
+        vector_ranges: Vec<Range>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            filter_masks: RefCell::default(),
+            version,
+            vector_prefix: vector_prefix(&documents)?,
+            documents,
+            fields,
+            metadata_end,
+            vector_end,
+            vector_ranges,
+        })
+    }
+
+    #[must_use]
+    pub const fn terms(&self) -> &TermDictionary {
+        self.fields.terms()
+    }
+
+    pub const fn terms_mut(&mut self) -> &mut TermDictionary {
+        self.fields.terms_mut()
+    }
+
+    #[must_use]
+    pub fn total_title_length(&self) -> u64 {
+        self.fields.total(fields::NATIVE_TITLE)
+    }
+
+    #[must_use]
+    pub fn total_body_length(&self) -> u64 {
+        self.fields.total(fields::NATIVE_TEXT)
+    }
+
     #[doc = "# Errors\nRejects missing rows or inconsistent vector references."]
     pub fn vector_range(&self, row: usize) -> Result<Option<&Range>, String> {
         self.documents.rows.get(row).ok_or("Invalid row")?;
@@ -1296,20 +2184,19 @@ impl Header {
         let documents = self.documents.rows.capacity()
             * size_of::<DocumentMeta<std::ops::Range<usize>, (), (), ()>>()
             + self.documents.ids.capacity()
+            + size_of_val(self.documents.typed_ids.as_ref())
             + self.documents.attributes.heap_bytes()
-            + self.documents.title_lengths.heap_bytes()
-            + self.documents.body_lengths.heap_bytes()
-            + self.documents.vectors.heap_bytes();
-        let terms = self.terms.entries.len() * size_of::<(std::ops::Range<usize>, TermMeta)>()
-            + self.terms.text.len()
+            + self.documents.lengths.capacity() * size_of::<ScalarColumn<u32>>()
             + 16
             + self
-                .terms
-                .values()
-                .map(|meta| meta.blocks.len() * size_of::<BlockMeta>())
-                .sum::<usize>();
+                .documents
+                .lengths
+                .iter()
+                .map(ScalarColumn::heap_bytes)
+                .sum::<usize>()
+            + self.documents.vectors.heap_bytes();
         documents
-            + terms
+            + self.fields.heap_bytes()
             + self.vector_ranges.capacity() * size_of::<Range>()
             + self.vector_prefix.capacity() * size_of::<u32>()
             + size_of::<Self>()
@@ -1317,18 +2204,34 @@ impl Header {
             + FILTER_CACHE_BYTES
     }
 
-    fn compact_json(&self) -> Result<Vec<u8>, String> {
-        serde_json::to_vec(&(
-            self.version,
-            DirectoryDocuments(&self.documents),
-            DirectoryTerms(&self.terms),
-            self.total_title_length,
-            self.total_body_length,
-            self.metadata_end,
-            self.vector_end,
-            DirectoryRanges(&self.vector_ranges),
-        ))
-        .map_err(|cause| cause.to_string())
+    #[doc = "# Errors\nRejects headers whose version cannot carry their field table, and serialization failures."]
+    pub fn compact_json(&self) -> Result<Vec<u8>, String> {
+        let encoded = if self.version < 4 {
+            if self.fields.len() != fields::NATIVE_FIELDS {
+                return Err("Named text requires segment version 4".into());
+            }
+            serde_json::to_vec(&(
+                self.version,
+                DirectoryDocuments(&self.documents),
+                DirectoryTerms(self.terms()),
+                self.total_title_length(),
+                self.total_body_length(),
+                self.metadata_end,
+                self.vector_end,
+                DirectoryRanges(&self.vector_ranges),
+            ))
+        } else {
+            serde_json::to_vec(&(
+                self.version,
+                StoredDocuments(&self.documents),
+                StoredFields(self),
+                StoredGroups(&self.fields),
+                self.metadata_end,
+                self.vector_end,
+                DirectoryRanges(&self.vector_ranges),
+            ))
+        };
+        encoded.map_err(|cause| cause.to_string())
     }
 
     fn encode(&self, payload: &[u8]) -> Result<Vec<u8>, String> {
@@ -1337,7 +2240,7 @@ impl Header {
             return Err("Segment exceeds 16 MiB".into());
         }
         let mut bytes = Vec::with_capacity(json.len() + payload.len() + 16);
-        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(segment_magic(self.version)?);
         bytes.extend_from_slice(
             &(u32::try_from(json.len()).map_err(|cause| cause.to_string())?).to_le_bytes(),
         );
@@ -1369,6 +2272,17 @@ impl Header {
             ))
     }
 
+    #[cfg(test)]
+    fn vector_rows(&self, filters: &[Filter], dead: &[u32]) -> Result<Vec<u32>, String> {
+        let allowed = self.allowed(filters, dead)?;
+        self.documents
+            .iter()
+            .enumerate()
+            .filter(|(index, document)| document.vector && allowed[*index])
+            .map(|(index, _)| u32::try_from(index).map_err(|cause| cause.to_string()))
+            .collect()
+    }
+
     fn allowed(&self, filters: &[Filter], dead: &[u32]) -> Result<BitVec, String> {
         let mut allowed = if filters.is_empty() {
             BitVec::from_elem(self.documents.len(), true)
@@ -1385,13 +2299,20 @@ impl Header {
                 mask
             } else {
                 let mut allowed = BitVec::from_elem(self.documents.len(), true);
+                let typed = self.version >= TYPED_VERSION;
+                let prepared = filters
+                    .iter()
+                    .map(|filter| filter.prepare(typed))
+                    .collect::<Result<Vec<_>, _>>()?;
                 let fields: BTreeSet<_> =
                     filters.iter().map(|filter| filter.field.as_str()).collect();
-                let mut values: BTreeMap<_, Option<serde_json::Value>> =
+                let mut values: BTreeMap<_, Option<Cell>> =
                     fields.iter().map(|field| (*field, None)).collect();
-                self.filter_masks
-                    .borrow_mut()
-                    .prepare_representatives(&self.documents, &fields)?;
+                self.filter_masks.borrow_mut().prepare_representatives(
+                    &self.documents,
+                    &fields,
+                    typed,
+                )?;
                 let cache = self.filter_masks.borrow();
                 for (index, doc) in self.documents.metadata().enumerate() {
                     if let Some((_, representatives)) = &cache.representatives {
@@ -1407,16 +2328,17 @@ impl Header {
                     }
                     let mut decoder = serde_json::Deserializer::from_str(doc.attributes.get());
                     serde::de::DeserializeSeed::deserialize(
-                        FilterAttributes {
+                        CellAttributes {
                             fields: &fields,
                             values: &mut values,
+                            typed,
                         },
                         &mut decoder,
                     )
                     .map_err(|cause| cause.to_string())?;
                     decoder.end().map_err(|cause| cause.to_string())?;
-                    for filter in filters {
-                        if !filter
+                    for (filter, predicate) in filters.iter().zip(&prepared) {
+                        if !predicate
                             .matches(values.get(filter.field.as_str()).and_then(Option::as_ref))?
                         {
                             allowed.set(index, false);
@@ -1457,10 +2379,10 @@ fn summary_bounds(blocks: &[BlockMeta]) -> Vec<TermBound> {
         .iter()
         .map(|block| {
             (
-                block.max_title_tf,
-                block.max_body_tf,
-                block.min_title_length,
-                block.min_body_length,
+                block.max_tf[0],
+                block.max_tf[1],
+                block.min_length[0],
+                block.min_length[1],
             )
         })
         .collect();
@@ -1483,7 +2405,7 @@ impl CommonTermProjection {
             .iter()
             .map(|term| {
                 header
-                    .terms
+                    .terms()
                     .get(term)
                     .map(|metadata| summary_bounds(&metadata.blocks))
                     .ok_or_else(|| "Missing common-term metadata".to_owned())
@@ -1578,7 +2500,7 @@ fn common_term_projection(
     }))
 }
 
-fn append(payload: &mut Vec<u8>, data: &[u8]) -> Result<Range, String> {
+pub(crate) fn append(payload: &mut Vec<u8>, data: &[u8]) -> Result<Range, String> {
     let compressed = miniz_oxide::deflate::compress_to_vec_zlib(data, 3);
     let range = Range {
         offset: u32::try_from(payload.len()).map_err(|cause| cause.to_string())?,
@@ -1649,7 +2571,64 @@ fn get_int(bytes: &[u8], offset: &mut usize) -> Result<u32, String> {
     Err("Overflowing varint".into())
 }
 
-fn encode_postings(postings: &[Posting]) -> Result<Vec<u8>, String> {
+#[derive(Clone, Copy)]
+struct PostingShape {
+    lanes: usize,
+    inputs: [bool; LANES],
+}
+
+impl PostingShape {
+    const NATIVE: Self = Self {
+        lanes: LANES,
+        inputs: [false; LANES],
+    };
+
+    const fn single(inputs: bool) -> Self {
+        Self {
+            lanes: 1,
+            inputs: [inputs, false],
+        }
+    }
+}
+
+trait PostingSource {
+    fn row(&self) -> u32;
+    fn lane(&self, lane: usize) -> (&[u32], &[u32]);
+}
+
+impl PostingSource for Posting {
+    fn row(&self) -> u32 {
+        self.row
+    }
+    fn lane(&self, lane: usize) -> (&[u32], &[u32]) {
+        if lane == 0 {
+            (self.title.as_slice(), &[])
+        } else {
+            (self.body.as_slice(), &[])
+        }
+    }
+}
+
+struct FieldPosting {
+    row: u32,
+    positions: Vec<u32>,
+    inputs: Vec<u32>,
+}
+
+impl PostingSource for FieldPosting {
+    fn row(&self) -> u32 {
+        self.row
+    }
+    fn lane(&self, lane: usize) -> (&[u32], &[u32]) {
+        if lane == 0 {
+            (self.positions.as_slice(), self.inputs.as_slice())
+        } else {
+            (&[], &[])
+        }
+    }
+}
+
+fn encode_shaped<R: PostingSource>(postings: &[R], shape: PostingShape) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     put_int(
         u32::try_from(postings.len()).map_err(|cause| cause.to_string())?,
@@ -1657,32 +2636,42 @@ fn encode_postings(postings: &[Posting]) -> Result<Vec<u8>, String> {
     );
     let mut previous = 0;
     for posting in postings {
-        put_int(posting.row - previous, &mut bytes);
-        previous = posting.row;
-        for positions in [&posting.title, &posting.body] {
+        put_int(posting.row() - previous, &mut bytes);
+        previous = posting.row();
+        for (lane, preserves_inputs) in shape.inputs.iter().take(shape.lanes).enumerate() {
+            let (positions, inputs) = posting.lane(lane);
             put_int(
                 u32::try_from(positions.len()).map_err(|cause| cause.to_string())?,
                 &mut bytes,
             );
+            if *preserves_inputs && inputs.len() != positions.len() {
+                return Err("Token inputs do not match token positions".into());
+            }
             let mut prior = 0;
-            for position in positions {
+            for (index, position) in positions.iter().enumerate() {
                 put_int(position - prior, &mut bytes);
                 prior = *position;
+                if *preserves_inputs {
+                    put_int(inputs[index], &mut bytes);
+                }
             }
         }
     }
     Ok(bytes)
 }
 
+#[derive(Default)]
 struct DecodedPositions {
     count: u32,
     last: Option<u32>,
     values: Vec<u32>,
+    inputs: Vec<u32>,
 }
 
 fn decode_positions<const POSITIONAL: bool>(
     data: &[u8],
     offset: &mut usize,
+    preserves_inputs: bool,
 ) -> Result<DecodedPositions, String> {
     let count = get_int(data, offset)?;
     let length = count as usize;
@@ -1694,13 +2683,25 @@ fn decode_positions<const POSITIONAL: bool>(
     } else {
         Vec::new()
     };
+    let mut inputs = Vec::new();
     let mut position = 0u32;
+    let mut input = 0u32;
     for index in 0..length {
         let delta = get_int(data, offset)?;
         if index > 0 && delta == 0 {
             return Err("Duplicate token position".into());
         }
         position = position.checked_add(delta).ok_or("Position overflow")?;
+        if preserves_inputs {
+            let next = get_int(data, offset)?;
+            if next < input {
+                return Err("Token input regressed".into());
+            }
+            input = next;
+            if POSITIONAL {
+                inputs.push(input);
+            }
+        }
         if POSITIONAL {
             values.push(position);
         }
@@ -1710,11 +2711,20 @@ fn decode_positions<const POSITIONAL: bool>(
         count,
         last,
         values,
+        inputs,
     })
 }
 
 fn decode_posting_rows<const POSITIONAL: bool, T>(
     bytes: &[u8],
+    make: impl Fn(u32, DecodedPositions, DecodedPositions) -> T,
+) -> Result<Vec<T>, String> {
+    decode_shaped_rows::<POSITIONAL, T>(bytes, PostingShape::NATIVE, make)
+}
+
+fn decode_shaped_rows<const POSITIONAL: bool, T>(
+    bytes: &[u8],
+    shape: PostingShape,
     make: impl Fn(u32, DecodedPositions, DecodedPositions) -> T,
 ) -> Result<Vec<T>, String> {
     let data = decode_page(bytes)?;
@@ -1731,8 +2741,12 @@ fn decode_posting_rows<const POSITIONAL: bool, T>(
             return Err("Duplicate posting row".into());
         }
         row = row.checked_add(delta).ok_or("Row overflow")?;
-        let title = decode_positions::<POSITIONAL>(&data, &mut offset)?;
-        let body = decode_positions::<POSITIONAL>(&data, &mut offset)?;
+        let title = decode_positions::<POSITIONAL>(&data, &mut offset, shape.inputs[0])?;
+        let body = if shape.lanes > 1 {
+            decode_positions::<POSITIONAL>(&data, &mut offset, shape.inputs[1])?
+        } else {
+            DecodedPositions::default()
+        };
         if body.count == 0 && title.count == 0 {
             return Err("Empty posting".into());
         }
@@ -1840,46 +2854,40 @@ fn validate_posting(
     Ok(())
 }
 
-fn encode_terms(
+fn encode_group<R: PostingSource>(
     payload: &mut Vec<u8>,
-    metadata: &DocumentTable,
-    lists: BTreeMap<String, Vec<Posting>>,
+    shape: PostingShape,
+    length: impl Fn(usize, u32) -> u32,
+    lists: BTreeMap<String, Vec<R>>,
 ) -> Result<TermDictionary, String> {
     let mut terms = Vec::with_capacity(lists.len());
     for (term, postings) in lists {
         let mut blocks = Vec::with_capacity(postings.len().div_ceil(BLOCK_SIZE));
         for chunk in postings.chunks(BLOCK_SIZE) {
-            let data = append(payload, &encode_postings(chunk)?)?;
+            let data = append(payload, &encode_shaped(chunk, shape)?)?;
+            let mut max_tf = [0; LANES];
+            let mut min_length = [0; LANES];
+            for lane in 0..shape.lanes {
+                max_tf[lane] = u32::try_from(
+                    chunk
+                        .iter()
+                        .map(|posting| posting.lane(lane).0.len())
+                        .max()
+                        .ok_or("Empty posting block")?,
+                )
+                .map_err(|cause| cause.to_string())?;
+                min_length[lane] = chunk
+                    .iter()
+                    .map(|posting| length(lane, posting.row()))
+                    .min()
+                    .ok_or("Empty posting block")?;
+            }
             blocks.push(BlockMeta {
-                first: chunk[0].row,
-                last: chunk[chunk.len() - 1].row,
+                first: chunk[0].row(),
+                last: chunk[chunk.len() - 1].row(),
                 count: u32::try_from(chunk.len()).map_err(|cause| cause.to_string())?,
-                max_title_tf: u32::try_from(
-                    chunk
-                        .iter()
-                        .map(|posting| posting.title.len())
-                        .max()
-                        .ok_or("Empty posting block")?,
-                )
-                .map_err(|cause| cause.to_string())?,
-                max_body_tf: u32::try_from(
-                    chunk
-                        .iter()
-                        .map(|posting| posting.body.len())
-                        .max()
-                        .ok_or("Empty posting block")?,
-                )
-                .map_err(|cause| cause.to_string())?,
-                min_title_length: chunk
-                    .iter()
-                    .map(|p| metadata.title_lengths.get(p.row as usize))
-                    .min()
-                    .ok_or("Empty posting block")?,
-                min_body_length: chunk
-                    .iter()
-                    .map(|p| metadata.body_lengths.get(p.row as usize))
-                    .min()
-                    .ok_or("Empty posting block")?,
+                max_tf,
+                min_length,
                 data,
             });
         }
@@ -1898,16 +2906,9 @@ fn filterable_fields(names: &[String]) -> Result<BTreeSet<&str>, String> {
     let selected: BTreeSet<_> = names.iter().map(String::as_str).collect();
     if names.len() > 64
         || selected.len() != names.len()
-        || names.iter().any(|name| {
-            name.len() > 64
-                || !name
-                    .as_bytes()
-                    .first()
-                    .is_some_and(|first| first.is_ascii_alphabetic() || *first == b'_')
-                || !name
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        })
+        || names
+            .iter()
+            .any(|name| name.is_empty() || name.len() > 128 || name.starts_with('$'))
     {
         return Err("Invalid filterable attributes".to_owned());
     }
@@ -1940,30 +2941,39 @@ fn finish_document_columns(
     ))
 }
 
+fn encode_canonical_metadata_page(
+    document: &Document,
+    facts: VectorFacts,
+    typed: bool,
+) -> Result<Vec<u8>, String> {
+    let json = document.to_stored_canonical_vec(typed)?;
+    let mut metadata_bytes = Vec::with_capacity(7 + json.len());
+    metadata_bytes.push(if typed {
+        METADATA_CODEC_TYPED
+    } else {
+        METADATA_CODEC_CANONICAL
+    });
+    write_vector_facts(facts, &mut metadata_bytes);
+    metadata_bytes.extend_from_slice(&json);
+    Ok(metadata_bytes)
+}
+
 fn append_document_columns(
-    document: &mut Document,
+    document: &Document,
     payload: &mut Vec<u8>,
     vector_payload: &mut Vec<u8>,
     vector_ranges: &mut Vec<Range>,
+    typed: bool,
 ) -> Result<Range, String> {
-    let vector = document.vector.take();
-    let facts = vector_facts(vector.as_deref())?;
-    let json = serde_json::to_vec(&document).map_err(|cause| cause.to_string())?;
-    let data = if let Some(values) = &vector {
-        let mut metadata_bytes = Vec::with_capacity(6 + json.len());
-        write_vector_facts(facts, &mut metadata_bytes);
-        metadata_bytes.extend_from_slice(&json);
-        let data = append(payload, &metadata_bytes)?;
-        let mut raw = Vec::with_capacity(values.len() * size_of::<f32>());
-        for value in values {
-            raw.extend_from_slice(&value.to_le_bytes());
-        }
-        vector_ranges.push(append(vector_payload, &raw)?);
-        data
-    } else {
-        append(payload, &json)?
-    };
-    document.vector = vector;
+    let vector = document.vector_values()?;
+    let facts = vector_facts(vector)?;
+    let data = append(
+        payload,
+        &encode_canonical_metadata_page(document, facts, typed)?,
+    )?;
+    if let Some(values) = vector {
+        vector_ranges.push(append(vector_payload, &vector_frame_bytes(values)?)?);
+    }
     Ok(data)
 }
 
@@ -1972,8 +2982,8 @@ fn index_document_postings(
     row: u32,
     lists: &mut BTreeMap<String, Vec<Posting>>,
 ) -> Result<(u32, u32), String> {
-    let title = normalize_text(&document.title);
-    let body = normalize_text(&document.text);
+    let title = normalize_text(document.role_text(NativeRole::Title)?);
+    let body = normalize_text(document.role_text(NativeRole::Text)?);
     let title_tokens: Vec<_> = title.split_whitespace().collect();
     let body_tokens: Vec<_> = body.split_whitespace().collect();
     let mut frequencies: BTreeMap<&str, Posting> = BTreeMap::new();
@@ -2009,8 +3019,131 @@ fn index_document_postings(
 
 #[doc = "# Errors\nRejects empty or duplicate documents, invalid field declarations, wire-size overflow, serialization errors, and segments beyond the size budget."]
 pub fn build(
+    documents: Vec<Document>,
+    filterable: Option<&[String]>,
+) -> Result<BuiltSegment, String> {
+    build_versioned(documents, filterable, &[], 4, None)
+}
+
+#[doc = "# Errors\nRejects empty or duplicate documents, unsorted or invalid text field declarations, non-text attributes, wire-size overflow, and segments beyond the size budget."]
+pub fn build_text_fields(
+    documents: Vec<Document>,
+    filterable: Option<&[String]>,
+    text_fields: &[NamedTextField<'_>],
+) -> Result<BuiltSegment, String> {
+    build_versioned(documents, filterable, text_fields, 4, None)
+}
+
+#[doc = "# Errors\nRejects everything `build_text_fields` rejects, plus attributes that are undeclared, legacy, or do not match their declared type, and named text attributes that are not declared strings or string arrays. Builds the typed segment (`RAIOSEG6`); the schema, not the caller, selects the filterable directory attributes."]
+pub fn build_typed(
+    documents: Vec<Document>,
+    schema: &AttributeSchema,
+    text_fields: &[NamedTextField<'_>],
+) -> Result<BuiltSegment, String> {
+    for field in text_fields {
+        schema.validate_text_field(field.attribute)?;
+    }
+    let filterable = schema.filterable_names();
+    build_versioned(
+        documents,
+        Some(filterable.as_slice()),
+        text_fields,
+        TYPED_VERSION,
+        Some(schema),
+    )
+}
+
+#[doc = "# Errors\nRejects malformed bytes, unknown or duplicate fields, invalid queries, corrupt posting pages, and filters or tombstones applied before ranking."]
+pub fn rank_fields(
+    bytes: &[u8],
+    fields: &[DocumentColumnId],
+    text: &str,
+    mode: &str,
+    top_k: usize,
+    dead: &[u32],
+    filters: &[Filter],
+) -> Result<Vec<Hit>, String> {
+    rank_fields_with(
+        bytes,
+        &FieldQuery {
+            fields,
+            text,
+            mode,
+            top_k,
+            dead,
+            filters,
+            bm25: Bm25Parameters::DEFAULT,
+            statistics: None,
+        },
+    )
+}
+
+#[doc = "# Errors\nRejects everything `rank_fields` rejects, plus global statistics that do not match the selected fields and analyzed query terms exactly, duplicate identities, document frequencies above the document count, and totals below the live local rows or loaded eligible postings. Callers must supply unfiltered live corpus statistics; this operation does not prove global counts by scanning filtered-out postings."]
+pub fn rank_fields_with(bytes: &[u8], query: &FieldQuery<'_>) -> Result<Vec<Hit>, String> {
+    let (header, base) = parse_header(bytes)?;
+    fields::rank(&header, bytes, base, query)
+}
+
+#[doc = "# Errors\nRejects malformed bytes, unknown or duplicate fields, invalid match modes, analysis over budget, invalid tombstones, and corrupt posting pages."]
+pub fn local_field_statistics(
+    bytes: &[u8],
+    fields: &[DocumentColumnId],
+    text: &str,
+    mode: &str,
+    dead: &[u32],
+) -> Result<CorpusStatistics, String> {
+    let (header, base) = parse_header(bytes)?;
+    fields::local_statistics(&header, bytes, base, fields, text, mode, dead)
+}
+
+fn attribute_json(
+    document: &Document,
+    filterable: Option<&BTreeSet<&str>>,
+) -> Result<Box<serde_json::value::RawValue>, String> {
+    let source_attributes = document.columns().attributes();
+    filterable
+        .map_or_else(
+            || serde_json::value::to_raw_value(source_attributes),
+            |fields| {
+                serde_json::value::to_raw_value(
+                    &source_attributes
+                        .iter()
+                        .filter(|(name, _)| fields.contains(name.as_str()))
+                        .collect::<BTreeMap<_, _>>(),
+                )
+            },
+        )
+        .map_err(|cause| cause.to_string())
+}
+
+fn validate_build_attributes(
+    documents: &[Document],
+    schema: Option<&AttributeSchema>,
+) -> Result<(), String> {
+    match schema {
+        Some(schema) => {
+            for document in documents {
+                schema.validate_attributes(document.columns().attributes())?;
+            }
+        }
+        None => {
+            if documents
+                .iter()
+                .any(|document| !document.columns().is_legacy())
+            {
+                return Err("Typed attributes require the typed segment builder".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_versioned(
     mut documents: Vec<Document>,
     filterable: Option<&[String]>,
+    text_fields: &[NamedTextField<'_>],
+    version: u32,
+    schema: Option<&AttributeSchema>,
 ) -> Result<BuiltSegment, String> {
     if documents.is_empty() {
         return Err("Segment must contain at least one document".into());
@@ -2018,7 +3151,28 @@ pub fn build(
     if documents.len() > 10000 {
         return Err("Segment exceeds 10000 documents".into());
     }
+    validate_build_attributes(&documents, schema)?;
+    let typed_ids = documents
+        .iter()
+        .any(|document| !matches!(document.id, DocumentId::String(_)));
+    let version = if schema.is_some() {
+        TYPED_VERSION
+    } else if typed_ids {
+        5
+    } else {
+        version
+    };
+    if !matches!(version, 3..=6) {
+        return Err("Invalid segment version".into());
+    }
+    if version < 4 && !text_fields.is_empty() {
+        return Err("Named text requires segment version 4".into());
+    }
+    if documents.iter().any(|document| !document.id.is_valid()) {
+        return Err("Invalid document id".into());
+    }
     let filterable = filterable.map(filterable_fields).transpose()?;
+    let mut named = fields::NamedBuilder::prepare(text_fields)?;
     documents.sort_by(|a, b| compare_document_ids(&a.id, &b.id));
     if documents.windows(2).any(|pair| pair[0].id == pair[1].id) {
         return Err("Duplicate segment ids".into());
@@ -2030,9 +3184,10 @@ pub fn build(
     let mut lists: BTreeMap<String, Vec<Posting>> = BTreeMap::new();
     let mut total_title_length = 0;
     let mut total_body_length = 0;
-    for (index, document) in documents.iter_mut().enumerate() {
+    for (index, document) in documents.iter().enumerate() {
         let row = u32::try_from(index).map_err(|cause| cause.to_string())?;
         let (title_length, body_length) = index_document_postings(document, row, &mut lists)?;
+        named.observe(document, row)?;
         total_title_length += u64::from(title_length);
         total_body_length += u64::from(body_length);
         let data = append_document_columns(
@@ -2040,51 +3195,39 @@ pub fn build(
             &mut payload,
             &mut vector_payload,
             &mut vector_ranges,
+            schema.is_some(),
         )?;
-        let attributes = filterable
-            .as_ref()
-            .map_or_else(
-                || serde_json::value::to_raw_value(&document.attributes),
-                |fields| {
-                    serde_json::value::to_raw_value(
-                        &document
-                            .attributes
-                            .iter()
-                            .filter(|(name, _)| fields.contains(name.as_str()))
-                            .collect::<BTreeMap<_, _>>(),
-                    )
-                },
-            )
-            .map_err(|cause| cause.to_string())?;
+        let attributes = attribute_json(document, filterable.as_ref())?;
         metadata.push(DocumentMeta {
-            id: document.id.clone().into_boxed_str(),
+            id: document.id.borrowed().into_boxed(),
             revision: document.revision,
             title_length,
             body_length,
             attributes: attributes.into(),
             data,
-            vector: document.vector.is_some(),
+            vector: document.vector_values()?.is_some(),
         });
     }
-    let metadata = DocumentTable::from(metadata);
+    let mut metadata = DocumentTable::from(metadata);
     let common_projection = common_term_projection(&metadata, &lists)?;
     let (metadata_end, vector_end) =
         finish_document_columns(&mut payload, &vector_payload, &mut vector_ranges)?;
     drop(vector_payload);
-    let terms = encode_terms(&mut payload, &metadata, lists)?;
-    let vector_prefix = vector_prefix(&metadata)?;
-    let header = Header {
-        filter_masks: RefCell::default(),
-        version: 2,
-        documents: metadata,
-        terms,
-        total_title_length,
-        total_body_length,
-        metadata_end,
-        vector_end,
+    let terms = encode_group(
+        &mut payload,
+        PostingShape::NATIVE,
+        |lane, row| metadata.field_length(lane, row as usize),
+        lists,
+    )?;
+    let mut table = FieldTable::native(total_title_length, total_body_length, terms);
+    named.finish(&mut payload, &mut metadata, &mut table)?;
+    let header = Header::from_parts(
+        version,
+        metadata,
+        table,
+        (metadata_end, vector_end),
         vector_ranges,
-        vector_prefix,
-    };
+    )?;
     let common_projection = common_projection
         .map(|projection| projection.encode(&header))
         .transpose()?
@@ -2134,8 +3277,148 @@ fn parse_legacy_segment(bytes: &[u8]) -> Result<(LegacySegmentHeader, usize), St
     Ok((legacy, 16 + length))
 }
 
+fn owned_directory_row(
+    row: &DocumentMeta<DocumentIdRef<'_>, &DocumentAttributes>,
+    data: Range,
+) -> DocumentMeta {
+    DocumentMeta {
+        id: row.id.into_boxed(),
+        revision: row.revision,
+        title_length: row.title_length,
+        body_length: row.body_length,
+        attributes: row.attributes.clone(),
+        data,
+        vector: row.vector,
+    }
+}
+
+fn rebase_postings(terms: &mut TermDictionary, old_end: u32, new_end: u32) -> Result<(), String> {
+    for (_, term) in &mut terms.entries {
+        for block in &mut term.blocks {
+            if block.data.offset < old_end {
+                return Err("Posting range outside its payload".into());
+            }
+            block.data.offset = new_end
+                .checked_add(block.data.offset - old_end)
+                .ok_or("Migrated posting offset overflow")?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_migration_lengths(
+    document: &Document,
+    title_length: u32,
+    body_length: u32,
+) -> Result<(), String> {
+    let title = normalize_text(document.role_text(NativeRole::Title)?);
+    let body = normalize_text(document.role_text(NativeRole::Text)?);
+    let actual_title =
+        u32::try_from(title.split_whitespace().count()).map_err(|cause| cause.to_string())?;
+    let actual_body =
+        u32::try_from(body.split_whitespace().count()).map_err(|cause| cause.to_string())?;
+    if actual_title != title_length || actual_body != body_length {
+        return Err("Segment document token lengths do not match its directory".into());
+    }
+    Ok(())
+}
+
+fn migrate_v2_segment(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let (header, base) = parse_header(bytes)?;
+    let source = bytes.get(base..).ok_or("Truncated segment payload")?;
+    let old_vector_end = header.vector_end;
+    let mut metadata = Vec::with_capacity(header.documents.len());
+    let mut payload = Vec::new();
+    let mut vectors = Vec::new();
+    let mut vector_ranges = Vec::new();
+    for (index, row) in header.documents.iter().enumerate() {
+        let start = usize::try_from(row.data.offset).map_err(|cause| cause.to_string())?;
+        let length = usize::try_from(row.data.length).map_err(|cause| cause.to_string())?;
+        let end = start.checked_add(length).ok_or("Metadata range overflow")?;
+        let decoded = decode_page(
+            source
+                .get(start..end)
+                .ok_or("Truncated document metadata")?,
+        )?;
+        let (facts, mut document) = parse_document_metadata(&decoded)?;
+        if document.id != row.id
+            || document.revision != row.revision
+            || ((facts.flags & 1) != 0) != row.vector
+        {
+            return Err("Segment document does not match its directory".into());
+        }
+        validate_migration_lengths(&document, row.title_length, row.body_length)?;
+        let data = append(
+            &mut payload,
+            &encode_canonical_metadata_page(&document, facts, false)?,
+        )?;
+        if row.vector {
+            let range = header
+                .vector_range(index)?
+                .cloned()
+                .ok_or_else(|| "Missing vector frame".to_owned())?;
+            let vector_start = usize::try_from(range.offset).map_err(|cause| cause.to_string())?;
+            let vector_length = usize::try_from(range.length).map_err(|cause| cause.to_string())?;
+            let vector_end = vector_start
+                .checked_add(vector_length)
+                .ok_or("Vector range overflow")?;
+            let frame = source
+                .get(vector_start..vector_end)
+                .ok_or("Truncated vector frame")?;
+            attach_vector_frame(&mut document, frame, facts)?;
+            vector_ranges.push(append_existing_frame(&mut vectors, frame)?);
+        }
+        metadata.push(owned_directory_row(&row, data));
+    }
+    let (metadata_end, vector_end) =
+        finish_document_columns(&mut payload, &vectors, &mut vector_ranges)?;
+    drop(vectors);
+    let tail = source
+        .get(old_vector_end as usize..)
+        .ok_or("Missing posting tail")?;
+    if payload
+        .len()
+        .checked_add(tail.len())
+        .is_none_or(|length| length > MAX_BYTES)
+    {
+        return Err("Converted segment exceeds sixteen MiB before its header".into());
+    }
+    payload.extend_from_slice(tail);
+    let mut terms = header.terms().clone();
+    rebase_postings(&mut terms, old_vector_end, vector_end)?;
+    let migrated = Header::from_parts(
+        3,
+        DocumentTable::from(metadata),
+        FieldTable::native(
+            header.total_title_length(),
+            header.total_body_length(),
+            terms,
+        ),
+        (metadata_end, vector_end),
+        vector_ranges,
+    )?;
+    validate_header(&migrated)?;
+    migrated.encode(&payload)
+}
+
 #[doc = "# Errors\nRejects invalid legacy segments, corrupt documents or postings, and converted segments above sixteen MiB."]
 pub fn migrate_segment(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    if bytes.len() >= 8
+        && (&bytes[..8] == MAGIC_V3
+            || &bytes[..8] == MAGIC_V4
+            || &bytes[..8] == MAGIC_V5
+            || &bytes[..8] == MAGIC_V6)
+    {
+        parse_header(bytes)?;
+        return Ok(bytes.to_vec());
+    }
+    if bytes.len() >= 8 && &bytes[..8] == MAGIC_V2 {
+        return migrate_v2_segment(bytes);
+    }
+    migrate_v1_segment(bytes)
+}
+
+fn migrate_v1_segment(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let (legacy, base) = parse_legacy_segment(bytes)?;
     let source = bytes.get(base..).ok_or("Truncated legacy payload")?;
     let mut metadata = Vec::with_capacity(legacy.documents.len());
@@ -2154,18 +3437,22 @@ pub fn migrate_segment(bytes: &[u8]) -> Result<Vec<u8>, String> {
             .get(row.data.offset as usize..source_end as usize)
             .ok_or("Truncated legacy document")?;
         let decoded = decode_page(frame)?;
-        let document: Document =
-            serde_json::from_slice(&decoded).map_err(|cause| cause.to_string())?;
-        if document.id.as_bytes() != row.id.as_bytes()
+        let document = Document::from_native_slice(&decoded)?;
+        let values = document.vector_values()?;
+        if document.id != row.id
             || document.revision != row.revision
-            || document.vector.is_some() != row.vector
+            || values.is_some() != row.vector
         {
             return Err("Legacy document does not match its directory".into());
         }
-        let separated = split_document_frame_parts(frame, &decoded, document)?;
-        row.data = append_existing_frame(&mut payload, &separated.metadata)?;
-        if let Some(vector) = separated.vector {
-            vector_ranges.push(append_existing_frame(&mut vectors, &vector)?);
+        validate_migration_lengths(&document, row.title_length, row.body_length)?;
+        let facts = vector_facts(values)?;
+        row.data = append(
+            &mut payload,
+            &encode_canonical_metadata_page(&document, facts, false)?,
+        )?;
+        if let Some(values) = values {
+            vector_ranges.push(append(&mut vectors, &vector_frame_bytes(values)?)?);
         }
         metadata.push(row);
     }
@@ -2194,24 +3481,16 @@ pub fn migrate_segment(bytes: &[u8]) -> Result<Vec<u8>, String> {
             if block.data.offset < source_end || end as usize > source.len() {
                 return Err("Legacy posting range outside its payload".into());
             }
-            block.data.offset = vector_end
-                .checked_add(block.data.offset - source_end)
-                .ok_or("Migrated posting offset overflow")?;
         }
     }
-    let metadata = DocumentTable::from(metadata);
-    let header = Header {
-        filter_masks: RefCell::default(),
-        version: 2,
-        vector_prefix: vector_prefix(&metadata)?,
-        documents: metadata,
-        terms,
-        total_title_length: legacy.total_title_length,
-        total_body_length: legacy.total_body_length,
-        metadata_end,
-        vector_end,
+    rebase_postings(&mut terms, source_end, vector_end)?;
+    let header = Header::from_parts(
+        3,
+        DocumentTable::from(metadata),
+        FieldTable::native(legacy.total_title_length, legacy.total_body_length, terms),
+        (metadata_end, vector_end),
         vector_ranges,
-    };
+    )?;
     validate_header(&header)?;
     header.encode(&payload)
 }
@@ -2233,11 +3512,31 @@ fn append_existing_frame(payload: &mut Vec<u8>, frame: &[u8]) -> Result<Range, S
     Ok(range)
 }
 
+/// Whether the segment bytes carry the typed magic. `parse_header` later proves the stored
+/// version equals the magic, so a forged magic can only fail, never change the reading.
+#[cfg(target_arch = "wasm32")]
+fn has_typed_magic(bytes: &[u8]) -> bool {
+    bytes.starts_with(MAGIC_V6)
+}
+
 #[doc = "# Errors\nRejects invalid framing, checksums, versions, ordering, frequencies, and posting directories."]
 pub fn parse_header(bytes: &[u8]) -> Result<(Header, usize), String> {
-    if bytes.len() < 16 || &bytes[..8] != MAGIC {
+    if bytes.len() < 16 {
         return Err("Invalid segment header".into());
     }
+    let expected_version = if &bytes[..8] == MAGIC_V2 {
+        2
+    } else if &bytes[..8] == MAGIC_V3 {
+        3
+    } else if &bytes[..8] == MAGIC_V4 {
+        4
+    } else if &bytes[..8] == MAGIC_V5 {
+        5
+    } else if &bytes[..8] == MAGIC_V6 {
+        6
+    } else {
+        return Err("Invalid segment header".into());
+    };
     let length = u32::from_le_bytes(
         bytes[8..12]
             .try_into()
@@ -2258,54 +3557,122 @@ pub fn parse_header(bytes: &[u8]) -> Result<(Header, usize), String> {
         return Err("Header integrity check failed".into());
     }
     let text = std::str::from_utf8(json).map_err(|cause| cause.to_string())?;
-    let mut header: Header = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let found = serde_json::from_str::<StoredVersion>(text)
+        .map_err(|e| e.to_string())?
+        .0;
+    if found != expected_version {
+        return Err("Segment magic does not match its version".into());
+    }
+    let mut header = if expected_version >= 4 {
+        serde_json::from_str::<StoredHeader>(text)
+            .map_err(|e| e.to_string())?
+            .into_header()?
+    } else {
+        serde_json::from_str::<Header>(text).map_err(|e| e.to_string())?
+    };
+    if header.version != expected_version {
+        return Err("Segment magic does not match its version".into());
+    }
     validate_header(&header)?;
-    header.vector_prefix = vector_prefix(&header.documents)?;
     header.documents.shrink_to_fit();
     Ok((header, 16 + length))
 }
 
 fn validate_header(header: &Header) -> Result<(), String> {
-    if header.version != 2 || header.documents.is_empty() || header.documents.len() > 10000 {
+    if !(2..=TYPED_VERSION).contains(&header.version)
+        || header.documents.is_empty()
+        || header.documents.len() > 10000
+    {
         return Err("Invalid segment version or document count".into());
     }
+    header.fields.validate(&header.documents, header.version)?;
     let documents = &header.documents;
-    if documents.rows.windows(2).any(|pair| {
-        compare_document_ids(
-            &documents.ids[pair[0].id.clone()],
-            &documents.ids[pair[1].id.clone()],
-        ) != Ordering::Less
+    if documents.iter().any(|row| {
+        !row.id.is_valid() || (header.version < 5 && !matches!(row.id, DocumentId::String(_)))
     }) {
+        return Err("Document id does not match segment version".into());
+    }
+    if header.version >= TYPED_VERSION {
+        for attributes in documents.attributes.unique_values() {
+            values::validate_directory_attributes(attributes.get())?;
+        }
+    }
+    if (1..documents.len())
+        .any(|row| compare_document_ids(documents.id(row - 1), documents.id(row)) != Ordering::Less)
+    {
         return Err("Segment ids are not strictly sorted".into());
     }
-    validate_columns(header)?;
-    for term in header.terms.values() {
-        if term.df > u32::try_from(header.documents.len()).map_err(|cause| cause.to_string())? {
-            return Err("Invalid term document frequency".into());
-        }
-        if term
-            .blocks
-            .windows(2)
-            .any(|pair| pair[0].last >= pair[1].first)
-        {
-            return Err("Posting block rows are not strictly ordered".into());
-        }
-        for block in &term.blocks {
-            if block.last
-                >= u32::try_from(header.documents.len()).map_err(|cause| cause.to_string())?
-                || block.first > block.last
-                || block.count as usize > BLOCK_SIZE
-            {
-                return Err("Invalid posting block directory".into());
-            }
-        }
-    }
-    Ok(())
+    validate_columns(header)
 }
 
 const DIRECTORY_MAGIC: &[u8; 8] = b"RAIODIR5";
+const DIRECTORY_MAGIC_V6: &[u8; 8] = b"RAIODIR6";
+const DIRECTORY_MAGIC_V7: &[u8; 8] = b"RAIODIR7";
+const DIRECTORY_MAGIC_V8: &[u8; 8] = b"RAIODIR8";
 const COMMON_DIRECTORY_MAGIC: &[u8; 8] = b"RAIOCOM3";
+const COMMON_DIRECTORY_MAGIC_V4: &[u8; 8] = b"RAIOCOM4";
+const COMMON_DIRECTORY_MAGIC_V5: &[u8; 8] = b"RAIOCOM5";
+const COMMON_DIRECTORY_MAGIC_V6: &[u8; 8] = b"RAIOCOM6";
 const MAX_COMMON_POSTING_BYTES: usize = 32 * 1024;
+
+fn directory_magic(version: u32) -> Result<&'static [u8; 8], String> {
+    match version {
+        2 | 3 => Ok(DIRECTORY_MAGIC),
+        4 => Ok(DIRECTORY_MAGIC_V6),
+        5 => Ok(DIRECTORY_MAGIC_V7),
+        6 => Ok(DIRECTORY_MAGIC_V8),
+        _ => Err("Invalid segment version".into()),
+    }
+}
+
+fn common_directory_magic_for(version: u32) -> Result<&'static [u8; 8], String> {
+    match version {
+        2 | 3 => Ok(COMMON_DIRECTORY_MAGIC),
+        4 => Ok(COMMON_DIRECTORY_MAGIC_V4),
+        5 => Ok(COMMON_DIRECTORY_MAGIC_V5),
+        6 => Ok(COMMON_DIRECTORY_MAGIC_V6),
+        _ => Err("Invalid segment version".into()),
+    }
+}
+
+fn is_common_directory_magic(magic: [u8; 8]) -> bool {
+    magic == *COMMON_DIRECTORY_MAGIC
+        || magic == *COMMON_DIRECTORY_MAGIC_V4
+        || magic == *COMMON_DIRECTORY_MAGIC_V5
+        || magic == *COMMON_DIRECTORY_MAGIC_V6
+}
+
+fn frame_magic_matches(magic: [u8; 8], version: u32) -> bool {
+    match version {
+        2 | 3 => magic == *DIRECTORY_MAGIC || magic == *COMMON_DIRECTORY_MAGIC,
+        4 => magic == *DIRECTORY_MAGIC_V6 || magic == *COMMON_DIRECTORY_MAGIC_V4,
+        5 => magic == *DIRECTORY_MAGIC_V7 || magic == *COMMON_DIRECTORY_MAGIC_V5,
+        6 => magic == *DIRECTORY_MAGIC_V8 || magic == *COMMON_DIRECTORY_MAGIC_V6,
+        _ => false,
+    }
+}
+
+fn directory_frame_magic(bytes: &[u8], partial: bool) -> Result<[u8; 8], String> {
+    let Some(prefix) = bytes.get(..8) else {
+        return Err("Invalid compressed directory frame".into());
+    };
+    let magic: [u8; 8] = prefix
+        .try_into()
+        .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?;
+    let accepted = if partial {
+        is_common_directory_magic(magic)
+    } else {
+        &magic == DIRECTORY_MAGIC
+            || &magic == DIRECTORY_MAGIC_V6
+            || &magic == DIRECTORY_MAGIC_V7
+            || &magic == DIRECTORY_MAGIC_V8
+    };
+    if accepted {
+        Ok(magic)
+    } else {
+        Err("Invalid compressed directory frame".into())
+    }
+}
 const MAX_COMMON_FRAME_BYTES: usize = 64 * 1024;
 const MAX_COMMON_DECODED_POSTING_BYTES: usize = 64 * 1024;
 
@@ -2383,13 +3750,179 @@ impl Serialize for DirectoryBlocks<'_> {
                 block.first,
                 block.last,
                 block.count,
-                block.max_title_tf,
-                block.max_body_tf,
-                block.min_title_length,
-                block.min_body_length,
+                block.max_tf[0],
+                block.max_tf[1],
+                block.min_length[0],
+                block.min_length[1],
                 (block.data.offset, block.data.length),
             )
         }))
+    }
+}
+
+struct StoredDocuments<'a>(&'a DocumentTable);
+
+impl Serialize for StoredDocuments<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(|document| {
+            (
+                document.id,
+                document.revision,
+                document.attributes,
+                (document.data.offset, document.data.length),
+                document.vector,
+            )
+        }))
+    }
+}
+
+struct StoredFieldLengths<'a>(&'a DocumentTable, usize);
+
+impl Serialize for StoredFieldLengths<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq((0..self.0.len()).map(|row| self.0.field_length(self.1, row)))
+    }
+}
+
+struct StoredFields<'a>(&'a Header);
+
+impl Serialize for StoredFields<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.fields.iter().enumerate().map(|(ordinal, field)| {
+            let (kind, name) = field.wire_id();
+            (
+                kind,
+                name,
+                field.analysis().config(),
+                field.total(),
+                StoredFieldLengths(&self.0.documents, ordinal),
+            )
+        }))
+    }
+}
+
+struct StoredGroups<'a>(&'a FieldTable);
+
+impl Serialize for StoredGroups<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.dictionaries().map(DirectoryTerms))
+    }
+}
+
+struct StoredVersion(u32);
+
+impl<'de> Deserialize<'de> for StoredVersion {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Probe;
+
+        impl<'de> serde::de::Visitor<'de> for Probe {
+            type Value = StoredVersion;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a stored segment header")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                let version = sequence
+                    .next_element::<u32>()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                while sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(StoredVersion(version))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut version = None;
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    if key == "version" {
+                        version = Some(map.next_value::<u32>()?);
+                    } else {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                version
+                    .map(StoredVersion)
+                    .ok_or_else(|| serde::de::Error::missing_field("version"))
+            }
+        }
+
+        deserializer.deserialize_any(Probe)
+    }
+}
+
+#[derive(Deserialize)]
+struct StoredRow {
+    id: DocumentId<Box<str>>,
+    revision: u64,
+    attributes: DocumentAttributes,
+    data: Range,
+    vector: bool,
+}
+
+#[derive(Deserialize)]
+struct StoredField {
+    kind: u8,
+    name: String,
+    analysis: Option<WordV4Config>,
+    total: u64,
+    lengths: Vec<u32>,
+}
+
+#[derive(Deserialize)]
+struct StoredHeader {
+    version: u32,
+    documents: Vec<StoredRow>,
+    fields: Vec<StoredField>,
+    groups: Vec<TermDictionary>,
+    metadata_end: u32,
+    vector_end: u32,
+    vector_ranges: Vec<Range>,
+}
+
+impl StoredHeader {
+    fn into_header(self) -> Result<Header, String> {
+        let count = self.documents.len();
+        let mut documents = DocumentTable::from(
+            self.documents
+                .into_iter()
+                .map(|row| DocumentMeta {
+                    id: row.id,
+                    revision: row.revision,
+                    title_length: 0,
+                    body_length: 0,
+                    attributes: row.attributes,
+                    data: row.data,
+                    vector: row.vector,
+                })
+                .collect::<Vec<_>>(),
+        );
+        documents.lengths.clear();
+        let mut metas = Vec::with_capacity(self.fields.len());
+        for field in self.fields {
+            if field.lengths.len() != count {
+                return Err("Field lengths do not match the document count".into());
+            }
+            metas.push(FieldMeta::from_wire(
+                field.kind,
+                field.name,
+                field.analysis,
+                field.total,
+            )?);
+            documents.push_field_lengths(field.lengths);
+        }
+        let fields = FieldTable::from_wire(metas, self.groups)?;
+        Header::from_parts(
+            self.version,
+            documents,
+            fields,
+            (self.metadata_end, self.vector_end),
+            self.vector_ranges,
+        )
     }
 }
 
@@ -2416,7 +3949,7 @@ fn compress_directory_header(header: &Header, length: usize) -> Result<Vec<u8>, 
         return Err("Invalid directory length".into());
     }
     let compact = binary_directory::encode(header)?;
-    compress_directory_payload(&compact, length, *DIRECTORY_MAGIC)
+    compress_directory_payload(&compact, length, *directory_magic(header.version)?)
 }
 
 fn compress_directory_payload(
@@ -2425,7 +3958,7 @@ fn compress_directory_payload(
     magic: [u8; 8],
 ) -> Result<Vec<u8>, String> {
     let maximum_compact = length
-        + (if magic == *COMMON_DIRECTORY_MAGIC {
+        + (if is_common_directory_magic(magic) {
             MAX_COMMON_FRAME_BYTES + 4
         } else {
             0
@@ -2472,7 +4005,8 @@ pub fn parse_compressed_directory(
     expected: usize,
     max_heap_bytes: usize,
 ) -> Result<Header, String> {
-    decode_directory_payload(bytes, expected, max_heap_bytes, None, *DIRECTORY_MAGIC)
+    let magic = directory_frame_magic(bytes, false)?;
+    decode_directory_payload(bytes, expected, max_heap_bytes, None, magic)
 }
 
 fn decode_directory_payload(
@@ -2484,6 +4018,47 @@ fn decode_directory_payload(
 ) -> Result<Header, String> {
     decode_directory_contents(bytes, expected, max_heap_bytes, validated, magic)
         .map(|contents| contents.header)
+}
+
+fn validate_directory_header(
+    header: &Header,
+    expected: usize,
+    magic: [u8; 8],
+    reserved: usize,
+    max_heap_bytes: usize,
+    previously_validated: bool,
+) -> Result<(), String> {
+    if !frame_magic_matches(magic, header.version) {
+        return Err("Directory magic does not match its version".into());
+    }
+    header.documents.attributes.validate_expansion(expected)?;
+    if !previously_validated {
+        if header.version >= TYPED_VERSION {
+            // Typed attribute validation decodes one carrier at a time; its transient working
+            // set is charged against the same budget as the retained directory.
+            let widest = header
+                .documents
+                .attributes
+                .unique_values()
+                .iter()
+                .map(|attributes| attributes.get().len())
+                .max()
+                .unwrap_or(0);
+            if header
+                .heap_bytes()
+                .saturating_add(values::directory_validation_reservation(widest))
+                .saturating_add(reserved)
+                > max_heap_bytes
+            {
+                return Err("Typed directory validation exceeds memory budget".into());
+            }
+        }
+        validate_header(header)?;
+        if is_common_directory_magic(magic) {
+            validate_common_directory_header(header)?;
+        }
+    }
+    Ok(())
 }
 
 fn decode_directory_contents(
@@ -2511,7 +4086,7 @@ fn decode_directory_contents(
             .map_err(|cause: std::array::TryFromSliceError| cause.to_string())?,
     ) as usize;
     let maximum_compact = expected
-        + (if magic == *COMMON_DIRECTORY_MAGIC {
+        + (if is_common_directory_magic(magic) {
             MAX_COMMON_FRAME_BYTES + 4
         } else {
             0
@@ -2544,7 +4119,7 @@ fn decode_directory_contents(
             return Err("Compressed directory integrity check failed".into());
         }
     }
-    let (header_bytes, hot_bytes) = if magic == *COMMON_DIRECTORY_MAGIC {
+    let (header_bytes, hot_bytes) = if is_common_directory_magic(magic) {
         let (header, hot) = common_directory_parts(&decoded, expected)?;
         (header, Some(hot))
     } else {
@@ -2558,19 +4133,14 @@ fn decode_directory_contents(
         return Err("Common posting payload exceeds memory budget".into());
     }
     let header = binary_directory::decode(header_bytes, max_heap_bytes.saturating_sub(reserved))?;
-    header.documents.attributes.validate_expansion(expected)?;
-    if !previously_validated {
-        validate_header(&header)?;
-        if magic == *COMMON_DIRECTORY_MAGIC
-            && (header.terms.len() > 16
-                || header
-                    .terms
-                    .iter()
-                    .any(|(term, metadata)| term.len() > 64 || metadata.df <= 1))
-        {
-            return Err("Invalid common-directory term selection".into());
-        }
-    }
+    validate_directory_header(
+        &header,
+        expected,
+        magic,
+        reserved,
+        max_heap_bytes,
+        previously_validated,
+    )?;
     let hot = match hot_bytes {
         Some(bytes) => {
             let hot = decode_hot_postings(bytes, &header)?;
@@ -2590,6 +4160,21 @@ fn decode_directory_contents(
         verified.set(true);
     }
     Ok(DecodedDirectory { header, hot })
+}
+
+fn validate_common_directory_header(header: &Header) -> Result<(), String> {
+    if header.fields.has_named_terms() {
+        return Err("Common directory cannot carry named postings".into());
+    }
+    if header.terms().len() > 16
+        || header
+            .terms()
+            .iter()
+            .any(|(term, metadata)| term.len() > 64 || metadata.df <= 1)
+    {
+        return Err("Invalid common-directory term selection".into());
+    }
+    Ok(())
 }
 
 fn common_directory_parts(decoded: &[u8], expected: usize) -> Result<(&[u8], &[u8]), String> {
@@ -2635,17 +4220,17 @@ fn compress_common_directory_header(
     }
     let names = common_term_names(
         header
-            .terms
+            .terms()
             .iter()
             .map(|(term, meta)| (term, meta.df as usize)),
     );
     let terms = TermDictionary::from_entries(
         names
             .into_iter()
-            .filter_map(|term| header.terms.get(term).map(|meta| (term, meta.clone())))
+            .filter_map(|term| header.terms().get(term).map(|meta| (term, meta.clone())))
             .collect(),
     );
-    let compact_header = binary_directory::encode_terms(header, &terms)?;
+    let compact_header = binary_directory::encode_terms(header, &terms, true)?;
     let hot = match source {
         Some(bytes) => encode_hot_postings(header, &terms, bytes, expected)?,
         None => vec![0, 0],
@@ -2664,7 +4249,11 @@ fn compress_common_directory_header(
     {
         return Err("Common-directory payload exceeds size budget".into());
     }
-    compress_directory_payload(&compact, expected, *COMMON_DIRECTORY_MAGIC)
+    compress_directory_payload(
+        &compact,
+        expected,
+        *common_directory_magic_for(header.version)?,
+    )
 }
 
 fn encode_hot_postings(
@@ -2845,13 +4434,13 @@ fn decode_hot_postings(bytes: &[u8], header: &Header) -> Result<HotPostings, Str
             .terms
             .last_key_value()
             .is_some_and(|(prior, _)| prior >= &term)
-            || header.terms.get(&term).is_none()
+            || header.terms().get(&term).is_none()
         {
             return Err("Invalid common posting term".into());
         }
         let block_count = read_u16(&mut cursor)? as usize;
         let metadata = header
-            .terms
+            .terms()
             .get(&term)
             .ok_or("Missing common posting term")?;
         if block_count == 0 || block_count != metadata.blocks.len() {
@@ -2999,7 +4588,7 @@ impl CommonDirectory {
             expected,
             max_heap_bytes,
             None,
-            *COMMON_DIRECTORY_MAGIC,
+            directory_frame_magic(bytes, true)?,
         )?;
         Ok(Self {
             header: Rc::new(contents.header),
@@ -3013,7 +4602,7 @@ impl CommonDirectory {
             .terms
             .words
             .iter()
-            .all(|term| self.header.terms.get(term).is_some())
+            .all(|term| self.header.terms().get(term).is_some())
     }
 
     #[must_use]
@@ -3211,17 +4800,19 @@ pub struct Filter {
     pub value: serde_json::Value,
 }
 
-fn compare_number(value: &serde_json::Value, expected: &serde_json::Value, op: &str) -> bool {
-    if let (Some(a), Some(b)) = (value.as_f64(), expected.as_f64()) {
-        return match op {
-            "gt" => a > b,
-            "gte" => a >= b,
-            "lt" => a < b,
-            "lte" => a <= b,
-            _ => false,
-        };
-    }
-    false
+fn compare_scalar(value: &serde_json::Value, expected: &serde_json::Value, op: &str) -> bool {
+    let ordering = match (value, expected) {
+        (serde_json::Value::String(a), serde_json::Value::String(b)) => Some(a.cmp(b)),
+        (serde_json::Value::Number(a), serde_json::Value::Number(b)) => numbers::compare(a, b),
+        _ => None,
+    };
+    ordering.is_some_and(|order| match op {
+        "gt" => order.is_gt(),
+        "gte" => order.is_ge(),
+        "lt" => order.is_lt(),
+        "lte" => order.is_le(),
+        _ => false,
+    })
 }
 
 #[doc = "# Errors\nRejects unknown operators or invalid exists predicates."]
@@ -3237,7 +4828,52 @@ pub fn matches(
     Ok(true)
 }
 
+#[doc = "# Errors\nRejects unknown operators, invalid exists predicates and, under the typed reading, operands that are not valid typed cells. `typed` selects the reading from the segment version, never from the value shape."]
+pub fn matches_cells(
+    attributes: &BTreeMap<String, Cell>,
+    filters: &[Filter],
+    typed: bool,
+) -> Result<bool, String> {
+    for filter in filters {
+        if !filter
+            .prepare(typed)?
+            .matches(attributes.get(&filter.field))?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// A filter bound to one segment reading. Legacy filters keep their raw JSON semantics;
+/// typed filters decode their operand once with the typed wire rules.
+enum PreparedFilter<'a> {
+    Legacy(&'a Filter),
+    Typed(values::TypedFilter),
+}
+
+impl PreparedFilter<'_> {
+    fn matches(&self, actual: Option<&Cell>) -> Result<bool, String> {
+        match self {
+            Self::Typed(filter) => filter.matches(actual),
+            Self::Legacy(filter) => match actual {
+                None => filter.matches(None),
+                Some(Cell::Legacy(value)) => filter.matches(Some(value)),
+                Some(_) => Err("Typed attribute cell in a legacy segment".into()),
+            },
+        }
+    }
+}
+
 impl Filter {
+    fn prepare(&self, typed: bool) -> Result<PreparedFilter<'_>, String> {
+        if typed {
+            values::TypedFilter::prepare(&self.op, &self.value).map(PreparedFilter::Typed)
+        } else {
+            Ok(PreparedFilter::Legacy(self))
+        }
+    }
+
     fn matches(&self, actual: Option<&serde_json::Value>) -> Result<bool, String> {
         let equal = actual == Some(&self.value);
         let matched = match self.op.as_str() {
@@ -3249,8 +4885,30 @@ impl Filter {
                     .as_array()
                     .is_some_and(|items| items.contains(value))
             }),
+            "notIn" => {
+                let items = self.value.as_array().ok_or("Invalid notIn filter")?;
+                !actual.is_some_and(|value| items.contains(value))
+            }
+            "contains" => actual
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|values| values.contains(&self.value)),
+            "notContains" => !actual
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|values| values.contains(&self.value)),
+            "containsAny" => actual
+                .and_then(serde_json::Value::as_array)
+                .zip(self.value.as_array())
+                .is_some_and(|(values, expected)| {
+                    expected.iter().any(|value| values.contains(value))
+                }),
+            "notContainsAny" => !actual
+                .and_then(serde_json::Value::as_array)
+                .zip(self.value.as_array())
+                .is_some_and(|(values, expected)| {
+                    expected.iter().any(|value| values.contains(value))
+                }),
             "gt" | "gte" | "lt" | "lte" => {
-                actual.is_some_and(|value| compare_number(value, &self.value, &self.op))
+                actual.is_some_and(|value| compare_scalar(value, &self.value, &self.op))
             }
             _ => return Err("Unknown filter operation".into()),
         };
@@ -3497,12 +5155,12 @@ impl Search {
         let maximum_bytes = u32::try_from(MAX_BYTES).ok()?;
         let mut frequencies = Vec::with_capacity(self.terms.order.len());
         for term in &self.terms.order {
-            let metadata = self.header.terms.get(self.words[*term].as_str())?;
+            let metadata = self.header.terms().get(self.words[*term].as_str())?;
             if metadata.df != count || metadata.blocks.is_empty() {
                 return None;
             }
             let first = metadata.blocks.first()?;
-            let frequency = (first.max_title_tf, first.max_body_tf);
+            let frequency: (u32, u32) = first.max_tf.into();
             if frequency != (0, 1) && frequency != (1, 0) {
                 return None;
             }
@@ -3514,7 +5172,7 @@ impl Search {
                     || block.count == 0
                     || block.count > u32::try_from(BLOCK_SIZE).ok()?
                     || block.last.checked_sub(block.first)?.checked_add(1)? != block.count
-                    || (block.max_title_tf, block.max_body_tf) != frequency
+                    || <(u32, u32)>::from(block.max_tf) != frequency
                     || block.data.length == 0
                     || block.data.offset < previous_end
                     || end > maximum_bytes
@@ -3588,7 +5246,17 @@ impl Search {
         score: f64,
         id: &str,
     ) -> Result<Vec<PostingSpan<'_>>, String> {
-        self.posting_spans_cutoff(score, id, false)
+        self.posting_spans_cutoff(score, DocumentId::String(id), false)
+    }
+
+    #[doc = "# Errors\nRejects malformed canonical IDs, invalid ID bounds or non-positive/non-finite cutoff scores."]
+    pub fn posting_spans_after_id(
+        &self,
+        score: f64,
+        encoded_id: &str,
+    ) -> Result<Vec<PostingSpan<'_>>, String> {
+        let id = decode_document_id(encoded_id)?;
+        self.posting_spans_cutoff(score, id.borrowed(), false)
     }
 
     fn dense_cutoff(&self) -> Option<Hit> {
@@ -3602,7 +5270,7 @@ impl Search {
             .enumerate()
             .filter(|(_, term)| {
                 self.header
-                    .terms
+                    .terms()
                     .get(self.words[**term].as_str())
                     .is_some_and(|metadata| {
                         usize::try_from(metadata.df).ok() == Some(self.header.documents.len())
@@ -3695,7 +5363,7 @@ impl Search {
     fn posting_spans_cutoff(
         &self,
         score: f64,
-        id: &str,
+        id: DocumentIdRef<'_>,
         inclusive: bool,
     ) -> Result<Vec<PostingSpan<'_>>, String> {
         if !score.is_finite() || score <= 0.0 {
@@ -3734,7 +5402,7 @@ impl Search {
         let mut spans: Vec<PostingSpan<'_>> = Vec::new();
         for index in &self.terms.order {
             let term = &self.words[*index];
-            let Some(metadata) = self.header.terms.get(term) else {
+            let Some(metadata) = self.header.terms().get(term) else {
                 continue;
             };
             let mut blocks: Vec<&BlockMeta> = Vec::new();
@@ -3829,7 +5497,7 @@ impl Search {
             .map(|span| {
                 let metadata = self
                     .header
-                    .terms
+                    .terms()
                     .get(span.term)
                     .ok_or("Missing selected term")?;
                 let indices = span
@@ -3869,7 +5537,7 @@ impl Search {
                 continue;
             };
             let metadata = header
-                .terms
+                .terms()
                 .get(&selected.term)
                 .ok_or("Missing selected term")?;
             for index in &selected.indices {
@@ -3955,7 +5623,7 @@ impl Search {
             .map(|term| {
                 let metadata = self
                     .header
-                    .terms
+                    .terms()
                     .get(term)
                     .ok_or("Missing hot posting term")?;
                 Ok(SelectedPostingBlocks {
@@ -3977,7 +5645,11 @@ impl Search {
                 .terms
                 .word(&selected.term)
                 .ok_or("Missing selected query term")?;
-            let metadata = self.header.terms.get(term).ok_or("Missing selected term")?;
+            let metadata = self
+                .header
+                .terms()
+                .get(term)
+                .ok_or("Missing selected term")?;
             let blocks = selected
                 .indices
                 .iter()
@@ -4123,13 +5795,13 @@ impl Search {
             .enumerate()
             .map(|(index, term)| {
                 self.header
-                    .terms
+                    .terms()
                     .get(self.words[*term].as_str())
                     .into_iter()
                     .flat_map(|meta| meta.blocks.iter())
                     .map(|block| {
                         let minimum = if unrestricted {
-                            Some((block.min_title_length, block.min_body_length))
+                            Some(block.min_length.into())
                         } else {
                             let rows = block.first as usize..=block.last as usize;
                             rows.filter(|row| self.allowed[*row])
@@ -4144,10 +5816,10 @@ impl Search {
                         };
                         let score = minimum.map_or(0.0, |(title, body)| {
                             self.terms.scorers[index].score(
-                                block.max_title_tf,
-                                block.max_body_tf,
-                                block.min_title_length.max(title),
-                                block.min_body_length.max(body),
+                                block.max_tf[0],
+                                block.max_tf[1],
+                                block.min_length[0].max(title),
+                                block.min_length[1].max(body),
                             )
                         });
                         (block, score)
@@ -4305,12 +5977,38 @@ impl Search {
     }
 }
 
-pub fn document_terms(document: &Document) -> Vec<String> {
-    normalize_text(&format!("{} {}", document.title, document.text))
+#[doc = "# Errors\nRejects a document whose native title or text role is not text."]
+pub fn document_terms(document: &Document) -> Result<Vec<String>, String> {
+    let title = document.role_text(NativeRole::Title)?;
+    let text = document.role_text(NativeRole::Text)?;
+    Ok(normalize_text(&format!("{title} {text}"))
         .split_whitespace()
         .map(str::to_owned)
         .collect::<BTreeSet<_>>()
         .into_iter()
+        .collect())
+}
+
+#[cfg(test)]
+fn vector_bits(document: &Document) -> Result<Option<Vec<u32>>, String> {
+    match document.column(ColumnId::Role(NativeRole::Vector)) {
+        Some(ColumnValue::Vector(values)) => {
+            Ok(Some(values.iter().map(|value| value.to_bits()).collect()))
+        }
+        None => Ok(None),
+        Some(ColumnValue::Text(_) | ColumnValue::Attribute(_)) => {
+            Err("Native vector role is not a vector".into())
+        }
+    }
+}
+
+#[cfg(test)]
+fn documents_from_native_value(
+    value: serde_json::Value,
+) -> Result<Vec<Document>, serde_json::Error> {
+    serde_json::from_value::<Vec<serde_json::Value>>(value)?
+        .into_iter()
+        .map(Document::from_native_value)
         .collect()
 }
 
@@ -4330,12 +6028,32 @@ fn bloom_hashes(text: &str) -> (u64, u64) {
 
 #[doc = "# Errors\nRejects values beyond the bloom size budget or an unrepresentable bit index."]
 pub fn bloom_build(values: &[String]) -> Result<Vec<u8>, String> {
-    if values.len() > MAX_BYTES / 2 {
+    bloom_build_hashes(values.iter().map(|value| Ok(bloom_hashes(value))))
+}
+
+fn bloom_id_hashes(value: DocumentIdRef<'_>) -> Result<(u64, u64), String> {
+    match value {
+        DocumentId::String(text) => Ok(bloom_hashes(text)),
+        DocumentId::Uint(_) | DocumentId::Uuid(_) => serde_json::to_string(&value)
+            .map(|wire| bloom_hashes(&wire))
+            .map_err(|cause| cause.to_string()),
+    }
+}
+
+#[doc = "# Errors\nRejects canonical ID serialization failures, bloom size budgets or unrepresentable bit indexes."]
+pub fn bloom_build_ids(values: &[DocumentId]) -> Result<Vec<u8>, String> {
+    bloom_build_hashes(values.iter().map(|value| bloom_id_hashes(value.borrowed())))
+}
+
+fn bloom_build_hashes(
+    hashes: impl ExactSizeIterator<Item = Result<(u64, u64), String>>,
+) -> Result<Vec<u8>, String> {
+    if hashes.len() > MAX_BYTES / 2 {
         return Err("Bloom exceeds size budget".into());
     }
-    let mut bytes = vec![0u8; (values.len() * 2).max(8)];
-    for value in values {
-        let (a, b) = bloom_hashes(value);
+    let mut bytes = vec![0u8; (hashes.len() * 2).max(8)];
+    for hashes in hashes {
+        let (a, b) = hashes?;
         for index in 0u64..7 {
             let bit = usize::try_from(
                 a.wrapping_add(index.wrapping_mul(b))
@@ -4383,6 +6101,32 @@ pub fn bloom_filter_many<'a>(
     offsets: &[u32],
     values: &'a [String],
 ) -> Result<Vec<Vec<&'a str>>, String> {
+    let hashes = values.iter().map(|value| {
+        let (a, b) = bloom_hashes(value);
+        Ok((value.as_str(), a, b))
+    });
+    bloom_filter_hashes(bytes, offsets, hashes)
+}
+
+#[doc = "# Errors\nRejects canonical ID serialization failures, oversized batches or invalid offset framing."]
+pub fn bloom_filter_ids<'a>(
+    bytes: &[u8],
+    offsets: &[u32],
+    values: &'a [DocumentId],
+) -> Result<Vec<Vec<DocumentIdRef<'a>>>, String> {
+    let hashes = values.iter().map(|value| {
+        let value = value.borrowed();
+        let (a, b) = bloom_id_hashes(value)?;
+        Ok((value, a, b))
+    });
+    bloom_filter_hashes(bytes, offsets, hashes)
+}
+
+fn bloom_filter_hashes<T: Copy>(
+    bytes: &[u8],
+    offsets: &[u32],
+    hashes: impl Iterator<Item = Result<(T, u64, u64), String>>,
+) -> Result<Vec<Vec<T>>, String> {
     if bytes.len() > MAX_BYTES || offsets.len() > 65 {
         return Err("Bloom batch exceeds size budget".into());
     }
@@ -4397,13 +6141,7 @@ pub fn bloom_filter_many<'a>(
     {
         return Err("Invalid bloom offsets".into());
     }
-    let hashes: Vec<_> = values
-        .iter()
-        .map(|value| {
-            let (a, b) = bloom_hashes(value);
-            (value.as_str(), a, b)
-        })
-        .collect();
+    let hashes = hashes.collect::<Result<Vec<_>, _>>()?;
     let mut cached_positions: Option<(usize, Vec<[usize; 7]>)> = None;
     offsets
         .windows(2)
@@ -4467,16 +6205,491 @@ pub fn bloom_filter_many<'a>(
 #[cfg(target_arch = "wasm32")]
 pub mod wasm {
     use super::{
-        BuiltSegment, Document, DocumentAttributes, DocumentMeta, Filter, Header, MAX_BYTES,
-        MAX_QUERY_TERMS, Range, Search, SelectedAttributes, Statistics, TermDictionary, TermMeta,
-        TermScorer, append, bloom_build, bloom_filter_many, build, compare_document_ids,
-        decode_page, document_terms, matches, parse_header,
+        Bm25Parameters, BuiltSegment, CanonicalDocumentDto, CorpusStatistics, Document,
+        DocumentAttributes, DocumentColumnId, DocumentId, DocumentIdRef, DocumentMeta, FieldQuery,
+        FieldStatistics, Filter, Header, MAX_BYTES, MAX_QUERY_TERMS, NamedTextField, NativeRole,
+        Range, Search, SelectedAttributes, Statistics, TermDictionary, TermMeta, TermScorer,
+        append, bloom_build_ids, bloom_filter_ids, build, build_text_fields, compare_document_ids,
+        decode_page, document_terms, local_field_statistics, matches, parse_header,
+        rank_fields_with,
     };
     use serde::{Deserialize, Serialize};
     use std::cell::RefCell;
     use std::collections::{BTreeMap, BTreeSet};
     use std::rc::{Rc, Weak};
     use wasm_bindgen::prelude::*;
+
+    const FIELD_JSON_LIMIT: usize = 16 * 1024 * 1024;
+    const SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
+
+    fn deserialize_nonnull_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+        T: Deserialize<'de>,
+    {
+        T::deserialize(deserializer).map(Some)
+    }
+
+    #[derive(Deserialize)]
+    #[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+    enum FieldColumnDto {
+        Native { role: String },
+        Attribute { name: String },
+    }
+
+    impl TryFrom<FieldColumnDto> for DocumentColumnId {
+        type Error = String;
+
+        fn try_from(value: FieldColumnDto) -> Result<Self, Self::Error> {
+            match value {
+                FieldColumnDto::Native { role } => match role.as_str() {
+                    "title" => Ok(Self::Role(NativeRole::Title)),
+                    "text" => Ok(Self::Role(NativeRole::Text)),
+                    "vector" => Err("Vector is not a text field".into()),
+                    _ => Err("Unknown native document role".into()),
+                },
+                FieldColumnDto::Attribute { name }
+                    if !name.is_empty()
+                        && name.encode_utf16().count() <= 128
+                        && name.len() <= 128
+                        && !name.starts_with('$') =>
+                {
+                    Ok(Self::Attribute(name))
+                }
+                FieldColumnDto::Attribute { .. } => Err("Invalid attribute field name".into()),
+            }
+        }
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct NamedFieldDto {
+        name: String,
+        #[serde(default)]
+        config: crate::analysis::WordV4Config,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FieldBuildDto {
+        documents: Vec<CanonicalDocumentDto>,
+        text_fields: Vec<NamedFieldDto>,
+        #[serde(default)]
+        #[serde(deserialize_with = "deserialize_nonnull_option")]
+        filterable: Option<Vec<String>>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FieldStatisticDto {
+        id: FieldColumnDto,
+        tokens: u64,
+        frequencies: BTreeMap<String, u64>,
+    }
+
+    #[derive(Serialize)]
+    #[serde(untagged)]
+    enum FieldColumnOut {
+        Native {
+            source: &'static str,
+            role: &'static str,
+        },
+        Attribute {
+            source: &'static str,
+            name: String,
+        },
+    }
+
+    impl From<&DocumentColumnId> for FieldColumnOut {
+        fn from(id: &DocumentColumnId) -> Self {
+            match id {
+                DocumentColumnId::Role(NativeRole::Title) => Self::Native {
+                    source: "native",
+                    role: "title",
+                },
+                DocumentColumnId::Role(NativeRole::Text) => Self::Native {
+                    source: "native",
+                    role: "text",
+                },
+                DocumentColumnId::Role(NativeRole::Vector) => Self::Native {
+                    source: "native",
+                    role: "vector",
+                },
+                DocumentColumnId::Attribute(name) => Self::Attribute {
+                    source: "attribute",
+                    name: name.clone(),
+                },
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct FieldStatisticsOut<'a> {
+        id: FieldColumnOut,
+        tokens: u64,
+        frequencies: &'a BTreeMap<String, u64>,
+    }
+
+    #[derive(Serialize)]
+    struct CorpusStatisticsOut<'a> {
+        documents: u64,
+        fields: Vec<FieldStatisticsOut<'a>>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct CorpusStatisticsDto {
+        documents: u64,
+        fields: Vec<FieldStatisticDto>,
+    }
+
+    impl TryFrom<CorpusStatisticsDto> for CorpusStatistics {
+        type Error = String;
+
+        fn try_from(value: CorpusStatisticsDto) -> Result<Self, Self::Error> {
+            if value.documents > SAFE_JSON_INTEGER {
+                return Err("Document count exceeds safe JSON integer range".into());
+            }
+            if value.fields.len() > 66 {
+                return Err("Corpus field count exceeds field budget".into());
+            }
+            let fields = value
+                .fields
+                .into_iter()
+                .map(|field| {
+                    if field.tokens > SAFE_JSON_INTEGER
+                        || field.frequencies.len() > MAX_QUERY_TERMS
+                        || field
+                            .frequencies
+                            .values()
+                            .any(|count| *count > SAFE_JSON_INTEGER)
+                    {
+                        return Err("Field count exceeds safe JSON integer range".into());
+                    }
+                    Ok(FieldStatistics {
+                        id: field.id.try_into()?,
+                        tokens: field.tokens,
+                        frequencies: field.frequencies,
+                    })
+                })
+                .collect::<Result<_, String>>()?;
+            Ok(Self {
+                documents: value.documents,
+                fields,
+            })
+        }
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FieldQueryDto {
+        fields: Vec<FieldColumnDto>,
+        text: String,
+        mode: String,
+        #[serde(default = "default_top_k")]
+        top_k: usize,
+        #[serde(default)]
+        dead: Vec<u32>,
+        #[serde(default)]
+        filters: Vec<FieldFilterDto>,
+        #[serde(default)]
+        #[serde(deserialize_with = "deserialize_nonnull_option")]
+        bm25: Option<Bm25Dto>,
+        #[serde(default)]
+        #[serde(deserialize_with = "deserialize_nonnull_option")]
+        statistics: Option<CorpusStatisticsDto>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FieldStatisticsQueryDto {
+        fields: Vec<FieldColumnDto>,
+        text: String,
+        mode: String,
+        #[serde(default)]
+        dead: Vec<u32>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Bm25Dto {
+        k1: f64,
+        b: f64,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FieldFilterDto {
+        field: String,
+        op: String,
+        value: serde_json::Value,
+    }
+
+    struct DecodedFieldQuery {
+        fields: Vec<DocumentColumnId>,
+        text: String,
+        mode: String,
+        top_k: usize,
+        dead: Vec<u32>,
+        filters: Vec<Filter>,
+        bm25: Bm25Parameters,
+        statistics: Option<CorpusStatistics>,
+    }
+
+    impl DecodedFieldQuery {
+        fn as_query(&self) -> FieldQuery<'_> {
+            FieldQuery {
+                fields: &self.fields,
+                text: &self.text,
+                mode: &self.mode,
+                top_k: self.top_k,
+                dead: &self.dead,
+                filters: &self.filters,
+                bm25: self.bm25,
+                statistics: self.statistics.as_ref(),
+            }
+        }
+    }
+
+    fn is_legacy_scalar(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::String(_) => {
+                true
+            }
+            serde_json::Value::Number(number) => number.as_f64().is_some_and(f64::is_finite),
+            serde_json::Value::Array(_) | serde_json::Value::Object(_) => false,
+        }
+    }
+
+    fn is_legacy_operand(op: &str, value: &serde_json::Value) -> bool {
+        match op {
+            "eq" | "ne" | "contains" | "notContains" => is_legacy_scalar(value),
+            "gt" | "gte" | "lt" | "lte" => {
+                value.is_string() || (value.is_number() && is_legacy_scalar(value))
+            }
+            "exists" => value.is_boolean(),
+            "in" => value.as_array().is_some_and(|items| {
+                (1..=32).contains(&items.len()) && items.iter().all(is_legacy_scalar)
+            }),
+            "notIn" | "containsAny" | "notContainsAny" => value
+                .as_array()
+                .is_some_and(|items| items.len() <= 32 && items.iter().all(is_legacy_scalar)),
+            _ => false,
+        }
+    }
+
+    fn is_typed_operand(op: &str, value: &serde_json::Value) -> bool {
+        match op {
+            "eq" | "ne" | "contains" | "notContains" => !value.is_array(),
+            "gt" | "gte" | "lt" | "lte" => value.is_string() || value.is_object(),
+            "exists" => value.is_boolean(),
+            "in" => value.as_array().is_some_and(|items| {
+                (1..=32).contains(&items.len()) && items.iter().all(|item| !item.is_array())
+            }),
+            "notIn" | "containsAny" | "notContainsAny" => value.as_array().is_some_and(|items| {
+                items.len() <= 32 && items.iter().all(|item| !item.is_array())
+            }),
+            _ => false,
+        }
+    }
+
+    impl FieldFilterDto {
+        /// `typed` comes from the canonical segment version, never from the operand shape.
+        /// Legacy segments keep the scalar grammar; typed segments take exact typed cells
+        /// through the engine's own typed filter preparation.
+        fn into_filter(self, typed: bool) -> Result<Filter, String> {
+            if self.field.is_empty()
+                || self.field.encode_utf16().count() > 128
+                || self.field.len() > 128
+                || self.field.starts_with('$')
+            {
+                return Err("Invalid filter field name".into());
+            }
+            let filter = Filter {
+                field: self.field,
+                op: self.op,
+                value: self.value,
+            };
+            if typed {
+                if !is_typed_operand(&filter.op, &filter.value) {
+                    return Err("Invalid field filter".into());
+                }
+                filter.prepare(true)?;
+            } else if !is_legacy_operand(&filter.op, &filter.value) {
+                return Err("Invalid field filter".into());
+            }
+            Ok(filter)
+        }
+    }
+
+    fn named_text_fields(declarations: &[NamedFieldDto]) -> Vec<NamedTextField<'_>> {
+        declarations
+            .iter()
+            .map(|field| NamedTextField {
+                attribute: &field.name,
+                config: field.config,
+            })
+            .collect()
+    }
+
+    fn decode_named_declarations(json: &str) -> Result<Vec<NamedFieldDto>, JsValue> {
+        check_field_json(json)?;
+        let declarations: Vec<NamedFieldDto> =
+            serde_json::from_str(json).map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        if declarations.len() > 64 {
+            return Err(JsValue::from_str("Field build exceeds its input budget"));
+        }
+        Ok(declarations)
+    }
+
+    const fn default_top_k() -> usize {
+        10
+    }
+
+    fn check_field_json(value: &str) -> Result<(), JsValue> {
+        if value.len() > FIELD_JSON_LIMIT {
+            Err(JsValue::from_str("Field JSON exceeds sixteen MiB"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn decode_field_query(json: &str, typed: bool) -> Result<DecodedFieldQuery, JsValue> {
+        check_field_json(json)?;
+        let dto: FieldQueryDto =
+            serde_json::from_str(json).map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        if dto.fields.is_empty()
+            || dto.fields.len() > 66
+            || dto.dead.len() > 100_000
+            || dto.filters.len() > 64
+            || !(1..=100).contains(&dto.top_k)
+            || dto.text.is_empty()
+            || dto.text.encode_utf16().count() > 8_192
+        {
+            return Err(JsValue::from_str("Field query exceeds its input budget"));
+        }
+        let fields = dto
+            .fields
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(|cause| JsValue::from_str(&cause))?;
+        let bm25 = dto
+            .bm25
+            .map_or(Ok(Bm25Parameters::DEFAULT), |p| {
+                Bm25Parameters::new(p.k1, p.b)
+            })
+            .map_err(|cause| JsValue::from_str(&cause))?;
+        let statistics = dto
+            .statistics
+            .map(TryInto::try_into)
+            .transpose()
+            .map_err(|cause: String| JsValue::from_str(&cause))?;
+        let filters = dto
+            .filters
+            .into_iter()
+            .map(|filter| filter.into_filter(typed))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|cause| JsValue::from_str(&cause))?;
+        Ok(DecodedFieldQuery {
+            fields,
+            text: dto.text,
+            mode: dto.mode,
+            top_k: dto.top_k,
+            dead: dto.dead,
+            filters,
+            bm25,
+            statistics,
+        })
+    }
+
+    #[wasm_bindgen]
+    #[doc = "# Errors\nRejects malformed or oversized field build JSON, invalid canonical documents, declarations, and segments beyond engine budgets."]
+    pub fn segment_build_text_fields(json: &str) -> Result<Vec<u8>, JsValue> {
+        check_field_json(json)?;
+        let dto: FieldBuildDto =
+            serde_json::from_str(json).map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        if dto.documents.is_empty()
+            || dto.documents.len() > 10_000
+            || dto.text_fields.len() > 64
+            || dto
+                .filterable
+                .as_ref()
+                .is_some_and(|fields| fields.len() > 64)
+        {
+            return Err(JsValue::from_str("Field build exceeds its input budget"));
+        }
+        let documents = dto
+            .documents
+            .into_iter()
+            .map(Document::from_canonical_dto)
+            .collect();
+        let fields = named_text_fields(&dto.text_fields);
+        build_text_fields(documents, dto.filterable.as_deref(), &fields)
+            .map(|built| built.bytes)
+            .map_err(|cause| JsValue::from_str(&cause))
+    }
+
+    #[wasm_bindgen]
+    #[doc = "# Errors\nRejects malformed field query JSON, invalid global statistics, corrupt segments, filters, and tombstones."]
+    pub fn segment_rank_fields(bytes: &[u8], json: &str) -> Result<String, JsValue> {
+        let decoded = decode_field_query(json, super::has_typed_magic(bytes))?;
+        let query = decoded.as_query();
+        let hits = rank_fields_with(bytes, &query).map_err(|cause| JsValue::from_str(&cause))?;
+        serde_json::to_string(&hits).map_err(|cause| JsValue::from_str(&cause.to_string()))
+    }
+
+    #[wasm_bindgen]
+    #[doc = "# Errors\nRejects malformed field query JSON, unsafe count transport, corrupt segments, and invalid tombstones."]
+    pub fn segment_local_field_statistics(bytes: &[u8], json: &str) -> Result<String, JsValue> {
+        check_field_json(json)?;
+        let dto: FieldStatisticsQueryDto =
+            serde_json::from_str(json).map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        if dto.fields.is_empty()
+            || dto.fields.len() > 66
+            || dto.dead.len() > 100_000
+            || dto.text.is_empty()
+            || dto.text.encode_utf16().count() > 8_192
+        {
+            return Err(JsValue::from_str(
+                "Field statistics query exceeds its input budget",
+            ));
+        }
+        let fields = dto
+            .fields
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(|cause| JsValue::from_str(&cause))?;
+        let statistics = local_field_statistics(bytes, &fields, &dto.text, &dto.mode, &dto.dead)
+            .map_err(|cause| JsValue::from_str(&cause))?;
+        if statistics.documents > SAFE_JSON_INTEGER
+            || statistics.fields.iter().any(|field| {
+                field.tokens > SAFE_JSON_INTEGER
+                    || field
+                        .frequencies
+                        .values()
+                        .any(|count| *count > SAFE_JSON_INTEGER)
+            })
+        {
+            return Err(JsValue::from_str(
+                "Field statistics exceed safe JSON integer range",
+            ));
+        }
+        let output = CorpusStatisticsOut {
+            documents: statistics.documents,
+            fields: statistics
+                .fields
+                .iter()
+                .map(|field| FieldStatisticsOut {
+                    id: (&field.id).into(),
+                    tokens: field.tokens,
+                    frequencies: &field.frequencies,
+                })
+                .collect(),
+        };
+        serde_json::to_string(&output).map_err(|cause| JsValue::from_str(&cause.to_string()))
+    }
 
     #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
     struct TermSummary {
@@ -4500,15 +6713,14 @@ pub mod wasm {
     #[serde(deny_unknown_fields)]
     struct TermDocument {
         row: u32,
-        id: String,
+        id: DocumentId,
         data: Range,
     }
 
     impl TermDocument {
         fn is_bounded(&self, count: u32) -> bool {
             self.row < count
-                && !self.id.is_empty()
-                && self.id.encode_utf16().count() <= 128
+                && self.id.is_valid()
                 && self.data.length >= 8
                 && self
                     .data
@@ -4583,7 +6795,7 @@ pub mod wasm {
                 .take(required)
                 .map(|document| Ranked {
                     row: document.row,
-                    id: &document.id,
+                    id: document.id.borrowed(),
                     score,
                     data: document.data.clone(),
                 })
@@ -4601,22 +6813,22 @@ pub mod wasm {
         for field in ["title", "body"] {
             let title = field == "title";
             let terms: Vec<_> = header
-                .terms
+                .terms()
                 .iter()
                 .filter(|(term, metadata)| count > 1 && metadata.df == count && term.len() <= 64)
                 .take(16)
                 .filter(|(_, metadata)| {
-                    metadata.blocks.iter().all(|block| {
-                        (block.max_title_tf, block.max_body_tf)
-                            == if title { (1, 0) } else { (0, 1) }
-                    })
+                    metadata
+                        .blocks
+                        .iter()
+                        .all(|block| block.max_tf == if title { [1, 0] } else { [0, 1] })
                 })
                 .map(|(term, _)| term.to_owned())
                 .collect();
             if terms.is_empty() {
                 continue;
             }
-            let length = |document: &DocumentMeta<&str, &DocumentAttributes>| {
+            let length = |document: &DocumentMeta<DocumentIdRef<'_>, &DocumentAttributes>| {
                 if title {
                     document.title_length
                 } else {
@@ -4637,14 +6849,14 @@ pub mod wasm {
                 if length(&document) != minimum {
                     continue;
                 }
-                let charge = document.id.len() * 6 + 128;
+                let charge = document.id.encoded_len() * 6 + 128;
                 if documents.len() == 16 || bytes + charge > 4096 {
                     break;
                 }
                 bytes += charge;
                 documents.push(TermDocument {
                     row: u32::try_from(row).map_err(|cause| cause.to_string())?,
-                    id: document.id.to_string(),
+                    id: document.id.to_owned(),
                     data: document.data.clone(),
                 });
             }
@@ -4668,7 +6880,17 @@ pub mod wasm {
             .is_some_and(|value| (-9_007_199_254_740_991..=9_007_199_254_740_991).contains(&value))
     }
 
+    fn legacy_projection_only(header: &Header, operation: &str) -> Result<(), String> {
+        if header.version >= super::TYPED_VERSION {
+            return Err(format!(
+                "{operation} reads legacy raw attributes and does not support typed segments"
+            ));
+        }
+        Ok(())
+    }
+
     fn constant_attributes(header: &Header) -> Result<String, String> {
+        legacy_projection_only(header, "Constant attribute projection")?;
         let first = header.documents.first().ok_or("Segment has no documents")?;
         let attributes: BTreeMap<String, &serde_json::value::RawValue> =
             serde_json::from_str(first.attributes.get()).map_err(|cause| cause.to_string())?;
@@ -4746,14 +6968,14 @@ pub mod wasm {
     fn common_terms(header: &Header) -> Result<String, String> {
         let dictionary: BTreeMap<_, _> = super::common_term_names(
             header
-                .terms
+                .terms()
                 .iter()
                 .map(|(term, metadata)| (term, metadata.df as usize)),
         )
         .into_iter()
         .map(|term| {
             let metadata = header
-                .terms
+                .terms()
                 .get(term)
                 .ok_or("Common term metadata disappeared")?;
             let first = metadata
@@ -4762,17 +6984,17 @@ pub mod wasm {
                 .ok_or("Common term has no posting blocks")?;
             let bounds = metadata.blocks.iter().skip(1).fold(
                 (
-                    first.max_title_tf,
-                    first.max_body_tf,
-                    first.min_title_length,
-                    first.min_body_length,
+                    first.max_tf[0],
+                    first.max_tf[1],
+                    first.min_length[0],
+                    first.min_length[1],
                 ),
                 |(title, body, title_length, body_length), block| {
                     (
-                        title.max(block.max_title_tf),
-                        body.max(block.max_body_tf),
-                        title_length.min(block.min_title_length),
-                        body_length.min(block.min_body_length),
+                        title.max(block.max_tf[0]),
+                        body.max(block.max_tf[1]),
+                        title_length.min(block.min_length[0]),
+                        body_length.min(block.min_length[1]),
                     )
                 },
             );
@@ -5250,7 +7472,7 @@ pub mod wasm {
                 + summary
                     .single
                     .as_ref()
-                    .map_or(0, |document| document.id.capacity())
+                    .map_or(0, |document| document.id.heap_bytes())
                 + 192;
             if charge > SUMMARY_POOL_BYTES.saturating_sub(self.bytes) {
                 return None;
@@ -5349,7 +7571,7 @@ pub mod wasm {
             let pool = RefCell::new(SummaryPool::default());
             let mut tuple = serializer.serialize_tuple(5)?;
             tuple.serialize_element(&OverviewDictionary {
-                terms: &self.header.terms,
+                terms: self.header.terms(),
                 pool: &pool,
             })?;
             tuple.serialize_element(&self.eligibility)?;
@@ -5865,7 +8087,8 @@ pub mod wasm {
             let mut selected = BTreeMap::new();
             while let Some(term) = map.next_key_seed(SelectedTerm(self.0))? {
                 if let Some(term) = term {
-                    let (row, id, offset, length) = map.next_value::<(u32, String, u32, u32)>()?;
+                    let (row, id, offset, length) =
+                        map.next_value::<(u32, DocumentId, u32, u32)>()?;
                     let document = TermDocument {
                         row,
                         id,
@@ -6273,6 +8496,7 @@ pub mod wasm {
         groups: &[EligibilityGroup],
         singletons: &BTreeMap<&str, TermDocument>,
     ) -> Result<Vec<u8>, String> {
+        legacy_projection_only(header, "Overview encoding")?;
         let json = serde_json::to_vec(&DirectoryOverview {
             header,
             singletons,
@@ -6303,7 +8527,7 @@ pub mod wasm {
             return Ok(None);
         }
         let document = header.documents.row(block.first as usize);
-        let charge = term.len() + document.id.len() + size_of::<TermDocument>() + 256;
+        let charge = term.len() + document.id.encoded_len() + size_of::<TermDocument>() + 256;
         if charge > *remaining {
             return Ok(None);
         }
@@ -6332,9 +8556,8 @@ pub mod wasm {
         };
         super::validate_posting(header, row.posting.row, row.title_last, row.body_last, None)?;
         if row.posting.row != block.first
-            || (row.posting.title, row.posting.body) != (block.max_title_tf, block.max_body_tf)
-            || (document.title_length, document.body_length)
-                != (block.min_title_length, block.min_body_length)
+            || (row.posting.title, row.posting.body) != <(u32, u32)>::from(block.max_tf)
+            || (document.title_length, document.body_length) != <(u32, u32)>::from(block.min_length)
         {
             return Ok(None);
         }
@@ -6367,8 +8590,8 @@ pub mod wasm {
         let mut entries = 0;
         let mut singletons = BTreeMap::new();
         let mut singleton_budget = 4 * 1024 * 1024;
-        let entry_budget = (header.terms.len() / 4).clamp(512, 65536);
-        for (term, metadata) in &header.terms {
+        let entry_budget = (header.terms().len() / 4).clamp(512, 65536);
+        for (term, metadata) in header.terms() {
             if metadata.df == 1 {
                 if let Some(document) =
                     singleton_document(bytes, base, &header, term, metadata, &mut singleton_budget)?
@@ -6454,11 +8677,43 @@ pub mod wasm {
 
     #[wasm_bindgen]
     impl Segment {
+        #[doc = "# Errors\nRejects invalid typed documents, undeclared attributes, mismatched cell types, unsupported column settings, malformed, oversized, duplicate, unsorted, undeclared or non-text named field declarations, or segment bounds. The optional third argument declares named text fields over string or string-array columns."]
+        pub fn with_columns(
+            json: &str,
+            columns: &str,
+            text_fields: Option<String>,
+        ) -> Result<Self, JsValue> {
+            let declarations = text_fields
+                .map(|json| decode_named_declarations(&json))
+                .transpose()?
+                .unwrap_or_default();
+            let schema = super::AttributeSchema::from_json(columns)
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            let fields = named_text_fields(&declarations);
+            for field in &fields {
+                schema
+                    .validate_text_field(field.attribute)
+                    .map_err(|cause| JsValue::from_str(&cause))?;
+            }
+            let documents = serde_json::from_str::<Vec<super::TypedDocumentDto>>(json)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?
+                .into_iter()
+                .map(Document::from_typed_dto)
+                .collect();
+            Ok(Self {
+                built: super::build_typed(documents, &schema, &fields)
+                    .map_err(|cause| JsValue::from_str(&cause))?,
+            })
+        }
+
         #[wasm_bindgen(constructor)]
         #[doc = "# Errors\nRejects invalid input serialization or segment framing, size, and integrity constraints."]
         pub fn new(json: &str, filterable: Option<String>) -> Result<Self, JsValue> {
-            let documents: Vec<Document> =
-                serde_json::from_str(json).map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let documents = serde_json::from_str::<Vec<CanonicalDocumentDto>>(json)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?
+                .into_iter()
+                .map(Document::from_canonical_dto)
+                .collect();
             let filterable = filterable
                 .map(|json| serde_json::from_str::<Vec<String>>(&json))
                 .transpose()
@@ -6512,11 +8767,6 @@ pub mod wasm {
 
     impl CachedDirectoryFrame {
         fn new(bytes: Vec<u8>, expected: usize, partial: bool) -> Result<Self, String> {
-            let magic = if partial {
-                super::COMMON_DIRECTORY_MAGIC
-            } else {
-                super::DIRECTORY_MAGIC
-            };
             let maximum = MAX_BYTES
                 + (if partial {
                     super::MAX_COMMON_FRAME_BYTES
@@ -6526,7 +8776,7 @@ pub mod wasm {
                 + 8192;
             if bytes.len() < 20
                 || bytes.len() > maximum
-                || &bytes[..8] != magic
+                || super::directory_frame_magic(&bytes, partial).is_err()
                 || !(16..=MAX_BYTES).contains(&expected)
             {
                 return Err("Invalid compressed directory frame".into());
@@ -6585,11 +8835,8 @@ pub mod wasm {
 
         #[doc = "# Errors\nRejects corruption, invalid headers and decoded-memory budget violations."]
         pub fn directory(&self, max_heap_bytes: u32) -> Result<Directory, JsValue> {
-            let magic = if self.frame.partial {
-                *super::COMMON_DIRECTORY_MAGIC
-            } else {
-                *super::DIRECTORY_MAGIC
-            };
+            let magic = super::directory_frame_magic(&self.frame.bytes, self.frame.partial)
+                .map_err(|cause| JsValue::from_str(&cause))?;
             let contents = super::decode_directory_contents(
                 &self.frame.bytes,
                 self.frame.expected,
@@ -6615,6 +8862,23 @@ pub mod wasm {
         overview_groups: RefCell<Option<Box<[EligibilityGroup]>>>,
     }
 
+    #[wasm_bindgen]
+    pub struct VectorRows {
+        scan: super::VectorScan,
+    }
+
+    #[wasm_bindgen]
+    impl VectorRows {
+        #[doc = "# Errors\nRejects inconsistent vector ranges, row overflow or page serialization failures."]
+        pub fn next_page(&mut self) -> Result<String, JsValue> {
+            let page = self
+                .scan
+                .page()
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            serde_json::to_string(&page).map_err(|cause| JsValue::from_str(&cause.to_string()))
+        }
+    }
+
     struct EligibleCatalog {
         minimum: Option<(u32, u32)>,
         eligibility: Option<EligibilityProjection>,
@@ -6626,6 +8890,7 @@ pub mod wasm {
         fields: &BTreeSet<&str>,
         filters: &[Filter],
     ) -> Result<EligibleCatalog, String> {
+        legacy_projection_only(header, "Eligibility projection")?;
         let mut groups = EligibilityProjectionBuilder::new(
             fields.iter().map(|field| (*field).to_owned()).collect(),
         )?;
@@ -6782,7 +9047,7 @@ pub mod wasm {
                     .terms
                     .words
                     .iter()
-                    .all(|term| self.header.terms.get(term).is_some())
+                    .all(|term| self.header.terms().get(term).is_some())
         }
 
         #[doc = "# Errors\nRejects invalid expected lengths and compact directory size limits."]
@@ -6853,7 +9118,7 @@ pub mod wasm {
                 serde_json::from_str(terms).map_err(|e| JsValue::from_str(&e.to_string()))?;
             let selected: BTreeMap<_, _> = terms
                 .iter()
-                .filter_map(|term| self.header.terms.get(term).map(|meta| (term, meta)))
+                .filter_map(|term| self.header.terms().get(term).map(|meta| (term, meta)))
                 .collect();
             serde_json::to_string(&selected).map_err(|e| JsValue::from_str(&e.to_string()))
         }
@@ -6869,7 +9134,7 @@ pub mod wasm {
                 .iter()
                 .filter_map(|term| {
                     self.header
-                        .terms
+                        .terms()
                         .get(term)
                         .map(|meta| (term, TermSummary::from(meta)))
                 })
@@ -6902,7 +9167,7 @@ pub mod wasm {
                     .iter()
                     .filter_map(|term| {
                         self.header
-                            .terms
+                            .terms()
                             .get(term)
                             .map(|meta| (term.clone(), TermSummary::from(meta)))
                     })
@@ -6976,7 +9241,7 @@ pub mod wasm {
         #[doc = "# Errors\nRejects invalid ids or tombstones, row overflow, or result serialization errors."]
         pub fn lookup(&self, ids: &str, dead: &str) -> Result<String, JsValue> {
             let header = &self.header;
-            let ids: Vec<String> =
+            let ids: Vec<DocumentId> =
                 serde_json::from_str(ids).map_err(|e| JsValue::from_str(&e.to_string()))?;
             let dead: BTreeSet<u32> =
                 serde_json::from_str(dead).map_err(|e| JsValue::from_str(&e.to_string()))?;
@@ -7032,6 +9297,20 @@ pub mod wasm {
                 .collect::<Result<Vec<_>, String>>()
                 .map_err(|cause| JsValue::from_str(&cause))?;
             serde_json::to_string(&selected).map_err(|e| JsValue::from_str(&e.to_string()))
+        }
+
+        #[doc = "# Errors\nRejects partial directories, malformed filters/tombstones or invalid filter attributes."]
+        pub fn vector_reader(&self, filters: &str, dead: &str) -> Result<VectorRows, JsValue> {
+            if self.partial {
+                return Err(JsValue::from_str("Operation requires a complete directory"));
+            }
+            let filters: Vec<Filter> = serde_json::from_str(filters)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            let dead: Vec<u32> = serde_json::from_str(dead)
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            let scan = super::VectorScan::new(Rc::clone(&self.header), &filters, &dead)
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            Ok(VectorRows { scan })
         }
 
         #[doc = "# Errors\nRejects invalid tombstone JSON, filter attributes, or deleted rows."]
@@ -7090,7 +9369,7 @@ pub mod wasm {
     #[derive(Serialize)]
     struct Located<'a> {
         row: u32,
-        document: DocumentMeta<&'a str, &'a DocumentAttributes>,
+        document: DocumentMeta<DocumentIdRef<'a>, &'a DocumentAttributes>,
         #[serde(rename = "vectorData")]
         vector_data: Option<&'a Range>,
     }
@@ -7130,28 +9409,49 @@ pub mod wasm {
     }
 
     #[wasm_bindgen]
-    #[doc = "# Errors\nRejects invalid v2 canonical header framing or serialization."]
+    #[doc = "# Errors\nRejects invalid v2 or v3 canonical header framing or serialization."]
     pub fn segment_header(bytes: &[u8]) -> Result<String, JsValue> {
         let (header, _) = parse_header(bytes).map_err(|cause| JsValue::from_str(&cause))?;
         serde_json::to_string(&header).map_err(|cause| JsValue::from_str(&cause.to_string()))
     }
 
     #[wasm_bindgen]
-    #[doc = "# Errors\nRejects invalid v1 sources or migration output above sixteen MiB."]
+    #[doc = "# Errors\nRejects invalid v2, v3 or v4 canonical header framing or field serialization."]
+    pub fn segment_fields(bytes: &[u8]) -> Result<String, JsValue> {
+        let (header, _) = parse_header(bytes).map_err(|cause| JsValue::from_str(&cause))?;
+        serde_json::to_string(&header.fields).map_err(|cause| JsValue::from_str(&cause.to_string()))
+    }
+
+    #[wasm_bindgen]
+    #[doc = "# Errors\nRejects invalid v1 or v2 sources or migration output above sixteen MiB."]
     pub fn segment_migrate(bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
         super::migrate_segment(bytes).map_err(|cause| JsValue::from_str(&cause))
     }
 
     #[wasm_bindgen]
     #[doc = "# Errors\nRejects corrupt pages or invalid document serialization."]
-    pub fn segment_document(bytes: &[u8], vector: &[u8]) -> Result<String, JsValue> {
-        super::full_document_from_frames(bytes, vector).map_err(|cause| JsValue::from_str(&cause))
+    pub fn segment_document(
+        bytes: &[u8],
+        vector: &[u8],
+        typed: Option<bool>,
+    ) -> Result<String, JsValue> {
+        let document = if typed == Some(true) {
+            super::full_typed_document_from_frames(bytes, vector)
+        } else {
+            super::full_document_from_frames(bytes, vector)
+        };
+        document.map_err(|cause| JsValue::from_str(&cause))
     }
 
     #[wasm_bindgen]
     #[doc = "# Errors\nRejects corrupt pages, invalid document serialization, or query projection errors."]
-    pub fn segment_query_document(bytes: &[u8]) -> Result<String, JsValue> {
-        super::query_document_from_metadata(bytes).map_err(|cause| JsValue::from_str(&cause))
+    pub fn segment_query_document(bytes: &[u8], typed: Option<bool>) -> Result<String, JsValue> {
+        let document = if typed == Some(true) {
+            super::query_typed_document_from_metadata(bytes)
+        } else {
+            super::query_document_from_metadata(bytes)
+        };
+        document.map_err(|cause| JsValue::from_str(&cause))
     }
 
     #[wasm_bindgen]
@@ -7167,10 +9467,12 @@ pub mod wasm {
     #[wasm_bindgen]
     #[doc = "# Errors\nRejects invalid document JSON or term serialization errors."]
     pub fn segment_document_terms(json: &str) -> Result<String, JsValue> {
-        let document: Document =
-            serde_json::from_str(json).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        serde_json::to_string(&document_terms(&document))
-            .map_err(|e| JsValue::from_str(&e.to_string()))
+        let document =
+            Document::from_canonical_json(json).map_err(|cause| JsValue::from_str(&cause))?;
+        serde_json::to_string(
+            &document_terms(&document).map_err(|cause| JsValue::from_str(&cause))?,
+        )
+        .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     #[wasm_bindgen]
@@ -7186,9 +9488,9 @@ pub mod wasm {
     #[wasm_bindgen]
     #[doc = "# Errors\nRejects invalid values or bloom size/index budgets."]
     pub fn segment_bloom(values: &str) -> Result<Vec<u8>, JsValue> {
-        let values: Vec<String> =
+        let values: Vec<DocumentId> =
             serde_json::from_str(values).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        bloom_build(&values).map_err(|cause| JsValue::from_str(&cause))
+        bloom_build_ids(&values).map_err(|cause| JsValue::from_str(&cause))
     }
 
     #[wasm_bindgen]
@@ -7198,10 +9500,10 @@ pub mod wasm {
         offsets: &[u32],
         values: &str,
     ) -> Result<String, JsValue> {
-        let values: Vec<String> =
+        let values: Vec<DocumentId> =
             serde_json::from_str(values).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let selected = bloom_filter_many(bytes, offsets, &values)
-            .map_err(|cause| JsValue::from_str(&cause))?;
+        let selected =
+            bloom_filter_ids(bytes, offsets, &values).map_err(|cause| JsValue::from_str(&cause))?;
         serde_json::to_string(&selected).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
@@ -7216,7 +9518,7 @@ pub mod wasm {
         #[wasm_bindgen(constructor)]
         #[doc = "# Errors\nRejects oversized batches or invalid offset framing."]
         pub fn new(bytes: Vec<u8>, offsets: Vec<u32>) -> Result<Self, JsValue> {
-            bloom_filter_many(&bytes, &offsets, &[]).map_err(|cause| JsValue::from_str(&cause))?;
+            bloom_filter_ids(&bytes, &offsets, &[]).map_err(|cause| JsValue::from_str(&cause))?;
             Ok(Self {
                 bytes: bytes.into_boxed_slice(),
                 offsets: offsets.into_boxed_slice(),
@@ -7230,9 +9532,9 @@ pub mod wasm {
 
         #[doc = "# Errors\nRejects invalid values or result serialization errors."]
         pub fn filter(&self, values: &str) -> Result<String, JsValue> {
-            let values: Vec<String> = serde_json::from_str(values)
+            let values: Vec<DocumentId> = serde_json::from_str(values)
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
-            let selected = bloom_filter_many(&self.bytes, &self.offsets, &values)
+            let selected = bloom_filter_ids(&self.bytes, &self.offsets, &values)
                 .map_err(|cause| JsValue::from_str(&cause))?;
             serde_json::to_string(&selected).map_err(|cause| JsValue::from_str(&cause.to_string()))
         }
@@ -7387,7 +9689,7 @@ pub mod wasm {
                 }
                 ranked.push(Ranked {
                     row: document.row,
-                    id: &document.id,
+                    id: document.id.borrowed(),
                     score,
                     data: document.data.clone(),
                 });
@@ -7448,11 +9750,10 @@ pub mod wasm {
                         .iter()
                         .any(|term| term.is_empty() || term.len() > 64)
                     || leader.documents.len() > 16
-                    || leader.documents.iter().any(|document| {
-                        document.row >= count
-                            || document.id.is_empty()
-                            || document.id.encode_utf16().count() > 128
-                    })
+                    || leader
+                        .documents
+                        .iter()
+                        .any(|document| document.row >= count || !document.id.is_valid())
                     || leader.documents.windows(2).any(|pair| {
                         pair[0].row >= pair[1].row
                             || compare_document_ids(&pair[0].id, &pair[1].id).is_ge()
@@ -7540,26 +9841,18 @@ pub mod wasm {
 
         #[doc = "# Errors\nRejects invalid cutoffs or posting span serialization errors."]
         pub fn posting_spans_after(&mut self, score: f64, id: &str) -> Result<String, JsValue> {
-            let spans = self
-                .search
-                .posting_spans_after(score, id)
-                .map_err(|cause| JsValue::from_str(&cause))?;
-            if !self.search.has_hot_selection(&spans) {
-                return serde_json::to_string(&spans)
-                    .map_err(|cause| JsValue::from_str(&cause.to_string()));
-            }
-            let selection = self
-                .search
-                .own_posting_selection(&spans)
-                .map_err(|cause| JsValue::from_str(&cause))?;
-            drop(spans);
-            let remaining = self
-                .search
-                .satisfy_hot_selection(selection)
-                .map_err(|cause| JsValue::from_str(&cause))?;
-            self.search
-                .encode_posting_selection(&remaining)
-                .map_err(|cause| JsValue::from_str(&cause))
+            self.encode_cutoff_spans(score, DocumentId::String(id))
+        }
+
+        #[doc = "# Errors\nRejects malformed canonical IDs, invalid ID bounds, invalid cutoffs or posting span serialization errors."]
+        pub fn posting_spans_after_id(
+            &mut self,
+            score: f64,
+            encoded_id: &str,
+        ) -> Result<String, JsValue> {
+            let id =
+                super::decode_document_id(encoded_id).map_err(|cause| JsValue::from_str(&cause))?;
+            self.encode_cutoff_spans(score, id.borrowed())
         }
 
         #[doc = "# Errors\nRejects unrequested terms, positional mode, invalid rows/positions, or unordered blocks."]
@@ -7614,6 +9907,33 @@ pub mod wasm {
     }
 
     impl Ranker {
+        fn encode_cutoff_spans(
+            &mut self,
+            score: f64,
+            id: DocumentIdRef<'_>,
+        ) -> Result<String, JsValue> {
+            let spans = self
+                .search
+                .posting_spans_cutoff(score, id, false)
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            if !self.search.has_hot_selection(&spans) {
+                return serde_json::to_string(&spans)
+                    .map_err(|cause| JsValue::from_str(&cause.to_string()));
+            }
+            let selection = self
+                .search
+                .own_posting_selection(&spans)
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            drop(spans);
+            let remaining = self
+                .search
+                .satisfy_hot_selection(selection)
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            self.search
+                .encode_posting_selection(&remaining)
+                .map_err(|cause| JsValue::from_str(&cause))
+        }
+
         fn encode_hits(&self, hits: &[super::Hit]) -> Result<String, JsValue> {
             let ranked: Vec<_> = hits
                 .iter()
@@ -7634,7 +9954,7 @@ pub mod wasm {
     #[derive(Serialize)]
     struct Ranked<'a> {
         row: u32,
-        id: &'a str,
+        id: DocumentIdRef<'a>,
         score: f64,
         data: Range,
     }
@@ -7647,13 +9967,23 @@ mod query_document_projection_tests {
     use std::collections::BTreeMap;
 
     fn document(vector: Option<Vec<f32>>) -> Document {
-        Document {
-            id: "row-1".into(),
-            revision: 7,
-            title: "title".into(),
-            text: "body".into(),
-            attributes: BTreeMap::from([("field".into(), json!("value"))]),
+        Document::native(
+            "row-1",
+            7,
+            "title",
+            "body",
+            BTreeMap::from([("field".into(), json!("value"))]),
             vector,
+        )
+    }
+
+    fn vector_bits(document: &Document) -> Result<Option<Vec<u32>>, Box<dyn std::error::Error>> {
+        match document.column(super::ColumnId::Role(super::NativeRole::Vector)) {
+            Some(super::ColumnValue::Vector(values)) => {
+                Ok(Some(values.iter().map(|value| value.to_bits()).collect()))
+            }
+            None => Ok(None),
+            Some(_) => Err("Native vector role is not a vector".into()),
         }
     }
 
@@ -7661,16 +9991,23 @@ mod query_document_projection_tests {
         vector: Option<Vec<f32>>,
         expected_summary: Value,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut document = document(vector);
-        let mut expected = serde_json::to_value(&document)?;
+        let expected_bits = vector.as_ref().map(|values| {
+            values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        });
+        let document = document(vector);
+        let mut expected = serde_json::from_str::<Value>(&document.to_canonical_json()?)?;
         let fields = expected
             .as_object_mut()
             .ok_or("Document was not an object")?;
         fields.remove("vector");
         fields.insert("vectorSummary".into(), expected_summary);
-        let actual = serde_json::from_str::<Value>(&serialize_query_document(&mut document)?)?;
+        let actual = serde_json::from_str::<Value>(&serialize_query_document(&document)?)?;
         assert_eq!(actual, expected);
-        assert!(document.vector.is_none());
+        assert!(actual.get("vector").is_none());
+        assert_eq!(vector_bits(&document)?, expected_bits);
         Ok(())
     }
 
@@ -7679,7 +10016,7 @@ mod query_document_projection_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let values = vec![f32::MAX, -f32::MAX, 0.1, -0.0, f32::from_bits(1)];
         let source = document(Some(values.clone()));
-        let encoded = serde_json::to_vec(&source)?;
+        let encoded = source.to_canonical_vec()?;
         let fields =
             serde_json::from_slice::<BTreeMap<String, Box<serde_json::value::RawValue>>>(&encoded)?;
         let vector = serde_json::from_str::<Vec<Box<serde_json::value::RawValue>>>(
@@ -7703,13 +10040,10 @@ mod query_document_projection_tests {
                 .to_bits(),
             f64::from(-f32::MAX).to_bits()
         );
-        let decoded: Document = serde_json::from_slice(&encoded)?;
-        let decoded = decoded.vector.ok_or("Vector disappeared")?;
+        let decoded = Document::from_canonical_slice(&encoded)?;
+        let decoded = vector_bits(&decoded)?.ok_or("Vector disappeared")?;
         assert_eq!(
-            decoded
-                .iter()
-                .map(|value| value.to_bits())
-                .collect::<Vec<_>>(),
+            decoded,
             values
                 .iter()
                 .map(|value| value.to_bits())
@@ -7743,11 +10077,77 @@ mod filter_cache_tests {
     use std::collections::BTreeSet;
 
     #[test]
+    fn vector_pages_bound_projection_and_apply_filters_before_emission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let documents = (0..200)
+            .map(|index| {
+                Document::from_native_value(json!({
+                    "id": format!("{index:03}"), "text": "paged vectors",
+                    "attributes": {"eligible": index >= 5, "padding": "x".repeat(1024)},
+                    "vector": if index % 3 == 0 { None } else { Some(vec![1.0, 0.0]) }
+                }))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let header = std::rc::Rc::new(build(documents, None)?.header);
+        let filters = [Filter {
+            field: "eligible".into(),
+            op: "eq".into(),
+            value: json!(true),
+        }];
+        let mut scan = super::VectorScan::new(header, &filters, &[7, 128])?;
+        let mut found = Vec::new();
+        loop {
+            let page = scan.page()?;
+            assert!(page.rows.len() <= 64);
+            let encoded = serde_json::to_value(&page)?;
+            for row in encoded["rows"].as_array().ok_or("Missing projected rows")? {
+                assert!(row.get("attributes").is_none());
+                assert!(row.get("document").is_none());
+            }
+            found.extend(page.rows.iter().map(|row| row.row));
+            if page.complete {
+                break;
+            }
+        }
+        let expected: Vec<u32> = (5..200)
+            .filter(|row| row % 3 != 0 && ![7, 128].contains(row))
+            .collect();
+        assert_eq!(found, expected);
+        let complete = scan.page()?;
+        assert!(complete.complete && complete.rows.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn vector_selection_excludes_tombstones_missing_vectors_and_filtered_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let documents = (0..4)
+            .map(|index| {
+                Document::from_native_value(json!({
+                    "id": format!("{index}"), "text": "vector",
+                    "attributes": {"group": if index == 3 { "other" } else { "selected" }},
+                    "vector": if index == 1 { None } else { Some(vec![1.0, 0.0]) }
+                }))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let header = build(documents, None)?.header;
+        let filters = [Filter {
+            field: "group".into(),
+            op: "eq".into(),
+            value: json!("selected"),
+        }];
+        assert_eq!(header.vector_rows(&filters, &[0])?, vec![2]);
+        assert_eq!(header.vector_rows(&filters, &[])?, vec![0, 2]);
+        assert_eq!(header.vector_rows(&[], &[])?, vec![0, 2, 3]);
+        Ok(())
+    }
+
+    #[test]
     fn configured_headers_keep_selected_attributes_and_preserve_document_payloads()
     -> Result<(), Box<dyn std::error::Error>> {
         let documents = (0..32)
             .map(|index| {
-                serde_json::from_value::<Document>(json!({
+                Document::from_native_value(json!({
                     "id": format!("{index:02}"), "text": format!("rust unique{index}"),
                     "attributes": {
                         "year": 2024 + index % 2, "__proto__": index % 2 == 0,
@@ -7770,15 +10170,20 @@ mod filter_cache_tests {
             let attributes: serde_json::Value = serde_json::from_str(metadata.attributes.get())?;
             assert_eq!(
                 attributes,
-                json!({"year": document.attributes["year"], "__proto__": document.attributes["__proto__"]})
+                json!({"year": document.columns().attributes()["year"], "__proto__": document.columns().attributes()["__proto__"]})
             );
             let start = selected_base + metadata.data.offset as usize;
             let payload =
                 super::decode_page(&selected.bytes[start..start + metadata.data.length as usize])?;
-            let stored: Document = serde_json::from_slice(&payload)?;
-            assert_eq!(stored.attributes, document.attributes);
+            let (_, stored) = super::parse_document_metadata(&payload)?;
+            assert_eq!(
+                stored.columns().attributes(),
+                document.columns().attributes()
+            );
         }
-        for op in ["eq", "ne", "gt", "gte", "lt", "lte", "in", "exists"] {
+        for op in [
+            "eq", "ne", "gt", "gte", "lt", "lte", "in", "notIn", "exists",
+        ] {
             for value in [json!(2024), json!([2024]), json!(true)] {
                 let filters = [Filter {
                     field: "year".into(),
@@ -7802,10 +10207,10 @@ mod filter_cache_tests {
         for fields in [
             vec!["year".into(), "year".into()],
             vec![String::new()],
-            vec!["1year".into()],
-            vec!["a-b".into()],
-            vec!["á".into()],
-            vec!["x".repeat(65)],
+            vec!["$reserved".into()],
+            vec!["x".repeat(129)],
+            vec![format!("{}x", "é".repeat(64))],
+            vec![format!("{}x", "😀".repeat(32))],
             (0..65).map(|index| format!("field{index}")).collect(),
         ] {
             assert!(build(documents.clone(), Some(&fields)).is_err());
@@ -7869,13 +10274,15 @@ mod filter_cache_tests {
         let documents = inputs
             .iter()
             .enumerate()
-            .map(|(index, _)| Document {
-                id: format!("{index}"),
-                revision: 1,
-                title: String::new(),
-                text: "target".into(),
-                attributes: std::collections::BTreeMap::new(),
-                vector: None,
+            .map(|(index, _)| {
+                Document::native(
+                    format!("{index}"),
+                    1,
+                    String::new(),
+                    "target",
+                    std::collections::BTreeMap::new(),
+                    None,
+                )
             })
             .collect();
         let mut header = build(documents, None)?.header;
@@ -7888,7 +10295,9 @@ mod filter_cache_tests {
         {
             *document = serde_json::value::RawValue::from_string(input.into())?.into();
         }
-        for op in ["eq", "ne", "exists", "in", "gt", "gte", "lt", "lte"] {
+        for op in [
+            "eq", "ne", "exists", "in", "notIn", "gt", "gte", "lt", "lte",
+        ] {
             for value in [
                 json!(2),
                 json!(true),
@@ -7951,7 +10360,7 @@ mod filter_cache_tests {
             .iter()
             .enumerate()
             .map(|(index, _)| {
-                serde_json::from_value::<Document>(json!({
+                Document::from_native_value(json!({
                     "id": format!("{index}"), "text": "target", "attributes": {}
                 }))
             })
@@ -7966,7 +10375,9 @@ mod filter_cache_tests {
         {
             *document = serde_json::value::RawValue::from_string(input.into())?.into();
         }
-        for op in ["eq", "ne", "exists", "in", "gt", "gte", "lt", "lte"] {
+        for op in [
+            "eq", "ne", "exists", "in", "notIn", "gt", "gte", "lt", "lte",
+        ] {
             for value in [
                 json!(2),
                 json!(true),
@@ -8022,7 +10433,7 @@ mod filter_cache_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let documents = (0..5000)
             .map(|index| {
-                serde_json::from_value::<Document>(json!({
+                Document::from_native_value(json!({
                     "id": format!("{index:05}"), "text": "target",
                     "attributes": {"group": index % 2100}
                 }))
@@ -8125,7 +10536,7 @@ mod filter_cache_tests {
             r#"{"ignored":1e999,"group":1}"#,
             r#"{"ignored":{"nested":1e999},"group":1}"#,
         ] {
-            let document: Document = serde_json::from_value(json!({
+            let document = Document::from_native_value(json!({
                 "id":"a", "text":"target", "attributes":{}
             }))?;
             let mut header = build(vec![document], None)?.header;
@@ -8167,7 +10578,7 @@ mod filter_cache_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let documents = (0..10_000)
             .map(|index| {
-                serde_json::from_value::<Document>(json!({
+                Document::from_native_value(json!({
                     "id": format!("{index}"), "text": "target", "attributes": {"group": index}
                 }))
             })
@@ -8203,7 +10614,7 @@ mod filter_cache_tests {
     #[test]
     fn masks_are_bounded_and_tombstones_remain_query_local()
     -> Result<(), Box<dyn std::error::Error>> {
-        let document: Document = serde_json::from_value(json!({
+        let document = Document::from_native_value(json!({
             "id": "a", "text": "target", "attributes": {"group": 0}
         }))?;
         let header = build(vec![document], None)?.header;
@@ -8433,13 +10844,15 @@ mod frequency_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         for (repetitions, total_body_length) in [(1, 759), (64, 48_576)] {
             let docs: Vec<Document> = (0..256)
-                .map(|index| Document {
-                    id: format!("{index:05}"),
-                    revision: 0,
-                    title: "beta alpha".into(),
-                    text: "alpha beta alpha ".repeat(repetitions),
-                    attributes: BTreeMap::from([("group".into(), json!(index % 4))]),
-                    vector: None,
+                .map(|index| {
+                    Document::native(
+                        format!("{index:05}"),
+                        0,
+                        "beta alpha",
+                        "alpha beta alpha ".repeat(repetitions),
+                        BTreeMap::from([("group".into(), json!(index % 4))]),
+                        None,
+                    )
                 })
                 .collect();
             let built = build(docs, None)?;
@@ -8471,7 +10884,7 @@ mod frequency_tests {
                         }],
                     )?;
                     search.mode = mode.into();
-                    for (term, metadata) in &header.terms {
+                    for (term, metadata) in header.terms() {
                         for block in &metadata.blocks {
                             let start = base + block.data.offset as usize;
                             search.add(
@@ -8519,7 +10932,7 @@ mod frequency_tests {
     fn frequency_decoding_still_checks_positions_against_document_lengths()
     -> Result<(), Box<dyn std::error::Error>> {
         let built = build(
-            serde_json::from_value(json!([
+            super::documents_from_native_value(json!([
                 {"id":"a","text":"alpha beta alpha","attributes":{}}
             ]))?,
             None,
@@ -8553,7 +10966,7 @@ mod frequency_tests {
     fn excluded_rows_do_not_hide_corruption_or_disordered_blocks()
     -> Result<(), Box<dyn std::error::Error>> {
         let built = build(
-            serde_json::from_value(json!([
+            super::documents_from_native_value(json!([
                 {"id":"a","text":"alpha","attributes":{}},
                 {"id":"b","text":"alpha","attributes":{}},
                 {"id":"c","text":"alpha","attributes":{}}
@@ -8582,7 +10995,7 @@ mod frequency_tests {
                 &[],
             )?;
             search.add("alpha", &later)?;
-            assert!(search.finish()?.is_empty());
+            assert_eq!(search.finish()?, Vec::<super::Hit>::new());
             assert_eq!(search.last_decoded_rows.get("alpha"), Some(&Some(2)));
             match &search.lists {
                 PostingLists::Positions(lists) => assert!(lists.values().all(Vec::is_empty)),
@@ -8604,13 +11017,15 @@ mod frequency_tests {
     fn retained_eligible_rows_match_a_full_list_reference_in_every_mode()
     -> Result<(), Box<dyn std::error::Error>> {
         let docs: Vec<Document> = (0..256)
-            .map(|index| Document {
-                id: format!("{index:05}"),
-                revision: 0,
-                title: String::new(),
-                text: "alpha beta alpha".into(),
-                attributes: BTreeMap::from([("group".into(), json!(index % 8))]),
-                vector: None,
+            .map(|index| {
+                Document::native(
+                    format!("{index:05}"),
+                    0,
+                    String::new(),
+                    "alpha beta alpha",
+                    BTreeMap::from([("group".into(), json!(index % 8))]),
+                    None,
+                )
             })
             .collect();
         let built = build(docs, None)?;
@@ -8641,7 +11056,7 @@ mod frequency_tests {
                 if full {
                     search.allowed.fill(true);
                 }
-                for (term, metadata) in &header.terms {
+                for (term, metadata) in header.terms() {
                     for block in &metadata.blocks {
                         let start = base + block.data.offset as usize;
                         search.add(
@@ -8688,7 +11103,7 @@ mod common_term_projection_tests {
                     "attributes": {}
                 })
             })
-            .map(serde_json::from_value)
+            .map(Document::from_native_value)
             .collect::<Result<_, _>>()?;
         let built = build(documents, None)?;
         let projection: Value = serde_json::from_str(
@@ -8736,7 +11151,7 @@ mod common_term_projection_tests {
                     "attributes": {}
                 })
             })
-            .map(serde_json::from_value)
+            .map(Document::from_native_value)
             .collect::<Result<_, _>>()?;
         let built = build(documents, None)?;
         assert!(built.common_projection.is_none());
@@ -8766,7 +11181,7 @@ mod common_term_projection_tests {
                 };
                 json!({ "id": id, "text": text, "attributes": {} })
             })
-            .map(serde_json::from_value)
+            .map(Document::from_native_value)
             .collect::<Result<_, _>>()?;
         let built = build(documents, None)?;
         let projection: Value = serde_json::from_str(
@@ -8797,7 +11212,7 @@ mod common_term_projection_tests {
 
 #[cfg(test)]
 mod candidate_tests {
-    use super::{Document, Search, Statistics, build};
+    use super::{Search, Statistics, build};
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::rc::Rc;
@@ -8805,7 +11220,7 @@ mod candidate_tests {
     #[test]
     fn reusable_candidates_preserve_phrase_order_and_exclusions()
     -> Result<(), Box<dyn std::error::Error>> {
-        let documents: Vec<Document> = serde_json::from_value(json!([
+        let documents = super::documents_from_native_value(json!([
             {"id":"a","text":"beta alpha beta","attributes":{}},
             {"id":"b","text":"alpha beta alpha","attributes":{}},
             {"id":"c","text":"alpha beta","attributes":{}},
@@ -8828,7 +11243,7 @@ mod candidate_tests {
             };
             let mut search =
                 Search::new(header.clone(), statistics, text, "phrase", 10, &dead, &[])?;
-            for (term, meta) in &header.terms {
+            for (term, meta) in header.terms() {
                 if !search.words.iter().any(|word| word == term) {
                     continue;
                 }
@@ -8973,13 +11388,15 @@ mod dense_cutoff_tests {
         for stride in [1, 8] {
             let built = build(
                 (0..1024)
-                    .map(|row| Document {
-                        id: format!("{row:05}"),
-                        revision: 0,
-                        title: "alpha ".repeat(row / stride % 7),
-                        text: format!("alpha beta {}", "padding ".repeat(row / stride % 257)),
-                        attributes: BTreeMap::from([("group".into(), json!(row % 3))]),
-                        vector: None,
+                    .map(|row| {
+                        Document::native(
+                            format!("{row:05}"),
+                            0,
+                            "alpha ".repeat(row / stride % 7),
+                            format!("alpha beta {}", "padding ".repeat(row / stride % 257)),
+                            BTreeMap::from([("group".into(), json!(row % 3))]),
+                            None,
+                        )
                     })
                     .collect(),
                 None,
@@ -8987,10 +11404,10 @@ mod dense_cutoff_tests {
             let header = std::rc::Rc::new(built.header);
             let statistics = Statistics {
                 documents: u64::try_from(header.documents.len())?,
-                title_length: header.total_title_length,
-                body_length: header.total_body_length,
+                title_length: header.total_title_length(),
+                body_length: header.total_body_length(),
                 frequencies: header
-                    .terms
+                    .terms()
                     .iter()
                     .map(|(term, meta)| (term.to_owned(), u64::from(meta.df)))
                     .collect(),
@@ -9062,35 +11479,40 @@ mod eligible_bound_tests {
     use serde_json::json;
     use std::collections::BTreeMap;
 
+    fn documents() -> Vec<Document> {
+        (0..384)
+            .map(|row| {
+                Document::native(
+                    format!("{row:05}"),
+                    0,
+                    "alpha ".repeat(row % 2 * (row % 4 + 1)),
+                    format!(
+                        "{} {}",
+                        match row % 3 {
+                            0 => "alpha beta",
+                            1 => "alpha gamma",
+                            _ => "beta gamma",
+                        },
+                        "padding ".repeat(row % 2 * (row % 17 + 20))
+                    ),
+                    BTreeMap::from([("group".into(), json!(row % 2))]),
+                    None,
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn eligible_bounds_cover_actual_scores_without_loosening_physical_bounds()
     -> Result<(), Box<dyn std::error::Error>> {
-        let docs = (0..384)
-            .map(|row| Document {
-                id: format!("{row:05}"),
-                revision: 0,
-                title: "alpha ".repeat(row % 2 * (row % 4 + 1)),
-                text: format!(
-                    "{} {}",
-                    match row % 3 {
-                        0 => "alpha beta",
-                        1 => "alpha gamma",
-                        _ => "beta gamma",
-                    },
-                    "padding ".repeat(row % 2 * (row % 17 + 20))
-                ),
-                attributes: BTreeMap::from([("group".into(), json!(row % 2))]),
-                vector: None,
-            })
-            .collect();
-        let built = build(docs, None)?;
+        let built = build(documents(), None)?;
         let (header, base) = parse_header(&built.bytes)?;
         let statistics = Statistics {
             documents: u64::try_from(header.documents.len())?,
-            title_length: header.total_title_length,
-            body_length: header.total_body_length,
+            title_length: header.total_title_length(),
+            body_length: header.total_body_length(),
             frequencies: header
-                .terms
+                .terms()
                 .iter()
                 .map(|(term, meta)| (term.to_owned(), u64::from(meta.df)))
                 .collect(),
@@ -9113,7 +11535,7 @@ mod eligible_bound_tests {
                     &dead,
                     &filters,
                 )?;
-                for (term, metadata) in &header.terms {
+                for (term, metadata) in header.terms() {
                     if search.words.iter().any(|word| word == term) {
                         for block in &metadata.blocks {
                             let start = base + block.data.offset as usize;
@@ -9136,10 +11558,10 @@ mod eligible_bound_tests {
                 for (index, term) in terms.iter().enumerate() {
                     for (block, bound) in &bounds[index] {
                         let physical = scorers[index].score(
-                            block.max_title_tf,
-                            block.max_body_tf,
-                            block.min_title_length,
-                            block.min_body_length,
+                            block.max_tf[0],
+                            block.max_tf[1],
+                            block.min_length[0],
+                            block.min_length[1],
                         );
                         assert!(*bound <= physical + 1e-12);
                         if !(block.first as usize..=block.last as usize)
@@ -9213,11 +11635,11 @@ mod cutoff_certificate_tests {
                     1 => String::from("\u{10000}"),
                     _ => format!("row-{row:03}"),
                 };
-                Document {
+                Document::native(
                     id,
-                    revision: 0,
-                    title: "alpha ".repeat(row % 4),
-                    text: format!(
+                    0,
+                    "alpha ".repeat(row % 4),
+                    format!(
                         "{} {}",
                         match row % 3 {
                             0 => "alpha beta",
@@ -9226,9 +11648,9 @@ mod cutoff_certificate_tests {
                         },
                         "padding ".repeat(row % 17)
                     ),
-                    attributes: BTreeMap::from([("group".into(), serde_json::json!(row % 2))]),
-                    vector: None,
-                }
+                    BTreeMap::from([("group".into(), serde_json::json!(row % 2))]),
+                    None,
+                )
             })
             .collect();
         build(documents, None)
@@ -9268,8 +11690,8 @@ mod cutoff_certificate_tests {
         }
         let mut upper = score;
         let mut minimum_id = header.documents.first().ok_or("Missing source minimum")?.id;
-        if minimum_id.encode_utf16().cmp(id.encode_utf16()) == Ordering::Less {
-            minimum_id = id;
+        if compare_document_ids(minimum_id, id) == Ordering::Less {
+            minimum_id = super::DocumentId::String(id);
         }
         for hit in search.finish()? {
             let hit_id = header.documents.row(hit.row as usize).id;
@@ -9279,7 +11701,7 @@ mod cutoff_certificate_tests {
                     minimum_id = hit_id;
                 }
                 Ordering::Equal => {
-                    if hit_id.encode_utf16().cmp(minimum_id.encode_utf16()) == Ordering::Less {
+                    if compare_document_ids(hit_id, minimum_id) == Ordering::Less {
                         minimum_id = hit_id;
                     }
                 }
@@ -9289,7 +11711,7 @@ mod cutoff_certificate_tests {
         assert!(
             best.score < upper
                 || (best.score.total_cmp(&upper) == Ordering::Equal
-                    && best_id.encode_utf16().cmp(minimum_id.encode_utf16()) != Ordering::Less)
+                    && compare_document_ids(best_id, minimum_id) != Ordering::Less)
         );
         Ok(())
     }
@@ -9302,10 +11724,10 @@ mod cutoff_certificate_tests {
         let base = super::parse_header(&built.bytes)?.1;
         let statistics = Statistics {
             documents: u64::try_from(header.documents.len())?,
-            title_length: header.total_title_length,
-            body_length: header.total_body_length,
+            title_length: header.total_title_length(),
+            body_length: header.total_body_length(),
             frequencies: header
-                .terms
+                .terms()
                 .iter()
                 .map(|(word, meta)| (word.to_owned(), u64::from(meta.df)))
                 .collect(),
@@ -9329,7 +11751,7 @@ mod cutoff_certificate_tests {
                         &dead,
                         &filters,
                     )?;
-                    for (word, metadata) in &header.terms {
+                    for (word, metadata) in header.terms() {
                         if word == "alpha" || word == "beta" {
                             for block in &metadata.blocks {
                                 let start = base + usize::try_from(block.data.offset)?;
@@ -9345,7 +11767,13 @@ mod cutoff_certificate_tests {
                     let best = all.first().ok_or("Missing complete hit")?;
                     let best_id = header.documents.row(best.row as usize).id;
                     for score in [best.score - 1e-13, best.score, best.score + 1e-13] {
-                        for id in ["", "row-150", "\u{10000}", "\u{e000}", best_id] {
+                        for id in [
+                            "",
+                            "row-150",
+                            "\u{10000}",
+                            "\u{e000}",
+                            best_id.native_str()?,
+                        ] {
                             for top_k in [1, 10, 100] {
                                 let partial = Search::new(
                                     header.clone(),
@@ -9431,27 +11859,29 @@ mod required_term_tests {
     fn a_required_rare_term_avoids_scoring_common_only_rows()
     -> Result<(), Box<dyn std::error::Error>> {
         let docs = (0..4096)
-            .map(|row| Document {
-                id: format!("{row:05}"),
-                revision: 1,
-                title: String::new(),
-                text: format!(
-                    "{} {}",
-                    "alpha beta gamma ".repeat(8 + row % 8),
-                    if row % 97 == 0 { "needle" } else { "filler" }
-                ),
-                attributes: BTreeMap::new(),
-                vector: None,
+            .map(|row| {
+                Document::native(
+                    format!("{row:05}"),
+                    1,
+                    String::new(),
+                    format!(
+                        "{} {}",
+                        "alpha beta gamma ".repeat(8 + row % 8),
+                        if row % 97 == 0 { "needle" } else { "filler" }
+                    ),
+                    BTreeMap::new(),
+                    None,
+                )
             })
             .collect();
         let built = build(docs, None)?;
         let (header, base) = parse_header(&built.bytes)?;
         let statistics = Statistics {
             documents: u64::try_from(header.documents.len())?,
-            title_length: header.total_title_length,
-            body_length: header.total_body_length,
+            title_length: header.total_title_length(),
+            body_length: header.total_body_length(),
             frequencies: header
-                .terms
+                .terms()
                 .iter()
                 .map(|(term, meta)| (term.to_owned(), u64::from(meta.df)))
                 .collect(),
@@ -9468,7 +11898,7 @@ mod required_term_tests {
         let calls = Rc::new(Cell::new(0));
         let mut lists = BTreeMap::new();
         for term in ["alpha", "beta", "gamma", "needle"] {
-            let metadata = header.terms.get(term).ok_or("Missing term")?;
+            let metadata = header.terms().get(term).ok_or("Missing term")?;
             let mut postings = Vec::new();
             for block in &metadata.blocks {
                 let start = base + block.data.offset as usize;
@@ -9499,24 +11929,26 @@ mod required_term_tests {
     fn required_terms_preserve_exhaustive_scores_with_filters_deletions_and_changed_statistics()
     -> Result<(), Box<dyn std::error::Error>> {
         let docs = (0..1024)
-            .map(|row| Document {
-                id: format!("{row:05}"),
-                revision: 1,
-                title: if row % 97 == 0 {
-                    "needle alpha".into()
-                } else {
-                    "gamma ".repeat(row % 3)
-                },
-                text: format!(
-                    "{} {} {} {} {}",
-                    "alpha ".repeat(row % 5),
-                    "beta ".repeat(row % 7),
-                    "gamma ".repeat(row % 11),
-                    if row % 53 == 0 { "scarce" } else { "filler" },
-                    "padding ".repeat(row % 17)
-                ),
-                attributes: BTreeMap::from([("group".into(), serde_json::json!(row % 2))]),
-                vector: None,
+            .map(|row| {
+                Document::native(
+                    format!("{row:05}"),
+                    1,
+                    if row % 97 == 0 {
+                        "needle alpha".into()
+                    } else {
+                        "gamma ".repeat(row % 3)
+                    },
+                    format!(
+                        "{} {} {} {} {}",
+                        "alpha ".repeat(row % 5),
+                        "beta ".repeat(row % 7),
+                        "gamma ".repeat(row % 11),
+                        if row % 53 == 0 { "scarce" } else { "filler" },
+                        "padding ".repeat(row % 17)
+                    ),
+                    BTreeMap::from([("group".into(), serde_json::json!(row % 2))]),
+                    None,
+                )
             })
             .collect();
         let built = build(docs, None)?;
@@ -9525,7 +11957,7 @@ mod required_term_tests {
         let mut lists = BTreeMap::new();
         for term in ["alpha", "beta", "gamma", "needle", "scarce"] {
             let mut postings = Vec::new();
-            for block in &header.terms.get(term).ok_or("Missing term")?.blocks {
+            for block in &header.terms().get(term).ok_or("Missing term")?.blocks {
                 let start = base + block.data.offset as usize;
                 postings.extend(
                     decode_postings(&built.bytes[start..start + block.data.length as usize])?
@@ -9541,10 +11973,10 @@ mod required_term_tests {
         for factor in [1, 3] {
             let statistics = Statistics {
                 documents: u64::try_from(header.documents.len())? * factor,
-                title_length: header.total_title_length * factor + 1000,
-                body_length: header.total_body_length * factor + 1234,
+                title_length: header.total_title_length() * factor + 1000,
+                body_length: header.total_body_length() * factor + 1234,
                 frequencies: header
-                    .terms
+                    .terms()
                     .iter()
                     .map(|(term, meta)| (term.to_owned(), u64::from(meta.df) * factor))
                     .collect(),
@@ -9604,7 +12036,7 @@ mod uniform_hits_tests {
                     "wide" => ("filler ".repeat(index % 5), format!("alpha beta {}", "noise ".repeat(index % 67))),
                     _ => ("heading".to_owned(), format!("alpha beta {}", "noise ".repeat(index % 7))),
                 };
-                serde_json::from_value::<Document>(json!({"id":id,"title":title,"text":text,"attributes":{"group":index%3,"empty":null}}))
+                Document::from_native_value(json!({"id":id,"title":title,"text":text,"attributes":{"group":index%3,"empty":null}}))
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(build(documents, None)?)
@@ -9662,7 +12094,7 @@ mod uniform_hits_tests {
                                 )?;
                                 let uniform =
                                     search.uniform_hits().ok_or("Expected uniform proof")?;
-                                for (term, metadata) in &header.terms {
+                                for (term, metadata) in header.terms() {
                                     if !search.words.iter().any(|word| word == term) {
                                         continue;
                                     }
@@ -9711,13 +12143,13 @@ mod uniform_hits_tests {
                 built.header.clone()
             };
             if defect == "zero-title-length" {
-                header.documents.title_lengths.set(0, 0);
+                header.documents.lengths[0].set(0, 0);
             } else if defect == "zero-body-length" {
-                header.documents.body_lengths.set(0, 0);
+                header.documents.lengths[1].set(0, 0);
             } else if defect == "empty-documents" {
                 header.documents = super::DocumentTable::from(Vec::new());
             } else {
-                let term = header.terms.get_mut("alpha").ok_or("Missing alpha")?;
+                let term = header.terms_mut().get_mut("alpha").ok_or("Missing alpha")?;
                 match defect {
                     "empty-blocks" => term.blocks = Box::new([]),
                     "sparse-df" => term.df -= 1,
@@ -9728,11 +12160,11 @@ mod uniform_hits_tests {
                     "zero-range" => term.blocks[0].data.length = 0,
                     "overflow-range" => term.blocks[0].data.offset = u32::MAX,
                     "range-order" => term.blocks[1].data.offset = 0,
-                    "body-tf" => term.blocks[0].max_body_tf = 2,
-                    "both-fields" => term.blocks[0].max_title_tf = 1,
+                    "body-tf" => term.blocks[0].max_tf[1] = 2,
+                    "both-fields" => term.blocks[0].max_tf[0] = 1,
                     "mixed-field" => {
-                        term.blocks[1].max_title_tf = 1;
-                        term.blocks[1].max_body_tf = 0;
+                        term.blocks[1].max_tf[0] = 1;
+                        term.blocks[1].max_tf[1] = 0;
                     }
                     _ => return Err("Unknown metadata defect".into()),
                 }
@@ -9778,16 +12210,18 @@ mod dictionary_frames_tests {
             for cardinality in [1, 100, 700, 2048] {
                 let built = build(
                     (0..count)
-                        .map(|i| Document {
-                            id: format!("ação-{i:06}😀"),
-                            revision: u64::MAX,
-                            title: "cloudflare rust".into(),
-                            text: "cloudflare rust search".into(),
-                            attributes: BTreeMap::from([
-                                ("group".into(), serde_json::json!(i % cardinality)),
-                                ("nested".into(), serde_json::json!([null, true, "😀"])),
-                            ]),
-                            vector: None,
+                        .map(|i| {
+                            Document::native(
+                                format!("ação-{i:06}😀"),
+                                u64::MAX,
+                                "cloudflare rust",
+                                "cloudflare rust search",
+                                BTreeMap::from([
+                                    ("group".into(), serde_json::json!(i % cardinality)),
+                                    ("nested".into(), serde_json::json!([null, true, "😀"])),
+                                ]),
+                                None,
+                            )
                         })
                         .collect(),
                     None,
@@ -9837,7 +12271,7 @@ mod shared_attribute_identity_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let input = (0..512)
             .map(|index| {
-                serde_json::from_value::<Document>(json!({
+                Document::from_native_value(json!({
                     "id": format!("{index:04}"),
                     "text": "cloudflare rust",
                     "attributes": {
@@ -9879,13 +12313,15 @@ mod shared_attribute_identity_tests {
         }
         for field in ["group", "year", "flag", "missing", "nested"] {
             for op in [
-                "eq", "ne", "in", "exists", "gt", "gte", "lt", "lte", "invalid",
+                "eq", "ne", "in", "notIn", "exists", "gt", "gte", "lt", "lte", "invalid",
             ] {
                 for value in [
                     json!(3),
                     json!(true),
                     json!(null),
                     json!([3, 5]),
+                    json!(""),
+                    json!("a"),
                     json!({"a":1}),
                 ] {
                     let filters = [Filter {
@@ -9934,9 +12370,9 @@ mod shared_attribute_identity_tests {
 #[cfg(test)]
 mod common_frame_validation_tests {
     use super::{
-        COMMON_DIRECTORY_MAGIC, Document, build, compress_common_directory_segment,
-        compress_directory, compress_directory_payload, decode_directory_contents,
-        decode_directory_payload, parse_header,
+        COMMON_DIRECTORY_MAGIC, COMMON_DIRECTORY_MAGIC_V4, Document, build,
+        compress_common_directory_segment, compress_directory, compress_directory_payload,
+        decode_directory_contents, decode_directory_payload, parse_header,
     };
     use std::{cell::Cell, collections::BTreeMap};
 
@@ -10000,13 +12436,15 @@ mod common_frame_validation_tests {
             .join(" ");
         let built = build(
             (0..2)
-                .map(|value| Document {
-                    id: value.to_string(),
-                    revision: 1,
-                    title: String::new(),
-                    text: text.clone(),
-                    attributes: BTreeMap::new(),
-                    vector: None,
+                .map(|value| {
+                    Document::native(
+                        value.to_string(),
+                        1,
+                        String::new(),
+                        text.clone(),
+                        BTreeMap::new(),
+                        None,
+                    )
                 })
                 .collect(),
             None,
@@ -10019,7 +12457,7 @@ mod common_frame_validation_tests {
         compact.extend_from_slice(&u32::try_from(header_compact.len())?.to_le_bytes());
         compact.extend_from_slice(&header_compact);
         compact.extend_from_slice(&[0, 0]);
-        let frame = compress_directory_payload(&compact, length, *COMMON_DIRECTORY_MAGIC)?;
+        let frame = compress_directory_payload(&compact, length, *COMMON_DIRECTORY_MAGIC_V4)?;
         let validated = Cell::new(false);
         for _ in 0..2 {
             let result = decode_directory_payload(
@@ -10027,7 +12465,7 @@ mod common_frame_validation_tests {
                 length,
                 40 * 1024 * 1024,
                 Some(&validated),
-                *COMMON_DIRECTORY_MAGIC,
+                *COMMON_DIRECTORY_MAGIC_V4,
             );
             assert_eq!(
                 result.err().ok_or("Invalid selection accepted")?,
@@ -10063,13 +12501,15 @@ mod common_frame_validation_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let built = build(
             (0..256)
-                .map(|value| Document {
-                    id: format!("row{value:04}"),
-                    revision: 1,
-                    title: "common term".into(),
-                    text: "common term common".into(),
-                    attributes: BTreeMap::new(),
-                    vector: None,
+                .map(|value| {
+                    Document::native(
+                        format!("row{value:04}"),
+                        1,
+                        "common term",
+                        "common term common",
+                        BTreeMap::new(),
+                        None,
+                    )
                 })
                 .collect(),
             None,
@@ -10087,14 +12527,14 @@ mod common_frame_validation_tests {
             u16::from_le_bytes(compact[hot_start + 2..hot_start + 4].try_into()?) as usize;
         let inner_crc = hot_start + 18 + term_length;
         compact[inner_crc] ^= 1;
-        let damaged = compress_directory_payload(&compact, length, *COMMON_DIRECTORY_MAGIC)?;
+        let damaged = compress_directory_payload(&compact, length, *COMMON_DIRECTORY_MAGIC_V4)?;
         let validated = Cell::new(false);
         let error = decode_directory_contents(
             &damaged,
             length,
             40 * 1024 * 1024,
             Some(&validated),
-            *COMMON_DIRECTORY_MAGIC,
+            *COMMON_DIRECTORY_MAGIC_V4,
         )
         .err()
         .ok_or("Corrupt common posting block was accepted")?;
@@ -10111,13 +12551,15 @@ mod common_frame_validation_tests {
         let text = "dense ".repeat(512);
         let built = build(
             (0..256)
-                .map(|value| Document {
-                    id: format!("row{value:04}"),
-                    revision: 1,
-                    title: String::new(),
-                    text: text.clone(),
-                    attributes: BTreeMap::new(),
-                    vector: None,
+                .map(|value| {
+                    Document::native(
+                        format!("row{value:04}"),
+                        1,
+                        String::new(),
+                        text.clone(),
+                        BTreeMap::new(),
+                        None,
+                    )
                 })
                 .collect(),
             None,
@@ -10145,17 +12587,19 @@ mod selected_hot_posting_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let built = build(
             (0_u32..256)
-                .map(|index| Document {
-                    id: format!("row{index:04}"),
-                    revision: 1,
-                    title: String::new(),
-                    text: if index < 128 {
-                        format!("common {}", "padding ".repeat(300))
-                    } else {
-                        "common ".repeat(4)
-                    },
-                    attributes: BTreeMap::from([("group".into(), serde_json::json!(index % 2))]),
-                    vector: None,
+                .map(|index| {
+                    Document::native(
+                        format!("row{index:04}"),
+                        1,
+                        String::new(),
+                        if index < 128 {
+                            format!("common {}", "padding ".repeat(300))
+                        } else {
+                            "common ".repeat(4)
+                        },
+                        BTreeMap::from([("group".into(), serde_json::json!(index % 2))]),
+                        None,
+                    )
                 })
                 .collect(),
             None,
@@ -10169,15 +12613,15 @@ mod selected_hot_posting_tests {
                 .as_ref()
                 .is_some_and(|hot| hot.terms.contains_key("common"))
         );
-        let metadata = header.terms.get("common").ok_or("Missing common term")?;
+        let metadata = header.terms().get("common").ok_or("Missing common term")?;
         for mode in ["any", "all", "phrase"] {
             let query = PreparedQuery::new(
                 Statistics {
                     documents: 256,
-                    title_length: header.total_title_length,
-                    body_length: header.total_body_length,
+                    title_length: header.total_title_length(),
+                    body_length: header.total_body_length(),
                     frequencies: header
-                        .terms
+                        .terms()
                         .iter()
                         .map(|(term, value)| (term.to_owned(), u64::from(value.df)))
                         .collect(),
@@ -10242,13 +12686,15 @@ mod selected_hot_posting_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let built = build(
             (0_u32..512)
-                .map(|index| Document {
-                    id: format!("row{index:04}"),
-                    revision: 1,
-                    title: "common".into(),
-                    text: "dense ".repeat(512),
-                    attributes: BTreeMap::new(),
-                    vector: None,
+                .map(|index| {
+                    Document::native(
+                        format!("row{index:04}"),
+                        1,
+                        "common",
+                        "dense ".repeat(512),
+                        BTreeMap::new(),
+                        None,
+                    )
                 })
                 .collect(),
             None,
@@ -10259,10 +12705,10 @@ mod selected_hot_posting_tests {
         let query = PreparedQuery::new(
             Statistics {
                 documents: 512,
-                title_length: header.total_title_length,
-                body_length: header.total_body_length,
+                title_length: header.total_title_length(),
+                body_length: header.total_body_length(),
                 frequencies: header
-                    .terms
+                    .terms()
                     .iter()
                     .map(|(term, metadata)| (term.to_owned(), u64::from(metadata.df)))
                     .collect(),
@@ -10331,18 +12777,20 @@ mod columnar_v2_tests {
         ]
         .into_iter()
         .enumerate()
-        .map(|(index, vector)| Document {
-            id: format!("row-{index}"),
-            revision: 7,
-            title: "ação 日本語".into(),
-            text: "cloudflare rust cloudflare".into(),
-            attributes: BTreeMap::from([
-                ("tiny".into(), serde_json::json!(1e-307)),
-                ("max".into(), serde_json::json!(3.402_823_466_385_288_6e38)),
-                ("fraction".into(), serde_json::json!(0.1)),
-                ("nested".into(), serde_json::json!({"vector":"preserved"})),
-            ]),
-            vector,
+        .map(|(index, vector)| {
+            Document::native(
+                format!("row-{index}"),
+                7,
+                "ação 日本語",
+                "cloudflare rust cloudflare",
+                BTreeMap::from([
+                    ("tiny".into(), serde_json::json!(1e-307)),
+                    ("max".into(), serde_json::json!(3.402_823_466_385_288_6e38)),
+                    ("fraction".into(), serde_json::json!(0.1)),
+                    ("nested".into(), serde_json::json!({"vector":"preserved"})),
+                ]),
+                vector,
+            )
         })
         .collect()
     }
@@ -10360,13 +12808,10 @@ mod columnar_v2_tests {
         let mut payload = Vec::new();
         let mut metadata = built.header.documents.clone();
         for (row, document) in metadata.rows.iter_mut().zip(&documents) {
-            row.data = append(
-                &mut payload,
-                &serde_json::to_vec(document).map_err(|cause| cause.to_string())?,
-            )?;
+            row.data = append(&mut payload, &document.to_native_vec()?)?;
         }
         let document_end = u32::try_from(payload.len()).map_err(|cause| cause.to_string())?;
-        let mut terms = built.header.terms;
+        let mut terms = built.header.terms().clone();
         for (_, term) in &mut terms.entries {
             for block in &mut term.blocks {
                 block.data.offset = document_end + block.data.offset - built.header.vector_end;
@@ -10380,8 +12825,8 @@ mod columnar_v2_tests {
             )
             .map_err(|cause| cause.to_string())?,
             terms,
-            total_title_length: built.header.total_title_length,
-            total_body_length: built.header.total_body_length,
+            total_title_length: built.header.total_title_length(),
+            total_body_length: built.header.total_body_length(),
         };
         let json = serde_json::to_vec(&header).map_err(|cause| cause.to_string())?;
         let mut bytes = b"RAIOSEG1".to_vec();
@@ -10402,7 +12847,7 @@ mod columnar_v2_tests {
         let original = documents();
         let built = build(original.clone(), None)?;
         let (header, base) = parse_header(&built.bytes)?;
-        assert_eq!(header.version, 2);
+        assert_eq!(header.version, 4);
         assert_eq!(header.vector_ranges.len(), 3);
         assert!(parse_header(&built.bytes[..base]).is_ok());
         let payload = &built.bytes[base..];
@@ -10414,30 +12859,21 @@ mod columnar_v2_tests {
                 .transpose()?
                 .unwrap_or_default();
             let reconstructed = full_document_from_frames(data, vector)?;
-            let actual: Document =
-                serde_json::from_str(&reconstructed).map_err(|cause| cause.to_string())?;
+            let actual = Document::from_canonical_json(&reconstructed)?;
             assert_eq!(actual.id, document.id);
-            assert_eq!(
-                actual.vector.as_ref().map(|values| values
-                    .iter()
-                    .map(|value| value.to_bits())
-                    .collect::<Vec<_>>()),
-                document.vector.as_ref().map(|values| values
-                    .iter()
-                    .map(|value| value.to_bits())
-                    .collect::<Vec<_>>())
-            );
+            assert_eq!(super::vector_bits(&actual)?, super::vector_bits(document)?);
             let query: serde_json::Value =
                 serde_json::from_str(&query_document_from_metadata(data)?)
                     .map_err(|cause| cause.to_string())?;
             assert!(query.get("vector").is_none());
             assert_eq!(query["attributes"]["nested"]["vector"], "preserved");
-            if document.vector.is_none() {
+            let vector = super::vector_bits(document)?;
+            if vector.is_none() {
                 assert!(query["vectorSummary"].is_null());
             } else {
                 assert_eq!(
                     query["vectorSummary"][0],
-                    document.vector.as_ref().map_or(0, Vec::len)
+                    vector.as_ref().map_or(0, Vec::len)
                 );
             }
         }
@@ -10460,8 +12896,8 @@ mod columnar_v2_tests {
             + old.documents.last().ok_or("Missing row")?.data.length;
         let migrated = migrate_segment(&source)?;
         let (header, base) = parse_header(&migrated)?;
-        assert_eq!(header.total_title_length, old.total_title_length);
-        assert_eq!(header.total_body_length, old.total_body_length);
+        assert_eq!(header.total_title_length(), old.total_title_length);
+        assert_eq!(header.total_body_length(), old.total_body_length);
         assert_eq!(
             &migrated[base + header.vector_end as usize..],
             &old_payload[old_end as usize..]
@@ -10472,7 +12908,7 @@ mod columnar_v2_tests {
             .zip(header.documents.iter())
             .enumerate()
         {
-            assert_eq!(before.id.as_ref(), after.id);
+            assert_eq!(before.id.borrowed(), after.id);
             assert_eq!(before.revision, after.revision);
             assert_eq!(before.attributes.get(), after.attributes.get());
             let source_attributes: BTreeMap<String, serde_json::Value> =
@@ -10492,8 +12928,7 @@ mod columnar_v2_tests {
                 }
             }
             let source_document = decode_page(frame(old_payload, &before.data)?)?;
-            let expected: Document =
-                serde_json::from_slice(&source_document).map_err(|cause| cause.to_string())?;
+            let expected = Document::from_native_slice(&source_document)?;
             let data = frame(&migrated[base..], &after.data)?;
             let vector = header
                 .vector_range(row)?
@@ -10502,11 +12937,11 @@ mod columnar_v2_tests {
                 .unwrap_or_default();
             assert_eq!(
                 full_document_from_frames(data, vector)?,
-                serde_json::to_string(&expected).map_err(|cause| cause.to_string())?
+                expected.to_canonical_json()?
             );
         }
         for ((before_name, before), (after_name, after)) in
-            old.terms.iter().zip(header.terms.iter())
+            old.terms.iter().zip(header.terms().iter())
         {
             assert_eq!(before_name, after_name);
             assert_eq!(before.df, after.df);
@@ -10520,20 +12955,50 @@ mod columnar_v2_tests {
                 assert_eq!(before_block.last, after_block.last);
             }
         }
-        assert!(migrate_segment(&migrated).is_err());
+        assert_eq!(migrate_segment(&migrated)?, migrated);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_v1_migration_rejects_payload_and_directory_length_disagreement() -> Result<(), String>
+    {
+        let source = legacy_segment()?;
+        let (mut header, base) = super::parse_legacy_segment(&source)?;
+        let first = header
+            .documents
+            .first_mut()
+            .ok_or("Missing legacy document")?;
+        first.body_length += 1;
+        header.total_body_length += 1;
+        let json = serde_json::to_vec(&header).map_err(|cause| cause.to_string())?;
+        let mut corrupt = b"RAIOSEG1".to_vec();
+        corrupt.extend_from_slice(
+            &u32::try_from(json.len())
+                .map_err(|cause| cause.to_string())?
+                .to_le_bytes(),
+        );
+        corrupt.extend_from_slice(&crc32fast::hash(&json).to_le_bytes());
+        corrupt.extend_from_slice(&json);
+        corrupt.extend_from_slice(source.get(base..).ok_or("Missing legacy payload")?);
+        assert_eq!(
+            migrate_segment(&corrupt),
+            Err("Segment document token lengths do not match its directory".into()),
+        );
         Ok(())
     }
 
     #[test]
     fn dense_vector_ranges_cross_multiple_prefix_blocks() -> Result<(), String> {
         let values = (0_u16..130)
-            .map(|index| Document {
-                id: format!("row-{index:03}"),
-                revision: u64::from(index),
-                title: "rust".into(),
-                text: "cloudflare rust".into(),
-                attributes: BTreeMap::new(),
-                vector: (index % 3 != 1).then_some(vec![f32::from(index), 0.5]),
+            .map(|index| {
+                Document::native(
+                    format!("row-{index:03}"),
+                    u64::from(index),
+                    "rust",
+                    "cloudflare rust",
+                    BTreeMap::new(),
+                    (index % 3 != 1).then_some(vec![f32::from(index), 0.5]),
+                )
             })
             .collect::<Vec<_>>();
         let built = build(values.clone(), None)?;
@@ -10545,10 +13010,12 @@ mod columnar_v2_tests {
                 .map(|range| frame(&built.bytes[base..], range))
                 .transpose()?
                 .unwrap_or_default();
-            let reconstructed: Document =
-                serde_json::from_str(&full_document_from_frames(data, vector)?)
-                    .map_err(|cause| cause.to_string())?;
-            assert_eq!(reconstructed.vector, values[index].vector);
+            let reconstructed =
+                Document::from_canonical_json(&full_document_from_frames(data, vector)?)?;
+            assert_eq!(
+                super::vector_bits(&reconstructed)?,
+                super::vector_bits(&values[index])?
+            );
         }
         Ok(())
     }
@@ -10597,6 +13064,764 @@ mod columnar_v2_tests {
         let last = corrupt.last_mut().ok_or("Missing vector byte")?;
         *last ^= 1;
         assert!(full_document_from_frames(metadata, &corrupt).is_err());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod canonical_column_tests {
+    use super::{
+        ColumnId, ColumnValue, Document, DocumentTable, FieldTable, Filter, Header, NativeRole,
+        Range, Search, Statistics, append, build, decode_page, document_terms, fields,
+        full_document_from_frames, migrate_segment, owned_directory_row, parse_document_metadata,
+        parse_header, query_document_from_metadata, rebase_postings, write_vector_facts,
+    };
+    use std::collections::BTreeMap;
+
+    fn collision_documents() -> Vec<Document> {
+        let collided = [
+            ("id", serde_json::json!("attr-id")),
+            ("revision", serde_json::json!(99)),
+            ("title", serde_json::json!("attr-title")),
+            ("text", serde_json::json!("attr-text")),
+            ("vector", serde_json::json!([1, 2])),
+            ("year", serde_json::json!(3)),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value))
+        .collect();
+        vec![
+            Document::native(
+                "row-a",
+                7,
+                "alpha unique",
+                "shared beta",
+                collided,
+                Some(vec![f32::MAX, -0.0]),
+            ),
+            Document::native("row-b", 1, "", "shared", BTreeMap::new(), None),
+            Document::native(
+                "row-c",
+                2,
+                "gamma",
+                "shared gamma",
+                BTreeMap::from([("year".into(), serde_json::json!(4))]),
+                Some(Vec::new()),
+            ),
+        ]
+    }
+
+    fn frame<'a>(payload: &'a [u8], range: &Range) -> Result<&'a [u8], String> {
+        let offset = usize::try_from(range.offset).map_err(|cause| cause.to_string())?;
+        let length = usize::try_from(range.length).map_err(|cause| cause.to_string())?;
+        let end = offset.checked_add(length).ok_or("Frame range overflow")?;
+        payload
+            .get(offset..end)
+            .ok_or_else(|| "Missing test frame".into())
+    }
+
+    fn legacy_metadata_page(
+        facts: super::VectorFacts,
+        document: &Document,
+    ) -> Result<Vec<u8>, String> {
+        let json = document.to_native_metadata_vec()?;
+        if (facts.flags & 1) == 0 {
+            return Ok(json);
+        }
+        let mut page = Vec::with_capacity(6 + json.len());
+        write_vector_facts(facts, &mut page);
+        page.extend_from_slice(&json);
+        Ok(page)
+    }
+
+    fn encode_legacy_v2(bytes: &[u8]) -> Result<Vec<u8>, String> {
+        encode_legacy_v2_with_facts(bytes, std::convert::identity)
+    }
+
+    fn encode_legacy_v2_with_facts(
+        bytes: &[u8],
+        change: impl Fn(super::VectorFacts) -> super::VectorFacts,
+    ) -> Result<Vec<u8>, String> {
+        let (header, base) = parse_header(bytes)?;
+        let source = bytes.get(base..).ok_or("Truncated segment payload")?;
+        let mut metadata = Vec::new();
+        let mut rows = Vec::with_capacity(header.documents.len());
+        for row in header.documents.iter() {
+            let decoded = decode_page(frame(source, &row.data)?)?;
+            let (facts, document) = parse_document_metadata(&decoded)?;
+            if document.id != row.id || document.revision != row.revision {
+                return Err("Legacy fixture row does not match its directory".into());
+            }
+            let data = append(
+                &mut metadata,
+                &legacy_metadata_page(change(facts), &document)?,
+            )?;
+            rows.push(owned_directory_row(&row, data));
+        }
+        let metadata_end = u32::try_from(metadata.len()).map_err(|cause| cause.to_string())?;
+        let mut vector_ranges = header.vector_ranges.clone();
+        for range in &mut vector_ranges {
+            let relative = range
+                .offset
+                .checked_sub(header.metadata_end)
+                .ok_or("Vector range precedes metadata")?;
+            range.offset = metadata_end
+                .checked_add(relative)
+                .ok_or("Vector offset overflow")?;
+        }
+        let vectors = source
+            .get(header.metadata_end as usize..header.vector_end as usize)
+            .ok_or("Missing vector column")?;
+        metadata.extend_from_slice(vectors);
+        let vector_end = u32::try_from(metadata.len()).map_err(|cause| cause.to_string())?;
+        let tail = source
+            .get(header.vector_end as usize..)
+            .ok_or("Missing posting tail")?;
+        metadata.extend_from_slice(tail);
+        let mut terms = header.terms().clone();
+        rebase_postings(&mut terms, header.vector_end, vector_end)?;
+        let legacy = Header::from_parts(
+            2,
+            DocumentTable::from(rows),
+            FieldTable::native(
+                header.total_title_length(),
+                header.total_body_length(),
+                terms,
+            ),
+            (metadata_end, vector_end),
+            vector_ranges,
+        )?;
+        legacy.encode(&metadata)
+    }
+
+    fn source_for<'a>(documents: &'a [Document], id: &str) -> Result<&'a Document, String> {
+        documents
+            .iter()
+            .find(|document| document.id == id)
+            .ok_or_else(|| format!("Missing {id}"))
+    }
+
+    fn text_role(document: &Document, role: NativeRole) -> Result<&str, String> {
+        match document.column(ColumnId::Role(role)) {
+            Some(ColumnValue::Text(text)) => Ok(text),
+            Some(ColumnValue::Vector(_) | ColumnValue::Attribute(_)) | None => {
+                Err("Missing native text role".into())
+            }
+        }
+    }
+
+    fn ranked(
+        bytes: &[u8],
+        text: &str,
+        mode: &str,
+        filters: &[Filter],
+        dead: &[u32],
+    ) -> Result<Vec<(u32, u64)>, String> {
+        let (header, base) = parse_header(bytes)?;
+        let statistics = Statistics {
+            documents: u64::try_from(header.documents.len()).map_err(|cause| cause.to_string())?,
+            title_length: header.total_title_length(),
+            body_length: header.total_body_length(),
+            frequencies: header
+                .terms()
+                .iter()
+                .map(|(term, metadata)| (term.to_owned(), u64::from(metadata.df)))
+                .collect(),
+        };
+        let mut search = Search::new(header.clone(), statistics, text, mode, 10, dead, filters)?;
+        let words = crate::normalize_text(text);
+        for term in words.split_whitespace() {
+            if let Some(metadata) = header.terms().get(term) {
+                for block in &metadata.blocks {
+                    let start = base
+                        .checked_add(block.data.offset as usize)
+                        .ok_or("Posting offset overflow")?;
+                    let end = start
+                        .checked_add(block.data.length as usize)
+                        .ok_or("Posting length overflow")?;
+                    search.add(term, bytes.get(start..end).ok_or("Missing posting page")?)?;
+                }
+            }
+        }
+        Ok(search
+            .finish()?
+            .into_iter()
+            .map(|hit| (hit.row, hit.score.to_bits()))
+            .collect())
+    }
+
+    fn projections(bytes: &[u8]) -> Result<BTreeMap<String, (String, String)>, String> {
+        let (header, base) = parse_header(bytes)?;
+        let payload = bytes.get(base..).ok_or("Truncated segment payload")?;
+        let mut rows = BTreeMap::new();
+        for (index, row) in header.documents.iter().enumerate() {
+            let metadata = frame(payload, &row.data)?;
+            let vector = header
+                .vector_range(index)?
+                .map(|range| frame(payload, range))
+                .transpose()?
+                .unwrap_or_default();
+            let full = full_document_from_frames(metadata, vector)?;
+            let query = query_document_from_metadata(metadata)?;
+            if rows
+                .insert(row.id.native_str()?.to_owned(), (full, query))
+                .is_some()
+            {
+                return Err("Duplicate row id".into());
+            }
+        }
+        Ok(rows)
+    }
+
+    type DirectoryRow = (super::DocumentId, u64, u32, u32, String, bool);
+
+    fn directory(bytes: &[u8]) -> Result<Vec<DirectoryRow>, String> {
+        let (header, _) = parse_header(bytes)?;
+        Ok(header
+            .documents
+            .iter()
+            .map(|row| {
+                (
+                    row.id.to_owned(),
+                    row.revision,
+                    row.title_length,
+                    row.body_length,
+                    row.attributes.get().to_owned(),
+                    row.vector,
+                )
+            })
+            .collect())
+    }
+
+    fn payload_range(bytes: &[u8], vector_column: bool) -> Result<Vec<u8>, String> {
+        let (header, base) = parse_header(bytes)?;
+        let payload = bytes.get(base..).ok_or("Truncated segment payload")?;
+        let range = if vector_column {
+            header.metadata_end as usize..header.vector_end as usize
+        } else {
+            header.vector_end as usize..payload.len()
+        };
+        payload
+            .get(range)
+            .ok_or_else(|| "Missing payload column".into())
+            .map(<[u8]>::to_vec)
+    }
+
+    type BlockShape = (u32, u32, u32, u32, u32, u32, u32, u32, u32);
+
+    fn term_shapes(bytes: &[u8]) -> Result<Vec<(String, u32, Vec<BlockShape>)>, String> {
+        let (header, _) = parse_header(bytes)?;
+        let mut shapes = Vec::new();
+        for (term, metadata) in header.terms().iter() {
+            let mut blocks = Vec::new();
+            for block in &metadata.blocks {
+                blocks.push((
+                    block.first,
+                    block.last,
+                    block.count,
+                    block.max_tf[0],
+                    block.max_tf[1],
+                    block.min_length[0],
+                    block.min_length[1],
+                    block
+                        .data
+                        .offset
+                        .checked_sub(header.vector_end)
+                        .ok_or("Posting precedes vectors")?,
+                    block.data.length,
+                ));
+            }
+            shapes.push((term.to_owned(), metadata.df, blocks));
+        }
+        Ok(shapes)
+    }
+
+    fn allowed_rows(
+        bytes: &[u8],
+        field: &str,
+        value: serde_json::Value,
+    ) -> Result<Vec<bool>, String> {
+        let (header, _) = parse_header(bytes)?;
+        let mask = header.allowed(
+            &[Filter {
+                field: field.into(),
+                op: "eq".into(),
+                value,
+            }],
+            &[],
+        )?;
+        Ok(mask.iter().collect())
+    }
+
+    fn metadata_page(raw: &[u8]) -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        let range = append(&mut bytes, raw)?;
+        frame(&bytes, &range).map(<[u8]>::to_vec)
+    }
+
+    fn canonical_metadata_page(json: &str) -> Result<Vec<u8>, String> {
+        let mut raw = vec![super::METADATA_CODEC_CANONICAL];
+        write_vector_facts(
+            super::VectorFacts {
+                flags: 0,
+                dimensions: 0,
+            },
+            &mut raw,
+        );
+        raw.extend_from_slice(json.as_bytes());
+        metadata_page(&raw)
+    }
+
+    fn rejection_eq<T>(result: Result<T, String>, expected: &str) -> Result<(), String> {
+        match result {
+            Err(error) if error == expected => Ok(()),
+            Err(error) => Err(error),
+            Ok(_) => Err(format!("Expected rejection {expected}")),
+        }
+    }
+
+    fn rejection_contains<T>(result: Result<T, String>, needle: &str) -> Result<(), String> {
+        match result {
+            Err(error) if error.contains(needle) => Ok(()),
+            Err(error) => Err(format!("Rejection {error} did not contain {needle}")),
+            Ok(_) => Err(format!("Expected rejection containing {needle}")),
+        }
+    }
+
+    #[test]
+    fn native_roles_stay_distinct_from_same_name_attributes() -> Result<(), String> {
+        let documents = collision_documents();
+        let collided = &documents[0];
+        assert_eq!(collided.id, "row-a");
+        assert_eq!(collided.revision, 7);
+        assert_eq!(text_role(collided, NativeRole::Title)?, "alpha unique");
+        assert_eq!(text_role(collided, NativeRole::Text)?, "shared beta");
+        assert_eq!(
+            collided
+                .columns()
+                .attributes()
+                .get("id")
+                .and_then(crate::segment::Cell::as_legacy)
+                .and_then(serde_json::Value::as_str),
+            Some("attr-id")
+        );
+        assert_eq!(
+            collided.columns().attributes().get("revision"),
+            Some(&crate::segment::Cell::Legacy(serde_json::json!(99)))
+        );
+        assert_eq!(
+            collided
+                .columns()
+                .attributes()
+                .get("title")
+                .and_then(crate::segment::Cell::as_legacy)
+                .and_then(serde_json::Value::as_str),
+            Some("attr-title")
+        );
+        assert_eq!(
+            document_terms(collided)?,
+            vec![
+                "alpha".to_owned(),
+                "beta".to_owned(),
+                "shared".to_owned(),
+                "unique".to_owned(),
+            ]
+        );
+        let built = build(documents.clone(), None)?;
+        let (header, _) = parse_header(&built.bytes)?;
+        for (row, document) in header.documents.iter().zip(&documents) {
+            assert_eq!(row.id, document.id);
+            assert_eq!(row.revision, document.revision);
+            let projected: BTreeMap<String, serde_json::Value> =
+                serde_json::from_str(row.attributes.get()).map_err(|cause| cause.to_string())?;
+            let projected: BTreeMap<String, crate::segment::Cell> = projected
+                .into_iter()
+                .map(|(name, value)| (name, value.into()))
+                .collect();
+            assert_eq!(&projected, document.columns().attributes());
+        }
+        for term in ["alpha", "beta", "gamma", "shared", "unique"] {
+            assert!(header.terms().get(term).is_some(), "missing {term}");
+        }
+        for term in ["attr", "id", "revision", "title", "text", "vector"] {
+            assert!(header.terms().get(term).is_none(), "indexed {term}");
+        }
+        assert_eq!(
+            allowed_rows(&built.bytes, "title", serde_json::json!("attr-title"))?,
+            vec![true, false, false]
+        );
+        assert_eq!(
+            allowed_rows(&built.bytes, "id", serde_json::json!("attr-id"))?,
+            vec![true, false, false]
+        );
+        assert_eq!(
+            allowed_rows(&built.bytes, "revision", serde_json::json!(99))?,
+            vec![true, false, false]
+        );
+        assert!(
+            allowed_rows(&built.bytes, "title", serde_json::json!("alpha unique"))?
+                .iter()
+                .all(|bit| !bit)
+        );
+        assert!(
+            allowed_rows(&built.bytes, "revision", serde_json::json!(7))?
+                .iter()
+                .all(|bit| !bit)
+        );
+        let hits = ranked(&built.bytes, "alpha", "any", &[], &[])?;
+        let hit = hits.first().ok_or("Missing alpha hit")?;
+        assert_eq!(hit.0, 0);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            ranked(&built.bytes, "attr-title", "any", &[], &[])?,
+            Vec::<(u32, u64)>::new()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_v2_rows_rank_and_read_without_rewrite_then_migrate() -> Result<(), String> {
+        let documents = collision_documents();
+        let built = build(documents, None)?;
+        let legacy = encode_legacy_v2(&built.bytes)?;
+        let (legacy_header, _) = parse_header(&legacy)?;
+        assert_eq!(&legacy[..8], b"RAIOSEG2");
+        assert_eq!(legacy_header.version, 2);
+        let checksum = crc32fast::hash(&legacy);
+        for mode in ["any", "all"] {
+            assert_eq!(
+                ranked(&built.bytes, "shared", mode, &[], &[])?,
+                ranked(&legacy, "shared", mode, &[], &[])?
+            );
+            assert_eq!(
+                ranked(&built.bytes, "shared", mode, &[], &[0])?,
+                ranked(&legacy, "shared", mode, &[], &[0])?
+            );
+        }
+        let title_filter = [Filter {
+            field: "title".into(),
+            op: "eq".into(),
+            value: serde_json::json!("attr-title"),
+        }];
+        assert_eq!(
+            ranked(&built.bytes, "shared", "any", &title_filter, &[])?,
+            ranked(&legacy, "shared", "any", &title_filter, &[])?
+        );
+        assert_eq!(
+            ranked(&built.bytes, "shared gamma", "phrase", &[], &[])?,
+            ranked(&legacy, "shared gamma", "phrase", &[], &[])?
+        );
+        assert_eq!(
+            ranked(&built.bytes, "alpha", "any", &[], &[])?,
+            ranked(&legacy, "alpha", "any", &[], &[])?
+        );
+        assert_eq!(projections(&built.bytes)?, projections(&legacy)?);
+        assert_eq!(crc32fast::hash(&legacy), checksum);
+        let migrated = migrate_segment(&legacy)?;
+        assert_eq!(crc32fast::hash(&legacy), checksum);
+        assert_eq!(&migrated[..8], b"RAIOSEG3");
+        assert_eq!(directory(&built.bytes)?, directory(&legacy)?);
+        assert_eq!(directory(&legacy)?, directory(&migrated)?);
+        assert_eq!(
+            payload_range(&built.bytes, true)?,
+            payload_range(&legacy, true)?
+        );
+        assert_eq!(
+            payload_range(&legacy, true)?,
+            payload_range(&migrated, true)?
+        );
+        assert_eq!(
+            payload_range(&built.bytes, false)?,
+            payload_range(&legacy, false)?
+        );
+        assert_eq!(
+            payload_range(&legacy, false)?,
+            payload_range(&migrated, false)?
+        );
+        assert_eq!(term_shapes(&built.bytes)?, term_shapes(&legacy)?);
+        assert_eq!(term_shapes(&legacy)?, term_shapes(&migrated)?);
+        assert_eq!(projections(&built.bytes)?, projections(&migrated)?);
+        for (field, value) in [
+            ("title", serde_json::json!("attr-title")),
+            ("id", serde_json::json!("attr-id")),
+            ("revision", serde_json::json!(99)),
+            ("year", serde_json::json!(4)),
+        ] {
+            assert_eq!(
+                allowed_rows(&built.bytes, field, value.clone())?,
+                allowed_rows(&migrated, field, value)?
+            );
+        }
+        assert_eq!(
+            ranked(&built.bytes, "shared", "any", &[], &[0])?,
+            ranked(&migrated, "shared", "any", &[], &[0])?
+        );
+        assert_eq!(migrate_segment(&migrated)?, migrated);
+        assert_eq!(migrate_segment(&built.bytes)?, built.bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn migration_rejects_directory_lengths_that_disagree_with_document_roles() -> Result<(), String>
+    {
+        let built = build(collision_documents(), None)?;
+        let legacy = encode_legacy_v2(&built.bytes)?;
+        for title in [true, false] {
+            let (mut header, base) = parse_header(&legacy)?;
+            let mut rows = header
+                .documents
+                .iter()
+                .map(|row| owned_directory_row(&row, row.data.clone()))
+                .collect::<Vec<_>>();
+            let first = rows.first_mut().ok_or("Missing migration fixture row")?;
+            if title {
+                first.title_length += 1;
+                header
+                    .fields
+                    .set_total(fields::NATIVE_TITLE, header.total_title_length() + 1);
+            } else {
+                first.body_length += 1;
+                header
+                    .fields
+                    .set_total(fields::NATIVE_TEXT, header.total_body_length() + 1);
+            }
+            header.documents = DocumentTable::from(rows);
+            let changed = header.encode(legacy.get(base..).ok_or("Missing migration payload")?)?;
+            parse_header(&changed)?;
+            rejection_eq(
+                migrate_segment(&changed),
+                "Segment document token lengths do not match its directory",
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn migration_validates_legacy_vector_frames_before_copying_them() -> Result<(), String> {
+        let built = build(collision_documents(), None)?;
+        let mut legacy = encode_legacy_v2(&built.bytes)?;
+        let (header, base) = parse_header(&legacy)?;
+        let vector = header.vector_range(0)?.ok_or("Missing migration vector")?;
+        let checksum = base + vector.offset as usize + 4;
+        let byte = legacy.get_mut(checksum).ok_or("Missing vector checksum")?;
+        *byte ^= 1;
+        parse_header(&legacy)?;
+        rejection_contains(migrate_segment(&legacy), "integrity")?;
+        Ok(())
+    }
+
+    #[test]
+    fn migration_rejects_valid_frames_with_a_conflicting_vector_summary() -> Result<(), String> {
+        let built = build(collision_documents(), None)?;
+        let legacy = encode_legacy_v2_with_facts(&built.bytes, |mut facts| {
+            if facts.flags & 1 != 0 {
+                facts.dimensions += 1;
+            }
+            facts
+        })?;
+        parse_header(&legacy)?;
+        rejection_eq(
+            migrate_segment(&legacy),
+            "Vector frame does not match metadata vector summary",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn document_attribute_numbers_keep_binary64_bits_across_codecs() -> Result<(), String> {
+        for value in [
+            1e-307,
+            f64::from(f32::MAX),
+            0.1,
+            -0.0,
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            f64::MAX,
+        ] {
+            let source = Document::native(
+                "numeric-attribute",
+                1,
+                "",
+                "",
+                BTreeMap::from([("number".into(), serde_json::json!(value))]),
+                None,
+            );
+            let mut native = source.to_native_vec()?;
+            for _ in 0..3 {
+                let document = Document::from_native_slice(&native)?;
+                let canonical = document.to_canonical_vec()?;
+                let document = Document::from_canonical_slice(&canonical)?;
+                let actual = document
+                    .columns()
+                    .attributes()
+                    .get("number")
+                    .and_then(crate::segment::Cell::as_legacy)
+                    .and_then(serde_json::Value::as_f64)
+                    .ok_or("Missing numeric attribute")?;
+                assert_eq!(actual.to_bits(), value.to_bits());
+                native = document.to_native_vec()?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn query_metadata_keeps_vector_bytes_in_a_separate_frame() -> Result<(), String> {
+        let documents = collision_documents();
+        let built = build(documents.clone(), None)?;
+        assert_eq!(&built.bytes[..8], b"RAIOSEG4");
+        let (header, base) = parse_header(&built.bytes)?;
+        assert_eq!(header.version, 4);
+        let payload = built.bytes.get(base..).ok_or("Truncated segment payload")?;
+        for (index, row) in header.documents.iter().enumerate() {
+            let metadata = frame(payload, &row.data)?;
+            let metadata_end = row
+                .data
+                .offset
+                .checked_add(row.data.length)
+                .ok_or("Metadata range overflow")?;
+            assert!(metadata_end <= header.metadata_end);
+            let decoded = decode_page(metadata)?;
+            assert_eq!(
+                decoded.first().copied(),
+                Some(super::METADATA_CODEC_CANONICAL)
+            );
+            assert_eq!(decoded.get(1).copied(), Some(super::METADATA_CODEC_FACTS));
+            let flags = decoded.get(2).copied().ok_or("Missing vector flags")?;
+            assert_eq!((flags & 1) != 0, row.vector);
+            let stored: serde_json::Value =
+                serde_json::from_slice(decoded.get(7..).ok_or("Truncated canonical metadata")?)
+                    .map_err(|cause| cause.to_string())?;
+            assert!(stored.get("vector").is_none());
+            let vector = header
+                .vector_range(index)?
+                .map(|range| frame(payload, range))
+                .transpose()?
+                .unwrap_or_default();
+            if let Some(range) = header.vector_range(index)? {
+                assert!(range.offset >= header.metadata_end);
+            }
+            let source = source_for(&documents, row.id.native_str()?)?;
+            assert_eq!(
+                full_document_from_frames(metadata, vector)?,
+                source.to_canonical_json()?
+            );
+            let query = query_document_from_metadata(metadata)?;
+            assert_eq!(query, super::serialize_query_document(source)?);
+            let query_value: serde_json::Value =
+                serde_json::from_str(&query).map_err(|cause| cause.to_string())?;
+            assert!(query_value.get("vector").is_none());
+            assert!(query_value.get("vectorSummary").is_some());
+            assert_eq!(
+                query_value["roles"]["title"],
+                text_role(source, NativeRole::Title)?
+            );
+            assert_eq!(
+                query_value["attributes"]
+                    .get("title")
+                    .and_then(serde_json::Value::as_str),
+                source
+                    .columns()
+                    .attributes()
+                    .get("title")
+                    .and_then(crate::segment::Cell::as_legacy)
+                    .and_then(serde_json::Value::as_str)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn magic_codec_and_unknown_fields_fail_closed() -> Result<(), String> {
+        let built = build(collision_documents(), None)?;
+        assert_eq!(migrate_segment(&built.bytes)?, built.bytes);
+        let mut mismatched = built.bytes;
+        mismatched[..8].copy_from_slice(b"RAIOSEG2");
+        rejection_eq(
+            parse_header(&mismatched).map(|_| ()),
+            "Segment magic does not match its version",
+        )?;
+        let unknown = metadata_page(&[9, b'{', b'}'])?;
+        rejection_eq(
+            query_document_from_metadata(&unknown).map(|_| ()),
+            "Unknown document metadata codec",
+        )?;
+        let mut vector_in_metadata = vec![super::METADATA_CODEC_CANONICAL];
+        write_vector_facts(
+            super::VectorFacts {
+                flags: 1,
+                dimensions: 1,
+            },
+            &mut vector_in_metadata,
+        );
+        vector_in_metadata.extend_from_slice(
+            br#"{"id":"row-a","revision":1,"roles":{"title":"","text":"shared"},"attributes":{},"vector":[1.0]}"#,
+        );
+        let vector_page = metadata_page(&vector_in_metadata)?;
+        rejection_contains(query_document_from_metadata(&vector_page), "vector")?;
+        let unknown_role = r#"{"id":"row-a","revision":1,"roles":{"title":"","text":"shared","weight":1},"attributes":{}}"#;
+        rejection_contains(Document::from_canonical_json(unknown_role), "weight")?;
+        let mut stored_role = vec![super::METADATA_CODEC_CANONICAL];
+        write_vector_facts(
+            super::VectorFacts {
+                flags: 0,
+                dimensions: 0,
+            },
+            &mut stored_role,
+        );
+        stored_role.extend_from_slice(unknown_role.as_bytes());
+        let role_page = metadata_page(&stored_role)?;
+        rejection_contains(query_document_from_metadata(&role_page), "weight")?;
+        assert!(
+            Document::from_canonical_json(r#"{"id":"row-a","text":"shared","attributes":{}}"#)
+                .is_err()
+        );
+        rejection_contains(
+            Document::from_canonical_json(
+                r#"{"id":"row-a","revision":4,"roles":{"text":"shared"},"attributes":{}}"#,
+            ),
+            "missing field `title`",
+        )?;
+        rejection_contains(
+            Document::from_canonical_json(
+                r#"{"id":"row-a","roles":{"title":"","text":"shared"},"attributes":{}}"#,
+            ),
+            "missing field `revision`",
+        )?;
+        rejection_contains(
+            Document::from_canonical_json(
+                r#"{"revision":1,"roles":{"title":"","text":"shared"},"attributes":{}}"#,
+            ),
+            "missing field `id`",
+        )?;
+        rejection_contains(
+            Document::from_canonical_json(
+                r#"{"id":"row-a","revision":1,"roles":{"title":null,"text":"shared"},"attributes":{}}"#,
+            ),
+            "null",
+        )?;
+        rejection_contains(
+            Document::from_canonical_json(
+                r#"{"id":"row-a","revision":null,"roles":{"title":"","text":"shared"},"attributes":{}}"#,
+            ),
+            "null",
+        )?;
+        rejection_contains(
+            query_document_from_metadata(&canonical_metadata_page(
+                r#"{"id":"row-a","revision":4,"roles":{"text":"shared"},"attributes":{}}"#,
+            )?),
+            "missing field `title`",
+        )?;
+        rejection_contains(
+            query_document_from_metadata(&canonical_metadata_page(
+                r#"{"id":"row-a","roles":{"title":"","text":"shared"},"attributes":{}}"#,
+            )?),
+            "missing field `revision`",
+        )?;
+        let native =
+            Document::from_native_json(r#"{"id":"row-a","text":"shared","attributes":{}}"#)?;
+        assert_eq!(native.revision, 0);
+        assert_eq!(text_role(&native, NativeRole::Title)?, "");
         Ok(())
     }
 }
@@ -10706,9 +13931,18 @@ mod metadata_batch_tests {
             ranges.push(range.offset);
             ranges.push(range.length);
         }
-        let requested: Vec<_> = ranges.chunks_exact(2).rev().flatten().copied().collect();
+        let requested: Vec<_> = ranges
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .rev()
+            .flatten()
+            .copied()
+            .collect();
         let expected: Vec<serde_json::Value> = requested
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|range| {
                 let start = range[0] as usize;
                 let end = start + range[1] as usize;
@@ -10779,7 +14013,7 @@ mod scalar_column_tests {
         let documents = (0..20)
             .map(|row| {
                 Ok(DocumentMeta {
-                    id: format!("id-{row:02}").into_boxed_str(),
+                    id: format!("id-{row:02}").into(),
                     revision: u64::MAX - row,
                     title_length: 7,
                     body_length: u32::try_from(row % 3)?,
@@ -10796,14 +14030,947 @@ mod scalar_column_tests {
             .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
         let expected = serde_json::to_vec(&documents)?;
         let table = DocumentTable::from(documents);
-        assert_eq!(table.title_lengths.heap_bytes(), 0);
-        assert_eq!(table.body_lengths.heap_bytes(), 20 * size_of::<u32>());
+        assert_eq!(table.lengths[0].heap_bytes(), 0);
+        assert_eq!(table.lengths[1].heap_bytes(), 20 * size_of::<u32>());
         assert_eq!(table.vectors.heap_bytes(), 20 * size_of::<bool>());
         assert_eq!(serde_json::to_vec(&table)?, expected);
         let restored: DocumentTable = serde_json::from_slice(&expected)?;
         assert_eq!(serde_json::to_vec(&restored)?, expected);
         assert_eq!(vector_prefix(&table)?, [0]);
         assert_eq!(table.vectors.iter().filter(|value| *value).count(), 10);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod attribute_name_tests {
+    use super::filterable_fields;
+
+    #[test]
+    fn names_use_utf8_byte_bounds_and_binary_field_order() -> Result<(), String> {
+        for name in [
+            "1year".to_owned(),
+            "a-b".to_owned(),
+            "ação".to_owned(),
+            "a/b".to_owned(),
+            "x".repeat(128),
+            "é".repeat(64),
+            "😀".repeat(32),
+        ] {
+            let names = [name.clone()];
+            assert!(filterable_fields(&names)?.contains(name.as_str()));
+        }
+        for name in [
+            String::new(),
+            "$reserved".to_owned(),
+            "x".repeat(129),
+            format!("{}x", "é".repeat(64)),
+            format!("{}x", "😀".repeat(32)),
+        ] {
+            assert!(filterable_fields(&[name]).is_err());
+        }
+        let names = ["😀".to_owned(), "\u{e000}".to_owned()];
+        assert_eq!(
+            filterable_fields(&names)?.into_iter().collect::<Vec<_>>(),
+            ["\u{e000}", "😀"]
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod array_filter_tests {
+    use super::{Filter, matches};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn scalar_ranges_preserve_binary_string_order_and_reject_cross_type_coercion()
+    -> Result<(), String> {
+        for (actual, value, expected) in [
+            (
+                serde_json::json!(""),
+                serde_json::json!("a"),
+                [false, false, true, true],
+            ),
+            (
+                serde_json::json!("a"),
+                serde_json::json!("aa"),
+                [false, false, true, true],
+            ),
+            (
+                serde_json::json!("A"),
+                serde_json::json!("a"),
+                [false, false, true, true],
+            ),
+            (
+                serde_json::json!("é"),
+                serde_json::json!("e\u{301}"),
+                [true, true, false, false],
+            ),
+            (
+                serde_json::json!("\u{e000}"),
+                serde_json::json!("😀"),
+                [false, false, true, true],
+            ),
+            (
+                serde_json::json!("😀"),
+                serde_json::json!("😀"),
+                [false, true, false, true],
+            ),
+            (serde_json::json!(1), serde_json::json!("1"), [false; 4]),
+            (serde_json::json!("1"), serde_json::json!(1), [false; 4]),
+            (serde_json::json!(null), serde_json::json!("a"), [false; 4]),
+            (serde_json::json!(true), serde_json::json!(1), [false; 4]),
+            (serde_json::json!(["a"]), serde_json::json!("b"), [false; 4]),
+            (
+                serde_json::json!(0),
+                serde_json::json!(-0.0),
+                [false, true, false, true],
+            ),
+            (
+                serde_json::json!(1.5),
+                serde_json::json!(1),
+                [true, true, false, false],
+            ),
+        ] {
+            for (op, expected) in ["gt", "gte", "lt", "lte"].into_iter().zip(expected) {
+                let filter = Filter {
+                    field: "value".to_owned(),
+                    op: op.to_owned(),
+                    value: value.clone(),
+                };
+                assert_eq!(filter.matches(Some(&actual))?, expected);
+                assert!(!filter.matches(None)?);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn scalar_exclusion_is_exact_and_preserves_missing_values() -> Result<(), String> {
+        let attributes: BTreeMap<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "string": "ação",
+                "number": 1,
+                "boolean": true,
+                "null": null
+            }))
+            .map_err(|cause| cause.to_string())?;
+        for (field, value, expected) in [
+            ("string", serde_json::json!(["ação"]), false),
+            ("string", serde_json::json!(["AÇÃO"]), true),
+            ("number", serde_json::json!([1]), false),
+            ("number", serde_json::json!(["1"]), true),
+            ("boolean", serde_json::json!([true]), false),
+            ("boolean", serde_json::json!([1]), true),
+            ("null", serde_json::json!([null]), false),
+            ("missing", serde_json::json!([null]), true),
+            ("null", serde_json::json!([]), true),
+            ("missing", serde_json::json!([]), true),
+        ] {
+            let filter = Filter {
+                field: field.to_owned(),
+                op: "notIn".to_owned(),
+                value,
+            };
+            assert_eq!(matches(&attributes, &[filter])?, expected);
+        }
+        let invalid = Filter {
+            field: "missing".to_owned(),
+            op: "notIn".to_owned(),
+            value: serde_json::Value::Null,
+        };
+        assert_eq!(
+            matches(&attributes, &[invalid]),
+            Err("Invalid notIn filter".into())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn membership_preserves_types_empty_intersections_and_negation() -> Result<(), String> {
+        let attributes: BTreeMap<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "tags": ["ação", "😀", 1, true, null],
+                "empty": [],
+                "null": null,
+                "scalar": "ação"
+            }))
+            .map_err(|cause| cause.to_string())?;
+        for (field, op, value, expected) in [
+            ("tags", "contains", serde_json::json!("ação"), true),
+            ("tags", "contains", serde_json::json!("AÇÃO"), false),
+            ("tags", "contains", serde_json::json!(1), true),
+            ("tags", "contains", serde_json::json!("1"), false),
+            ("tags", "contains", serde_json::json!(null), true),
+            ("null", "contains", serde_json::json!(null), false),
+            ("missing", "contains", serde_json::json!("ação"), false),
+            ("missing", "notContains", serde_json::json!("ação"), true),
+            ("scalar", "contains", serde_json::json!("ação"), false),
+            (
+                "tags",
+                "containsAny",
+                serde_json::json!([false, "😀"]),
+                true,
+            ),
+            (
+                "tags",
+                "containsAny",
+                serde_json::json!([false, "1"]),
+                false,
+            ),
+            ("tags", "containsAny", serde_json::json!([]), false),
+            ("tags", "notContainsAny", serde_json::json!([]), true),
+            ("empty", "notContainsAny", serde_json::json!([1]), true),
+            ("null", "notContainsAny", serde_json::json!([null]), true),
+            ("scalar", "notContains", serde_json::json!("ação"), true),
+        ] {
+            let filter = Filter {
+                field: field.to_owned(),
+                op: op.to_owned(),
+                value,
+            };
+            assert_eq!(matches(&attributes, &[filter])?, expected);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod typed_id_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn document(id: &Value) -> Result<Document, String> {
+        Document::from_canonical_json(
+            &json!({
+                "id":id,"revision":1,"roles":{"title":"","text":"shared"},
+                "attributes":{"keep":true},"vector":[1.0,0.0]
+            })
+            .to_string(),
+        )
+    }
+
+    #[test]
+    fn typed_id_columns_roundtrip_frames_directories_and_rebuild()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ids = [
+            json!("1"),
+            json!("00112233-4455-6677-8899-aabbccddeeff"),
+            json!({"kind":"uint","value":"2"}),
+            json!({"kind":"uint","value":"10"}),
+            json!({"kind":"uint","value":"18446744073709551615"}),
+            json!({"kind":"uuid","value":"00112233-4455-6677-8899-aabbccddeeff"}),
+        ];
+        let documents = ids.iter().map(document).collect::<Result<Vec<_>, _>>()?;
+        let built = build(documents.clone(), None)?;
+        assert_eq!(&built.bytes[..8], b"RAIOSEG5");
+        let (header, base) = parse_header(&built.bytes)?;
+        assert_eq!(header.version, 5);
+        assert_eq!(header.documents.typed_ids.len(), 4);
+        assert_eq!(
+            header.documents.ids,
+            "00112233-4455-6677-8899-aabbccddeeff1"
+        );
+        let mut restored = Vec::new();
+        for (index, row) in header.documents.iter().enumerate() {
+            assert_eq!(header.documents.find_id(row.id), Ok(index));
+            let metadata = &built.bytes[base + row.data.offset as usize
+                ..base + row.data.offset as usize + row.data.length as usize];
+            let vector = header.vector_range(index)?.ok_or("Missing typed vector")?;
+            let vector = &built.bytes[base + vector.offset as usize
+                ..base + vector.offset as usize + vector.length as usize];
+            let full = full_document_from_frames(metadata, vector)?;
+            let query: Value = serde_json::from_str(&query_document_from_metadata(metadata)?)?;
+            let full_value: Value = serde_json::from_str(&full)?;
+            assert_eq!(query["id"], full_value["id"]);
+            assert_eq!(serde_json::to_value(row.id)?, full_value["id"]);
+            restored.push(Document::from_canonical_json(&full)?);
+        }
+        assert_eq!(build(restored, None)?.bytes, built.bytes);
+        assert_eq!(migrate_segment(&built.bytes)?, built.bytes);
+        let frame = compress_directory(&built.bytes[..base])?;
+        assert_eq!(&frame[..8], b"RAIODIR7");
+        let decoded = parse_compressed_directory(&frame, base, MAX_BYTES)?;
+        assert_eq!(decoded.compact_json()?, header.compact_json()?);
+        let common = compress_common_directory_segment(&built.bytes)?;
+        assert_eq!(&common[..8], b"RAIOCOM5");
+        let decoded_common =
+            decode_directory_contents(&common, base, MAX_BYTES, None, *COMMON_DIRECTORY_MAGIC_V5)?;
+        assert_eq!(
+            serde_json::to_value(&decoded_common.header.documents)?,
+            serde_json::to_value(&header.documents)?
+        );
+        let mut bad = built.bytes.clone();
+        bad[..8].copy_from_slice(MAGIC_V4);
+        assert!(parse_header(&bad).is_err());
+        let mut bad = frame;
+        bad[..8].copy_from_slice(DIRECTORY_MAGIC_V6);
+        assert!(parse_compressed_directory(&bad, base, MAX_BYTES).is_err());
+        for version in [2, 3, 4] {
+            let mut bad = header.clone();
+            bad.version = version;
+            assert!(validate_header(&bad).is_err());
+            let forged = bad.encode(&built.bytes[base..])?;
+            assert!(parse_header(&forged).is_err());
+        }
+        let mut compact = binary_directory::encode(&header)?;
+        compact[0] = 4;
+        let forged = compress_directory_payload(&compact, base, *DIRECTORY_MAGIC_V6)?;
+        assert!(parse_compressed_directory(&forged, base, MAX_BYTES).is_err());
+        for document in documents
+            .iter()
+            .filter(|document| !matches!(document.id, DocumentId::String(_)))
+        {
+            assert!(document.to_native_json().is_err());
+            assert!(document.to_native_vec().is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_string_identity_keeps_version_four_bytes_and_packed_storage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let native = Document::native(
+            "row",
+            1,
+            "",
+            "shared",
+            BTreeMap::from([("keep".into(), json!(true))]),
+            Some(vec![1.0, 0.0]),
+        );
+        let canonical = document(&json!("row"))?;
+        let built = build(vec![native], None)?;
+        assert_eq!(build(vec![canonical], None)?.bytes, built.bytes);
+        assert_eq!(&built.bytes[..8], b"RAIOSEG4");
+        assert!(built.header.documents.typed_ids.is_empty());
+        assert_eq!(built.header.documents.ids, "row");
+        let (_, base) = parse_header(&built.bytes)?;
+        let mut compact = binary_directory::encode(&built.header)?;
+        compact[0] = 5;
+        let forged = compress_directory_payload(&compact, base, *DIRECTORY_MAGIC_V7)?;
+        assert!(parse_compressed_directory(&forged, base, MAX_BYTES).is_err());
+        assert_eq!(migrate_segment(&built.bytes)?, built.bytes);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod typed_id_filter_tests {
+    use super::*;
+
+    #[test]
+    fn typed_ids_keep_filters_and_tombstones_before_text_and_vector_limits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut documents = Vec::new();
+        for value in [2, 10, 20, 30] {
+            let mut document = Document::native(
+                "placeholder",
+                1,
+                "",
+                "shared",
+                BTreeMap::new(),
+                Some(vec![1.0]),
+            );
+            document.id = DocumentId::Uint(value);
+            document
+                .columns_mut()
+                .attributes_mut()
+                .insert("keep".into(), serde_json::json!(value != 2).into());
+            documents.push(document);
+        }
+        let built = build(documents, None)?;
+        let (header, base) = parse_header(&built.bytes)?;
+        assert_eq!(header.documents.row(0).id, DocumentId::<String>::Uint(2));
+        assert_eq!(header.documents.row(1).id, DocumentId::<String>::Uint(10));
+        let filters = [Filter {
+            field: "keep".into(),
+            op: "eq".into(),
+            value: serde_json::json!(true),
+        }];
+        let dead = [1];
+        assert_eq!(header.vector_rows(&filters, &dead)?, vec![2, 3]);
+        let statistics = Statistics {
+            documents: 4,
+            title_length: 0,
+            body_length: 4,
+            frequencies: BTreeMap::from([("shared".into(), 4)]),
+        };
+        let mut search = Search::new(
+            header.clone(),
+            statistics,
+            "shared",
+            "any",
+            1,
+            &dead,
+            &filters,
+        )?;
+        for block in &header
+            .terms()
+            .get("shared")
+            .ok_or("Missing shared posting")?
+            .blocks
+        {
+            let start = base + usize::try_from(block.data.offset)?;
+            search.add(
+                "shared",
+                &built.bytes[start..start + usize::try_from(block.data.length)?],
+            )?;
+        }
+        let hits = search.finish()?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            header.documents.row(usize::try_from(hits[0].row)?).id,
+            DocumentId::<String>::Uint(20)
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod typed_id_bloom_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn canonical_blooms_preserve_legacy_string_hashes_and_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let strings = [
+            "",
+            "1",
+            "ação",
+            "😀",
+            "00112233-4455-6677-8899-aabbccddeeff",
+            "{\"kind\":\"uint\",\"value\":\"1\"}",
+        ]
+        .map(str::to_owned);
+        let ids = strings
+            .iter()
+            .cloned()
+            .map(DocumentId::String)
+            .collect::<Vec<_>>();
+        assert_eq!(bloom_build_ids(&ids)?, bloom_build(&strings)?);
+        assert_eq!(bloom_build_ids(&[])?, bloom_build(&[])?);
+        for (id, string) in ids.iter().zip(&strings) {
+            assert_eq!(bloom_id_hashes(id.borrowed())?, bloom_hashes(string));
+        }
+        let bytes = bloom_build(&strings)?;
+        let offsets = [0, u32::try_from(bytes.len())?];
+        let selected = bloom_filter_ids(&bytes, &offsets, &ids)?;
+        let strings_selected = bloom_filter_many(&bytes, &offsets, &strings)?;
+        assert_eq!(
+            serde_json::to_value(selected)?,
+            serde_json::to_value(strings_selected)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_bloom_membership_retains_tags_and_exact_lookup_does_not_alias()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let uuid = "00112233-4455-6677-8899-aabbccddeeff";
+        let ids = [
+            json!("1"),
+            json!({"kind":"uint","value":"1"}),
+            json!({"kind":"uint","value":"18446744073709551615"}),
+            json!(uuid),
+            json!({"kind":"uuid","value":uuid}),
+            json!("{\"kind\":\"uint\",\"value\":\"1\"}"),
+        ]
+        .into_iter()
+        .map(serde_json::from_value::<DocumentId>)
+        .collect::<Result<Vec<_>, _>>()?;
+        let bytes = bloom_build_ids(&ids)?;
+        let mut batch = bytes.clone();
+        batch.extend_from_slice(&bytes);
+        let offsets = [0, u32::try_from(bytes.len())?, u32::try_from(batch.len())?];
+        let selected = bloom_filter_ids(&batch, &offsets, &ids)?;
+        for selected in selected {
+            assert_eq!(serde_json::to_value(selected)?, serde_json::to_value(&ids)?);
+        }
+        let documents = ids
+            .iter()
+            .cloned()
+            .map(|id| {
+                let mut document =
+                    Document::native("placeholder", 1, "", "shared", BTreeMap::new(), None);
+                document.id = id;
+                document
+            })
+            .collect();
+        let built = build(documents, None)?;
+        let strings = [
+            DocumentId::<String>::String("1".into()),
+            DocumentId::String(uuid.into()),
+        ];
+        let numbers = [DocumentId::<String>::Uint(1), DocumentId::Uint(u64::MAX)];
+        for id in strings.iter().chain(&numbers).chain(&ids) {
+            let index = built
+                .header
+                .documents
+                .find_id(id)
+                .map_err(|cause| format!("Missing canonical ID after bloom: {cause}"))?;
+            assert_eq!(built.header.documents.row(index).id, id.borrowed());
+        }
+        assert_ne!(
+            built.header.documents.find_id(&strings[0]),
+            built.header.documents.find_id(&numbers[0])
+        );
+        let tagged_wire = DocumentId::<String>::String(serde_json::to_string(&numbers[0])?);
+        assert_eq!(
+            bloom_id_hashes(tagged_wire.borrowed())?,
+            bloom_id_hashes(numbers[0].borrowed())?
+        );
+        assert_ne!(
+            built.header.documents.find_id(&tagged_wire),
+            built.header.documents.find_id(&numbers[0])
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod typed_cutoff_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_cutoffs_share_exhaustive_ranking_and_never_alias_raw_json_strings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cutoff = serde_json::json!({"kind":"uint","value":"10"}).to_string();
+        let ids = [
+            DocumentId::<String>::String(cutoff.clone()),
+            DocumentId::Uint(2),
+            DocumentId::Uint(10),
+        ];
+        let documents = ids
+            .into_iter()
+            .map(|id| {
+                let mut document =
+                    Document::native("placeholder", 1, "", "shared", BTreeMap::new(), None);
+                document.id = id;
+                document
+            })
+            .collect();
+        let built = build(documents, None)?;
+        let (header, base) = parse_header(&built.bytes)?;
+        let statistics = Statistics {
+            documents: 3,
+            title_length: 0,
+            body_length: 3,
+            frequencies: BTreeMap::from([("shared".into(), 3)]),
+        };
+        let mut exhaustive = Search::new(
+            header.clone(),
+            statistics.clone(),
+            "shared",
+            "any",
+            1,
+            &[],
+            &[],
+        )?;
+        let metadata = header
+            .terms()
+            .get("shared")
+            .ok_or("Missing cutoff posting")?;
+        for block in &metadata.blocks {
+            let start = base + usize::try_from(block.data.offset)?;
+            exhaustive.add(
+                "shared",
+                &built.bytes[start..start + usize::try_from(block.data.length)?],
+            )?;
+        }
+        let score = exhaustive
+            .block_bounds()
+            .first()
+            .and_then(|bounds| bounds.first())
+            .ok_or("Missing cutoff bound")?
+            .1;
+        let mut selected = Search::new(header, statistics, "shared", "any", 1, &[], &[])?;
+        assert!(selected.posting_spans_after(score, &cutoff)?.is_empty());
+        let spans = selected.posting_spans_after_id(score, &cutoff)?;
+        assert!(!spans.is_empty());
+        let ranges = spans
+            .iter()
+            .flat_map(|span| span.blocks.iter().map(|block| block.data.clone()))
+            .collect::<Vec<_>>();
+        drop(spans);
+        for range in ranges {
+            let start = base + usize::try_from(range.offset)?;
+            selected.add(
+                "shared",
+                &built.bytes[start..start + usize::try_from(range.length)?],
+            )?;
+        }
+        let expected = exhaustive.finish()?;
+        let actual = selected.finish()?;
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(&expected) {
+            assert_eq!(actual.row, expected.row);
+            assert_eq!(actual.score.to_bits(), expected.score.to_bits());
+        }
+        for invalid in [
+            "10",
+            r#"{"kind":"uint","value":"01"}"#,
+            r#"{"kind":"uint","value":10}"#,
+            r#"{"kind":"uuid","value":"INVALID"}"#,
+            "\"\"",
+        ] {
+            assert!(selected.posting_spans_after_id(score, invalid).is_err());
+        }
+        assert!(selected.posting_spans_after_id(f64::NAN, &cutoff).is_err());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod typed_cell_tests {
+    use super::*;
+    use serde_json::json;
+
+    const BOUNDARY: i64 = 1 << 53;
+
+    fn schema() -> Result<AttributeSchema, String> {
+        AttributeSchema::from_json(
+            r#"[
+                {"name":"stamp","type":"i64","filterable":true,"nullable":true},
+                {"name":"tags","type":"[string]","filterable":true},
+                {"name":"blob","type":"bytes","nullable":true}
+            ]"#,
+        )
+    }
+
+    fn typed_document(
+        id: &str,
+        attributes: Vec<(&str, Cell)>,
+        vector: Option<Vec<f32>>,
+    ) -> Result<Document, String> {
+        Document::typed(
+            DocumentId::String(id.into()),
+            1,
+            "",
+            "shared",
+            attributes
+                .into_iter()
+                .map(|(name, cell)| (name.to_owned(), cell))
+                .collect(),
+            vector,
+        )
+    }
+
+    fn stamp_filter(op: &str, value: i64) -> Filter {
+        Filter {
+            field: "stamp".into(),
+            op: op.into(),
+            value: json!({"i64": value.to_string()}),
+        }
+    }
+
+    fn forged(header: &Header, version: u32, payload: &[u8]) -> Result<Vec<u8>, String> {
+        Header::from_parts(
+            version,
+            header.documents.clone(),
+            header.fields.clone(),
+            (header.metadata_end, header.vector_end),
+            header.vector_ranges.clone(),
+        )?
+        .encode(payload)
+    }
+
+    #[test]
+    fn typed_vector_rows_apply_filters_and_tombstones_before_selection() -> Result<(), String> {
+        let documents = (0..4)
+            .map(|index| {
+                typed_document(
+                    &format!("row{index}"),
+                    vec![("stamp", Cell::I64(BOUNDARY + index))],
+                    Some(vec![1.0]),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let built = build_typed(documents, &schema()?, &[])?;
+        let (header, _) = parse_header(&built.bytes)?;
+        assert_eq!(header.version, 6);
+        let filters = [stamp_filter("gte", BOUNDARY + 1)];
+        assert_eq!(header.vector_rows(&filters, &[])?, vec![1, 2, 3]);
+        assert_eq!(header.vector_rows(&filters, &[2])?, vec![1, 3]);
+        assert_eq!(header.vector_rows(&[], &[0])?, vec![1, 2, 3]);
+        let exact = [stamp_filter("eq", BOUNDARY + 1)];
+        assert_eq!(header.vector_rows(&exact, &[])?, vec![1]);
+        let neighbor = [stamp_filter("eq", BOUNDARY + 4)];
+        assert_eq!(header.vector_rows(&neighbor, &[])?, [] as [u32; 0]);
+        let wrong_kind = [Filter {
+            field: "stamp".into(),
+            op: "eq".into(),
+            value: json!({"u64": (BOUNDARY + 1).to_string()}),
+        }];
+        assert_eq!(header.vector_rows(&wrong_kind, &[])?, [] as [u32; 0]);
+        let raw_number = [Filter {
+            field: "stamp".into(),
+            op: "eq".into(),
+            value: json!(BOUNDARY + 1),
+        }];
+        assert!(header.vector_rows(&raw_number, &[]).is_err());
+        assert!(header.vector_rows(&filters, &[4]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn the_segment_version_not_the_value_shape_selects_the_attribute_reading() -> Result<(), String>
+    {
+        let typed_built = build_typed(
+            vec![typed_document("a", vec![("stamp", Cell::I64(1))], None)?],
+            &schema()?,
+            &[],
+        )?;
+        let (typed_header, typed_base) = parse_header(&typed_built.bytes)?;
+        assert_eq!(
+            typed_header.documents.row(0).attributes.get(),
+            r#"{"stamp":{"i64":"1"}}"#
+        );
+        let payload = &typed_built.bytes[typed_base..];
+
+        // The same carrier bytes under a legacy version are an opaque object.
+        let as_legacy = forged(&typed_header, 4, payload)?;
+        let (legacy_header, _) = parse_header(&as_legacy)?;
+        assert_eq!(legacy_header.version, 4);
+        let equal = [stamp_filter("eq", 1)];
+        let greater = [stamp_filter("gt", 0)];
+        let raw_number = [Filter {
+            field: "stamp".into(),
+            op: "eq".into(),
+            value: json!(1),
+        }];
+        assert!(legacy_header.allowed(&equal, &[])?[0]);
+        assert!(!legacy_header.allowed(&greater, &[])?[0]);
+        assert!(!legacy_header.allowed(&raw_number, &[])?[0]);
+        assert!(typed_header.allowed(&equal, &[])?[0]);
+        assert!(typed_header.allowed(&greater, &[])?[0]);
+        assert!(typed_header.allowed(&raw_number, &[]).is_err());
+
+        // Legacy carriers that are not valid typed cells cannot claim the typed version.
+        let native = build(
+            vec![Document::native(
+                "a",
+                1,
+                "",
+                "shared",
+                BTreeMap::from([("stamp".into(), json!(2024))]),
+                None,
+            )],
+            None,
+        )?;
+        let (native_header, native_base) = parse_header(&native.bytes)?;
+        assert!(parse_header(&forged(&native_header, 6, &native.bytes[native_base..])?).is_err());
+        for carrier in [
+            r#"{"stamp":1}"#,
+            r#"{"stamp":1.5}"#,
+            r#"{"stamp":{"i32":"1"}}"#,
+            r#"{"stamp":{"i64":"01"}}"#,
+            r#"{"stamp":{"i64":"1"},"stamp":{"i64":"2"}}"#,
+            r#"{"blob":{"bytes":"Zg=="}}"#,
+            r#"{"tags":[1]}"#,
+            r#"{"tags":["a",true]}"#,
+            "[]",
+        ] {
+            let mut tampered = typed_header.clone();
+            tampered.documents.attributes.dense_mut()[0] =
+                serde_json::value::RawValue::from_string(carrier.into())
+                    .map_err(|cause| cause.to_string())?
+                    .into();
+            assert!(
+                parse_header(&forged(&tampered, 6, payload)?).is_err(),
+                "{carrier}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn empty_attributes_preserve_the_metadata_codec_boundary() -> Result<(), String> {
+        let typed = typed_document("a", vec![], None)?;
+        let legacy = Document::native("a", 1, "", "shared", BTreeMap::new(), None);
+        let facts = vector_facts(None)?;
+        for (document, typed_mode) in [(&typed, true), (&legacy, false)] {
+            let raw = encode_canonical_metadata_page(document, facts, typed_mode)?;
+            let mut page = Vec::new();
+            let range = append(&mut page, &raw)?;
+            assert_eq!(query_document_from_metadata(&page).is_ok(), !typed_mode);
+            assert_eq!(
+                query_typed_document_from_metadata(&page).is_ok(),
+                typed_mode
+            );
+            assert_eq!(full_document_from_frames(&page, &[]).is_ok(), !typed_mode);
+            assert_eq!(
+                full_typed_document_from_frames(&page, &[]).is_ok(),
+                typed_mode
+            );
+            assert_eq!(
+                query_documents_from_metadata(&page, &[range.offset, range.length]).is_ok(),
+                !typed_mode
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn typed_metadata_codec_is_exact_and_never_shared_with_the_legacy_codec() -> Result<(), String>
+    {
+        let facts = vector_facts(None)?;
+        let source = typed_document(
+            "a",
+            vec![
+                ("stamp", Cell::Null),
+                ("tags", Cell::Array(vec![Cell::String("x".into())])),
+                ("blob", Cell::Bytes(vec![0, 255, 7])),
+            ],
+            None,
+        )?;
+        let page = encode_canonical_metadata_page(&source, facts, true)?;
+        assert_eq!(page[0], METADATA_CODEC_TYPED);
+        let (_, decoded) = parse_document_metadata(&page)?;
+        assert_eq!(
+            decoded.columns().attributes(),
+            source.columns().attributes()
+        );
+        assert!(decoded.columns().is_typed());
+        assert!(encode_canonical_metadata_page(&source, facts, false).is_err());
+
+        let legacy = Document::native(
+            "a",
+            1,
+            "",
+            "shared",
+            BTreeMap::from([("stamp".into(), json!({"i64": "5"}))]),
+            None,
+        );
+        let legacy_page = encode_canonical_metadata_page(&legacy, facts, false)?;
+        assert_eq!(legacy_page[0], METADATA_CODEC_CANONICAL);
+        let (_, reread) = parse_document_metadata(&legacy_page)?;
+        assert_eq!(
+            reread.columns().attributes().get("stamp"),
+            Some(&Cell::Legacy(json!({"i64": "5"})))
+        );
+        assert!(encode_canonical_metadata_page(&legacy, facts, true).is_err());
+
+        // The codec byte decides the reading: the same JSON under the other codec differs.
+        let mut forged_page = page;
+        forged_page[0] = METADATA_CODEC_CANONICAL;
+        let (_, misread) = parse_document_metadata(&forged_page)?;
+        assert!(misread.columns().is_legacy());
+        assert_ne!(
+            misread.columns().attributes(),
+            source.columns().attributes()
+        );
+        forged_page[0] = 5;
+        assert!(parse_document_metadata(&forged_page).is_err());
+
+        for attributes in [
+            r#"{"stamp":1}"#,
+            r#"{"stamp":{"i64":"x"}}"#,
+            r#"{"stamp":null,"stamp":null}"#,
+            r#"{"tags":["a",1]}"#,
+        ] {
+            let mut bad = vec![METADATA_CODEC_TYPED];
+            write_vector_facts(facts, &mut bad);
+            bad.extend_from_slice(
+                format!(
+                    r#"{{"id":"a","revision":1,"roles":{{"title":"","text":"shared"}},"attributes":{attributes}}}"#
+                )
+                .as_bytes(),
+            );
+            assert!(parse_document_metadata(&bad).is_err(), "{attributes}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn typed_filter_masks_and_shared_representatives_match_per_row_evaluation() -> Result<(), String>
+    {
+        let documents = (0..300)
+            .map(|index| {
+                typed_document(
+                    &format!("row{index:03}"),
+                    match index % 3 {
+                        0 => vec![("stamp", Cell::I64(BOUNDARY + 1))],
+                        1 => vec![("stamp", Cell::I64(BOUNDARY - 1))],
+                        _ => vec![("stamp", Cell::Null)],
+                    },
+                    None,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let sources: Vec<_> = documents.clone();
+        let built = build_typed(documents, &schema()?, &[])?;
+        let (header, _) = parse_header(&built.bytes)?;
+        for filters in [
+            vec![stamp_filter("gt", BOUNDARY)],
+            vec![stamp_filter("lte", BOUNDARY)],
+            vec![stamp_filter("eq", BOUNDARY + 1)],
+            vec![Filter {
+                field: "stamp".into(),
+                op: "eq".into(),
+                value: json!(null),
+            }],
+            vec![Filter {
+                field: "stamp".into(),
+                op: "in".into(),
+                value: json!([{"i64": (BOUNDARY - 1).to_string()}, null]),
+            }],
+            vec![Filter {
+                field: "tags".into(),
+                op: "exists".into(),
+                value: json!(false),
+            }],
+        ] {
+            let first = header.allowed(&filters, &[])?;
+            let cached = header.allowed(&filters, &[])?;
+            assert_eq!(first, cached);
+            for (row, source) in sources.iter().enumerate() {
+                let expected = matches_cells(source.columns().attributes(), &filters, true)?;
+                assert_eq!(first[row], expected, "{row} {}", filters[0].op);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn typed_directory_validation_is_charged_to_the_directory_budget() -> Result<(), String> {
+        let built = build_typed(
+            vec![typed_document(
+                "a",
+                vec![("tags", Cell::Array(vec![Cell::String("x".repeat(1024))]))],
+                None,
+            )?],
+            &schema()?,
+            &[],
+        )?;
+        let (header, base) = parse_header(&built.bytes)?;
+        let frame = compress_directory(&built.bytes[..base])?;
+        assert_eq!(&frame[..8], DIRECTORY_MAGIC_V8);
+        let retained = header.heap_bytes();
+        assert!(parse_compressed_directory(&frame, base, retained).is_err());
+        assert!(parse_compressed_directory(&frame, base, retained + 64 * 1024).is_ok());
+        let common = compress_common_directory_segment(&built.bytes)?;
+        assert_eq!(&common[..8], COMMON_DIRECTORY_MAGIC_V6);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_builders_and_adapters_refuse_typed_cells_without_rounding() -> Result<(), String> {
+        let typed = typed_document("a", vec![("stamp", Cell::I64(BOUNDARY + 1))], None)?;
+        assert!(build(vec![typed.clone()], None).is_err());
+        assert!(typed.to_native_vec().is_err());
+        assert!(typed.to_canonical_vec().is_err());
+        assert!(typed.to_typed_canonical_vec().is_ok());
+        let mut mixed = typed;
+        mixed
+            .columns_mut()
+            .attributes_mut()
+            .insert("legacy".into(), json!(1).into());
+        assert!(!mixed.columns().is_typed());
+        assert!(!mixed.columns().is_legacy());
+        assert!(mixed.to_typed_canonical_vec().is_err());
+        assert!(build_typed(vec![mixed], &schema()?, &[]).is_err());
         Ok(())
     }
 }

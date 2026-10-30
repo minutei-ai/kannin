@@ -1,3 +1,4 @@
+import { canonicalFixtureDocuments } from "./segment-fixture";
 import { decodeRoot } from "../src/manifest";
 import { afterAll, expect, test } from "bun:test";
 import { Effect, Match, Schema } from "effect";
@@ -17,11 +18,13 @@ initSync({
   ),
 });
 const documents = Array.from({ length: 10 }, (_, index) => corpus(index * 500, 1000000)).flat();
-using segment = new Segment(JSON.stringify(documents));
+using segment = new Segment(JSON.stringify(canonicalFixtureDocuments(documents)));
 const canonical = segment.bytes();
 const length = 16 + new DataView(canonical.buffer, canonical.byteOffset).getUint32(8, true);
 const frame = new Uint8Array(directory_compress(canonical.subarray(0, length)));
-using smallSegment = new Segment(JSON.stringify([document("a", "alpha")]));
+using smallSegment = new Segment(
+  JSON.stringify(canonicalFixtureDocuments([document("a", "alpha")])),
+);
 const smallCanonical = smallSegment.bytes();
 const smallLength =
   16 + new DataView(smallCanonical.buffer, smallCanonical.byteOffset).getUint32(8, true);
@@ -37,10 +40,12 @@ function directoryWithLength(expected: number) {
   const boundary = { padding: expected - length, bytes: canonical, length };
   for (const attempt of Array.from({ length: 8 }, (_, index) => index)) {
     using built = new Segment(
-      JSON.stringify([
-        { ...first, attributes: { ...first.attributes, padding: "x".repeat(boundary.padding) } },
-        ...documents.slice(1),
-      ]),
+      JSON.stringify(
+        canonicalFixtureDocuments([
+          { ...first, attributes: { ...first.attributes, padding: "x".repeat(boundary.padding) } },
+          ...documents.slice(1),
+        ]),
+      ),
     );
     boundary.bytes = built.bytes();
     boundary.length =
@@ -101,7 +106,7 @@ async function cacheFrame(
   headerBytes: number,
   bytes: Uint8Array,
 ) {
-  const cacheKey = new URL("https://raio-cache.internal/directory-v5");
+  const cacheKey = new URL("https://raio-cache.internal/directory-v8");
   cacheKey.searchParams.set("key", key);
   cacheKey.searchParams.set("offset", "0");
   cacheKey.searchParams.set("length", String(headerBytes));
@@ -117,7 +122,7 @@ async function cacheFrame(
 
 test("R2 directory frames recover cold readers with compressed bytes across isolates", async () => {
   const key = "namespaces/directory-r2/segments/shared.rsix";
-  const identity = `cache/directory-v5/${key}/${length}`;
+  const identity = `cache/directory-v8/${key}/${length}`;
   const input = Schema.encodeSync(Schema.fromJsonString(DirectoryBudgetInput))({
     key,
     offset: 0,
@@ -175,7 +180,7 @@ test("invalid R2 directory frames recover canonical data and repair disposable a
   const bucket = await worker.getR2Bucket("STORAGE");
   for (const failure of ["checksum", "identity", "oversized", "missing"]) {
     const key = `namespaces/directory-r2/segments/${failure}.rsix`;
-    const identity = `cache/directory-v5/${key}/${length}`;
+    const identity = `cache/directory-v8/${key}/${length}`;
     await bucket.put(key, canonical);
     await cacheFrame(worker, key, length, frame);
     const bytes = frame.slice();
@@ -314,7 +319,7 @@ test("segment origins validate R2 frames before publishing the native Cache API 
   await using active = await fixture();
   const worker = active.worker;
   const key = "namespaces/directory-origin/segments/shared.rsix";
-  const identity = `cache/directory-v5/${key}/${length}`;
+  const identity = `cache/directory-v8/${key}/${length}`;
   const bucket = await worker.getR2Bucket("STORAGE");
   await bucket.put(key, canonical);
   await bucket.put(identity, frame, {
@@ -390,7 +395,7 @@ test("catalog recovery reuses a surviving compressed R2 directory before canonic
   const key = "namespaces/canonical-partial-loss/segments/source.rsix";
   const bucket = await worker.getR2Bucket("STORAGE");
   await bucket.put(key, canonical);
-  await bucket.put(`cache/directory-v5/${key}/${length}`, frame, {
+  await bucket.put(`cache/directory-v8/${key}/${length}`, frame, {
     customMetadata: {
       source: Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))({
         key,
@@ -536,7 +541,7 @@ test("slow compressed frame waits leave canonical body admission available", asy
   const bucket = await worker.getR2Bucket("STORAGE");
   for (const key of keys) {
     await bucket.put(key, boundary.bytes);
-    await bucket.put(`cache/directory-v5/${key}/${boundary.length}`, compressed, {
+    await bucket.put(`cache/directory-v8/${key}/${boundary.length}`, compressed, {
       customMetadata: {
         source: Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))({
           key,
@@ -578,7 +583,7 @@ test("distinct directory frames briefly share body admission before canonical fa
     (name) => `namespaces/directory-frame-burst/segments/${name}.rsix`,
   );
   for (const key of keys)
-    await bucket.put(`cache/directory-v5/${key}/${admissionLarge.length}`, admissionLargeFrame, {
+    await bucket.put(`cache/directory-v8/${key}/${admissionLarge.length}`, admissionLargeFrame, {
       customMetadata: {
         source: Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))({
           key,
@@ -648,7 +653,7 @@ for (const sample of [
       (_, index) => `namespaces/directory-frame-expiry/segments/${sample.name}-${index}.rsix`,
     );
     for (const key of keys)
-      await bucket.put(`cache/directory-v5/${key}/${sample.length}`, sample.frame, {
+      await bucket.put(`cache/directory-v8/${key}/${sample.length}`, sample.frame, {
         customMetadata: {
           source: Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))({
             key,
@@ -727,7 +732,7 @@ test("rejected cache admission shares a validated directory only for active read
             headerBytes: length,
           });
           yield* Effect.tryPromise(() =>
-            bucket.put(`cache/directory-v5/${input.key}/${length}`, frame, {
+            bucket.put(`cache/directory-v8/${input.key}/${length}`, frame, {
               customMetadata: { source },
             }),
           );
@@ -775,7 +780,7 @@ test("slow R2 directory cache bodies keep admission while canonical recovery ret
   for (const name of ["first", "second"]) {
     const key = `namespaces/directory-r2-stall/segments/${name}.rsix`;
     await bucket.put(key, admissionLarge.bytes);
-    await bucket.put(`cache/directory-v5/${key}/${admissionLarge.length}`, admissionLargeFrame, {
+    await bucket.put(`cache/directory-v8/${key}/${admissionLarge.length}`, admissionLargeFrame, {
       customMetadata: {
         source: Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))({
           key,
@@ -834,7 +839,7 @@ test("failed R2 directory publications preserve complete canonical results", asy
   expect(new Uint8Array(await response.arrayBuffer())).toEqual(frame);
   const state = await fetch(new URL("/state", await worker.ready));
   expect(state.headers.get("x-rejected-writes")).toBe("1");
-  expect(await bucket.head(`cache/directory-v5/${key}/${length}`)).toBeNull();
+  expect(await bucket.head(`cache/directory-v8/${key}/${length}`)).toBeNull();
 });
 
 test("writes and compaction publish valid immutable directory frames", async () => {
@@ -857,7 +862,7 @@ test("writes and compaction publish valid immutable directory frames", async () 
     if (object === null) throw new Error("Missing canonical root");
     const root = decodeRoot(await object.text());
     for (const source of root.segments) {
-      const identity = `cache/directory-v5/${source.key}/${source.headerBytes}`;
+      const identity = `cache/directory-v8/${source.key}/${source.headerBytes}`;
       for (const attempt of Array.from({ length: 40 }, (_, index) => index)) {
         const stored = await bucket.get(identity);
         if (stored !== null) {
@@ -1043,7 +1048,7 @@ test("a late validated directory wins while the losing canonical body retains it
   const encoded = new Uint8Array(directory_compress(built.bytes.subarray(0, built.length)));
   const key = "namespaces/directory-late/segments/late.rsix";
   await bucket.put(key, built.bytes);
-  await bucket.put(`cache/directory-v5/${key}/${built.length}`, encoded, {
+  await bucket.put(`cache/directory-v8/${key}/${built.length}`, encoded, {
     customMetadata: {
       source: Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))({
         key,
@@ -1092,7 +1097,7 @@ test("large directory caches bound compressed bodies and recover oversized frame
     const key = `namespaces/directory-large/segments/${kind}.rsix`;
     await bucket.put(key, built.bytes);
     await bucket.put(
-      `cache/directory-v5/${key}/${built.length}`,
+      `cache/directory-v8/${key}/${built.length}`,
       Match.value(kind).pipe(
         Match.when("valid", () => encoded),
         Match.orElse(() => new Uint8Array(2 * 1024 * 1024 + 8193)),
@@ -1137,7 +1142,7 @@ test("R2 directory publication includes exactly four MiB and excludes the next b
   for (const extra of [0, 1]) {
     const built = directoryWithLength(4 * 1024 * 1024 + extra);
     const key = `namespaces/directory-boundary/segments/frame-${extra}.rsix`;
-    const identity = `cache/directory-v5/${key}/${built.length}`;
+    const identity = `cache/directory-v8/${key}/${built.length}`;
     await bucket.put(key, built.bytes);
     const response = await fetch(new URL("/origin", await worker.ready), {
       method: "POST",
@@ -1301,7 +1306,7 @@ test("parallel R2-first directory readers share one delayed body", async () => {
   const key = "namespaces/r2-first-concurrent/segments/source.rsix";
   await (
     await worker.getR2Bucket("STORAGE")
-  ).put(`cache/directory-v5/${key}/${length}`, frame, {
+  ).put(`cache/directory-v8/${key}/${length}`, frame, {
     customMetadata: {
       source: Schema.encodeSync(Schema.fromJsonString(TermProjectionRange))({
         key,

@@ -3,26 +3,26 @@ import { expect, test } from "bun:test";
 import { Clock, Effect, Option, Schema } from "effect";
 import { createHash } from "node:crypto";
 import { CollectionResult, Metadata, QueryResult, Retirement, WriteResult } from "../src/protocol";
-import { document, request, startWorker, textQuery, write } from "./harness";
+import { document, request, textQuery, write } from "./harness";
 import { ageRetirementUploads, retentionFixture } from "./retention-fixture";
 
 test("a blocked query preserves its captured root while writes and reads progress and collection pins its segments", async () => {
   await using fixture = await retentionFixture();
   const worker = fixture.worker;
-  const backend = await worker.getWorker("vectors");
   await using cleanup = new AsyncDisposableStack();
   const entered = Promise.withResolvers<void>();
-  const release = Promise.withResolvers<Response>();
+  const release = Promise.withResolvers<void>();
   const gate = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
-    fetch() {
+    async fetch() {
       entered.resolve();
-      return release.promise;
+      await release.promise;
+      return new Response("released");
     },
   });
   cleanup.defer(() => gate.stop(true));
-  cleanup.defer(() => release.resolve(new Response("released")));
+  cleanup.defer(() => release.resolve());
   const namespace = "query-overlap";
   const vector = [1, ...Array.from({ length: 767 }, () => 0)];
   for (const index of [0, 1, 2])
@@ -36,7 +36,6 @@ test("a blocked query preserves its captured root while writes and reads progres
         )
       ).status,
     ).toBe(200);
-  expect((await request(worker, namespace, "vector-sync", {})).status).toBe(200);
   const bucket = await worker.getR2Bucket("STORAGE");
   const object = await bucket.get(`namespaces/${namespace}/root.json`);
   if (object === null) throw new Error("Missing fixture root");
@@ -45,7 +44,11 @@ test("a blocked query preserves its captured root while writes and reads progres
     ...root.segments.map((segment) => segment.key),
     ...root.bloomPacks.map((descriptor) => descriptor.key),
   ];
-  await backend.fetch("http://fixture/pause-query", { method: "POST", body: gate.url.href });
+  await fetch(new URL("/__segment_gate", await worker.ready), {
+    method: "POST",
+    headers: { authorization: "Bearer local-test-token" },
+    body: JSON.stringify({ url: gate.url.href, namespace }),
+  });
   const blocked = request(worker, namespace, "query", {
     kind: "hybrid",
     text: "alpha",
@@ -63,7 +66,7 @@ test("a blocked query preserves its captured root while writes and reads progres
     Effect.tryPromise(() => mutation).pipe(Effect.timeoutOption("2 seconds")),
   );
   if (Option.isNone(progress)) {
-    release.resolve(new Response("released"));
+    release.resolve();
     await blocked;
     await mutation;
   }
@@ -97,7 +100,7 @@ test("a blocked query preserves its captured root while writes and reads progres
   expect(collection.deleted).toBe(0);
   expect(collection.pinned).toBe(6);
   for (const key of capturedKeys) expect(await bucket.head(key)).not.toBeNull();
-  release.resolve(new Response("released"));
+  release.resolve();
   const captured = Schema.decodeUnknownSync(QueryResult)(await (await blocked).json());
   expect(captured.sequence).toBe(3);
   expect(captured.rows.map((row) => row.id)).toEqual(["0", "1", "2"]);
@@ -130,10 +133,9 @@ test("a blocked query preserves its captured root while writes and reads progres
 }, 15000);
 
 test("query admission stays bounded and backend failures release all reader slots", async () => {
-  const worker = await startWorker();
-  const backend = await worker.getWorker("vectors");
+  await using fixture = await retentionFixture();
+  const worker = fixture.worker;
   await using cleanup = new AsyncDisposableStack();
-  cleanup.defer(() => worker.dispose());
   const entered = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
   const state = { active: 0, maximum: 0, calls: 0 };
@@ -154,17 +156,34 @@ test("query admission stays bounded and backend failures release all reader slot
   cleanup.defer(() => release.resolve());
   const namespace = "query-admission";
   const vector = [1, ...Array.from({ length: 767 }, () => 0)];
-  expect(
-    (await request(worker, namespace, "write", write([document("old", "alpha")]))).status,
-  ).toBe(200);
-  await backend.fetch("http://fixture/pause-query", { method: "POST", body: gate.url.href });
-  const queries = Array.from({ length: 5 }, () =>
-    request(worker, namespace, "query", {
-      kind: "vector",
-      vector,
-      topK: 10,
-      filters: [],
-    }),
+  const queries: Promise<Response>[] = [];
+  for (const ordinal of [0, 1, 2, 3]) {
+    expect(
+      (
+        await request(
+          worker,
+          namespace,
+          "write",
+          write([{ ...document(`old-${ordinal}`, "alpha"), vector }]),
+        )
+      ).status,
+    ).toBe(200);
+    await fetch(new URL("/__segment_gate", await worker.ready), {
+      method: "POST",
+      headers: { authorization: "Bearer local-test-token" },
+      body: JSON.stringify({ url: gate.url.href, namespace }),
+    });
+    queries.push(
+      request(worker, namespace, "query", { kind: "vector", vector, topK: 10, filters: [] }),
+    );
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        while (state.calls < ordinal + 1) yield* Effect.sleep("10 millis");
+      }).pipe(Effect.timeout("3 seconds")),
+    );
+  }
+  queries.push(
+    request(worker, namespace, "query", { kind: "vector", vector, topK: 10, filters: [] }),
   );
   await entered.promise;
   expect(
@@ -178,10 +197,14 @@ test("query admission stays bounded and backend failures release all reader slot
   expect(state.calls).toBe(4);
   release.resolve();
   const responses = await Promise.all(queries);
-  expect(responses.map((response) => response.status)).toEqual([503, 503, 503, 503, 503]);
-  expect(state.calls).toBe(5);
+  expect(responses.map((response) => response.status)).toEqual([503, 503, 503, 503, 200]);
+  expect(state.calls).toBe(4);
   expect(state.maximum).toBe(4);
-  await backend.fetch("http://fixture/release-query");
+  await fetch(new URL("/__segment_gate", await worker.ready), {
+    method: "POST",
+    headers: { authorization: "Bearer local-test-token" },
+    body: JSON.stringify({ url: "", namespace }),
+  });
   expect(
     (
       await request(worker, namespace, "query", {
@@ -189,13 +212,16 @@ test("query admission stays bounded and backend failures release all reader slot
         vector,
         topK: 10,
         filters: [],
-        minimumSequence: 2,
+        minimumSequence: 5,
       })
     ).status,
   ).toBe(200);
+  const bucket = await worker.getR2Bucket("STORAGE");
+  const segmentObjects = await bucket.list({ prefix: `namespaces/${namespace}/segments/` });
+  const bloomObjects = await bucket.list({ prefix: `namespaces/${namespace}/bloom-packs/` });
   const collected = Schema.decodeUnknownSync(CollectionResult)(
     await (await request(worker, namespace, "collect", {})).json(),
   );
   expect(collected.pinned).toBe(2);
-  expect(collected.marked).toBe(2);
+  expect(collected.marked).toBe(segmentObjects.objects.length + bloomObjects.objects.length - 2);
 }, 15000);

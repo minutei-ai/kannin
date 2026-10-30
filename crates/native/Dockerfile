@@ -1,7 +1,8 @@
-FROM rust:1.96.0-slim-bookworm AS build
+FROM rust:1.99.1-slim-bookworm AS build
 WORKDIR /build
 COPY Cargo.toml Cargo.lock LICENSE ./
 COPY crates ./crates
+COPY .cargo ./.cargo
 RUN cargo build --locked --release --package kannin-native
 
 FROM gcr.io/distroless/cc-debian12:nonroot

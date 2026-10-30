@@ -1,10 +1,17 @@
+import Turbopuffer from "@turbopuffer/turbopuffer";
 import { afterAll, expect, test } from "bun:test";
 import { Effect, Schema } from "effect";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { encodeRoot } from "../src/manifest";
-import { ErrorBody, NamespacesPage, RootMigrationResult } from "../src/protocol";
+import {
+  ErrorBody,
+  NamespaceName,
+  NamespacesPage,
+  QueryResult,
+  RootMigrationResult,
+} from "../src/protocol";
 import { namespaceCatalogPrefix } from "../src/namespaces";
 import { document, request, startWorker, write } from "./harness";
 
@@ -284,5 +291,52 @@ test("namespace publication failure preserves committed writes and repairs on sa
     expect(Schema.decodeUnknownSync(NamespacesPage)(await listed.json())).toEqual({
       namespaces: [{ id: namespace }],
     });
+  }
+});
+
+test("dotted and 128-character namespace identities survive writes, SDK pagination and warming", async () => {
+  const names = ["identity.a-b_c", `identity.${"x".repeat(119)}`, ".identity"];
+  const client = new Turbopuffer({
+    apiKey: "local-test-token",
+    baseURL: (await worker.ready).origin,
+    maxRetries: 0,
+  });
+  for (const namespace of names) {
+    expect(
+      (await request(worker, namespace, "write", write([document("one", `marker ${namespace}`)])))
+        .status,
+    ).toBe(200);
+    const hinted = await client.namespace(namespace).hintCacheWarm().withResponse();
+    expect(hinted.response.status).toBe(202);
+    const response = await request(worker, namespace, "query", {
+      kind: "text",
+      text: "marker",
+      topK: 1,
+      filters: [],
+    });
+    expect(response.status).toBe(200);
+    const found = Schema.decodeUnknownSync(QueryResult)(await response.json());
+    expect(found.rows.map((row) => row.text)).toEqual([`marker ${namespace}`]);
+  }
+  for (const prefix of ["identity.", "."]) {
+    const listed: string[] = [];
+    for await (const namespace of client.namespaces({ prefix, page_size: 1 }))
+      listed.push(namespace.id);
+    expect(listed.toSorted()).toEqual(names.filter((name) => name.startsWith(prefix)).toSorted());
+    expect(new Set(listed).size).toBe(listed.length);
+  }
+  const bucket = await worker.getR2Bucket("STORAGE");
+  for (const namespace of names)
+    expect(await bucket.head(`namespaces/${namespace}/root.json`)).not.toBeNull();
+  for (const invalid of [
+    "x".repeat(129),
+    ".",
+    "..",
+    "has/slash",
+    "has%2Eescape",
+    "has space",
+    "á",
+  ]) {
+    expect(Schema.is(NamespaceName)(invalid)).toBe(false);
   }
 });

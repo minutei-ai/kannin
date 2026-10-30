@@ -1,3 +1,4 @@
+import { encodeCanonicalDocuments } from "./segment-fixture";
 import { afterAll, expect, test } from "bun:test";
 import { Clock, Effect, Schema } from "effect";
 import { Directory, EligibilityQuery, Segment, initSync } from "../dist/wasm/raio_engine";
@@ -9,7 +10,6 @@ import {
   QueryResult,
   RootMigrationResult,
   Scalar,
-  StoredDocument,
   StoredRoot,
   TermFilters,
   VectorRebuildCheckpointMetadata,
@@ -44,9 +44,7 @@ const fixtures = Array.from({ length: 48 }, (_, index) =>
 
 test("declared native producers agree across 64 fields and exact subset minima", () => {
   using segment = new Segment(
-    Schema.encodeSync(Schema.fromJsonString(Schema.Array(StoredDocument)))(
-      fixtures.map((source) => ({ ...source, revision: 1 })),
-    ),
+    encodeCanonicalDocuments(fixtures.map((source) => ({ ...source, revision: 1 }))),
     Schema.encodeSync(Schema.fromJsonString(NamespaceSchema.fields.filterable))(
       fields.toReversed(),
     ),
@@ -81,6 +79,46 @@ test("declared native producers agree across 64 fields and exact subset minima",
   }
 });
 
+test("Unicode field order survives prepared eligibility models and exact subset minima", () => {
+  const names = ["\uE000", "😀"];
+  const encodeNames = Schema.encodeSync(Schema.fromJsonString(NamespaceSchema.fields.filterable));
+  using segment = new Segment(
+    encodeCanonicalDocuments([
+      { ...document("a", "alpha beta", { "\uE000": "keep", "😀": 1 }), revision: 1 },
+      { ...document("b", "alpha", { "\uE000": "keep", "😀": 0 }), revision: 1 },
+      { ...document("c", "alpha beta gamma", { "\uE000": "drop", "😀": 1 }), revision: 1 },
+    ]),
+    encodeNames(names.toReversed()),
+  );
+  using directory = new Directory(segment.bytes());
+  const encoded = segment.eligibility(encodeNames(names.toReversed()));
+  if (encoded === undefined) throw new Error("Missing Unicode eligibility model");
+  expect(directory.eligibility(encodeNames(names))).toBe(encoded);
+  expect(Schema.decodeSync(Schema.fromJsonString(EligibilityProjection))(encoded).fields).toEqual(
+    names,
+  );
+  const check = (
+    filters: readonly (typeof Filter.Type)[],
+    expected: typeof EligibleMinimum.Type,
+  ) => {
+    const input = Schema.encodeSync(TermFilters)(filters);
+    using prepared = new EligibilityQuery(input);
+    const minimum = Schema.decodeSync(Schema.fromJsonString(EligibleMinimum));
+    expect(minimum(prepared.minimum(encoded))).toEqual(expected);
+    expect(minimum(directory.minimum(input))).toEqual(expected);
+  };
+  check([{ field: "\uE000", op: "eq", value: "keep" }], [0, 1]);
+  check([{ field: "😀", op: "eq", value: 1 }], [0, 2]);
+  check(
+    [
+      { field: "😀", op: "eq", value: 1 },
+      { field: "\uE000", op: "eq", value: "keep" },
+    ],
+    [0, 2],
+  );
+  check([{ field: "😀", op: "eq", value: 2 }], null);
+});
+
 test("write and compaction publish pooled declared models while subset ranking matches canonical fallback", async () => {
   const namespaces = ["eligibility-cutover", "eligibility-cutover-reference"] as const;
   for (const namespace of namespaces)
@@ -97,7 +135,7 @@ test("write and compaction publish pooled declared models while subset ranking m
   const object = await bucket.get(`namespaces/${namespaces[0]}/root.json`);
   if (object === null) throw new Error("Missing produced Root");
   const stored = Schema.decodeSync(Schema.fromJsonString(StoredRoot))(await object.text());
-  expect(stored.version).toBe(5);
+  expect(stored.version).toBe(8);
   expect(stored.eligibilityModels).toHaveLength(1);
   expect(stored.segments.every((segment) => segment.eligibilityIndex === 0)).toBe(true);
   const logical = decodeRoot(Schema.encodeSync(Schema.fromJsonString(StoredRoot))(stored));
@@ -321,7 +359,7 @@ for (const version of [1, 2, 3, 4] as const)
     const response = await request(worker, namespace, "migrate-root", {});
     expect(response.status).toBe(200);
     expect(Schema.decodeUnknownSync(RootMigrationResult)(await response.json())).toMatchObject({
-      version: 5,
+      version: 8,
       rootRewritten: true,
       migratedSnapshots: 1,
       expiredSnapshots: 0,
@@ -354,7 +392,7 @@ for (const version of [1, 2, 3, 4] as const)
     const repeated = Schema.decodeUnknownSync(RootMigrationResult)(
       await (await request(worker, namespace, "migrate-root", {})).json(),
     );
-    expect(repeated).toMatchObject({ version: 5, rootRewritten: false, migratedSnapshots: 0 });
+    expect(repeated).toMatchObject({ version: 8, rootRewritten: false, migratedSnapshots: 0 });
     expect((await bucket.head(key))?.etag).toBe(migrated.etag);
     expect((await bucket.head(checkpointKey))?.etag).toBe(checkpoint.etag);
   }, 15000);

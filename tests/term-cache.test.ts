@@ -186,7 +186,7 @@ test("immutable field models ignore predicate values while exact fallbacks retai
   for (const source of canonical.segments) {
     await bucket.delete([
       `cache/correlated-pool-v3/${source.key}`,
-      `cache/directory-v5/${source.key}/${source.headerBytes}`,
+      `cache/directory-v8/${source.key}/${source.headerBytes}`,
     ]);
   }
   expect((await request(worker, "catalog-canonical", "rebuild", {})).status).toBe(200);
@@ -269,7 +269,7 @@ test("Root-prefix catalog fallback preserves complete coverage across process re
     throw new Error("Missing root fallback term facts");
   await rootBucket.delete([
     `cache/correlated-pool-v3/${rootFallbackSegment.key}`,
-    `cache/directory-v5/${rootFallbackSegment.key}/${rootFallbackSegment.headerBytes}`,
+    `cache/directory-v8/${rootFallbackSegment.key}/${rootFallbackSegment.headerBytes}`,
   ]);
   await rootWriter.dispose();
   rootWriterDisposed.value = true;

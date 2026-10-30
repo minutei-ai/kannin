@@ -63,6 +63,7 @@
                 "group": [
                   "alchemy",
                   "alchemy/*",
+                  "@alchemy.run/*",
                   "node:*",
                   "bun:sqlite",
                   "better-sqlite3",
@@ -71,6 +72,40 @@
                 ],
                 "allowTypeImports": true,
                 "message": "Runtime search storage belongs to R2; provisioning and host tooling stay outside the Worker."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": [
+        "src/core/**/*.ts",
+        "src/platform.ts",
+        "src/object-store.ts",
+        "src/vector-store.ts",
+        "src/hash.ts"
+      ],
+      "rules": {
+        "eslint/no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "group": [
+                  "cloudflare:*",
+                  "@cloudflare/*",
+                  "alchemy",
+                  "alchemy/*",
+                  "@alchemy.run/*",
+                  "node:*",
+                  "bun:*",
+                  "@aws-sdk/*",
+                  "@qdrant/*",
+                  "../providers/*",
+                  "../storage"
+                ],
+                "message": "Portable search code uses provider-independent ports; platform and provisioning imports belong to adapters."
               }
             ]
           }

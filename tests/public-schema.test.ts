@@ -79,7 +79,7 @@ test("public array spellings map to canonical arrays and internal spellings are 
 });
 
 test("bytes attributes are never filterable", () => {
-  const expected = [{ name: "payload", type: "bytes", filterable: false, nullable: true }];
+  const expected = [{ name: "payload", type: "bytes", filterable: false, nullable: true }] as const;
   expect(decode({ payload: { type: "bytes" } }).columns).toEqual(expected);
   expect(decode({ payload: { type: "bytes", filterable: false } }).columns).toEqual(expected);
   expect(
@@ -277,7 +277,7 @@ test("supported public declarations roundtrip through the schema projection", ()
     ratio: { type: "float", filterable: true },
     signed: { type: "int", filterable: false },
     tags: { type: "[]string", filterable: true },
-  };
+  } as const;
   const declaration = decode(input);
   expect(Effect.runSync(encodePublicSchema(declaration))).toEqual(input);
   expect(decode(Effect.runSync(encodePublicSchema(declaration)))).toEqual(declaration);

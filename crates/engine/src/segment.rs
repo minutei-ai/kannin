@@ -9,8 +9,11 @@ pub use values::{
 };
 
 pub use fields::{
-    Bm25Parameters, CorpusStatistics, FieldAnalysis, FieldMeta, FieldQuery, FieldStatistics,
-    FieldTable, NamedTextField,
+    Bm25Parameters, CollectedPages, CorpusStatistics, FieldAnalysis, FieldBudget, FieldMeta,
+    FieldQuery, FieldStatistics, FieldTable, Measured, NamedTextField, PageCollector, PagePlan,
+    PostingPages, SlicePages, aggregate_statistics, plan_rank_pages, plan_statistics_pages,
+    rank_from_pages, rank_from_pages_measured, statistics_from_pages,
+    statistics_from_pages_measured,
 };
 
 use crate::analysis::WordV4Config;
@@ -3078,13 +3081,13 @@ pub fn rank_fields(
     )
 }
 
-#[doc = "# Errors\nRejects everything `rank_fields` rejects, plus global statistics that do not match the selected fields and analyzed query terms exactly, duplicate identities, document frequencies above the document count, and totals below the live local rows or loaded eligible postings. Callers must supply unfiltered live corpus statistics; this operation does not prove global counts by scanning filtered-out postings."]
+#[doc = "# Errors\nRejects everything `rank_fields` rejects, plus global statistics that do not match the selected fields and analyzed query terms exactly, duplicate identities, document frequencies above the document count, and totals below the live local rows or loaded eligible postings. Callers must supply unfiltered live corpus statistics; this operation does not prove global counts by scanning filtered-out postings. This full-bytes adapter runs the page scorer with `FieldBudget::UNBOUNDED` and no page or workspace limit; budgeted callers use `rank_from_pages`."]
 pub fn rank_fields_with(bytes: &[u8], query: &FieldQuery<'_>) -> Result<Vec<Hit>, String> {
     let (header, base) = parse_header(bytes)?;
     fields::rank(&header, bytes, base, query)
 }
 
-#[doc = "# Errors\nRejects malformed bytes, unknown or duplicate fields, invalid match modes, analysis over budget, invalid tombstones, and corrupt posting pages."]
+#[doc = "# Errors\nRejects malformed bytes, unknown or duplicate fields, invalid match modes, analysis over budget, invalid tombstones, and corrupt posting pages. This full-bytes adapter is unbounded; budgeted callers use `statistics_from_pages`."]
 pub fn local_field_statistics(
     bytes: &[u8],
     fields: &[DocumentColumnId],

@@ -303,7 +303,7 @@ fn typed_filters_and_tombstones_apply_before_text_top_k() -> Check {
         filter("stamp", "in", serde_json::json!([1, 2])),
         filter("stamp", "mystery", serde_json::json!({"i64": "1"})),
     ] {
-        assert_eq!(ranked(&built, "rust", &[], std::slice::from_ref(&invalid), 5).is_err());
+        assert!(ranked(&built, "rust", &[], std::slice::from_ref(&invalid), 5).is_err());
     }
     Ok(())
 }
@@ -470,7 +470,7 @@ fn legacy_objects_shaped_like_tags_remain_opaque_json() -> Check {
         serde_json::json!({"u64": "5"}),
     ] {
         let mismatch = filter("n", "eq", other);
-        assert!(
+        assert_eq!(
             ranked(&built, "rust", &[], std::slice::from_ref(&mismatch), 5)?,
             [] as [String; 0]
         );

@@ -8866,6 +8866,61 @@ pub mod wasm {
     }
 
     #[wasm_bindgen]
+    pub struct FieldRankPass {
+        header: Rc<Header>,
+        decoded: DecodedFieldQuery,
+        plan: super::PagePlan,
+        collector: super::PageCollector,
+        budget: super::FieldBudget,
+    }
+
+    #[wasm_bindgen]
+    impl FieldRankPass {
+        #[doc = "# Errors\nRejects range serialization failures."]
+        pub fn ranges(&self) -> Result<String, JsValue> {
+            serde_json::to_string(self.plan.ranges())
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))
+        }
+
+        #[doc = "# Errors\nRejects unplanned, duplicate and wrong-length pages before retaining bytes."]
+        pub fn add(&mut self, offset: u32, bytes: &[u8]) -> Result<(), JsValue> {
+            let length = u32::try_from(bytes.len())
+                .map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+            self.collector
+                .accept(&Range { offset, length }, bytes)
+                .map_err(|cause| JsValue::from_str(&cause))
+        }
+
+        #[doc = "# Errors\nRejects missing or corrupt pages, query budget violations and result serialization failures. Consumes the pass."]
+        pub fn finish(self) -> Result<String, JsValue> {
+            let mut pages = self
+                .collector
+                .finish()
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            let hits = super::rank_from_pages(
+                &self.header,
+                &mut pages,
+                &self.decoded.as_query(),
+                &self.budget,
+            )
+            .map_err(|cause| JsValue::from_str(&cause))?;
+            let ranked: Vec<_> = hits
+                .iter()
+                .map(|hit| {
+                    let document = self.header.documents.row(hit.row as usize);
+                    Ranked {
+                        row: hit.row,
+                        id: document.id,
+                        score: hit.score,
+                        data: document.data.clone(),
+                    }
+                })
+                .collect();
+            serde_json::to_string(&ranked).map_err(|cause| JsValue::from_str(&cause.to_string()))
+        }
+    }
+
+    #[wasm_bindgen]
     pub struct VectorRows {
         scan: super::VectorScan,
     }
@@ -8982,6 +9037,34 @@ pub mod wasm {
 
     #[wasm_bindgen]
     impl Directory {
+        #[doc = "# Errors\nRejects partial directories, malformed queries and planned workspace or page estimates above caller budgets before any page is retained."]
+        pub fn field_rank_pass(
+            &self,
+            json: &str,
+            workspace_bytes: u32,
+            page_bytes: u32,
+        ) -> Result<FieldRankPass, JsValue> {
+            if self.partial {
+                return Err(JsValue::from_str("Operation requires a complete directory"));
+            }
+            let decoded = decode_field_query(json, self.header.version >= super::TYPED_VERSION)?;
+            let budget = super::FieldBudget {
+                workspace_bytes: workspace_bytes as usize,
+                page_bytes: u64::from(page_bytes),
+            };
+            let plan = super::plan_rank_pages(&self.header, &decoded.as_query(), &budget)
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            let collector = super::PageCollector::new(&plan, budget.page_bytes)
+                .map_err(|cause| JsValue::from_str(&cause))?;
+            Ok(FieldRankPass {
+                header: Rc::clone(&self.header),
+                decoded,
+                plan,
+                collector,
+                budget,
+            })
+        }
+
         #[doc = "# Errors\nRejects partial common directories and field serialization failures."]
         pub fn fields(&self) -> Result<String, JsValue> {
             if self.partial {

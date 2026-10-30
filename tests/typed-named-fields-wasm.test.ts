@@ -18,6 +18,8 @@ import {
   FieldStatisticsQuery,
   NamedTextFields,
   SegmentTextFields,
+  DataRange,
+  SegmentHits,
 } from "../src/protocol";
 import type { DocumentColumnId } from "../src/protocol";
 import { canonicalFixtureDocuments } from "./segment-fixture";
@@ -307,4 +309,36 @@ test("complete directories expose the same typed named field table without posti
   expect(decode(compressed.fields())).toEqual(expected);
   expect(decode(retained.fields())).toEqual(expected);
   expect(expected.map((field) => field.name)).toEqual([null, null, "tags", "title"]);
+});
+
+test("directory field passes rank exact typed posting ranges in arbitrary arrival order", () => {
+  using segment = Segment.with_columns(phraseFixture, columns, declarations);
+  const bytes = segment.bytes();
+  const base =
+    16 + new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(8, true);
+  using directory = Directory.canonical(bytes.subarray(0, base), base);
+  const request = query([tags], "red fox", { mode: "phrase" });
+  const pass = directory.field_rank_pass(request, 16 * 1024 * 1024, 16 * 1024 * 1024);
+  const ranges = Schema.decodeSync(Schema.fromJsonString(Schema.Array(DataRange)))(pass.ranges());
+  expect(ranges.length).toBeGreaterThan(0);
+  for (const range of [...ranges].reverse()) {
+    pass.add(range.offset, bytes.subarray(base + range.offset, base + range.offset + range.length));
+  }
+  const hits = Schema.decodeSync(Schema.fromJsonString(SegmentHits))(pass.finish());
+  expect(hits.map(({ row, score }) => ({ row, score }))).toEqual(
+    decodeHits(segment_rank_fields(bytes, request)),
+  );
+  expect(hits.map(({ id }) => id)).toEqual(["c"]);
+  expect(() => directory.field_rank_pass(request, 0, 16 * 1024 * 1024)).toThrow("budget");
+  expect(() => directory.field_rank_pass(request, 16 * 1024 * 1024, 0)).toThrow("budget");
+  using invalid = directory.field_rank_pass(request, 16 * 1024 * 1024, 16 * 1024 * 1024);
+  for (const range of ranges.slice(0, 1)) {
+    const page = bytes.subarray(base + range.offset, base + range.offset + range.length);
+    expect(() => invalid.add(range.offset, page.subarray(1))).toThrow();
+    invalid.add(range.offset, page);
+    expect(() => invalid.add(range.offset, page)).toThrow("Duplicate");
+  }
+  expect(() => invalid.add(0xffffffff, new Uint8Array())).toThrow("Unplanned");
+  const missing = directory.field_rank_pass(request, 16 * 1024 * 1024, 16 * 1024 * 1024);
+  expect(() => missing.finish()).toThrow("Missing");
 });

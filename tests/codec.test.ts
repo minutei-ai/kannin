@@ -128,6 +128,7 @@ test("common directory handles retain their coverage and reject complete-diction
   expect(() => Directory.compressed(frame, base, 40 * 1024 * 1024)).toThrow();
   for (const operation of [
     () => retained.fields(),
+    () => retained.field_rank_pass("{}", 1024, 1024),
     () => retained.compressed_frame(base),
     () => retained.common_frame(base),
     () => retained.terms('["alpha"]'),

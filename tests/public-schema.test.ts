@@ -195,6 +195,33 @@ test("attribute names follow the current field name policy", () => {
   expect(decode({ [`a${"b".repeat(127)}`]: { type: "int" } }).columns).toHaveLength(1);
 });
 
+test("prototype-related attribute names remain ordinary own properties", () => {
+  const schema: unknown = JSON.parse(
+    '{"__proto__":{"type":"string"},"constructor":{"type":"string"},"prototype":{"type":"bool"}}',
+  );
+  const declaration = decode(schema);
+  expect(declaration.columns.map((column) => column.name)).toEqual([
+    "__proto__",
+    "constructor",
+    "prototype",
+  ]);
+  const text = '{"__proto__":"value","constructor":"owned","prototype":true}';
+  const cells = Effect.runSync(
+    decodePublicJson(text).pipe(
+      Effect.flatMap((wire) => decodePublicAttributes(declaration, wire)),
+    ),
+  );
+  expect(Object.hasOwn(cells, "__proto__")).toBe(true);
+  expect(cells["__proto__"]).toBe("value");
+  expect(Object.getPrototypeOf(cells)).toBe(Object.prototype);
+  expect(
+    Effect.runSync(
+      encodePublicAttributes(declaration, cells).pipe(Effect.flatMap(encodePublicJson)),
+    ),
+  ).toBe(text);
+  expect(Effect.runSync(encodePublicSchema(declaration))).toEqual(schema);
+});
+
 test("a parsed object has already lost duplicate keys so the last declaration wins", () => {
   const parsed: unknown = JSON.parse('{"a":{"type":"int"},"a":{"type":"string"}}');
   expect(decode(parsed).columns).toEqual([

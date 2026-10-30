@@ -6718,23 +6718,18 @@ pub mod wasm {
         encode_field_statistics(&statistics)
     }
 
+    #[derive(Default)]
     #[wasm_bindgen]
     pub struct FieldStatisticsTotal {
         total: Option<CorpusStatistics>,
-    }
-
-    impl Default for FieldStatisticsTotal {
-        fn default() -> Self {
-            Self::new()
-        }
     }
 
     #[wasm_bindgen]
     impl FieldStatisticsTotal {
         #[wasm_bindgen(constructor)]
         #[must_use]
-        pub const fn new() -> Self {
-            Self { total: None }
+        pub fn new() -> Self {
+            Self::default()
         }
 
         #[doc = "# Errors\nRejects malformed or oversized input, mismatching fields or terms and unsafe count totals. Failed additions preserve the previous total."]

@@ -164,7 +164,18 @@ enum TaggedId {
     Uuid(String),
 }
 
-fn parse_uuid(value: &str) -> Result<[u8; 16], String> {
+#[doc = "Parses the canonical unsigned decimal shared by uint identities and typed `u64` cells: ASCII digits only, no sign, no leading zero, within u64."]
+pub(super) fn parse_canonical_u64(value: &str) -> Result<u64, String> {
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err("Uint id requires canonical unsigned decimal".into());
+    }
+    value.parse::<u64>().map_err(|cause| cause.to_string())
+}
+
+pub(super) fn parse_uuid(value: &str) -> Result<[u8; 16], String> {
     if value.len() != 36 {
         return Err("UUID id must use canonical lowercase form".into());
     }
@@ -188,7 +199,7 @@ fn parse_uuid(value: &str) -> Result<[u8; 16], String> {
     Ok(result)
 }
 
-fn format_uuid(value: [u8; 16]) -> String {
+pub(super) fn format_uuid(value: [u8; 16]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(36);
     for (index, byte) in value.into_iter().enumerate() {
@@ -221,20 +232,9 @@ impl<'de, S: From<String>> Deserialize<'de> for DocumentId<S> {
         }
         match Wire::deserialize(deserializer)? {
             Wire::String(value) => Ok(Self::String(value.into())),
-            Wire::Tagged(TaggedId::Uint(value)) => {
-                if value.is_empty()
-                    || (value.len() > 1 && value.starts_with('0'))
-                    || !value.bytes().all(|byte| byte.is_ascii_digit())
-                {
-                    return Err(serde::de::Error::custom(
-                        "Uint id requires canonical unsigned decimal",
-                    ));
-                }
-                value
-                    .parse::<u64>()
-                    .map(Self::Uint)
-                    .map_err(serde::de::Error::custom)
-            }
+            Wire::Tagged(TaggedId::Uint(value)) => parse_canonical_u64(&value)
+                .map(Self::Uint)
+                .map_err(serde::de::Error::custom),
             Wire::Tagged(TaggedId::Uuid(value)) => parse_uuid(&value)
                 .map(Self::Uuid)
                 .map_err(serde::de::Error::custom),

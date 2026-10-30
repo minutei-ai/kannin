@@ -144,7 +144,7 @@ fn generic_pair_matches_legacy_scores_order_and_pruning_across_the_block_boundar
 -> Result<(), String> {
     for count in [127_u32, 128, 129, 300] {
         let documents = varied_documents(count);
-        let legacy = build_versioned(documents.clone(), None, &[], 3)?;
+        let legacy = build_versioned(documents.clone(), None, &[], 3, None)?;
         let generic = build(documents, None)?;
         assert_eq!(&legacy.bytes[..8], b"RAIOSEG3");
         assert_eq!(&generic.bytes[..8], b"RAIOSEG4");
@@ -183,7 +183,7 @@ fn mixed_version_segments_score_identically_under_shared_statistics() -> Result<
     let whole = build(documents.clone(), None)?;
     let statistics = statistics_for(&whole.bytes)?;
     let mixed = [
-        build_versioned(first.to_vec(), None, &[], 3)?,
+        build_versioned(first.to_vec(), None, &[], 3, None)?,
         build(second.to_vec(), None)?,
     ];
     let uniform = [build(first.to_vec(), None)?, build(second.to_vec(), None)?];
@@ -210,7 +210,7 @@ fn mixed_version_segments_score_identically_under_shared_statistics() -> Result<
 fn legacy_headers_synthesize_the_same_generic_native_pair() -> Result<(), String> {
     let documents = varied_documents(3);
     for version in [3, 4] {
-        let built = build_versioned(documents.clone(), None, &[], version)?;
+        let built = build_versioned(documents.clone(), None, &[], version, None)?;
         let (header, _) = parse_header(&built.bytes)?;
         let ids = header
             .fields
@@ -759,7 +759,13 @@ fn field_declarations_and_values_fail_closed() -> Result<(), String> {
         "Full-text arrays must contain only strings"
     );
     assert_eq!(
-        rejection(build_versioned(bare(BTreeMap::new()), None, &fields, 3))?,
+        rejection(build_versioned(
+            bare(BTreeMap::new()),
+            None,
+            &fields,
+            3,
+            None
+        ))?,
         "Named text requires segment version 4"
     );
     let empty = build_text_fields(single("tags", serde_json::Value::Null), None, &fields)?;

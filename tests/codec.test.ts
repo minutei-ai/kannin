@@ -1459,7 +1459,7 @@ test("compact directories validate framing, checksums and header semantics", () 
   expect(new DataView(encoded.buffer, encoded.byteOffset).getUint32(12, true)).toBe(compact.length);
   expect(compact[0]).toBe(4);
   const invalid = new Uint8Array(compact);
-  invalid[0] = 6;
+  invalid[0] = 7;
   const compressed = deflateSync(invalid);
   const forged = new Uint8Array(20 + compressed.byteLength);
   forged.set(encoded.subarray(0, 20));

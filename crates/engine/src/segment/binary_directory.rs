@@ -647,7 +647,7 @@ pub(super) fn decode(bytes: &[u8], max_heap_bytes: usize) -> Result<Header, Stri
     };
     decoder.charge(size_of::<Header>() + 32 + FILTER_CACHE_BYTES)?;
     let version = decoder.integer()?;
-    if !(2..=5).contains(&version) {
+    if !(2..=super::TYPED_VERSION).contains(&version) {
         return Err("Invalid segment version".into());
     }
     let legacy = version < 4;

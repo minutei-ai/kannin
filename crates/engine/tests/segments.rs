@@ -263,7 +263,7 @@ fn tombstones_and_filters_apply_before_top_k() -> Result<(), Box<dyn std::error:
     allowed
         .columns_mut()
         .attributes_mut()
-        .insert("public".into(), serde_json::json!(true));
+        .insert("public".into(), serde_json::json!(true).into());
     let private = document("a", "rust rust rust");
     let filter = Filter {
         field: "public".into(),
@@ -458,7 +458,7 @@ fn eligible_posting_spans_preserve_scores_across_gaps_and_tombstones()
             let mut doc = document(format!("{index:05}"), "alpha beta alpha");
             doc.columns_mut().attributes_mut().insert(
                 "group".into(),
-                serde_json::json!(!(128..384).contains(&index)),
+                serde_json::json!(!(128..384).contains(&index)).into(),
             );
             doc
         })
@@ -534,7 +534,7 @@ fn posting_spans_bound_gap_overfetch() -> Result<(), Box<dyn std::error::Error>>
             let mut doc = document(format!("{index:05}"), "alpha");
             doc.columns_mut().attributes_mut().insert(
                 "group".into(),
-                serde_json::json!(!(128..256).contains(&index)),
+                serde_json::json!(!(128..256).contains(&index)).into(),
             );
             doc
         })
@@ -643,7 +643,7 @@ fn intersections_match_exhaustive_membership_and_phrase_positions()
             }
             doc.columns_mut()
                 .attributes_mut()
-                .insert("group".into(), serde_json::json!(index % 4));
+                .insert("group".into(), serde_json::json!(index % 4).into());
             Ok(doc)
         })
         .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
@@ -827,7 +827,7 @@ fn compressed_directories_exceed_the_separate_mutation_log_budget()
             let mut doc = document(format!("large{index:04}"), "rust");
             doc.columns_mut().attributes_mut().insert(
                 "context".into(),
-                serde_json::Value::String("x".repeat(8192)),
+                serde_json::Value::String("x".repeat(8192)).into(),
             );
             doc
         })
@@ -1077,7 +1077,7 @@ fn canonical_headers_reuse_compact_tuples_and_preserve_object_readers()
     first
         .columns_mut()
         .attributes_mut()
-        .insert("escape\nkey".into(), serde_json::json!("á\n😀"));
+        .insert("escape\nkey".into(), serde_json::json!("á\n😀").into());
     let built = segment::build(vec![first, document("𐀀", "rust storage")], None)?;
     assert_eq!(built.bytes[16], b'[');
     let (compact, base) = segment::parse_header(&built.bytes)?;

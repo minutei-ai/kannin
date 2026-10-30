@@ -1,4 +1,4 @@
-use crate::segment::{ColumnId, ColumnValue, Document};
+use crate::segment::{Cell, ColumnId, ColumnValue, Document};
 use alyze::analyze::{
     AnalysisOptions, Analyzer, LanguageWithStopwords, ReusableBuffer, StemmingLanguage,
     StopwordRemoval, TokenizerOptions, stemming_cache::StemmingCache,
@@ -158,11 +158,14 @@ impl WordV4Analyzer {
         callback: impl FnMut(alyze::analyze::Token<'_>) -> bool,
     ) -> Result<(), String> {
         match document.column(ColumnId::Attribute(name)) {
-            None | Some(ColumnValue::Attribute(serde_json::Value::Null)) => {}
-            Some(ColumnValue::Attribute(serde_json::Value::String(text))) => {
+            None
+            | Some(ColumnValue::Attribute(Cell::Null | Cell::Legacy(serde_json::Value::Null))) => {}
+            Some(ColumnValue::Attribute(
+                Cell::String(text) | Cell::Legacy(serde_json::Value::String(text)),
+            )) => {
                 self.analyze_inputs(std::iter::once(text.as_str()), callback);
             }
-            Some(ColumnValue::Attribute(serde_json::Value::Array(values))) => {
+            Some(ColumnValue::Attribute(Cell::Legacy(serde_json::Value::Array(values)))) => {
                 if values.iter().any(|value| !value.is_string()) {
                     return Err("Full-text arrays must contain only strings".into());
                 }
@@ -170,6 +173,19 @@ impl WordV4Analyzer {
                     values.iter().filter_map(serde_json::Value::as_str),
                     callback,
                 );
+            }
+            Some(ColumnValue::Attribute(Cell::Array(values))) => {
+                let texts: Vec<&str> = values
+                    .iter()
+                    .filter_map(|value| match value {
+                        Cell::String(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if texts.len() != values.len() {
+                    return Err("Full-text arrays must contain only strings".into());
+                }
+                self.analyze_inputs(texts.into_iter(), callback);
             }
             Some(_) => return Err("Full-text attributes must be strings or string arrays".into()),
         }

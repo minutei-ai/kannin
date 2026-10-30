@@ -360,6 +360,36 @@ export const BytesBase64Text = Schema.String.check(
 export const UuidText = Schema.String.check(
   Schema.isPattern(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\s\S])/),
 );
+const TypedIntCell = Schema.Struct({ i64: Int64Text });
+const TypedUintCell = Schema.Struct({ u64: Uint64Text });
+const TypedFloatCell = Schema.Struct({ f64: Float64BitsText });
+const TypedUuidCell = Schema.Struct({ uuid: UuidText });
+const TypedDatetimeCell = Schema.Struct({ datetime_ms: Int64Text });
+const TypedBytesCell = Schema.Struct({ bytes: BytesBase64Text });
+export const TypedCellScalar = Schema.Union([
+  Unicode,
+  Schema.Boolean,
+  TypedIntCell,
+  TypedUintCell,
+  TypedFloatCell,
+  TypedUuidCell,
+  TypedDatetimeCell,
+]);
+const TypedCellArray = Schema.Union([
+  Schema.Array(Unicode),
+  Schema.Array(Schema.Boolean),
+  Schema.Array(TypedIntCell),
+  Schema.Array(TypedUintCell),
+  Schema.Array(TypedFloatCell),
+  Schema.Array(TypedUuidCell),
+  Schema.Array(TypedDatetimeCell),
+]).check(Schema.isMaxLength(4096));
+export const TypedCell = Schema.Union([
+  Schema.Null,
+  TypedCellScalar,
+  TypedBytesCell,
+  TypedCellArray,
+]);
 export const CanonicalId = Schema.Union([
   Id,
   Schema.Struct({ kind: Schema.Literal("uint"), value: Uint64Text }),

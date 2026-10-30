@@ -130,8 +130,9 @@ test("typed columns persist through real S3 restart, exact ranking and compactio
           upserts: [],
           deletes: ["a"],
         });
-        yield* invoke(restarted.fetch, "compact");
-        yield* invoke(restarted.fetch, "vector-sync");
+        for (const operation of ["vector-sync", "vector-rebuild", "rebuild", "compact"]) {
+          yield* invoke(restarted.fetch, operation);
+        }
         yield* Effect.promise(restarted.dispose);
         const recovered = yield* portableApplication({ token, scope: namespace, module }).pipe(
           Effect.provideContext(context),

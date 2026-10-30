@@ -223,6 +223,45 @@ export class PublicCellRejection extends Schema.TaggedError<
   ]),
   declared: TypedColumnType,
 }) {}
+export const PublicSchemaType = Schema.Union([
+  Schema.Literals(["string", "bool", "uuid", "bytes"]),
+  PublicCellAliasType,
+]);
+export const PublicSchemaVectorType = Schema.Union([
+  Schema.String.check(Schema.isPattern(/^(?:\[\])?\[[0-9]+\](?:f16|f32|i8)$/)),
+  Schema.Literal("{}f16"),
+]);
+export const PublicSchemaUnsupportedOption = Schema.Literals([
+  "full_text_search",
+  "ann",
+  "embed",
+  "regex",
+  "glob",
+  "fuzzy",
+  "sparse_knn",
+]);
+export const PublicSchemaAttribute = Schema.Struct({
+  type: PublicSchemaType,
+  filterable: Schema.optional(Schema.Boolean),
+});
+export const PublicSchemaInput = Schema.Record(FieldName, Schema.Unknown);
+export const PublicSchemaOptions = Schema.Record(Schema.String, Schema.Unknown);
+export const PublicSchema = Schema.Record(FieldName, PublicSchemaAttribute);
+export class PublicSchemaRejection extends Schema.TaggedError<
+  PublicSchemaRejection,
+  { readonly brand: unique symbol }
+>()("PublicSchemaRejection", {
+  field: Schema.optional(FieldName),
+  reason: Schema.Literals([
+    "reserved-id",
+    "unsupported-vector",
+    "unsupported-option",
+    "unsupported-datetime",
+    "bytes-filterable",
+    "non-nullable",
+    "vector-dimensions",
+  ]),
+}) {}
 const MAX_TYPED_FILTERABLE = 64;
 const TypedAttributeColumn = Schema.Struct({
   source: Schema.Literal("attribute"),

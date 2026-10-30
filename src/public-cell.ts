@@ -80,13 +80,21 @@ const rawNumber = (text: string) => Effect.try(() => JSON.rawJSON(text));
 const reject = (reason: PublicCellRejection["reason"], declared: ColumnType) =>
   Effect.fail(new PublicCellRejection({ reason, declared }));
 
-function resolveType(input: typeof PublicCellType.Type): ColumnType {
+const PUBLIC_SPELLINGS = new Map<ColumnType, string>(
+  Object.entries(ALIASES).map(([alias, type]) => [type, alias] as const),
+);
+
+export function normalizePublicCellType(input: typeof PublicCellType.Type): ColumnType {
   if (isAlias(input)) return ALIASES[input];
   return input;
 }
 
+export function publicCellSpelling(type: ColumnType): string {
+  return PUBLIC_SPELLINGS.get(type) ?? type;
+}
+
 const resolveShape = Effect.fn("kannin.public.resolveCellType")(function* (declared: unknown) {
-  const type = resolveType(yield* Schema.decodeUnknownEffect(PublicCellType)(declared));
+  const type = normalizePublicCellType(yield* Schema.decodeUnknownEffect(PublicCellType)(declared));
   const shape = SHAPES[type];
   if (!isSupported(shape.element)) return yield* reject("unsupported-datetime", type);
   return { type, array: shape.array, element: shape.element };

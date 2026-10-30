@@ -930,6 +930,7 @@ fn parse_document_metadata(decoded: &[u8]) -> Result<(VectorFacts, Document), St
 #[doc = "# Errors\nRejects invalid metadata framing, vector summaries, or document JSON, and typed metadata pages, which have their own projection."]
 pub fn query_document_from_metadata(bytes: &[u8]) -> Result<String, String> {
     let decoded = decode_page(bytes)?;
+    validate_metadata_mode(&decoded, false)?;
     let (facts, document) = parse_document_metadata(&decoded)?;
     drop(decoded);
     serialize_query_document_with_facts(&document, facts, false)
@@ -938,6 +939,7 @@ pub fn query_document_from_metadata(bytes: &[u8]) -> Result<String, String> {
 #[doc = "# Errors\nRejects invalid metadata framing, vector summaries, or document JSON, and legacy metadata pages."]
 pub fn query_typed_document_from_metadata(bytes: &[u8]) -> Result<String, String> {
     let decoded = decode_page(bytes)?;
+    validate_metadata_mode(&decoded, true)?;
     let (facts, document) = parse_document_metadata(&decoded)?;
     drop(decoded);
     serialize_query_document_with_facts(&document, facts, true)
@@ -1004,6 +1006,7 @@ pub fn query_documents_from_metadata(
         if crc32fast::hash(&decoded[..length]) != crc {
             return Err("Page integrity check failed".into());
         }
+        validate_metadata_mode(&decoded[..length], false)?;
         let (facts, document) = parse_document_metadata(&decoded[..length])?;
         sequence
             .serialize_element(&document.query_ref(facts, false)?)
@@ -1021,6 +1024,7 @@ pub fn full_document_from_frames(
     vector_bytes: &[u8],
 ) -> Result<String, String> {
     let decoded = decode_page(metadata_bytes)?;
+    validate_metadata_mode(&decoded, false)?;
     let (facts, mut document) = parse_document_metadata(&decoded)?;
     drop(decoded);
     attach_vector_frame(&mut document, vector_bytes, facts)?;
@@ -1033,10 +1037,18 @@ pub fn full_typed_document_from_frames(
     vector_bytes: &[u8],
 ) -> Result<String, String> {
     let decoded = decode_page(metadata_bytes)?;
+    validate_metadata_mode(&decoded, true)?;
     let (facts, mut document) = parse_document_metadata(&decoded)?;
     drop(decoded);
     attach_vector_frame(&mut document, vector_bytes, facts)?;
     document.to_typed_canonical_json()
+}
+
+fn validate_metadata_mode(decoded: &[u8], typed: bool) -> Result<(), String> {
+    if (decoded.first() == Some(&METADATA_CODEC_TYPED)) != typed {
+        return Err("Document metadata codec does not match typed projection".into());
+    }
+    Ok(())
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -14661,6 +14673,33 @@ mod typed_cell_tests {
             assert!(
                 parse_header(&forged(&tampered, 6, payload)?).is_err(),
                 "{carrier}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn empty_attributes_preserve_the_metadata_codec_boundary() -> Result<(), String> {
+        let typed = typed_document("a", vec![], None)?;
+        let legacy = Document::native("a", 1, "", "shared", BTreeMap::new(), None);
+        let facts = vector_facts(None)?;
+        for (document, typed_mode) in [(&typed, true), (&legacy, false)] {
+            let raw = encode_canonical_metadata_page(document, facts, typed_mode)?;
+            let mut page = Vec::new();
+            let range = append(&mut page, &raw)?;
+            assert_eq!(query_document_from_metadata(&page).is_ok(), !typed_mode);
+            assert_eq!(
+                query_typed_document_from_metadata(&page).is_ok(),
+                typed_mode
+            );
+            assert_eq!(full_document_from_frames(&page, &[]).is_ok(), !typed_mode);
+            assert_eq!(
+                full_typed_document_from_frames(&page, &[]).is_ok(),
+                typed_mode
+            );
+            assert_eq!(
+                query_documents_from_metadata(&page, &[range.offset, range.length]).is_ok(),
+                !typed_mode
             );
         }
         Ok(())

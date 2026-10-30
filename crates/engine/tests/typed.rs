@@ -1,6 +1,7 @@
+use raio_engine::analysis::WordV4Config;
 use raio_engine::segment::{
-    self, AttributeSchema, Cell, ColumnId, ColumnValue, CommonDirectory, Document, DocumentId,
-    Filter, Header, NativeRole, Search, Statistics,
+    self, AttributeSchema, Cell, ColumnId, ColumnValue, CommonDirectory, Document,
+    DocumentColumnId, DocumentId, Filter, Header, NamedTextField, NativeRole, Search, Statistics,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -588,5 +589,102 @@ fn attributes_named_like_roles_stay_distinct_from_roles_in_typed_segments() -> C
         )?,
         [] as [String; 0]
     );
+    Ok(())
+}
+
+fn named_documents() -> Result<Vec<Document>, String> {
+    let tags =
+        |values: &[&str]| Cell::Array(values.iter().map(|v| Cell::String((*v).into())).collect());
+    Ok(vec![
+        typed(
+            "a",
+            "",
+            "",
+            vec![
+                ("stamp", Cell::I64(BOUNDARY + 1)),
+                ("tags", tags(&["rust rust", "go"])),
+            ],
+            None,
+        )?,
+        typed(
+            "b",
+            "",
+            "",
+            vec![
+                ("stamp", Cell::I64(BOUNDARY + 2)),
+                ("tags", tags(&["rust"])),
+            ],
+            None,
+        )?,
+        typed(
+            "c",
+            "",
+            "",
+            vec![
+                ("stamp", Cell::I64(BOUNDARY)),
+                ("title", Cell::String("rust rust rust".into())),
+            ],
+            None,
+        )?,
+    ])
+}
+
+fn named_rows(
+    bytes: &[u8],
+    field: &DocumentColumnId,
+    dead: &[u32],
+    filters: &[Filter],
+    k: usize,
+) -> Result<Vec<u32>, String> {
+    Ok(segment::rank_fields(
+        bytes,
+        std::slice::from_ref(field),
+        "rust",
+        "any",
+        k,
+        dead,
+        filters,
+    )?
+    .into_iter()
+    .map(|hit| hit.row)
+    .collect())
+}
+
+#[test]
+fn named_attribute_text_ranks_with_typed_filters_and_tombstones_before_top_k() -> Check {
+    let fields = [NamedTextField {
+        attribute: "tags",
+        config: WordV4Config::default(),
+    }];
+    let built = segment::build_typed(named_documents()?, &schema()?, &fields)?;
+    assert_eq!(&built.bytes[..8], b"RAIOSEG6");
+    let tags = DocumentColumnId::attribute("tags");
+    let mut every = named_rows(&built.bytes, &tags, &[], &[], 5)?;
+    every.sort_unstable();
+    // Rows are ordered by id: a=0 b=1 c=2. "c" only has the undeclared title attribute.
+    assert_eq!(every, [0, 1]);
+    let above = filter(
+        "stamp",
+        "gt",
+        serde_json::json!({"i64": (BOUNDARY + 1).to_string()}),
+    );
+    assert_eq!(
+        named_rows(&built.bytes, &tags, &[], std::slice::from_ref(&above), 1)?,
+        [1]
+    );
+    assert!(
+        named_rows(&built.bytes, &tags, &[1], std::slice::from_ref(&above), 1)?.is_empty(),
+        "tombstones and filters leave nothing to rank"
+    );
+    assert_eq!(named_rows(&built.bytes, &tags, &[0], &[], 1)?, [1]);
+    let title = DocumentColumnId::attribute("title");
+    assert!(named_rows(&built.bytes, &title, &[], &[], 5).is_err());
+    let invalid = filter("stamp", "gt", serde_json::json!(BOUNDARY));
+    assert!(named_rows(&built.bytes, &tags, &[], std::slice::from_ref(&invalid), 5).is_err());
+    let undeclared = [NamedTextField {
+        attribute: "count",
+        config: WordV4Config::default(),
+    }];
+    assert!(segment::build_typed(named_documents()?, &schema()?, &undeclared).is_err());
     Ok(())
 }

@@ -3512,6 +3512,13 @@ fn append_existing_frame(payload: &mut Vec<u8>, frame: &[u8]) -> Result<Range, S
     Ok(range)
 }
 
+/// Whether the segment bytes carry the typed magic. `parse_header` later proves the stored
+/// version equals the magic, so a forged magic can only fail, never change the reading.
+#[cfg(target_arch = "wasm32")]
+fn has_typed_magic(bytes: &[u8]) -> bool {
+    bytes.starts_with(MAGIC_V6)
+}
+
 #[doc = "# Errors\nRejects invalid framing, checksums, versions, ordering, frequencies, and posting directories."]
 pub fn parse_header(bytes: &[u8]) -> Result<(Header, usize), String> {
     if bytes.len() < 16 {
@@ -6444,8 +6451,53 @@ pub mod wasm {
         }
     }
 
+    fn is_legacy_scalar(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::String(_) => {
+                true
+            }
+            serde_json::Value::Number(number) => number.as_f64().is_some_and(f64::is_finite),
+            serde_json::Value::Array(_) | serde_json::Value::Object(_) => false,
+        }
+    }
+
+    fn is_legacy_operand(op: &str, value: &serde_json::Value) -> bool {
+        match op {
+            "eq" | "ne" | "contains" | "notContains" => is_legacy_scalar(value),
+            "gt" | "gte" | "lt" | "lte" => {
+                value.is_string() || (value.is_number() && is_legacy_scalar(value))
+            }
+            "exists" => value.is_boolean(),
+            "in" => value.as_array().is_some_and(|items| {
+                (1..=32).contains(&items.len()) && items.iter().all(is_legacy_scalar)
+            }),
+            "notIn" | "containsAny" | "notContainsAny" => value
+                .as_array()
+                .is_some_and(|items| items.len() <= 32 && items.iter().all(is_legacy_scalar)),
+            _ => false,
+        }
+    }
+
+    fn is_typed_operand(op: &str, value: &serde_json::Value) -> bool {
+        match op {
+            "eq" | "ne" | "contains" | "notContains" => !value.is_array(),
+            "gt" | "gte" | "lt" | "lte" => value.is_string() || value.is_object(),
+            "exists" => value.is_boolean(),
+            "in" => value.as_array().is_some_and(|items| {
+                (1..=32).contains(&items.len()) && items.iter().all(|item| !item.is_array())
+            }),
+            "notIn" | "containsAny" | "notContainsAny" => value.as_array().is_some_and(|items| {
+                items.len() <= 32 && items.iter().all(|item| !item.is_array())
+            }),
+            _ => false,
+        }
+    }
+
     impl FieldFilterDto {
-        fn into_filter(self) -> Result<Filter, String> {
+        /// `typed` comes from the canonical segment version, never from the operand shape.
+        /// Legacy segments keep the scalar grammar; typed segments take exact typed cells
+        /// through the engine's own typed filter preparation.
+        fn into_filter(self, typed: bool) -> Result<Filter, String> {
             if self.field.is_empty()
                 || self.field.encode_utf16().count() > 128
                 || self.field.len() > 128
@@ -6453,37 +6505,41 @@ pub mod wasm {
             {
                 return Err("Invalid filter field name".into());
             }
-            let scalar = |value: &serde_json::Value| match value {
-                serde_json::Value::Null
-                | serde_json::Value::Bool(_)
-                | serde_json::Value::String(_) => true,
-                serde_json::Value::Number(number) => number.as_f64().is_some_and(f64::is_finite),
-                serde_json::Value::Array(_) | serde_json::Value::Object(_) => false,
-            };
-            let valid = match self.op.as_str() {
-                "eq" | "ne" | "contains" | "notContains" => scalar(&self.value),
-                "gt" | "gte" | "lt" | "lte" => {
-                    self.value.is_string() || (self.value.is_number() && scalar(&self.value))
-                }
-                "exists" => self.value.is_boolean(),
-                "in" => self.value.as_array().is_some_and(|items| {
-                    (1..=32).contains(&items.len()) && items.iter().all(scalar)
-                }),
-                "notIn" | "containsAny" | "notContainsAny" => self
-                    .value
-                    .as_array()
-                    .is_some_and(|items| items.len() <= 32 && items.iter().all(scalar)),
-                _ => false,
-            };
-            if !valid {
-                return Err("Invalid field filter".into());
-            }
-            Ok(Filter {
+            let filter = Filter {
                 field: self.field,
                 op: self.op,
                 value: self.value,
-            })
+            };
+            if typed {
+                if !is_typed_operand(&filter.op, &filter.value) {
+                    return Err("Invalid field filter".into());
+                }
+                filter.prepare(true)?;
+            } else if !is_legacy_operand(&filter.op, &filter.value) {
+                return Err("Invalid field filter".into());
+            }
+            Ok(filter)
         }
+    }
+
+    fn named_text_fields(declarations: &[NamedFieldDto]) -> Vec<NamedTextField<'_>> {
+        declarations
+            .iter()
+            .map(|field| NamedTextField {
+                attribute: &field.name,
+                config: field.config,
+            })
+            .collect()
+    }
+
+    fn decode_named_declarations(json: &str) -> Result<Vec<NamedFieldDto>, JsValue> {
+        check_field_json(json)?;
+        let declarations: Vec<NamedFieldDto> =
+            serde_json::from_str(json).map_err(|cause| JsValue::from_str(&cause.to_string()))?;
+        if declarations.len() > 64 {
+            return Err(JsValue::from_str("Field build exceeds its input budget"));
+        }
+        Ok(declarations)
     }
 
     const fn default_top_k() -> usize {
@@ -6498,7 +6554,7 @@ pub mod wasm {
         }
     }
 
-    fn decode_field_query(json: &str) -> Result<DecodedFieldQuery, JsValue> {
+    fn decode_field_query(json: &str, typed: bool) -> Result<DecodedFieldQuery, JsValue> {
         check_field_json(json)?;
         let dto: FieldQueryDto =
             serde_json::from_str(json).map_err(|cause| JsValue::from_str(&cause.to_string()))?;
@@ -6532,7 +6588,7 @@ pub mod wasm {
         let filters = dto
             .filters
             .into_iter()
-            .map(FieldFilterDto::into_filter)
+            .map(|filter| filter.into_filter(typed))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|cause| JsValue::from_str(&cause))?;
         Ok(DecodedFieldQuery {
@@ -6568,14 +6624,7 @@ pub mod wasm {
             .into_iter()
             .map(Document::from_canonical_dto)
             .collect();
-        let fields = dto
-            .text_fields
-            .iter()
-            .map(|field| NamedTextField {
-                attribute: &field.name,
-                config: field.config,
-            })
-            .collect::<Vec<_>>();
+        let fields = named_text_fields(&dto.text_fields);
         build_text_fields(documents, dto.filterable.as_deref(), &fields)
             .map(|built| built.bytes)
             .map_err(|cause| JsValue::from_str(&cause))
@@ -6584,7 +6633,7 @@ pub mod wasm {
     #[wasm_bindgen]
     #[doc = "# Errors\nRejects malformed field query JSON, invalid global statistics, corrupt segments, filters, and tombstones."]
     pub fn segment_rank_fields(bytes: &[u8], json: &str) -> Result<String, JsValue> {
-        let decoded = decode_field_query(json)?;
+        let decoded = decode_field_query(json, super::has_typed_magic(bytes))?;
         let query = decoded.as_query();
         let hits = rank_fields_with(bytes, &query).map_err(|cause| JsValue::from_str(&cause))?;
         serde_json::to_string(&hits).map_err(|cause| JsValue::from_str(&cause.to_string()))
@@ -8628,17 +8677,31 @@ pub mod wasm {
 
     #[wasm_bindgen]
     impl Segment {
-        #[doc = "# Errors\nRejects invalid typed documents, undeclared attributes, mismatched cell types, unsupported column settings or segment bounds."]
-        pub fn with_columns(json: &str, columns: &str) -> Result<Self, JsValue> {
+        #[doc = "# Errors\nRejects invalid typed documents, undeclared attributes, mismatched cell types, unsupported column settings, malformed, oversized, duplicate, unsorted, undeclared or non-text named field declarations, or segment bounds. The optional third argument declares named text fields over string or string-array columns."]
+        pub fn with_columns(
+            json: &str,
+            columns: &str,
+            text_fields: Option<String>,
+        ) -> Result<Self, JsValue> {
+            let declarations = text_fields
+                .map(|json| decode_named_declarations(&json))
+                .transpose()?
+                .unwrap_or_default();
             let schema = super::AttributeSchema::from_json(columns)
                 .map_err(|cause| JsValue::from_str(&cause))?;
+            let fields = named_text_fields(&declarations);
+            for field in &fields {
+                schema
+                    .validate_text_field(field.attribute)
+                    .map_err(|cause| JsValue::from_str(&cause))?;
+            }
             let documents = serde_json::from_str::<Vec<super::TypedDocumentDto>>(json)
                 .map_err(|cause| JsValue::from_str(&cause.to_string()))?
                 .into_iter()
                 .map(Document::from_typed_dto)
                 .collect();
             Ok(Self {
-                built: super::build_typed(documents, &schema, &[])
+                built: super::build_typed(documents, &schema, &fields)
                     .map_err(|cause| JsValue::from_str(&cause))?,
             })
         }

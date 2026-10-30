@@ -983,9 +983,10 @@ export const NamedTextField = Schema.Struct({
   name: FieldName,
   config: Schema.optional(WordV4Config),
 });
+export const NamedTextFields = Schema.Array(NamedTextField).check(Schema.isMaxLength(64));
 export const FieldBuild = Schema.Struct({
   documents: Schema.Array(CanonicalDocument).check(Schema.isBetweenLength(1, 10_000)),
-  text_fields: Schema.Array(NamedTextField).check(Schema.isMaxLength(64)),
+  text_fields: NamedTextFields,
   filterable: Schema.optional(Schema.Array(FieldName).check(Schema.isMaxLength(64))),
 });
 export const FieldRankHit = Schema.Struct({
